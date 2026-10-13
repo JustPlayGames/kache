@@ -4159,8 +4159,8 @@ fn lexically_resolve_path(input: &str) -> String {
 /// candidate is found, or the unit neither links (`links`) nor bundles it
 /// (`-bundle`). A `static` spec whose file cannot be modelled (`:RENAME`,
 /// unknown modifier) is an error. Ambiguous/read/identity failures return an
-/// error so the invocation passes through uncached. `usage` picks the digest
-/// for the archive found.
+/// error so the invocation passes through uncached; candidates with the same
+/// bytes are not ambiguous. `usage` picks the digest for the archive found.
 /// Used to fold a native static lib's content into the cache key so an in-place
 /// rebuild of `lib<name>.a` (same name, same path, changed bytes) no longer
 /// produces a stale hit (#421).
@@ -4186,9 +4186,13 @@ fn resolve_native_static_lib(
     // file only exists where the build produced it). Build scripts can emit the
     // same search directory more than once (for example, one `cc::Build::compile`
     // call per archive), so repeated sightings of the same candidate are not
-    // ambiguous. If more than one distinct candidate matches — `lib<name>.a`
-    // and `<name>.lib`, or hits in two dirs — the choice is target-specific, so
-    // fail the cache key rather than risk hashing the wrong file.
+    // ambiguous. Nor are distinct candidates with the same bytes: for an MSVC
+    // target `cc` hard-links or copies each `lib<name>.a` it builds to
+    // `<name>.lib`, and whichever one rustc or the linker takes, it reads the
+    // same contents. The first one found is hashed. If candidates differ —
+    // `lib<name>.a` and `<name>.lib`, or hits in two dirs — the choice is
+    // target-specific, so fail the cache key rather than risk hashing the
+    // wrong file.
     let mut found: Option<PathBuf> = None;
     for dir in search_dirs {
         for filename in &file_names {
@@ -4197,8 +4201,11 @@ fn resolve_native_static_lib(
                 if found.as_ref().is_some_and(|path| path == &candidate) {
                     continue;
                 }
-                if found.is_some() {
-                    anyhow::bail!("ambiguous native static library {spec:?}");
+                if let Some(first) = &found {
+                    if file_hasher.hash(first)? != file_hasher.hash(&candidate)? {
+                        anyhow::bail!("ambiguous native static library {spec:?}");
+                    }
+                    continue;
                 }
                 found = Some(candidate);
             }

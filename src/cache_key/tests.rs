@@ -6739,6 +6739,62 @@ fn resolve_native_static_lib_hashes_only_unambiguous_static_archives() {
     );
 }
 
+/// For an MSVC target `cc` hard-links or copies each `lib<name>.a` it
+/// builds to `<name>.lib`. Candidates with the same bytes are one archive,
+/// keyed through the first one found; a candidate with other bytes anywhere
+/// keeps the choice ambiguous.
+#[test]
+fn resolve_native_static_lib_accepts_copies_with_the_same_bytes() {
+    let fh = FileHasher::new();
+    let resolve = |dirs: &[&Path]| {
+        let dirs: Vec<PathBuf> = dirs.iter().map(|dir| dir.to_path_buf()).collect();
+        resolve_native_static_lib("static=foo", &dirs, &fh, false, |_| StaticLibUse::Bundled)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let gnu = dir.path().join("libfoo.a");
+    std::fs::write(&gnu, b"archive bytes").unwrap();
+    let single = resolve(&[dir.path()]).unwrap().unwrap();
+    assert_eq!(single.0, gnu);
+
+    let msvc = dir.path().join("foo.lib");
+    std::fs::hard_link(&gnu, &msvc).unwrap();
+    assert_eq!(resolve(&[dir.path()]).unwrap().unwrap(), single);
+    std::fs::remove_file(&msvc).unwrap();
+    std::fs::write(&msvc, b"archive bytes").unwrap();
+    assert_eq!(
+        resolve(&[dir.path()]).unwrap().unwrap(),
+        single,
+        "a copy is the same archive; the first one found is hashed"
+    );
+
+    let copy = tempfile::tempdir().unwrap();
+    std::fs::write(copy.path().join("libfoo.a"), b"archive bytes").unwrap();
+    assert_eq!(
+        resolve(&[dir.path(), copy.path()]).unwrap().unwrap(),
+        single
+    );
+    assert_eq!(
+        resolve(&[copy.path(), dir.path()]).unwrap().unwrap().0,
+        copy.path().join("libfoo.a"),
+        "search order picks the copy"
+    );
+
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("foo.lib"), b"other bytes").unwrap();
+    for dirs in [
+        [dir.path(), other.path(), copy.path()],
+        [dir.path(), copy.path(), other.path()],
+    ] {
+        let error = resolve(&dirs).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous native static library"),
+            "{error:#}"
+        );
+    }
+}
+
 #[test]
 fn resolve_native_static_lib_hashes_archives_named_with_modifiers() {
     let fh = FileHasher::new();
