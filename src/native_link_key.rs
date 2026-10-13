@@ -469,6 +469,10 @@ pub(crate) struct WindowsProbeEnvironment {
     pub(crate) variables: BTreeMap<String, String>,
     pub(crate) path: Vec<PathBuf>,
     pub(crate) cwd: Option<PathBuf>,
+    /// The tool directories of rustc's sysroots (see [`rustc_tool_dir`]).
+    /// rustc puts them before `PATH` for the linker it runs, so a linker
+    /// named without a directory is looked up there first.
+    rustc_tool_dirs: Vec<PathBuf>,
     default_linker: Option<PathBuf>,
     compiler: Option<PathBuf>,
     linker_command_env: Vec<(OsString, OsString)>,
@@ -877,21 +881,60 @@ fn takes_non_input_value(token: &str) -> bool {
     })
 }
 
-fn windows_tool_from_name(path: &Path) -> Option<WindowsTool> {
+/// A tool's file name as Windows matches it: lowercase, without `.exe`.
+fn windows_tool_stem(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    match name {
+    Some(match name.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => name,
+    })
+}
+
+fn windows_tool_from_name(path: &Path) -> Option<WindowsTool> {
+    match windows_tool_stem(path)?.as_str() {
         "link" => Some(WindowsTool::Link),
-        "lld-link" => Some(WindowsTool::LldLink),
+        // rustc runs its own LLD, `rust-lld`, with `-flavor link` for an
+        // MSVC target: that is lld-link.
+        "lld-link" | "rust-lld" => Some(WindowsTool::LldLink),
         "cl" => Some(WindowsTool::Cl),
         _ => None,
     }
 }
 
+/// Whether `path` is rustc's LLD. It serves every LLD flavor and acts as
+/// lld-link only when its arguments start with `-flavor link`.
+fn is_rust_lld(path: &Path) -> bool {
+    windows_tool_stem(path).is_some_and(|stem| stem == "rust-lld")
+}
+
+/// `<sysroot>/lib/rustlib/<host>/bin`, where rustc keeps the tools it
+/// ships, `rust-lld` among them. rustc puts this directory before `PATH`
+/// when it runs a linker.
+pub(crate) fn rustc_tool_dir(sysroot: &Path, host: &str) -> PathBuf {
+    sysroot.join("lib").join("rustlib").join(host).join("bin")
+}
+
 fn path_lookup(environment: &WindowsProbeEnvironment, name: &str) -> Option<PathBuf> {
+    directory_lookup(&environment.path, name)
+}
+
+/// Where rustc finds a linker named without a directory: its sysroots'
+/// tool directories, then `PATH`.
+fn linker_lookup(environment: &WindowsProbeEnvironment, name: &str) -> Option<PathBuf> {
+    directory_lookup(
+        environment.rustc_tool_dirs.iter().chain(&environment.path),
+        name,
+    )
+}
+
+/// The first file named `name` in `directories`.
+fn directory_lookup<'a>(
+    directories: impl IntoIterator<Item = &'a PathBuf>,
+    name: &str,
+) -> Option<PathBuf> {
     let wanted = name.to_ascii_lowercase();
     let wanted = wanted.strip_suffix(".exe").unwrap_or(&wanted);
-    environment.path.iter().find_map(|directory| {
+    directories.into_iter().find_map(|directory| {
         let candidate = directory.join(name);
         candidate.is_file().then_some(candidate).or_else(|| {
             // Tests and a few Unix-hosted Windows SDK shims omit `.exe` from
@@ -1026,14 +1069,17 @@ fn windows_tool_command(
     path: &Path,
     environment: &[(OsString, OsString)],
 ) -> Command {
-    let argument = match tool {
-        WindowsTool::LldLink => "--version",
-        WindowsTool::Link => "/?",
-        WindowsTool::Cl => "/Bv",
+    let arguments: &[&str] = match tool {
+        // Without a flavor, `rust-lld` refuses to run and names the
+        // flavored drivers instead.
+        WindowsTool::LldLink if is_rust_lld(path) => &["-flavor", "link", "--version"],
+        WindowsTool::LldLink => &["--version"],
+        WindowsTool::Link => &["/?"],
+        WindowsTool::Cl => &["/Bv"],
     };
     let mut command = Command::new(path);
     command
-        .arg(argument)
+        .args(arguments)
         .envs(environment.iter().cloned())
         .env_remove("CL")
         .env_remove("_CL_")
@@ -1597,9 +1643,12 @@ fn hash_windows_runtime_libraries(
 
 /// Discover a Windows MSVC identity while honoring rustc/linker search paths
 /// that can shadow the environment's default CRT and direct `-l` libraries.
+/// `rustc_tool_dirs` are the tool directories of rustc's sysroots, searched
+/// before `PATH` for a linker named without a directory.
 pub(crate) fn probe_windows_msvc_identity_with_library_dirs<HashLibrary>(
     linker: Option<&Path>,
     target_architecture: &str,
+    rustc_tool_dirs: &[PathBuf],
     rustc_library_dirs: &[PathBuf],
     linker_library_dirs: &[PathBuf],
     link_libraries: &[String],
@@ -1610,6 +1659,7 @@ where
 {
     let mut environment =
         WindowsProbeEnvironment::current().context("capturing Windows MSVC environment")?;
+    environment.rustc_tool_dirs = rustc_tool_dirs.to_vec();
     environment.augment_from_installed_msvc(target_architecture)?;
     let mut identity = probe_windows_msvc_identity_with(
         linker,
@@ -1669,8 +1719,12 @@ where
             }
             resolved
         }
-        Some(name) => path_lookup(environment, &name.to_string_lossy())
-            .with_context(|| format!("selected linker {} is not on PATH", name.display()))?,
+        Some(name) => linker_lookup(environment, &name.to_string_lossy()).with_context(|| {
+            format!(
+                "selected linker {} is neither in rustc's tool directories nor on PATH",
+                name.display()
+            )
+        })?,
         None => environment
             .default_linker
             .clone()
@@ -2020,10 +2074,14 @@ mod tests {
     fn windows_production_probe_uses_current_environment() {
         let _lock = process_state_test_lock();
         const CHILD: &str = "KACHE_TEST_WINDOWS_PRODUCTION_PROBE_CHILD";
+        const RUST_LLD_TOOLS: &str = "KACHE_TEST_WINDOWS_PRODUCTION_PROBE_RUST_LLD_TOOLS";
+        const RUST_LLD_BANNER: &str =
+            "LLD 22.1.8 (https://github.com/rust-lang/llvm-project.git 52ed14fcd56a)";
         if std::env::var_os(CHILD).is_some() {
             let identity = probe_windows_msvc_identity_with_library_dirs(
                 None,
                 "x64",
+                &[],
                 &[],
                 &[],
                 &[],
@@ -2039,6 +2097,24 @@ mod tests {
             assert!(identity.libraries.contains_key("libcmt.lib"));
             assert!(identity.libraries.contains_key("vcruntime.lib"));
             assert!(identity.libraries.contains_key("ucrt.lib"));
+
+            // rustc's LLD is found in rustc's tool directory and asked for
+            // its lld-link banner with the flavor rustc gives it.
+            let tools = PathBuf::from(std::env::var_os(RUST_LLD_TOOLS).unwrap());
+            let rust_lld = |tool_dirs: &[PathBuf]| {
+                probe_windows_msvc_identity_with_library_dirs(
+                    Some(Path::new("rust-lld.exe")),
+                    "x64",
+                    tool_dirs,
+                    &[],
+                    &[],
+                    &[],
+                    hash_file,
+                )
+            };
+            assert!(rust_lld(&[]).is_err(), "rust-lld is not on PATH");
+            let identity = rust_lld(&[tools]).expect("rust-lld in rustc's tool directory");
+            assert_eq!(identity.linker, RUST_LLD_BANNER);
             return;
         }
 
@@ -2068,11 +2144,25 @@ mod tests {
         ] {
             std::fs::write(directory.path().join(name), contents).unwrap();
         }
+        // Outside PATH, like the sysroot's tool directory.
+        let tools = tempfile::tempdir().unwrap();
+        kache_fs::testutil::write_executable(
+            &tools.path().join("rust-lld.exe"),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$*\" = '-flavor link --version' ]; then\n\
+                   echo '{RUST_LLD_BANNER}'\n\
+                 else\n\
+                   echo 'lld is a generic driver.'\n\
+                 fi\n"
+            ),
+        );
 
         let output = Command::new(std::env::current_exe().unwrap())
             .arg("windows_production_probe_uses_current_environment")
             .arg("--nocapture")
             .env(CHILD, "1")
+            .env(RUST_LLD_TOOLS, tools.path())
             .env("PATH", directory.path())
             .env("LIB", directory.path())
             .env("Platform", "x64")
@@ -2107,6 +2197,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             hash_file,
         )
         .expect("hosted Windows must expose an installed MSVC toolchain");
@@ -2134,6 +2225,43 @@ mod tests {
                 identity.libraries.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// The toolchain running these tests ships `rust-lld` in its tool
+    /// directory. `-C linker=rust-lld.exe` resolves there, as for rustc,
+    /// and the identity carries that binary's lld-link banner.
+    #[cfg(windows)]
+    #[test]
+    fn windows_installed_msvc_probe_finds_the_toolchains_rust_lld() {
+        let _lock = process_state_test_lock();
+        let rustc = |arguments: &[&str]| {
+            let output = Command::new("rustc").args(arguments).output().unwrap();
+            assert!(output.status.success(), "rustc {arguments:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let sysroot = PathBuf::from(rustc(&["--print", "sysroot"]).trim());
+        let version = rustc(&["-vV"]);
+        let host = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap();
+        let tools = rustc_tool_dir(&sysroot, host);
+        let banner =
+            run_windows_tool_in(None, WindowsTool::LldLink, &tools.join("rust-lld.exe"), &[])
+                .unwrap();
+        assert!(banner.starts_with("LLD "), "{banner}");
+
+        let identity = probe_windows_msvc_identity_with_library_dirs(
+            Some(Path::new("rust-lld.exe")),
+            windows_msvc_architecture(host).unwrap(),
+            &[tools],
+            &[],
+            &[],
+            &[],
+            hash_file,
+        )
+        .expect("rust-lld in the toolchain's tool directory");
+        assert_eq!(identity.linker, banner);
     }
 
     /// The placement memo answers from disk while the searched directories
@@ -2562,6 +2690,23 @@ mod tests {
             Some(WindowsTool::Cl)
         );
         assert_eq!(windows_tool_from_name(Path::new("lld.exe")), None);
+        // rustc's own LLD is lld-link for an MSVC target; only that name
+        // takes the flavor argument.
+        for name in [
+            "rust-lld.exe",
+            "RUST-LLD",
+            "C:/toolchain/lib/rustlib/x86_64-pc-windows-msvc/bin/Rust-Lld.EXE",
+        ] {
+            assert_eq!(
+                windows_tool_from_name(Path::new(name)),
+                Some(WindowsTool::LldLink),
+                "{name}"
+            );
+            assert!(is_rust_lld(Path::new(name)), "{name}");
+        }
+        for name in ["lld-link.exe", "rust-lld-wrapper.exe", "rust-lld.cmd", ""] {
+            assert!(!is_rust_lld(Path::new(name)), "{name}");
+        }
         assert!(is_path_like(Path::new(r"tools\link.exe")));
         assert!(is_path_like(Path::new("tools/link.exe")));
         assert!(!is_path_like(Path::new("link.exe")));
@@ -2712,6 +2857,32 @@ mod tests {
             command.get_args().collect::<Vec<_>>(),
             vec![std::ffi::OsStr::new("/Bv")]
         );
+
+        // `rust-lld` prints its lld-link banner only once told the flavor
+        // rustc gives it; a real lld-link takes no flavor.
+        for (tool, path, arguments) in [
+            (
+                WindowsTool::LldLink,
+                "C:/toolchain/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe",
+                &["-flavor", "link", "--version"][..],
+            ),
+            (
+                WindowsTool::LldLink,
+                "C:/LLVM/bin/lld-link.exe",
+                &["--version"],
+            ),
+            (WindowsTool::Link, "link.exe", &["/?"]),
+        ] {
+            let command = windows_tool_command(tool, Path::new(path), &[]);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                arguments
+                    .iter()
+                    .map(std::ffi::OsStr::new)
+                    .collect::<Vec<_>>(),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -3498,6 +3669,85 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("selected arm64 architecture"));
+    }
+
+    /// `-C linker=rust-lld.exe` names the LLD in rustc's sysroot, which
+    /// rustc finds in its tool directory before `PATH` and runs as
+    /// lld-link. The identity looks where rustc does and carries the banner
+    /// of the binary it found, so another toolchain's LLD is another key.
+    #[test]
+    fn windows_identity_finds_rust_lld_where_rustc_does() {
+        const STABLE_LLD: &str =
+            "LLD 22.1.8 (https://github.com/rust-lang/llvm-project.git 52ed14fcd56a)";
+        const NEXT_LLD: &str = "LLD 23.1.1 (https://github.com/rust-lang/llvm-project.git 9c0f3b)";
+        let directory = tempfile::tempdir().unwrap();
+        let mut environment = windows_environment(directory.path(), "x64");
+        let toolchain = |name: &str| {
+            let sysroot = directory.path().join("toolchains").join(name);
+            let tools = rustc_tool_dir(&sysroot, "x86_64-pc-windows-msvc");
+            assert_eq!(
+                tools,
+                sysroot.join("lib/rustlib/x86_64-pc-windows-msvc/bin")
+            );
+            std::fs::create_dir_all(&tools).unwrap();
+            placed(&tools, "rust-lld.exe");
+            tools
+        };
+        let stable = toolchain("stable");
+        let next = toolchain("next");
+        let on_path = directory.path().join("rust-lld.exe");
+        let probe = |environment: &WindowsProbeEnvironment| {
+            probe_windows_msvc_identity_with(
+                Some(Path::new("rust-lld.exe")),
+                "x64",
+                &[],
+                environment,
+                |tool, path| {
+                    Ok(match tool {
+                        WindowsTool::LldLink if path == stable.join("rust-lld.exe") => {
+                            STABLE_LLD.into()
+                        }
+                        WindowsTool::LldLink if path == next.join("rust-lld.exe") => {
+                            NEXT_LLD.into()
+                        }
+                        WindowsTool::LldLink if path == on_path => LLD_LINK_BANNER.into(),
+                        WindowsTool::LldLink => unreachable!("unexpected LLD {}", path.display()),
+                        WindowsTool::Cl => compiler_banner("x64"),
+                        WindowsTool::Link => unreachable!("rust-lld replaces link.exe"),
+                    })
+                },
+            )
+        };
+
+        let error = probe(&environment).unwrap_err();
+        assert!(
+            error.to_string().contains("selected linker rust-lld.exe"),
+            "{error:#}"
+        );
+
+        environment.rustc_tool_dirs = vec![stable.clone()];
+        let identity = probe(&environment).unwrap();
+        assert_eq!(identity.linker, STABLE_LLD);
+        assert_eq!(identity.wrapper, None);
+
+        // A copy on PATH does not shadow the sysroot's, as for rustc.
+        placed(directory.path(), "rust-lld.exe");
+        assert_eq!(probe(&environment).unwrap(), identity);
+
+        // The first tool directory wins: an explicit `--sysroot`'s comes
+        // before the toolchain's own.
+        environment.rustc_tool_dirs = vec![next.clone(), stable.clone()];
+        let other = probe(&environment).unwrap();
+        assert_eq!(other.linker, NEXT_LLD);
+        assert_ne!(
+            other.encode(),
+            identity.encode(),
+            "another toolchain's LLD must change the identity"
+        );
+
+        // Without a sysroot to search, `PATH` still serves.
+        environment.rustc_tool_dirs.clear();
+        assert_eq!(probe(&environment).unwrap().linker, LLD_LINK_BANNER);
     }
 
     #[test]
