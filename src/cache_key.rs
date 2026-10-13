@@ -3810,11 +3810,12 @@ fn compute_key_into(
         args,
         &rustc_version,
         cfg!(target_os = "windows"),
-        |linker, architecture| {
+        |linker, architecture, host| {
             let search_dirs = windows_native_link_search_dirs(args)?;
             crate::native_link_key::probe_windows_msvc_identity_with_library_dirs(
                 linker,
                 architecture,
+                &rustc_tool_dirs(args, host),
                 &search_dirs.rustc,
                 &search_dirs.linker,
                 &args.link_libs,
@@ -8980,6 +8981,21 @@ fn default_rustc_sysroot(rustc: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(sysroot))
 }
 
+/// Where rustc looks first for a linker named without a directory, such as
+/// `-C linker=rust-lld.exe`: the tool directory of an explicit `--sysroot`,
+/// then that of the toolchain's own sysroot. rustc puts these before `PATH`
+/// for the linker it runs. In a double-wrapper invocation the sysroot is
+/// the inner rustc's, like the host triple.
+fn rustc_tool_dirs(args: &RustcArgs, host: &str) -> Vec<PathBuf> {
+    let rustc = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
+    args.sysroot
+        .iter()
+        .cloned()
+        .chain(default_rustc_sysroot(rustc))
+        .map(|sysroot| crate::native_link_key::rustc_tool_dir(&sysroot, host))
+        .collect()
+}
+
 /// The libraries rustc may load for the codegen backend `name`, with their
 /// content hashes, under an explicit `--sysroot` and under the toolchain's own
 /// sysroot. Both are hashed because which one rustc searches first depends on
@@ -9560,6 +9576,7 @@ where
 /// Fold the selected native Windows MSVC link identity into a linked-output
 /// key. The probe is injected so the admission gate can be tested without a
 /// Windows toolchain; production supplies the real tool/library discovery.
+/// It gets the selected linker, the MSVC architecture and rustc's host.
 fn fold_native_windows_msvc_identity<H, Probe>(
     hasher: &mut H,
     args: &RustcArgs,
@@ -9569,7 +9586,7 @@ fn fold_native_windows_msvc_identity<H, Probe>(
 ) -> Result<()>
 where
     H: KeyFold,
-    Probe: FnOnce(Option<&Path>, &str) -> Result<String>,
+    Probe: FnOnce(Option<&Path>, &str, &str) -> Result<String>,
 {
     if !running_on_windows || !args.is_executable_output() || !args.emits_link() {
         return Ok(());
@@ -9592,8 +9609,8 @@ where
     let architecture = crate::native_link_key::windows_msvc_architecture(host)
         .context("native Windows MSVC host has an unsupported architecture")?;
     let linker = args.get_codegen_opt("linker").map(Path::new);
-    let identity =
-        probe(linker, architecture).context("determining native Windows MSVC link identity")?;
+    let identity = probe(linker, architecture, host)
+        .context("determining native Windows MSVC link identity")?;
     fold_field(&mut *hasher, b"host_windows_msvc.v1:", identity.as_bytes());
     tracing::trace!(
         "[key:{}] host_windows_msvc={}",

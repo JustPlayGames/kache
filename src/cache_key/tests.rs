@@ -478,9 +478,13 @@ fn windows_fold_key_on_host(
 ) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"base-key");
-    fold_native_windows_msvc_identity(&mut hasher, args, version, running_on_windows, |_, _| {
-        Ok(identity.to_string())
-    })?;
+    fold_native_windows_msvc_identity(
+        &mut hasher,
+        args,
+        version,
+        running_on_windows,
+        |_, _, _| Ok(identity.to_string()),
+    )?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -595,6 +599,43 @@ fn native_windows_msvc_ignores_unrelated_generic_cc_identity() {
     assert_ne!(generic.finalize(), fold("anything"));
 }
 
+/// The probe gets the linker `-C linker` names, the MSVC architecture and
+/// rustc's host, whose tool directory rustc searches for that linker.
+#[test]
+fn native_windows_msvc_probe_gets_linker_architecture_and_host() {
+    let bin = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-type=bin".into(),
+        "src/main.rs".into(),
+        "-Clinker=rust-lld.exe".into(),
+    ])
+    .unwrap();
+    let mut seen = None;
+    fold_native_windows_msvc_identity(
+        &mut blake3::Hasher::new(),
+        &bin,
+        WINDOWS_RUSTC_VERSION,
+        true,
+        |linker, architecture, host| {
+            seen = Some((
+                linker.map(Path::to_path_buf),
+                architecture.to_string(),
+                host.to_string(),
+            ));
+            Ok("identity".into())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        seen,
+        Some((
+            Some(PathBuf::from("rust-lld.exe")),
+            "x64".to_string(),
+            "x86_64-pc-windows-msvc".to_string()
+        ))
+    );
+}
+
 #[test]
 fn native_windows_msvc_identity_probe_failure_is_cache_failure() {
     let bin = parsed_crate_type("bin", None);
@@ -604,7 +645,7 @@ fn native_windows_msvc_identity_probe_failure_is_cache_failure() {
         &bin,
         WINDOWS_RUSTC_VERSION,
         true,
-        |_, _| anyhow::bail!("ambiguous toolchain"),
+        |_, _, _| anyhow::bail!("ambiguous toolchain"),
     )
     .unwrap_err();
     assert!(
@@ -9785,6 +9826,32 @@ fn rustc_sysroot_prefers_the_explicit_one() {
         "{}",
         own.display()
     );
+}
+
+/// rustc looks for a linker named without a directory in the tool directory
+/// of an explicit `--sysroot`, then in that of its own sysroot. Behind a
+/// workspace wrapper, the sysroot is the inner rustc's.
+#[test]
+fn rustc_tool_dirs_follow_rustcs_sysroot_order() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    let explicit = dir.path().join("sysroot");
+    let host = "x86_64-pc-windows-msvc";
+    let tools = |sysroot: &Path| sysroot.join("lib").join("rustlib").join(host).join("bin");
+    let args = |extra: &[&str]| RustcArgs::parse(&flag_base(&source, extra)).unwrap();
+    let own = get_rustc_sysroot(&args(&[])).unwrap();
+
+    assert_eq!(rustc_tool_dirs(&args(&[]), host), [tools(&own)]);
+    assert_eq!(
+        rustc_tool_dirs(&args(&["--sysroot", &explicit.to_string_lossy()]), host),
+        [tools(&explicit), tools(&own)]
+    );
+
+    let mut wrapped = args(&[]);
+    wrapped.inner_rustc = Some(wrapped.rustc.clone());
+    wrapped.rustc = dir.path().join("workspace-wrapper");
+    assert_eq!(rustc_tool_dirs(&wrapped, host), [tools(&own)]);
 }
 
 /// H2: `--sysroot` selects which std rustc links against; with the
