@@ -544,6 +544,53 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
     e.cmd().args(["daemon", "stop"]).assert().success();
 }
 
+/// `kache daemon stop` with no daemon serving the cache has nothing to stop.
+/// It used to fail with "daemon connection timed out".
+#[test]
+fn daemon_stop_without_a_daemon_succeeds() {
+    let e = env();
+    e.cmd()
+        .args(["daemon", "stop"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("daemon not running"));
+}
+
+/// `kache daemon stop` drains a running daemon and returns once it is gone.
+#[test]
+fn daemon_stop_stops_a_running_daemon() {
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    assert!(common::daemon_run_lock_is_held(&e.cache));
+    e.cmd()
+        .args(["daemon", "stop"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("daemon stopped"));
+    assert!(!common::daemon_run_lock_is_held(&e.cache));
+}
+
+/// A daemon killed with SIGKILL leaves its socket file and state record
+/// behind. Stopping it afterwards is not an error.
+#[cfg(unix)]
+#[test]
+fn daemon_stop_after_the_daemon_was_killed_succeeds() {
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(e.cache.join("daemon.state.json")).unwrap()).unwrap();
+    let pid = libc::pid_t::try_from(state["pid"].as_i64().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    common::wait_for_daemon_exit(&e.cache, std::time::Duration::from_secs(10)).unwrap();
+    assert!(e.cache.join("daemon.sock").exists());
+
+    e.cmd()
+        .args(["daemon", "stop"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("daemon not running"));
+}
+
 /// #652 stats slice: the prefetch policy line may not disagree with the
 /// daemon. The daemon here inherited prefetch enabled, so a later
 /// `KACHE_PREFETCH_ENABLED=0` invocation gets a mismatch warning instead of

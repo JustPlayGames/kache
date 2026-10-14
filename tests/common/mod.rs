@@ -269,7 +269,7 @@ fn daemon_run_lock_path(runtime_dir: &Path) -> PathBuf {
 /// does not create the file, so a test that never started a daemon stays
 /// untouched. An error other than "missing" counts as held: the caller then
 /// asks the daemon to stop, which is harmless if there is none.
-fn daemon_run_lock_is_held(runtime_dir: &Path) -> bool {
+pub fn daemon_run_lock_is_held(runtime_dir: &Path) -> bool {
     let file = match std::fs::OpenOptions::new()
         .write(true)
         .open(daemon_run_lock_path(runtime_dir))

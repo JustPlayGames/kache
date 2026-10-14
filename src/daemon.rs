@@ -9543,6 +9543,27 @@ fn fetch_stats(
 /// Wait for ownership release after a verified drain acknowledgement. A timeout
 /// leaves unfinished work running and reports failure.
 pub fn send_shutdown_request(config: &Config) -> Result<()> {
+    if let Err(error) = request_drain(config) {
+        // A running daemon holds its run lock for its whole life, and the
+        // kernel releases it when the process dies. Without a holder there is
+        // nothing to stop: the cache never had a daemon, or it was killed and
+        // left its socket and state record behind.
+        if !existing_daemon_run_lock_is_held(&config.socket_path())? {
+            eprintln!("daemon not running");
+            return Ok(());
+        }
+        return Err(error);
+    }
+    anyhow::ensure!(
+        wait_for_run_lock_release(&config.socket_path(), Duration::from_secs(35))?,
+        "daemon is still draining; ownership has not been released"
+    );
+    eprintln!("daemon stopped");
+    Ok(())
+}
+
+/// Ask the daemon to drain, over the lifecycle endpoint or the legacy socket.
+fn request_drain(config: &Config) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     if lifecycle_control::request(config, kunobi_daemon::wire::operation::DRAIN, deadline)?
         .is_none()
@@ -9552,11 +9573,6 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
         let response: Response = serde_json::from_str(&response)?;
         anyhow::ensure!(response.ok, "daemon rejected shutdown");
     }
-    anyhow::ensure!(
-        wait_for_run_lock_release(&config.socket_path(), Duration::from_secs(35))?,
-        "daemon is still draining; ownership has not been released"
-    );
-    eprintln!("daemon stopped");
     Ok(())
 }
 
