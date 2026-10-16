@@ -16741,3 +16741,98 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
     assert_ne!(first["BUILD_MODE"], second["BUILD_MODE"]);
     assert!(hashed(Vec::new()).is_empty());
 }
+
+/// Cargo hands a package's `cargo:rustc-link-arg` (winresource's
+/// `<OUT_DIR>/resource.res`) to its library too. rustc ignores it there, so
+/// a library's key must not depend on the checkout the path names; a linking
+/// unit's key still does (its link reads the file, and an rpath-style
+/// argument lands in its output).
+#[test]
+fn a_link_arg_path_keys_a_library_by_checkout_relative_spelling_only() {
+    let key = |root: &Path, crate_type: &str| {
+        let res = root.join(
+            "target/x86_64-pc-windows-msvc/debug/build/app-0123456789abcdef/out/resource.res",
+        );
+        let mut parsed = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-name=app".into(),
+            format!("--crate-type={crate_type}"),
+            "--emit=dep-info,metadata,link".into(),
+            "--target=x86_64-pc-windows-msvc".into(),
+            "-Clink-arg=-nodefaultlib:ucrt".into(),
+            format!("-Clink-arg={}", res.display()),
+        ])
+        .unwrap();
+        parsed.source_file = None;
+        let pn = PathNormalizer::from_env(Some(root));
+        compute_cache_key(&parsed, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
+    };
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    assert_eq!(
+        key(a.path(), "lib"),
+        key(b.path(), "lib"),
+        "a library shares its key"
+    );
+    assert_ne!(
+        key(a.path(), "lib"),
+        key(a.path(), "rlib"),
+        "the crate type still counts"
+    );
+}
+
+/// embed-resource hands its compiled `.res` over as `-l dylib=<name>`
+/// (`<name>.lib` in OUT_DIR). It is not an archive, so no linker can spell
+/// `archive(member)` from it: two checkouts' identical files key alike.
+#[test]
+fn a_windows_resource_file_keys_by_its_bytes_not_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut res = super::WINDOWS_RES_MAGIC.to_vec();
+    res.extend_from_slice(&[0; 16]);
+    res.extend_from_slice(b"\x30\x00\x00\x00\x20\x00\x00\x00\xff\xff\x18\x00\xff\xff\x01\x00");
+    let [first, second] = ["a", "b"].map(|name| {
+        let out = dir.path().join(name).join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("gpui.lib");
+        std::fs::write(&lib, &res).unwrap();
+        lib
+    });
+    let fh = FileHasher::new();
+    let first_hash = fh.hash_static_lib(&first).unwrap();
+    assert!(first_hash.starts_with("res-v1:"), "{first_hash}");
+    assert_eq!(first_hash, fh.hash_static_lib(&second).unwrap());
+    res.push(0);
+    std::fs::write(&second, &res).unwrap();
+    assert_ne!(
+        first_hash,
+        FileHasher::new().hash_static_lib(&second).unwrap()
+    );
+}
+
+/// An archive the portable digest does not admit (COFF members, an MSVC
+/// `.lib` layout) keys by its bytes where rustc bundles it into an rlib,
+/// and by bytes and path where the unit links it.
+#[test]
+fn a_bundled_unportable_archive_keys_by_bytes_and_a_linked_one_by_path_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"!<arch>\n/               0           0     0     0       4         `\n\0\0\0\0/               0           0     0     0       4         `\n\0\0\0\0";
+    let [first, second] = ["a", "b"].map(|name| {
+        let out = dir.path().join(name);
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("foo.lib");
+        std::fs::write(&lib, bytes).unwrap();
+        lib
+    });
+    let bundled = |path: &Path| compute_static_lib_hash(path, StaticLibUse::Bundled).unwrap();
+    let linked = |path: &Path| compute_static_lib_hash(path, StaticLibUse::Linked).unwrap();
+    assert!(
+        bundled(&first).starts_with("bundled-ar-v1:"),
+        "{}",
+        bundled(&first)
+    );
+    assert_eq!(bundled(&first), bundled(&second));
+    assert!(linked(&first).starts_with("path-ar-v1:"));
+    assert_ne!(linked(&first), linked(&second));
+    std::fs::write(&second, [bytes.as_slice(), b"\0"].concat()).unwrap();
+    assert_ne!(bundled(&first), bundled(&second));
+}

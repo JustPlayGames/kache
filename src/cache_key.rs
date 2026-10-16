@@ -3199,9 +3199,24 @@ fn compute_key_into(
         })
         .collect();
     codegen_opts.sort_by_key(|(k, _)| k.as_str());
+    // rustc reads `-C link-arg(s)` only when it links, and they are not in a
+    // crate's metadata: a unit that does not link (an rlib, a check, a
+    // staticlib) writes the same output whatever they name. Cargo still hands
+    // a package's `cargo:rustc-link-arg` to its library (winresource prints
+    // `<OUT_DIR>/resource.res` that way), and spelled raw, that path kept the
+    // library's entry to one checkout. Such a unit keys the value with the
+    // checkout's roots mapped; a linking unit keeps it as spelled.
+    let neutral_link_args = !args.invokes_linker();
     for (key, value) in &codegen_opts {
         fold_field(&mut hasher, b"codegen_key:", key.as_bytes());
         if let Some(v) = value {
+            let mapped;
+            let v = if neutral_link_args && matches!(key.as_str(), "link-arg" | "link-args") {
+                mapped = path_normalizer.normalize(v);
+                &mapped
+            } else {
+                v
+            };
             // `-Clink-arg=`, `-Clink-args=…`, `-Cprofile-use=…`, etc. can
             // carry absolute paths. None of these go through
             // PathNormalizer (they're rustc-controlled flags, not env);
@@ -6127,6 +6142,12 @@ fn skip_ident_bytes(bytes: &[u8], mut i: usize) -> usize {
 // substitution). The ad-hoc helper had two failure modes — see
 // the `path_normalizer` module docs for the full story.
 
+/// The first 16 bytes of a 32-bit Windows `.res` file: its leading empty
+/// entry (DataSize 0, HeaderSize 32, type and name ordinal 0).
+const WINDOWS_RES_MAGIC: &[u8] = &[
+    0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00,
+];
+
 /// Compute a linked `static=` archive's cache-key digest. A proven GNU/BSD
 /// archive gets the structural member-identity hash, unless the invocation
 /// links an archive with DWARF-bearing Mach-O members itself. Every other
@@ -6146,6 +6167,34 @@ fn compute_static_lib_hash(path: &Path, usage: StaticLibUse) -> Result<String> {
         && !(usage == StaticLibUse::Linked && identity.macho_dwarf_members)
     {
         return Ok(identity.digest);
+    }
+    // A compiled Windows resource file (`.res`) that a build script hands
+    // over as a library: embed-resource prints `-l dylib=<name>` for the
+    // `<name>.lib` it writes into OUT_DIR, which is a `.res`, not an archive.
+    // It has no members, so no linker can name `archive(member)` from it,
+    // and the link turns its bytes into the image's resource section without
+    // its path. Keyed by its bytes, the library that names it (gpui) hits in
+    // every checkout instead of only the one that stored it.
+    if bytes.starts_with(WINDOWS_RES_MAGIC) {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"kache.native-res.content.v1\0");
+        hasher.update(&bytes);
+        return Ok(format!("res-v1:{}", hasher.finalize().to_hex()));
+    }
+
+    // An archive rustc bundles into an rlib (or staticlib) reaches the output
+    // as its bytes; its path does not (see [`StaticLibUse::Bundled`]). The
+    // path-bound fallback guards a link that names `archive(member)`, and a
+    // bundling unit does not link. Archives of COFF objects (every cc-built
+    // `-sys` library for `*-windows-msvc`, MSVC `.lib`s a crate ships) fall
+    // outside the structural digest, and bound to their path, each such rlib
+    // was rebuilt in every checkout. A link of the archive itself keeps the
+    // fallback.
+    if usage == StaticLibUse::Bundled && bytes.starts_with(b"!<arch>\n") {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"kache.native-ar.bundled-content.v1\0");
+        hasher.update(&bytes);
+        return Ok(format!("bundled-ar-v1:{}", hasher.finalize().to_hex()));
     }
 
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
