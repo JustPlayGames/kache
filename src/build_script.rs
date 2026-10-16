@@ -84,6 +84,9 @@ const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-l
 // Version 1 could omit whitespace-padded Cargo declarations.
 const PREDICTION_SCHEMA: u32 = 2;
 const PREDICTION_PREFIX: &str = "build-script:";
+/// The variables Cargo sets that pick the configuration a script runs in;
+/// a prediction is kept per binary and configuration ([`Run::identity_in`]).
+const PREDICTION_CONFIGURATION: &[&str] = &["TARGET", "HOST", "PROFILE", "OPT_LEVEL", "DEBUG"];
 /// A v2 key could replay a search path in a sibling Cargo build unit without
 /// restoring its library. Version 3 refuses those runs unless a dependency
 /// handed down the path and keys the dependency contents.
@@ -1315,9 +1318,29 @@ fn fold_dependency_inputs(
 
 impl Run {
     fn identity(&self) -> String {
+        self.identity_in(|name| std::env::var_os(name))
+    }
+
+    /// [`Self::identity`], reading the configuration through `var`. One
+    /// script binary runs in several configurations (a build script's binary
+    /// is the same for the host and a cross target, for `check` and `build`,
+    /// and often for dev and release), and each can declare other inputs: cc
+    /// declares `CC_<target>`-style variables, and a run whose objects spell
+    /// `OUT_DIR` binds other roots. One row per binary made each
+    /// configuration overwrite the other's, and the next lookup in the other
+    /// configuration computed its key from the wrong declarations and missed
+    /// a result the store held. A row per configuration keeps each one's.
+    fn identity_in(&self, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> String {
         let mut hasher = blake3::Hasher::new();
         fold(&mut hasher, "kind", b"kache-build-script-v1");
         fold(&mut hasher, "binary", self.binary_hash.as_bytes());
+        for name in PREDICTION_CONFIGURATION {
+            fold(&mut hasher, "configuration", name.as_bytes());
+            match var(name) {
+                Some(value) => fold(&mut hasher, "value", value.as_encoded_bytes()),
+                None => fold(&mut hasher, "absent", b""),
+            }
+        }
         format!("{PREDICTION_PREFIX}{}", hasher.finalize().to_hex())
     }
 
@@ -3569,6 +3592,22 @@ mod tests {
         assert!(identity.len() > PREDICTION_PREFIX.len() + 32);
         assert_eq!(identity, a.identity(), "stable across calls");
         assert_ne!(identity, run("bbbb").identity());
+        // One binary, two configurations: a row each.
+        let target = |value: &'static str| {
+            move |name: &str| (name == "TARGET").then(|| std::ffi::OsString::from(value))
+        };
+        assert_eq!(
+            a.identity_in(target("x86_64-unknown-linux-gnu")),
+            a.identity_in(target("x86_64-unknown-linux-gnu"))
+        );
+        assert_ne!(
+            a.identity_in(target("x86_64-unknown-linux-gnu")),
+            a.identity_in(target("x86_64-pc-windows-msvc"))
+        );
+        assert_ne!(
+            a.identity_in(|name| (name == "DEBUG").then(|| "true".into())),
+            a.identity_in(|name| (name == "DEBUG").then(|| "false".into()))
+        );
         // The unsettled marker is its own row, per binary.
         assert_eq!(
             a.unsettled_identity(),
