@@ -750,6 +750,9 @@ pub(crate) fn snapshot_for_handoff(
     // Each request has its own directory. PID-based names can collide with
     // a previous request still queued in the daemon, or with a reused PID.
     let batch = tempfile::Builder::new().prefix("cc-").tempdir_in(&dir)?;
+    // Temp dirs are 0700: in a store shared through a group, another
+    // account's staging sweep must be able to clear a leftover one.
+    kache_fs::share_in_group_store(batch.path());
     let mut snapshots = Vec::with_capacity(files.len());
     for (index, (source, store_name)) in files.iter().enumerate() {
         let target = batch

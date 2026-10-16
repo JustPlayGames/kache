@@ -77,7 +77,10 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) {
     if std::io::Write::write_all(&mut staging, contents.as_bytes()).is_err() {
         return; // the NamedTempFile drop removes the partial file
     }
-    let _ = staging.persist(path);
+    if staging.persist(path).is_ok() {
+        // Temp files are 0600: a store shared through a group shares memos.
+        kache_fs::share_in_group_store(path);
+    }
 }
 
 #[cfg(test)]

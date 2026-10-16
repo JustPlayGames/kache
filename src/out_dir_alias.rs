@@ -497,12 +497,23 @@ fn dir_builder(mode: u32, recursive: bool) -> std::fs::DirBuilder {
     builder
 }
 
-/// Create `path` and its missing parents, private to this user.
+/// Create `path` and its missing parents, private to this user, or to the
+/// group when the cache dir is a store several accounts share through a group
+/// (setgid, group rwx): each level it creates there gets the group's access.
 pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
-    dir_builder(0o700, true).create(path)
+    let missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|level| !level.exists())
+        .collect();
+    dir_builder(0o700, true).create(path)?;
+    for level in missing.into_iter().rev() {
+        kache_fs::share_in_group_store(level);
+    }
+    Ok(())
 }
 
-/// Is `path` a real directory owned by `euid` that no one else can write?
+/// Is `path` a real directory owned by `euid` that no one else can write, or
+/// a directory of a group store (setgid, group rwx) that others cannot write?
 fn is_private_dir(path: &Path, euid: u32) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;
@@ -510,7 +521,9 @@ fn is_private_dir(path: &Path, euid: u32) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        meta.is_dir() && meta.uid() == euid && meta.mode() & 0o022 == 0
+        meta.is_dir()
+            && ((meta.uid() == euid && meta.mode() & 0o022 == 0)
+                || (meta.mode() & 0o002 == 0 && kache_fs::group_store_gid(path).is_some()))
     }
     #[cfg(not(unix))]
     {
@@ -573,7 +586,9 @@ pub(crate) fn alias_state(dir: &Path, euid: u32) -> AliasState {
     #[cfg(unix)]
     let usable = {
         use std::os::unix::fs::MetadataExt;
-        meta.is_dir() && meta.uid() == euid && meta.mode() & 0o222 == 0 && dir_has_no_entries(dir)
+        let owned = meta.uid() == euid
+            || dir.parent().and_then(kache_fs::group_store_gid) == Some(meta.gid());
+        meta.is_dir() && owned && meta.mode() & 0o222 == 0 && dir_has_no_entries(dir)
     };
     #[cfg(not(unix))]
     let usable = {
@@ -596,7 +611,11 @@ pub(crate) fn ensure_alias_dir(dir: &Path, euid: u32) -> bool {
     if create_private_dir_all(parent).is_err() {
         return false;
     }
-    dir_builder(0o555, false).create(dir).is_ok() || alias_state(dir, euid) == AliasState::Usable
+    if dir_builder(0o555, false).create(dir).is_ok() {
+        kache_fs::share_in_group_store(dir);
+        return true;
+    }
+    alias_state(dir, euid) == AliasState::Usable
 }
 
 /// The unit ids registered as candidate libs.
@@ -1642,6 +1661,27 @@ mod tests {
             std::os::unix::fs::symlink(&dir, &link).unwrap();
             assert!(!is_private_dir(&link, euid));
             assert!(!is_private_dir(&tmp.path().join("missing"), euid));
+        }
+
+        #[test]
+        fn a_group_store_shares_the_root_and_aliases_with_its_group() {
+            let tmp = tempfile::tempdir().unwrap();
+            let euid = effective_uid();
+            let store = tmp.path().join("store");
+            std::fs::create_dir(&store).unwrap();
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o2770)).unwrap();
+            let root = store.join("out-dirs");
+            create_private_dir_all(&root.join("v1").join("d")).unwrap();
+            for level in [root.clone(), root.join("v1"), root.join("v1").join("d")] {
+                assert_eq!(mode(&level), 0o770, "{}", level.display());
+            }
+            // Another account of the group takes the same root and alias.
+            assert!(is_private_dir(&root, euid + 1));
+            let alias = root.join("v1").join("d").join("x-0123").join("out");
+            assert!(ensure_alias_dir(&alias, euid));
+            assert_eq!(alias_state(&alias, euid + 1), AliasState::Usable);
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o2772)).unwrap();
+            assert!(!is_private_dir(&root, euid + 1));
         }
 
         /// A tempdir `deps/` holding an aliased lib, and a root that lists it.

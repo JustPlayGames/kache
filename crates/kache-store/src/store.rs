@@ -81,7 +81,10 @@ fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(blob)?;
     let mut perms = meta.permissions();
     perms.set_readonly(true);
-    fs::set_permissions(blob, perms)
+    fs::set_permissions(blob, perms)?;
+    // A store shared by several accounts: the group reads what we publish.
+    kache_fs::share_in_group_store(blob);
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -1993,7 +1996,10 @@ fn try_open_index_db(db_path: &Path) -> std::result::Result<Connection, SqlError
             initialize_db(&db)?;
             Ok(db)
         }) {
-            Ok(db) => return Ok(db),
+            Ok(db) => {
+                share_index_files(db_path);
+                return Ok(db);
+            }
             Err(err)
                 if attempt < STORE_OPEN_MAX_ATTEMPTS && is_retryable_sqlite_open_error(&err) =>
             {
@@ -2015,6 +2021,20 @@ fn try_open_index_db(db_path: &Path) -> std::result::Result<Connection, SqlError
     }
 
     Err(last_error.expect("try_open_index_db must record an error before returning"))
+}
+
+/// In a store several accounts share through a group, let the group write
+/// the index: SQLite creates it, its WAL and its SHM with mode 0644.
+fn share_index_files(db_path: &Path) {
+    let Some(gid) = db_path.parent().and_then(kache_fs::group_store_gid) else {
+        return;
+    };
+    kache_fs::share_with_group(db_path, gid);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        kache_fs::share_with_group(Path::new(&sidecar), gid);
+    }
 }
 
 /// Whether a SQLite error means the database file itself is unusable
@@ -4149,7 +4169,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let removed = (|| -> std::io::Result<()> {
                 let mut perms = meta.permissions();
                 perms.set_readonly(false);
-                fs::set_permissions(entry.path(), perms)?;
+                // Another account's temp in a shared store cannot be
+                // chmod'ed; Unix unlinks it anyway (the directory decides).
+                let chmod = fs::set_permissions(entry.path(), perms);
+                if cfg!(windows) {
+                    chmod?;
+                }
                 fs::remove_file(entry.path())
             })()
             .is_ok();
