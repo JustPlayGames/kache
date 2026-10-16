@@ -141,6 +141,8 @@ fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     std::io::Write::write_all(&mut file, contents)?;
     file.persist(path).map_err(|error| error.error)?;
+    // Temp files are 0600: a store shared through a group shares records.
+    kache_fs::share_in_group_store(path);
     Ok(())
 }
 
@@ -460,6 +462,15 @@ fn sweep_stale(directory: &Path, now: SystemTime) {
     }
 }
 
+/// Whether a target directory no longer exists. One this account cannot
+/// look at (another account's, in a store shared through a group) is not gone.
+fn target_is_gone(target: &Path) -> bool {
+    match std::fs::metadata(target) {
+        Ok(metadata) => !metadata.is_dir(),
+        Err(error) => error.kind() != std::io::ErrorKind::PermissionDenied,
+    }
+}
+
 /// Drop records no build rewrote within [`RECORD_TTL`] or whose target
 /// directory is gone, and `latest` pointers to missing target directories.
 /// Called from the daemon's GC; returns how many files it removed.
@@ -478,7 +489,7 @@ pub(crate) fn prune(cache_dir: &Path, now: SystemTime) -> usize {
             let gone = std::fs::read(&path)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
-                .is_none_or(|target| !Path::new(&target).is_dir());
+                .is_none_or(|target| target_is_gone(Path::new(&target)));
             if gone && std::fs::remove_file(&path).is_ok() {
                 removed += 1;
             }
@@ -491,7 +502,7 @@ pub(crate) fn prune(cache_dir: &Path, now: SystemTime) -> usize {
             let dest = record.dest.to_string_lossy();
             let target_gone = dest
                 .strip_suffix(&*record.rel.to_string_lossy())
-                .is_none_or(|target| !Path::new(target).is_dir());
+                .is_none_or(|target| target_is_gone(Path::new(target)));
             let expired = std::fs::metadata(&record_path)
                 .is_ok_and(|metadata| older_than(&metadata, RECORD_TTL, now));
             if (target_gone || expired) && std::fs::remove_file(&record_path).is_ok() {
@@ -909,5 +920,23 @@ mod tests {
             latest_path(&cache, &kept_project).exists(),
             "the target is still there"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_this_account_cannot_look_at_is_not_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("home").join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(!target_is_gone(&target));
+        assert!(target_is_gone(&dir.path().join("missing")));
+        let home = dir.path().join("home");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let gone = target_is_gone(&target);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!gone, "permission denied is not gone");
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(target_is_gone(&target));
     }
 }

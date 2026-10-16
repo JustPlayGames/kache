@@ -177,7 +177,11 @@ pub fn store(cache_dir: &Path, key: &str, config: &ResolvedConfig) {
     if tmp.write_all(&json).is_err() {
         return;
     }
-    let _ = tmp.persist(record_path(cache_dir, key));
+    let path = record_path(cache_dir, key);
+    if tmp.persist(&path).is_ok() {
+        // Temp files are 0600: a store shared through a group shares probes.
+        kache_fs::share_in_group_store(&path);
+    }
 }
 
 fn record_path(cache_dir: &Path, key: &str) -> PathBuf {
