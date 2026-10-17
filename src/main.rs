@@ -64,6 +64,7 @@ mod run_diff;
 mod savings;
 mod scheduler;
 mod service;
+mod session_tree;
 mod shards;
 mod since;
 // Both callers (`clean`'s classifier and `compute_link_stats`) are `cfg(unix)`,
