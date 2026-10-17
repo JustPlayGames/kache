@@ -372,6 +372,15 @@ impl RustcArgs {
             && crate::compiler::is_clippy_driver(&self.rustc.to_string_lossy())
     }
 
+    /// The compiler Cargo probes for this unit (`rustc -vV`, its target
+    /// info): the inner rustc of a `RUSTC_WORKSPACE_WRAPPER` chain such as
+    /// `clippy-driver <rustc>`, else the compiler itself. Cargo probes
+    /// through `RUSTC_WRAPPER` only, never the workspace wrapper, so this is
+    /// the version a target directory's seeding compares.
+    pub fn probed_rustc(&self) -> &Path {
+        self.inner_rustc.as_deref().unwrap_or(&self.rustc)
+    }
+
     /// Parse RUSTC_WRAPPER-style arguments.
     /// In RUSTC_WRAPPER mode, argv[0] = kache, argv[1] = rustc path, argv[2..] = rustc args.
     pub fn parse(args: &[String]) -> Result<Self> {
@@ -2764,8 +2773,10 @@ mod tests {
         ]);
         assert!(chain.inner_rustc.is_some());
         assert!(chain.is_clippy_chain());
+        assert_eq!(chain.probed_rustc(), Path::new("/toolchain/bin/rustc"));
         let plain = parse(&["/toolchain/bin/rustc", "--crate-name", "kt", "src/lib.rs"]);
         assert!(plain.inner_rustc.is_none());
+        assert_eq!(plain.probed_rustc(), Path::new("/toolchain/bin/rustc"));
         assert!(!plain.is_clippy_chain(), "no inner rustc");
         let other_wrapper = parse(&[
             "/toolchain/bin/dylint-driver",
