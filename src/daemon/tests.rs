@@ -166,7 +166,8 @@ fn detached_daemon_survives_sigint_to_the_callers_group() {
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut caller = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut caller = std::process::Command::new(std::env::current_exe().unwrap());
+    caller
         .args([
             "--exact",
             "daemon::tests::detached_daemon_caller_fixture",
@@ -174,9 +175,20 @@ fn detached_daemon_survives_sigint_to_the_callers_group() {
             "--nocapture",
         ])
         .env(DETACH_FIXTURE_DIR, root)
-        .process_group(0)
-        .spawn()
-        .unwrap();
+        .process_group(0);
+    // A shell that runs the tests in the background (`cargo test &`, nohup)
+    // leaves SIGINT ignored, and the caller and its daemon would inherit
+    // that: the caller would never stop, and a daemon in the caller's group
+    // would survive for the wrong reason. A terminal's foreground group has
+    // the default action.
+    // SAFETY: signal() is async-signal-safe and the closure allocates nothing.
+    unsafe {
+        caller.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let mut caller = caller.spawn().unwrap();
     // The caller is a second copy of this debug test binary; on a loaded
     // machine its start alone can take seconds.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
