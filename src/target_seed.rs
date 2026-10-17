@@ -856,7 +856,7 @@ pub(crate) fn seed_for_lane(
     if built(&target.target_dir) {
         return Seeded::default();
     }
-    for (donor, layout) in ranked_donors(target, rustc_version, donors, &packages) {
+    for (donor, layout) in ranked_donors(target, rustc_version, donors, &packages, check_lane) {
         if Instant::now() >= deadline {
             break;
         }
@@ -979,9 +979,10 @@ fn pin_launcher(from: &Path, to: &Path, record: &Path, deadline: Instant) -> std
 const RANKED_DONORS: usize = 8;
 
 /// The donors that can give `target` units, in the order seeding tries them:
-/// of the [`RANKED_DONORS`] most recently used, the one holding the most
-/// units of `packages` first (the more recent of two that hold as many), then
-/// every other in order of use.
+/// of the [`RANKED_DONORS`] most recently used, the one that can give the
+/// most first (the more recent of two that give as many), then every other
+/// in order of use. A build gets every unit of `packages` a donor holds; a
+/// check (`check_lane`) only those [`check_units`] counts.
 ///
 /// The checkout used last may have built a small part of the workspace: a
 /// `cargo xtask` command builds the dependencies of one crate, 361 units of
@@ -992,6 +993,7 @@ fn ranked_donors<'a>(
     rustc_version: &'a str,
     donors: &'a [Donor],
     packages: &BTreeSet<String>,
+    check_lane: bool,
 ) -> impl Iterator<Item = (&'a Donor, Layout)> + 'a {
     let mut usable = donors.iter().filter_map(move |donor| {
         if donor.target_dir == target.target_dir
@@ -1002,20 +1004,74 @@ fn ranked_donors<'a>(
         }
         layout(&donor.target_dir.join(PROFILE)).map(|layout| (donor, layout))
     });
-    let mut ranked: Vec<_> = usable
-        .by_ref()
-        .take(RANKED_DONORS)
-        .map(|(donor, layout)| {
-            let held = units(&donor.target_dir.join(PROFILE), layout, packages).len();
-            (donor, layout, held)
-        })
-        .collect();
+    let candidates: Vec<_> = usable.by_ref().take(RANKED_DONORS).collect();
+    // Each donor's fingerprints are read in a thread of its own: a check
+    // reads every unit's, tens of milliseconds a donor.
+    let mut ranked: Vec<_> = std::thread::scope(|scope| {
+        let counts: Vec<_> = candidates
+            .iter()
+            .map(|&(donor, layout)| {
+                scope.spawn(move || {
+                    let profile = donor.target_dir.join(PROFILE);
+                    if check_lane && layout == Layout::Shared {
+                        check_units(&profile, packages)
+                    } else {
+                        units(&profile, layout, packages).len()
+                    }
+                })
+            })
+            .collect();
+        candidates
+            .iter()
+            .zip(counts)
+            .map(|(&(donor, layout), count)| (donor, layout, count.join().unwrap_or(0)))
+            .collect()
+    });
     // Stable: equals keep their order of use.
     ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     ranked
         .into_iter()
         .map(|(donor, layout, _)| (donor, layout))
         .chain(usable)
+}
+
+/// The units of `packages` in a donor's shared-layout `profile` a check
+/// build is given ([`seed_for_lane`]): those a check of the donor's
+/// workspace used ([`check_demand`]). A donor without a checked workspace
+/// unit gives every unit, but a check uses only those it compiled itself,
+/// which are metadata alone; only they count.
+///
+/// Ranked by every unit they hold, a workspace clippy in a new target was
+/// seeded from a checkout's test-build target, whose checks had used 808 to
+/// 1,000 registry units, while another checkout's workspace check, which
+/// used 1,285, held fewer units in all.
+fn check_units(profile: &Path, packages: &BTreeSet<String>) -> usize {
+    let deps = deps_by_hash(&profile.join("deps"));
+    let held = units(profile, Layout::Shared, packages);
+    match check_demand(profile, packages, &deps) {
+        Some(demand) => held
+            .iter()
+            .filter(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)))
+            .count(),
+        None => held
+            .iter()
+            .filter(|unit| metadata_only(&deps, &unit.hash))
+            .count(),
+    }
+}
+
+/// Are the unit's `deps/` outputs metadata alone (`.rmeta`, `.d`), as a
+/// check writes them?
+fn metadata_only(deps: &HashMap<String, Vec<PathBuf>>, hash: &str) -> bool {
+    deps.get(hash).is_some_and(|files| {
+        !files.is_empty()
+            && files.iter().all(|file| {
+                matches!(
+                    file.extension().and_then(OsStr::to_str),
+                    Some("rmeta" | "d")
+                )
+            })
+    })
 }
 
 /// What Cargo writes to `CACHEDIR.TAG` in a target directory it creates.
@@ -1172,17 +1228,7 @@ fn check_demand(
                 by_fingerprint.insert(fingerprint.trim().to_owned(), name.clone());
             }
         }
-        if !registry.contains(package)
-            && deps.get(hash).is_some_and(|files| {
-                !files.is_empty()
-                    && files.iter().all(|file| {
-                        matches!(
-                            file.extension().and_then(OsStr::to_str),
-                            Some("rmeta" | "d")
-                        )
-                    })
-            })
-        {
+        if !registry.contains(package) && metadata_only(deps, hash) {
             roots.push(name.clone());
         }
         edges.insert(name, wants);
@@ -3304,6 +3350,92 @@ source = "git+https://example.com/gitdep#abc"
         for unwanted in [format!("dep-{}", h(2)), format!("only_test-{}", h(5))] {
             assert!(!demand.contains(&unwanted), "{unwanted}");
         }
+    }
+
+    /// A checkout at `root/name` with `LOCK`, whose target `VERSION` built:
+    /// no units yet ([`fingerprinted_unit`] adds them).
+    fn empty_donor(root: &Path, name: &str) -> Donor {
+        let workspace_root = root.join(name);
+        write(
+            &workspace_root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        );
+        write(&workspace_root.join("Cargo.lock"), LOCK);
+        let target_dir = workspace_root.join("target");
+        let info = serde_json::json!({"outputs": {"1": {"stdout": VERSION}}});
+        write(&target_dir.join(".rustc_info.json"), &info.to_string());
+        Donor {
+            target_dir,
+            workspace_root,
+            rustc: None,
+        }
+    }
+
+    /// A check build goes to the donor whose check gives it the most units,
+    /// not the one holding the most: a target that also built tests holds
+    /// more units, most of which a check never reads.
+    #[test]
+    fn a_check_build_takes_the_donor_whose_check_gives_the_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        // Used last: `dep` and `gitdep` built for a test, `dep` checked, and
+        // the workspace's check read only the checked `dep`.
+        let tests = empty_donor(dir.path(), "tests");
+        let profile = tests.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "gitdep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(3), 13, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(4), 14, &[13], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(5), 15, &[11, 12], &["rlib", "rmeta"]);
+        // Used before: a check of the whole workspace, `dep` and `gitdep`.
+        let checks = empty_donor(dir.path(), "checks");
+        let profile = checks.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(3), 13, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "gitdep", &h(6), 16, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(7), 17, &[13, 16], &["rmeta"]);
+        let donors = [tests.clone(), checks.clone()];
+        let check = checkout(dir.path(), "check");
+        assert_eq!(
+            seed_for_lane(&check, VERSION, &donors, Path::new(NO_CACHE), later(), true),
+            Seeded {
+                units: 2,
+                donor: Some(checks.workspace_root.clone()),
+                ..Seeded::default()
+            }
+        );
+        // A build still takes the donor holding the most.
+        let build = checkout(dir.path(), "build");
+        assert_eq!(
+            seed_for_lane(
+                &build,
+                VERSION,
+                &donors,
+                Path::new(NO_CACHE),
+                later(),
+                false
+            ),
+            Seeded {
+                units: 3,
+                donor: Some(tests.workspace_root.clone()),
+                ..Seeded::default()
+            }
+        );
+    }
+
+    /// A check donor with no checked workspace unit gives every unit, but
+    /// counts only those a check compiled: its metadata-only ones.
+    #[test]
+    fn a_donor_without_a_workspace_check_counts_its_checked_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        let profile = dir.path().join("debug");
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(2), 12, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(3), 13, &[11], &["rlib", "rmeta"]);
+        let registry: BTreeSet<String> = ["dep"].map(String::from).into();
+        assert_eq!(check_units(&profile, &registry), 1);
+        fingerprinted_unit(&profile, "app", &h(4), 14, &[11, 12], &["rmeta"]);
+        assert_eq!(check_units(&profile, &registry), 2);
     }
 
     /// Without a checked workspace unit, nothing says what a check needs.
