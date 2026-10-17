@@ -9237,64 +9237,74 @@ fn send_build_started_with(
 
 /// Seed a new target directory from the most recently used tracked targets
 /// (see [`crate::target_seed`]), within [`crate::target_seed::SEED_DEADLINE`].
+/// Only a wrapper from before seeding moved into the wrapper sends this.
 fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
-    let deadline = std::time::Instant::now() + crate::target_seed::SEED_DEADLINE;
     let target = crate::target_seed::NewTarget {
         target_dir: PathBuf::from(&req.target_dir),
         workspace_root: PathBuf::from(&req.workspace_root),
     };
-    let tracked = Store::open(config).and_then(|store| store.tracked_target_roots(0));
-    let donors: Vec<_> = match tracked {
-        Ok(tracked) => tracked
-            .into_iter()
-            .filter(|root| !root.discovered)
-            .rev()
-            .map(|root| crate::target_seed::Donor {
-                target_dir: root.path,
-                workspace_root: root.workspace_root,
-                rustc: root.rustc,
-            })
-            .collect(),
-        Err(error) => return Response::err(format!("reading tracked targets: {error:#}")),
-    };
+    match seed_new_target(config, &target, &req.rustc_version, req.check_lane, false) {
+        Ok(_) => Response::ok(),
+        Err(error) => Response::err(format!("{error:#}")),
+    }
+}
+
+/// Seed `target` in this process from the most recently used tracked
+/// targets, within [`crate::target_seed::SEED_DEADLINE`].
+///
+/// The wrapper calls this for Cargo's target-info probe itself rather than
+/// asking the daemon: a build that started while no daemon ran, while one
+/// was still starting, or while one was busy with other builds' requests
+/// was not seeded, and restored every registry unit one compiler call at a
+/// time instead (62-110 CPU-s against 13-15 for a seeded first clippy of a
+/// 1,300-unit workspace). Cargo waits for the probe either way.
+///
+/// `note` also appends the outcome to the diagnostic log when no log layer
+/// writes it there: a wrapper's file log is off unless asked for.
+pub(crate) fn seed_new_target(
+    config: &Config,
+    target: &crate::target_seed::NewTarget,
+    rustc_version: &str,
+    check_lane: bool,
+    note: bool,
+) -> Result<crate::target_seed::Seeded> {
+    let started = std::time::Instant::now();
+    let deadline = started + crate::target_seed::SEED_DEADLINE;
+    let tracked = Store::open(config)
+        .and_then(|store| store.tracked_target_roots(0))
+        .context("reading tracked targets")?;
+    let donors: Vec<_> = tracked
+        .into_iter()
+        .filter(|root| !root.discovered)
+        .rev()
+        .map(|root| crate::target_seed::Donor {
+            target_dir: root.path,
+            workspace_root: root.workspace_root,
+            rustc: root.rustc,
+        })
+        .collect();
     let seeded = crate::target_seed::seed_for_lane(
-        &target,
-        &req.rustc_version,
+        target,
+        rustc_version,
         &donors,
         &config.cache_dir,
         deadline,
-        req.check_lane,
+        check_lane,
     );
     if let Some(donor) = &seeded.donor {
-        tracing::info!(
-            "seeded {} registry units into {} from {}",
+        let line = format!(
+            "seeded {} registry units into {} from {} in {} ms",
             seeded.units,
             target.target_dir.display(),
-            donor.display()
+            donor.display(),
+            started.elapsed().as_millis()
         );
+        tracing::info!("{line}");
+        if note {
+            crate::target_seed::note_in_log(&line);
+        }
     }
-    Response::ok()
-}
-
-/// Ask the daemon to seed a target directory Cargo has not built, and wait
-/// until it has, up to the seeding deadline. Never starts the daemon: a
-/// build without one simply is not seeded.
-pub fn send_seed_target(
-    config: &Config,
-    target: &crate::target_seed::NewTarget,
-    version: &str,
-    check_lane: bool,
-) {
-    let req = Request::SeedTarget(SeedTargetRequest {
-        target_dir: target.target_dir.to_string_lossy().into_owned(),
-        workspace_root: target.workspace_root.to_string_lossy().into_owned(),
-        rustc_version: version.to_owned(),
-        check_lane,
-    });
-    let wait = crate::target_seed::seed_wait();
-    if let Err(e) = send_request_with_timeout(&config.socket_path(), &req, wait) {
-        tracing::debug!("seed request: daemon unreachable or slow ({e}), building unseeded");
-    }
+    Ok(seeded)
 }
 
 /// Hint the daemon to stage `target_dir`'s recorded executables.
