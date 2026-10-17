@@ -4213,7 +4213,7 @@ fn run_parsed_rustc(
         && let Err(e) = store.remember_target_root_built_by(
             &target_dir,
             workspace_root,
-            crate::cache_key::rustc_version_text(&args.rustc).as_deref(),
+            crate::cache_key::rustc_version_text(args.probed_rustc()).as_deref(),
         )
     {
         tracing::warn!(

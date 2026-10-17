@@ -92,12 +92,22 @@ impl Env {
     /// Run `cargo build --lib` for `project` through the kache rustc wrapper,
     /// wired to this env's isolated cache/config/HOME. Returns the build output.
     fn wrapper_build(&self, project: &Path, target_dir: &Path) -> std::process::Output {
+        self.wrapper_cargo(project, target_dir, &["build", "--lib"])
+    }
+
+    /// `cargo <args>` in `project` with kache as `RUSTC_WRAPPER`.
+    fn wrapper_cargo(
+        &self,
+        project: &Path,
+        target_dir: &Path,
+        args: &[&str],
+    ) -> std::process::Output {
         hermetic_command(
             env!("CARGO"),
             &self.cache,
             Some(&self.cache.join("config.toml")),
         )
-        .args(["build", "--lib"])
+        .args(args)
         .current_dir(project)
         .env("RUSTC_WRAPPER", KACHE_BIN)
         .env("KACHE_LOG", "off")
@@ -4639,6 +4649,73 @@ fn daemon_start_needs_no_more_path_than_its_own_socket() {
     let stderr = String::from_utf8_lossy(&start.stderr);
     assert!(start.status.success(), "{stderr}");
     assert!(bound, "the daemon must have bound its socket: {stderr}");
+}
+
+/// `cargo clippy` runs each workspace unit as `kache clippy-driver <rustc>`,
+/// but Cargo probes plain rustc. The target records the inner rustc, so a
+/// checkout Clippy checked last still seeds a new one; it recorded
+/// `clippy-driver`'s own version before, which no probe matched. Cargo's
+/// rustc cache is removed so only kache's record can decide.
+#[test]
+fn a_target_clippy_checked_last_seeds_a_new_checkout() {
+    let clippy = std::process::Command::new(env!("CARGO"))
+        .args(["clippy", "--version"])
+        .output();
+    if !clippy.is_ok_and(|out| out.status.success()) {
+        eprintln!("skipping: no cargo clippy");
+        return;
+    }
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    let root = TempDir::new().unwrap();
+    let donor = root.path().join("donor");
+    std::fs::create_dir_all(donor.join("src")).unwrap();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    std::fs::write(donor.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(donor.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let donor_target = donor.join("target");
+    let checked = e.wrapper_cargo(&donor, &donor_target, &["clippy", "--lib"]);
+    assert!(checked.status.success(), "{checked:?}");
+    std::fs::remove_file(donor_target.join(".rustc_info.json")).unwrap();
+    let profile = donor_target.join("debug");
+    let hash = "0123456789abcdef";
+    let marker = |target: &Path| {
+        if profile.join(".fingerprint").is_dir() {
+            target
+                .join("debug/.fingerprint")
+                .join(format!("dep-{hash}"))
+        } else {
+            target.join("debug/build/dep").join(hash)
+        }
+    };
+    let donor_marker = marker(&donor_target);
+    std::fs::create_dir_all(donor_marker.join("fingerprint")).unwrap();
+    std::fs::write(donor_marker.join("fingerprint/lib"), "fp").unwrap();
+    let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                [[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n\
+                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let checkout = root.path().join("seeded");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(checkout.join("Cargo.lock"), lock).unwrap();
+    e.cmd()
+        .current_dir(&checkout)
+        .env("KACHE_SEED_NEW_TARGETS", "1")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .args(["rustc", "-", "--crate-name", "___", "--print=file-names"])
+        .args(["--crate-type", "lib"])
+        .write_stdin("")
+        .assert()
+        .success();
+    let seeded = marker(&checkout.join("target")).is_dir();
+    let tracked = e.cmd().args(["targets", "--json"]).output().unwrap();
+    assert!(
+        seeded,
+        "a target Clippy checked last must seed: {}",
+        String::from_utf8_lossy(&tracked.stdout)
+    );
 }
 
 /// Cargo's first call for a target directory it has not built is its

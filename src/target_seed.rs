@@ -905,9 +905,17 @@ fn tag_as_cargo_target(target_dir: &Path) {
 /// does not always write (it cannot fingerprint every rustc).
 fn donor_built_by(donor: &Donor, version: &str) -> bool {
     match &donor.rustc {
-        Some(recorded) => recorded.trim() == version.trim(),
-        None => built_by(&donor.target_dir, version),
+        Some(recorded) if is_rustc_version(recorded) => recorded.trim() == version.trim(),
+        // Not a `rustc -vV`: before 1.2.1-tasty.4 a unit Clippy checked
+        // recorded `clippy-driver`'s version (`clippy 0.1.99 (...)`), which
+        // no probe ever matches. Cargo's own cache decides instead.
+        _ => built_by(&donor.target_dir, version),
     }
+}
+
+/// Is `recorded` the output of `rustc -vV`, as a probe reports it?
+fn is_rustc_version(recorded: &str) -> bool {
+    recorded.trim_start().starts_with("rustc ")
 }
 
 fn built_by(target_dir: &Path, version: &str) -> bool {
@@ -1280,6 +1288,35 @@ source = "git+https://example.com/gitdep#abc"
             !donor_built_by(&contradicted, VERSION),
             "a record overrides Cargo's cache"
         );
+    }
+
+    /// A target whose last unit Clippy checked recorded the driver's version
+    /// before 1.2.1-tasty.4. That is no `rustc -vV`, so Cargo's cache decides:
+    /// the target still seeds a checkout built by the same rustc.
+    #[test]
+    fn a_donor_recorded_by_clippy_falls_back_to_cargos_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut clippy = donor(dir.path(), "clippy", Layout::Shared);
+        clippy.rustc = Some("clippy 0.1.99 (58cf8f9c35 2026-10-13)".into());
+        assert!(donor_built_by(&clippy, VERSION), "Cargo's cache decides");
+        assert!(!donor_built_by(&clippy, "rustc 2.0.0\n"));
+        std::fs::remove_file(clippy.target_dir.join(".rustc_info.json")).unwrap();
+        assert!(!donor_built_by(&clippy, VERSION), "no cache, no seed");
+
+        let target = checkout(dir.path(), "new");
+        let seeded = seed(
+            &target,
+            VERSION,
+            &[donor(dir.path(), "built", Layout::Shared)],
+            Path::new(NO_CACHE),
+            later(),
+        );
+        assert!(seeded.donor.is_some(), "the fixture seeds");
+        let mut by_clippy = donor(dir.path(), "checked", Layout::Shared);
+        by_clippy.rustc = Some("clippy 0.1.99 (58cf8f9c35 2026-10-13)".into());
+        let target = checkout(dir.path(), "after-clippy");
+        let seeded = seed(&target, VERSION, &[by_clippy], Path::new(NO_CACHE), later());
+        assert!(seeded.donor.is_some(), "a donor Clippy checked last seeds");
     }
 
     #[test]
