@@ -1238,6 +1238,7 @@ fn probe_is_check_lane() -> bool {
 
 /// The subcommand of a Cargo command line: the first argument after the
 /// program that is neither an option nor a `+toolchain`.
+#[cfg(any(target_os = "linux", test))]
 fn cargo_subcommand(args: &[String]) -> Option<&str> {
     args.iter()
         .skip(1)
