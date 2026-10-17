@@ -24,7 +24,9 @@
 //!   from a checkout with different sources could pass as fresh.
 //! - Modification times are kept: Cargo rebuilds a unit whose dependencies'
 //!   outputs are newer than its own.
-//! - Files are cloned where the filesystem can, else copied. Each unit's
+//! - Files are cloned where the filesystem can. Otherwise a file nobody may
+//!   write (a store blob the donor's restore linked) is hard-linked, and any
+//!   other file is copied (see [`shares_inode`]). Each unit's
 //!   fingerprint is put in place last, so an interrupted copy leaves a unit
 //!   Cargo rebuilds rather than one it trusts.
 //! - A build script's `OUT_DIR` that a hermetic run left as a link to its
@@ -517,6 +519,7 @@ fn copy_unit(
     unit: &Unit,
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
+    counts: &FileCounts,
     deadline: Instant,
 ) -> std::io::Result<()> {
     match layout {
@@ -527,6 +530,7 @@ fn copy_unit(
                 &from.join("build").join(&unit.package).join(&unit.hash),
                 &package.join(&unit.hash),
                 cache_dir,
+                counts,
                 deadline,
             )
         }
@@ -537,19 +541,26 @@ fn copy_unit(
             for file in deps.get(&unit.hash).into_iter().flatten() {
                 let name = file_name(file);
                 if !to_deps.join(&name).exists() {
-                    place_tree(file, &to_deps.join(&name), cache_dir, deadline)?;
+                    place_tree(file, &to_deps.join(&name), cache_dir, counts, deadline)?;
                 }
             }
             let build = from.join("build").join(&named);
             if build.is_dir() {
                 std::fs::create_dir_all(to.join("build"))?;
-                place_tree(&build, &to.join("build").join(&named), cache_dir, deadline)?;
+                place_tree(
+                    &build,
+                    &to.join("build").join(&named),
+                    cache_dir,
+                    counts,
+                    deadline,
+                )?;
             }
             std::fs::create_dir_all(to.join(".fingerprint"))?;
             place_tree(
                 &from.join(".fingerprint").join(&named),
                 &to.join(".fingerprint").join(&named),
                 cache_dir,
+                counts,
                 deadline,
             )
         }
@@ -557,12 +568,19 @@ fn copy_unit(
 }
 
 /// Copy `from` (a file or a directory) beside `to` and rename it there.
-fn place_tree(from: &Path, to: &Path, cache_dir: &Path, deadline: Instant) -> std::io::Result<()> {
+fn place_tree(
+    from: &Path,
+    to: &Path,
+    cache_dir: &Path,
+    counts: &FileCounts,
+    deadline: Instant,
+) -> std::io::Result<()> {
     let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
     let tree = Placing {
         from,
         to,
         cache_dir,
+        counts,
     };
     // Held past the rename, so a sweep keeps each run the tree links to until
     // its recorded `OUT_DIR` does.
@@ -584,6 +602,7 @@ struct Placing<'a> {
     from: &'a Path,
     to: &'a Path,
     cache_dir: &'a Path,
+    counts: &'a FileCounts,
 }
 
 /// Copy `from`, a file or directory in `tree`, to `to`, keeping every file's
@@ -635,16 +654,14 @@ fn copy_tree(
             from.display()
         )));
     }
-    copy_file(from, to, &metadata)
+    let below = from.strip_prefix(tree.from).unwrap_or(Path::new(""));
+    place_file(from, below, to, &metadata, tree.counts)
 }
 
-/// Copy the file `from` to `to`, giving it `metadata`'s permissions and
-/// modification time. A Linux reflink creates `to` with the default mode, so
+/// Give a cloned or copied file `metadata`'s modification time and
+/// permissions. A Linux reflink creates `to` with the default mode, so
 /// without the permissions a seeded build script is one Cargo cannot execute.
-fn copy_file(from: &Path, to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
-    if kache_store::link::try_reflink(from, to).is_err() {
-        std::fs::copy(from, to)?;
-    }
+fn stamp(to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
     filetime::set_file_mtime(
         to,
         filetime::FileTime::from_last_modification_time(metadata),
@@ -652,11 +669,90 @@ fn copy_file(from: &Path, to: &Path, metadata: &std::fs::Metadata) -> std::io::R
     std::fs::set_permissions(to, metadata.permissions())
 }
 
+/// Files a seeding gave by hard link and by copy or clone.
+#[derive(Debug, Default)]
+struct FileCounts {
+    linked: AtomicUsize,
+    copied: AtomicUsize,
+}
+
+/// Give `to` the donor file `from` (`below` is its path inside the unit's
+/// tree): a clone where the filesystem can make one, else a hard link when
+/// [`shares_inode`] allows it, else a copy. A link is the donor's own inode,
+/// so its modification time and mode are already the donor's.
+fn place_file(
+    from: &Path,
+    below: &Path,
+    to: &Path,
+    metadata: &std::fs::Metadata,
+    counts: &FileCounts,
+) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = below;
+    if kache_store::link::try_reflink(from, to).is_err() {
+        #[cfg(unix)]
+        if shares_inode(below, metadata) && link_read_only(from, to) {
+            counts.linked.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        std::fs::copy(from, to)?;
+    }
+    counts.copied.fetch_add(1, Ordering::Relaxed);
+    stamp(to, metadata)
+}
+
+/// Whether a donor file may be given to the new target as a hard link rather
+/// than a copy: a regular file that nobody may write, outside a build script's
+/// `out/`, while kache does not run as root (root writes any file).
+///
+/// kache's store keeps its blobs without write permission (`0444`, `0440`
+/// when a group shares the store), and a donor's restored outputs are links
+/// to them, so these are most of a donor's bytes. Nothing in a build rewrites
+/// such a file in place: rustc and the linkers write a new file and rename it
+/// over the old one, which leaves every other link alone, and a tool that
+/// opens one for writing fails in the new target exactly as it would in the
+/// donor, where the file has the same mode. So the shared inode is never
+/// written through, neither into the donor nor into the store. A build
+/// script's `out/` holds whatever the script wrote; a rerun could make a
+/// file writable and rewrite it, so those files stay copies.
+#[cfg(unix)]
+fn shares_inode(below: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.is_file()
+        && metadata.permissions().mode() & 0o222 == 0
+        && !below
+            .components()
+            .any(|component| component.as_os_str() == "out")
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        && unsafe { libc::geteuid() } != 0
+}
+
+/// Hard-link `from` to `to`. False when the link cannot be made (another
+/// filesystem, the link limit, the kernel's protected hard links for a file
+/// another user owns), or when the inode it shares turns out writable after
+/// all, in which case the link is removed again and the caller copies.
+#[cfg(unix)]
+fn link_read_only(from: &Path, to: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::hard_link(from, to).is_err() {
+        return false;
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(linked) if linked.is_file() && linked.permissions().mode() & 0o222 == 0 => true,
+        _ => {
+            let _ = std::fs::remove_file(to);
+            false
+        }
+    }
+}
+
 /// What a seeding did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seeded {
     pub(crate) units: usize,
     pub(crate) donor: Option<PathBuf>,
+    /// Files given as hard links rather than copies ([`shares_inode`]).
+    pub(crate) linked: usize,
 }
 
 /// Editor and check targets reuse only the same lane in another checkout.
@@ -742,6 +838,7 @@ pub(crate) fn seed_for_lane(
         }
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
+        let files = FileCounts::default();
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
                 scope.spawn(|| {
@@ -755,7 +852,9 @@ pub(crate) fn seed_for_lane(
                         {
                             continue;
                         }
-                        match copy_unit(&from, &to, layout, unit, &deps, cache_dir, deadline) {
+                        match copy_unit(
+                            &from, &to, layout, unit, &deps, cache_dir, &files, deadline,
+                        ) {
                             Ok(()) => {
                                 copied.fetch_add(1, Ordering::Relaxed);
                             }
@@ -776,6 +875,7 @@ pub(crate) fn seed_for_lane(
             return Seeded {
                 units: copied,
                 donor: Some(donor.workspace_root.clone()),
+                linked: files.linked.into_inner(),
             };
         }
     }
@@ -1405,6 +1505,7 @@ source = "git+https://example.com/gitdep#abc"
             Seeded {
                 units: 2,
                 donor: Some(more.workspace_root.clone()),
+                ..Seeded::default()
             }
         );
         // Holding as many, the one used last goes first.
@@ -1483,7 +1584,8 @@ source = "git+https://example.com/gitdep#abc"
                 seeded,
                 Seeded {
                     units: 1,
-                    donor: Some(donor.workspace_root.clone())
+                    donor: Some(donor.workspace_root.clone()),
+                    ..Seeded::default()
                 },
                 "{layout:?}"
             );
@@ -1827,6 +1929,7 @@ source = "git+https://example.com/gitdep#abc"
                 Seeded {
                     units: 1,
                     donor: Some(donor.workspace_root.clone()),
+                    ..Seeded::default()
                 },
                 "{layout:?}"
             );
@@ -2269,7 +2372,14 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join("out/include/rdkafka.h"), "h");
         std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
         let to = dir.path().join("copy");
-        place_tree(&from, &to, Path::new(NO_CACHE), later()).unwrap();
+        place_tree(
+            &from,
+            &to,
+            Path::new(NO_CACHE),
+            &FileCounts::default(),
+            later(),
+        )
+        .unwrap();
         let link = to.join("out/src/librdkafka.so");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -2287,6 +2397,7 @@ source = "git+https://example.com/gitdep#abc"
                 &from,
                 &dir.path().join("escaped"),
                 Path::new(NO_CACHE),
+                &FileCounts::default(),
                 later()
             )
             .is_err()
@@ -2300,6 +2411,7 @@ source = "git+https://example.com/gitdep#abc"
                 &linked_unit,
                 &dir.path().join("whole"),
                 Path::new(NO_CACHE),
+                &FileCounts::default(),
                 later()
             )
             .is_err()
@@ -2414,10 +2526,24 @@ source = "git+https://example.com/gitdep#abc"
         let from = dir.path().join("unit");
         write(&from.join("a/file"), "x");
         let to = dir.path().join("copy");
-        let error = place_tree(&from, &to, Path::new(NO_CACHE), Instant::now()).unwrap_err();
+        let error = place_tree(
+            &from,
+            &to,
+            Path::new(NO_CACHE),
+            &FileCounts::default(),
+            Instant::now(),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(entries(dir.path()), vec![from.clone()]);
-        place_tree(&from, &to, Path::new(NO_CACHE), later()).unwrap();
+        place_tree(
+            &from,
+            &to,
+            Path::new(NO_CACHE),
+            &FileCounts::default(),
+            later(),
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
     }
 
@@ -2463,10 +2589,121 @@ source = "git+https://example.com/gitdep#abc"
         write(&recorded, "");
         std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o751)).unwrap();
         let to = dir.path().join("copy");
-        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap()).unwrap();
+        place_file(
+            &from,
+            Path::new(""),
+            &to,
+            &std::fs::metadata(&recorded).unwrap(),
+            &FileCounts::default(),
+        )
+        .unwrap();
         let mode = std::fs::metadata(&to).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o751);
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
+    }
+
+    /// Whether this process writes files whatever their mode (root).
+    #[cfg(unix)]
+    fn writes_anything() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_is_linked_and_a_writable_one_copied() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("unit");
+        let blob = from.join("libdep-0123456789abcdef.rlib");
+        write(&blob, "rlib");
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o440)).unwrap();
+        let dep_info = from.join("dep-0123456789abcdef.d");
+        write(&dep_info, "d");
+        let to = dir.path().join("placed");
+        let counts = FileCounts::default();
+        place_tree(&from, &to, Path::new(NO_CACHE), &counts, later()).unwrap();
+        let linked = to.join("libdep-0123456789abcdef.rlib");
+        let copied = to.join("dep-0123456789abcdef.d");
+        assert_eq!(std::fs::read_to_string(&linked).unwrap(), "rlib");
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), "d");
+        let same_inode = |a: &Path, b: &Path| {
+            std::fs::metadata(a).unwrap().ino() == std::fs::metadata(b).unwrap().ino()
+        };
+        if writes_anything() {
+            assert!(!same_inode(&blob, &linked), "root must copy");
+            return;
+        }
+        if kache_store::link::try_reflink(&dep_info, &dir.path().join("probe")).is_ok() {
+            // A clone is preferred where the filesystem makes one.
+            assert!(!same_inode(&blob, &linked));
+            return;
+        }
+        assert!(same_inode(&blob, &linked));
+        assert!(!same_inode(&dep_info, &copied));
+        assert_eq!(counts.linked.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.copied.load(Ordering::Relaxed), 1);
+        // The shared inode cannot be written through the new name.
+        let opened = std::fs::OpenOptions::new().write(true).open(&linked);
+        assert_eq!(
+            opened.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::read_to_string(&blob).unwrap(), "rlib");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_under_a_build_scripts_out_dir_is_copied() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("dep-0123456789abcdef");
+        let generated = from.join("out/bindings.rs");
+        write(&generated, "generated");
+        std::fs::set_permissions(&generated, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let to = dir.path().join("placed");
+        let counts = FileCounts::default();
+        place_tree(&from, &to, Path::new(NO_CACHE), &counts, later()).unwrap();
+        let placed = to.join("out/bindings.rs");
+        assert_ne!(
+            std::fs::metadata(&generated).unwrap().ino(),
+            std::fs::metadata(&placed).unwrap().ino()
+        );
+        assert_eq!(counts.linked.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_on_another_filesystem_is_copied() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(other) = tempfile::tempdir_in("/dev/shm") else {
+            eprintln!("skipping: no /dev/shm");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        if std::fs::metadata(other.path()).unwrap().dev()
+            == std::fs::metadata(dir.path()).unwrap().dev()
+        {
+            eprintln!("skipping: /dev/shm is on the same filesystem");
+            return;
+        }
+        let blob = other.path().join("libdep-0123456789abcdef.rmeta");
+        write(&blob, "rmeta");
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let metadata = std::fs::metadata(&blob).unwrap();
+        let to = dir.path().join("libdep-0123456789abcdef.rmeta");
+        let counts = FileCounts::default();
+        place_file(&blob, Path::new(""), &to, &metadata, &counts).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "rmeta");
+        assert_eq!(counts.linked.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.copied.load(Ordering::Relaxed), 1);
+        let placed = std::fs::metadata(&to).unwrap();
+        assert_eq!(placed.permissions().mode() & 0o777, 0o444);
+        assert_eq!(placed.mtime(), metadata.mtime());
     }
 
     #[cfg(windows)]
@@ -2481,7 +2718,14 @@ source = "git+https://example.com/gitdep#abc"
         permissions.set_readonly(true);
         std::fs::set_permissions(&recorded, permissions).unwrap();
         let to = dir.path().join("copy");
-        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap()).unwrap();
+        place_file(
+            &from,
+            Path::new(""),
+            &to,
+            &std::fs::metadata(&recorded).unwrap(),
+            &FileCounts::default(),
+        )
+        .unwrap();
         assert!(std::fs::metadata(&to).unwrap().permissions().readonly());
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
     }

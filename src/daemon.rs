@@ -9293,8 +9293,9 @@ pub(crate) fn seed_new_target(
     );
     if let Some(donor) = &seeded.donor {
         let line = format!(
-            "seeded {} registry units into {} from {} in {} ms",
+            "seeded {} registry units ({} files hard-linked) into {} from {} in {} ms",
             seeded.units,
+            seeded.linked,
             target.target_dir.display(),
             donor.display(),
             started.elapsed().as_millis()
