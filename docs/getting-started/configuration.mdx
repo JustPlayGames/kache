@@ -294,7 +294,7 @@ The cleanup follows the configuration of the daemon that serves the cache direct
 
 The first build in a new checkout or worktree starts with an empty target directory. Kache fills it before Cargo decides what to build, so Cargo skips the dependencies another checkout already built instead of restoring each one from the cache.
 
-Cargo's first call through `RUSTC_WRAPPER` for a target directory it has never built is a probe of the compiler, made before it checks any unit. When it sees that probe, the wrapper asks the daemon to copy the matching units from the most recently used target directory built by the same `rustc`, and waits up to 3 seconds. Cargo then builds whatever was not copied. The daemon log names the checkout the units came from.
+Cargo's first call through `RUSTC_WRAPPER` for a target directory it has never built is a probe of the compiler, made before it checks any unit. When it sees that probe, the wrapper copies the matching units from the most recently used target directory built by the same `rustc`, for up to 3 seconds, before it answers. Cargo then builds whatever was not copied. The wrapper does this itself, so a build is seeded whether or not the daemon runs. The log (`kache.log`) names the checkout the units came from.
 
 What is copied:
 
@@ -309,7 +309,7 @@ Kache follows `build.target-dir`, `build.build-dir`, `CARGO_TARGET_DIR`, `CARGO_
 
 The Cargo shim and `kache cargo -- …` also pass `--target-dir` to the wrapper. They skip seeding for invocations with `--config`, `--manifest-path`, `-C`, or `-Z`. A compiler wrapper used without the Cargo shim cannot see those command-line options; use Cargo's configuration or environment variables to select a seedable directory.
 
-A unit whose build script or output files name the donor checkout, other than its own `OUT_DIR`, is not copied. A Windows path also counts when written with forward slashes, as CMake writes it in `CMakeCache.txt`, or with doubled backslashes, as JSON and string literals write it, and its drive letter matches in either case. A build script whose output files add up to more than 256 MiB, or are not all read before the deadline, is not copied either. Nothing is copied while a build holds either profile's lock or when no daemon is running. Config includes, unknown build-directory templates, and unreadable or invalid configuration are left unseeded. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn seeding off.
+A unit whose build script or output files name the donor checkout, other than its own `OUT_DIR`, is not copied. A Windows path also counts when written with forward slashes, as CMake writes it in `CMakeCache.txt`, or with doubled backslashes, as JSON and string literals write it, and its drive letter matches in either case. A build script whose output files add up to more than 256 MiB, or are not all read before the deadline, is not copied either. Nothing is copied while a build holds either profile's lock. Config includes, unknown build-directory templates, and unreadable or invalid configuration are left unseeded. Set `cache.seed_new_targets = false` or `KACHE_SEED_NEW_TARGETS=0` to turn seeding off.
 
 When the cache already holds a checkout's dependencies, seeding copies the same units it would otherwise restore one compiler call at a time.
 

@@ -4718,6 +4718,67 @@ fn a_target_clippy_checked_last_seeds_a_new_checkout() {
     );
 }
 
+/// A build that starts while no daemon runs is seeded too: the wrapper
+/// copies the units itself when it answers Cargo's target-info probe. It
+/// used to ask the daemon, so such a build restored every registry unit one
+/// compiler call at a time instead.
+#[test]
+fn the_target_info_probe_seeds_a_new_checkout_while_no_daemon_runs() {
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    let root = TempDir::new().unwrap();
+    let donor = root.path().join("donor");
+    std::fs::create_dir_all(donor.join("src")).unwrap();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    std::fs::write(donor.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(donor.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let donor_target = donor.join("target");
+    let built = e.wrapper_build(&donor, &donor_target);
+    assert!(built.status.success(), "{built:?}");
+    e.cmd().args(["daemon", "stop"]).assert().success();
+    let profile = donor_target.join("debug");
+    let hash = "0123456789abcdef";
+    let per_unit = !profile.join(".fingerprint").is_dir();
+    let marker = |target: &Path| {
+        if per_unit {
+            target.join("debug/build/dep").join(hash)
+        } else {
+            target
+                .join("debug/.fingerprint")
+                .join(format!("dep-{hash}"))
+        }
+    };
+    let donor_marker = marker(&donor_target);
+    std::fs::create_dir_all(donor_marker.join("fingerprint")).unwrap();
+    std::fs::write(donor_marker.join("fingerprint/lib"), "fp").unwrap();
+    let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                [[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n\
+                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let checkout = root.path().join("seeded");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(checkout.join("Cargo.lock"), lock).unwrap();
+    e.cmd()
+        .current_dir(&checkout)
+        .env("KACHE_SEED_NEW_TARGETS", "1")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .args(["rustc", "-", "--crate-name", "___", "--print=file-names"])
+        .args(["--crate-type", "lib"])
+        .write_stdin("")
+        .assert()
+        .success();
+    if !donor_target.join(".rustc_info.json").is_file() {
+        eprintln!("skipping: Cargo cached no rustc info for the donor");
+        return;
+    }
+    assert!(
+        marker(&checkout.join("target")).is_dir(),
+        "a probe while no daemon runs must seed"
+    );
+}
+
 /// Cargo's first call for a target directory it has not built is its
 /// target-info probe. Sent through the wrapper, it has the daemon copy the
 /// registry units another checkout built (see `src/target_seed.rs`) before

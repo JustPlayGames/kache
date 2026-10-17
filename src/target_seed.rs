@@ -6,9 +6,12 @@
 //! before it takes the build lock and before it checks any unit's freshness.
 //! Cargo caches the answer in `<target>/.rustc_info.json`, so a target
 //! directory without that file is one Cargo has not built yet. The wrapper
-//! asks the daemon to seed it and waits up to [`SEED_DEADLINE`]; the daemon
+//! seeds it before it answers the probe, for up to [`SEED_DEADLINE`]: it
 //! copies the units another checkout already built for the same registry and
-//! git packages, and Cargo then finds them fresh and skips them.
+//! git packages, and Cargo then finds them fresh and skips them. The wrapper
+//! does this itself rather than through the daemon, so a build that starts
+//! while no daemon runs, or while the daemon is starting or busy, is seeded
+//! all the same.
 //!
 //! A unit's directory name carries Cargo's hash of everything that decides it
 //! (package, version, features, profile, dependencies, compiler). A registry
@@ -61,15 +64,9 @@ use crate::build_script::HeldRun;
 #[cfg(not(unix))]
 type HeldRun = std::convert::Infallible;
 
-/// How long the daemon copies for. Copying stops at this deadline, between
+/// How long seeding copies for. Copying stops at this deadline, between
 /// files, and Cargo builds whatever was not copied.
 pub(crate) const SEED_DEADLINE: Duration = Duration::from_secs(3);
-
-/// How long the probe waits for the daemon's answer: the deadline and time
-/// for the file copy in progress when it passed.
-pub(crate) fn seed_wait() -> Duration {
-    SEED_DEADLINE + Duration::from_secs(2)
-}
 
 /// Units copied at once. A copy is mostly metadata calls, which overlap: on
 /// btrfs, 1159 units took 2.9 s on one thread, 0.6 s on four and 0.5 s on
@@ -1143,7 +1140,32 @@ pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
     let Some(version) = rustc_version(args.first().map(String::as_str)) else {
         return;
     };
-    crate::daemon::send_seed_target(config, &target, &version, probe_is_check_lane());
+    let note = std::env::var_os("KACHE_LOG_FILE").is_none();
+    if let Err(error) =
+        crate::daemon::seed_new_target(config, &target, &version, probe_is_check_lane(), note)
+    {
+        tracing::debug!("not seeding {}: {error:#}", target.target_dir.display());
+    }
+}
+
+/// Append `line` to kache's diagnostic log as its file layer writes an info
+/// event. A wrapper has no file layer unless `KACHE_LOG_FILE` asks for one
+/// (Cargo runs hundreds of wrappers a build), but a seeding happens once per
+/// new target directory and leaves no other trace of what it copied.
+pub(crate) fn note_in_log(line: &str) {
+    use std::io::Write;
+    let path = crate::diagnostic_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let _ = writeln!(file, "{now}  INFO kache::target_seed: {line}");
+    }
 }
 
 /// `rustc -vV` from the compiler Cargo is probing.
@@ -2861,7 +2883,6 @@ source = "git+https://example.com/gitdep#abc"
         #[cfg(unix)]
         assert_eq!(rustc_version(Some("false")), None);
         assert_eq!(SEED_DEADLINE, Duration::from_secs(3));
-        assert_eq!(seed_wait(), Duration::from_secs(5));
     }
 
     /// One Cargo unit in a shared-layout profile: its fingerprint directory
