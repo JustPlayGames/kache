@@ -502,6 +502,10 @@ pub struct SeedTargetRequest {
     pub workspace_root: String,
     /// `rustc -vV` from the compiler Cargo is probing.
     pub rustc_version: String,
+    /// The build only checks (`cargo check`, `cargo clippy`): seed only the
+    /// units a check of the donor's workspace used.
+    #[serde(default)]
+    pub check_lane: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -9253,12 +9257,13 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
             .collect(),
         Err(error) => return Response::err(format!("reading tracked targets: {error:#}")),
     };
-    let seeded = crate::target_seed::seed(
+    let seeded = crate::target_seed::seed_for_lane(
         &target,
         &req.rustc_version,
         &donors,
         &config.cache_dir,
         deadline,
+        req.check_lane,
     );
     if let Some(donor) = &seeded.donor {
         tracing::info!(
@@ -9274,11 +9279,17 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
 /// Ask the daemon to seed a target directory Cargo has not built, and wait
 /// until it has, up to the seeding deadline. Never starts the daemon: a
 /// build without one simply is not seeded.
-pub fn send_seed_target(config: &Config, target: &crate::target_seed::NewTarget, version: &str) {
+pub fn send_seed_target(
+    config: &Config,
+    target: &crate::target_seed::NewTarget,
+    version: &str,
+    check_lane: bool,
+) {
     let req = Request::SeedTarget(SeedTargetRequest {
         target_dir: target.target_dir.to_string_lossy().into_owned(),
         workspace_root: target.workspace_root.to_string_lossy().into_owned(),
         rustc_version: version.to_owned(),
+        check_lane,
     });
     let wait = crate::target_seed::seed_wait();
     if let Err(e) = send_request_with_timeout(&config.socket_path(), &req, wait) {
