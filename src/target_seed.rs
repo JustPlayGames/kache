@@ -66,7 +66,12 @@ type HeldRun = std::convert::Infallible;
 
 /// How long seeding copies for. Copying stops at this deadline, between
 /// files, and Cargo builds whatever was not copied.
-pub(crate) const SEED_DEADLINE: Duration = Duration::from_secs(3);
+///
+/// A unit left out costs far more later than copying it now: the wrapper
+/// restores it from the store in a compiler call of its own (about 50 ms of
+/// CPU each in a 1,300-unit workspace, against about 1 ms to copy). On a
+/// loaded machine 3 s cut seedings of 1,400-1,500 units to 78-166.
+pub(crate) const SEED_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Units copied at once. A copy is mostly metadata calls, which overlap: on
 /// btrfs, 1159 units took 2.9 s on one thread, 0.6 s on four and 0.5 s on
@@ -2474,7 +2479,7 @@ source = "git+https://example.com/gitdep#abc"
         assert_eq!(rustc_version(Some("/nonexistent/rustc")), None);
         #[cfg(unix)]
         assert_eq!(rustc_version(Some("false")), None);
-        assert_eq!(SEED_DEADLINE, Duration::from_secs(3));
+        assert_eq!(SEED_DEADLINE, Duration::from_secs(10));
     }
 
     /// One Cargo unit in a shared-layout profile: its fingerprint directory
