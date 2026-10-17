@@ -714,12 +714,27 @@ fn seed_lane(directory: &Path) -> &str {
 /// first, built by the `rustc -vV` in `rustc_version` that has any. A link
 /// to a hermetic run is linked again only into `cache_dir`. Stops at
 /// `deadline`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn seed(
     target: &NewTarget,
     rustc_version: &str,
     donors: &[Donor],
     cache_dir: &Path,
     deadline: Instant,
+) -> Seeded {
+    seed_for_lane(target, rustc_version, donors, cache_dir, deadline, false)
+}
+
+/// [`seed`], and for a build that only checks (`check_lane`), only the units
+/// a check of the donor's workspace used ([`check_demand`]). Without such a
+/// record in the donor, every unit, as [`seed`].
+pub(crate) fn seed_for_lane(
+    target: &NewTarget,
+    rustc_version: &str,
+    donors: &[Donor],
+    cache_dir: &Path,
+    deadline: Instant,
+    check_lane: bool,
 ) -> Seeded {
     let Ok(lockfile) = std::fs::read_to_string(target.workspace_root.join("Cargo.lock")) else {
         return Seeded::default();
@@ -764,7 +779,18 @@ pub(crate) fn seed(
             Layout::Shared => deps_by_hash(&from.join("deps")),
             Layout::PerUnit => HashMap::new(),
         };
-        let units = units(&from, layout, &packages);
+        let mut units = units(&from, layout, &packages);
+        if check_lane
+            && layout == Layout::Shared
+            && let Some(demand) = check_demand(&from, &packages, &deps)
+        {
+            let all = units.len();
+            units.retain(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)));
+            tracing::info!(
+                "check build: seeding {} of {all} registry units the donor's check used",
+                units.len()
+            );
+        }
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -945,6 +971,121 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The unit directories (`<package>-<hash>`) a check build of the donor's
+/// workspace reads, from Cargo's own fingerprints in the `profile` directory
+/// of the shared layout: every unit reachable from a workspace unit Cargo
+/// checked (one whose outputs are metadata only) through the `deps` of each
+/// unit's fingerprint. A dependency is named there by its fingerprint hash,
+/// the one the dependency's own hash file holds.
+///
+/// `None` when the donor holds no checked workspace unit or a fingerprint
+/// cannot be read: then nothing says what a check needs. Only ever a filter
+/// on what is copied: a unit left out is restored by the wrapper when Cargo
+/// asks for it, as without seeding.
+fn check_demand(
+    profile: &Path,
+    registry: &BTreeSet<String>,
+    deps: &HashMap<String, Vec<PathBuf>>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut by_fingerprint: HashMap<String, String> = HashMap::new();
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    let mut roots = Vec::new();
+    for unit in subdirectories(&profile.join(".fingerprint")) {
+        let name = file_name(&unit);
+        let Some((package, hash)) = name.rsplit_once('-') else {
+            continue;
+        };
+        let mut wants = Vec::new();
+        for file in entries(&unit) {
+            let file_name = file_name(&file);
+            if file_name.ends_with(".json") {
+                let text = std::fs::read_to_string(&file).ok()?;
+                let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+                for dep in json.get("deps")?.as_array()? {
+                    let fingerprint = dep.as_array()?.get(3)?.as_u64()?;
+                    wants.push(hex_le(fingerprint));
+                }
+            } else if file_name != "invoked.timestamp"
+                && !file_name.starts_with("dep-")
+                && !file_name.contains('.')
+            {
+                let fingerprint = std::fs::read_to_string(&file).ok()?;
+                by_fingerprint.insert(fingerprint.trim().to_owned(), name.clone());
+            }
+        }
+        if !registry.contains(package)
+            && deps.get(hash).is_some_and(|files| {
+                !files.is_empty()
+                    && files.iter().all(|file| {
+                        matches!(
+                            file.extension().and_then(OsStr::to_str),
+                            Some("rmeta" | "d")
+                        )
+                    })
+            })
+        {
+            roots.push(name.clone());
+        }
+        edges.insert(name, wants);
+    }
+    if roots.is_empty() {
+        return None;
+    }
+    let mut reached = std::collections::HashSet::new();
+    while let Some(unit) = roots.pop() {
+        if !reached.insert(unit.clone()) {
+            continue;
+        }
+        for fingerprint in edges.get(&unit).into_iter().flatten() {
+            if let Some(dep) = by_fingerprint.get(fingerprint) {
+                roots.push(dep.clone());
+            }
+        }
+    }
+    Some(reached)
+}
+
+/// A fingerprint as Cargo's hash files spell it: the little-endian bytes of
+/// the `u64` in hex.
+fn hex_le(fingerprint: u64) -> String {
+    fingerprint
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Does the Cargo that sent this probe only check? `cargo clippy` runs
+/// `cargo check` with `CLIPPY_ARGS` set; a `cargo check` is the subcommand of
+/// the parent process. Only narrows what is seeded, so a wrong answer costs
+/// time, never a wrong build.
+fn probe_is_check_lane() -> bool {
+    if std::env::var_os("CLIPPY_ARGS").is_some() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let ppid = std::os::unix::process::parent_id();
+        if let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline")) {
+            let args: Vec<String> = cmdline
+                .split(|byte| *byte == 0)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect();
+            return matches!(cargo_subcommand(&args), Some("check" | "clippy"));
+        }
+    }
+    false
+}
+
+/// The subcommand of a Cargo command line: the first argument after the
+/// program that is neither an option nor a `+toolchain`.
+fn cargo_subcommand(args: &[String]) -> Option<&str> {
+    args.iter()
+        .skip(1)
+        .map(String::as_str)
+        .find(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
+}
+
 /// Pass Cargo's explicit target selection to its compiler wrappers.
 pub(crate) fn configure_cargo_seed(
     command: &mut std::process::Command,
@@ -994,7 +1135,7 @@ pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
     let Some(version) = rustc_version(args.first().map(String::as_str)) else {
         return;
     };
-    crate::daemon::send_seed_target(config, &target, &version);
+    crate::daemon::send_seed_target(config, &target, &version, probe_is_check_lane());
 }
 
 /// `rustc -vV` from the compiler Cargo is probing.
@@ -2684,5 +2825,123 @@ source = "git+https://example.com/gitdep#abc"
         assert_eq!(rustc_version(Some("false")), None);
         assert_eq!(SEED_DEADLINE, Duration::from_secs(3));
         assert_eq!(seed_wait(), Duration::from_secs(5));
+    }
+
+    /// One Cargo unit in a shared-layout profile: its fingerprint directory
+    /// with a hash file and JSON naming its dependencies by fingerprint, and
+    /// its `deps/` outputs.
+    fn fingerprinted_unit(
+        profile: &Path,
+        package: &str,
+        hash: &str,
+        fingerprint: u64,
+        needs: &[u64],
+        outputs: &[&str],
+    ) {
+        let dir = profile
+            .join(".fingerprint")
+            .join(format!("{package}-{hash}"));
+        write(&dir.join(format!("lib-{package}")), &hex_le(fingerprint));
+        let deps: Vec<_> = needs
+            .iter()
+            .map(|need| serde_json::json!([1, "d", false, need]))
+            .collect();
+        write(
+            &dir.join(format!("lib-{package}.json")),
+            &serde_json::json!({"deps": deps}).to_string(),
+        );
+        write(&dir.join("invoked.timestamp"), "");
+        for ext in outputs {
+            write(
+                &profile
+                    .join("deps")
+                    .join(format!("lib{package}-{hash}.{ext}")),
+                "x",
+            );
+        }
+    }
+
+    /// A check build needs what the donor's checked workspace units reach,
+    /// through checked and built dependencies alike, and not what only a
+    /// built (test) workspace unit reaches.
+    #[test]
+    fn a_check_needs_what_the_checked_workspace_units_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let h = |n: u8| format!("{n:016x}");
+        // Registry: `dep` checked, `dep` built (for the test), `mac` a proc
+        // macro the check uses, `mac_dep` built for it, `only_test` built for
+        // the test alone.
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "mac_dep", &h(3), 13, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "mac", &h(4), 14, &[13], &["so"]);
+        fingerprinted_unit(&profile, "only_test", &h(5), 15, &[12], &["rlib", "rmeta"]);
+        // Workspace: `app` checked, and built as a test.
+        fingerprinted_unit(&profile, "app", &h(6), 16, &[11, 14], &["rmeta"]);
+        fingerprinted_unit(
+            &profile,
+            "app",
+            &h(7),
+            17,
+            &[12, 14, 15],
+            &["rlib", "rmeta"],
+        );
+        let registry: BTreeSet<String> = ["dep", "mac", "mac_dep", "only_test"]
+            .map(String::from)
+            .into();
+        let deps = deps_by_hash(&profile.join("deps"));
+        let demand = check_demand(&profile, &registry, &deps).unwrap();
+        for wanted in [
+            format!("dep-{}", h(1)),
+            format!("mac-{}", h(4)),
+            format!("mac_dep-{}", h(3)),
+        ] {
+            assert!(demand.contains(&wanted), "{wanted}");
+        }
+        for unwanted in [format!("dep-{}", h(2)), format!("only_test-{}", h(5))] {
+            assert!(!demand.contains(&unwanted), "{unwanted}");
+        }
+    }
+
+    /// Without a checked workspace unit, nothing says what a check needs.
+    #[test]
+    fn no_checked_workspace_unit_gives_no_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        fingerprinted_unit(
+            &profile,
+            "dep",
+            &format!("{:016x}", 2),
+            12,
+            &[],
+            &["rlib", "rmeta"],
+        );
+        fingerprinted_unit(
+            &profile,
+            "app",
+            &format!("{:016x}", 7),
+            17,
+            &[12],
+            &["rlib", "rmeta"],
+        );
+        let registry: BTreeSet<String> = ["dep"].map(String::from).into();
+        let deps = deps_by_hash(&profile.join("deps"));
+        assert!(check_demand(&profile, &registry, &deps).is_none());
+    }
+
+    #[test]
+    fn the_subcommand_skips_options_and_toolchains() {
+        let line = |text: &str| args(text);
+        assert_eq!(
+            cargo_subcommand(&line("cargo +nightly -q check --workspace")),
+            Some("check")
+        );
+        assert_eq!(
+            cargo_subcommand(&line("/usr/bin/cargo clippy")),
+            Some("clippy")
+        );
+        assert_eq!(cargo_subcommand(&line("cargo test --no-run")), Some("test"));
+        assert_eq!(cargo_subcommand(&line("cargo")), None);
     }
 }
