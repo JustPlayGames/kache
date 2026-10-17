@@ -760,20 +760,11 @@ pub(crate) fn seed_for_lane(
     if built(&target.target_dir) {
         return Seeded::default();
     }
-    for donor in donors {
+    for (donor, layout) in ranked_donors(target, rustc_version, donors, &packages) {
         if Instant::now() >= deadline {
             break;
         }
-        if donor.target_dir == target.target_dir
-            || seed_lane(&donor.target_dir) != seed_lane(&target.target_dir)
-            || !donor_built_by(donor, rustc_version)
-        {
-            continue;
-        }
         let from = donor.target_dir.join(PROFILE);
-        let Some(layout) = layout(&from) else {
-            continue;
-        };
         let Some(_theirs) = try_lock(&from.join(".cargo-lock")) else {
             continue;
         };
@@ -882,6 +873,49 @@ fn pin_launcher(from: &Path, to: &Path, record: &Path, deadline: Instant) -> std
     }
     kache_fs::set_writable_permissions(&staged, true)?;
     std::fs::rename(staged, pinned)
+}
+
+/// How many of the most recently used donors are ranked by what they hold.
+const RANKED_DONORS: usize = 8;
+
+/// The donors that can give `target` units, in the order seeding tries them:
+/// of the [`RANKED_DONORS`] most recently used, the one holding the most
+/// units of `packages` first (the more recent of two that hold as many), then
+/// every other in order of use.
+///
+/// The checkout used last may have built a small part of the workspace: a
+/// `cargo xtask` command builds the dependencies of one crate, 361 units of
+/// a 1,900-unit workspace. Seeding stops at the first donor it copies from,
+/// so taking the most recent one alone left a new checkout with those 361.
+fn ranked_donors<'a>(
+    target: &'a NewTarget,
+    rustc_version: &'a str,
+    donors: &'a [Donor],
+    packages: &BTreeSet<String>,
+) -> impl Iterator<Item = (&'a Donor, Layout)> + 'a {
+    let mut usable = donors.iter().filter_map(move |donor| {
+        if donor.target_dir == target.target_dir
+            || seed_lane(&donor.target_dir) != seed_lane(&target.target_dir)
+            || !donor_built_by(donor, rustc_version)
+        {
+            return None;
+        }
+        layout(&donor.target_dir.join(PROFILE)).map(|layout| (donor, layout))
+    });
+    let mut ranked: Vec<_> = usable
+        .by_ref()
+        .take(RANKED_DONORS)
+        .map(|(donor, layout)| {
+            let held = units(&donor.target_dir.join(PROFILE), layout, packages).len();
+            (donor, layout, held)
+        })
+        .collect();
+    // Stable: equals keep their order of use.
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+    ranked
+        .into_iter()
+        .map(|(donor, layout, _)| (donor, layout))
+        .chain(usable)
 }
 
 /// What Cargo writes to `CACHEDIR.TAG` in a target directory it creates.
@@ -1447,6 +1481,37 @@ source = "git+https://example.com/gitdep#abc"
         assert!(registry_packages("not toml [").is_empty());
         assert!(registry_packages("version = 3\n").is_empty());
         assert!(registry_packages("[[package]]\nsource = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn a_recent_donor_holding_more_units_is_used_before_the_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let more = donor(dir.path(), "more", Layout::Shared);
+        let named = format!("gitdep-{OTHER}");
+        let profile = more.target_dir.join(PROFILE);
+        write(&profile.join(".fingerprint").join(&named).join("lib"), "fp");
+        write(
+            &profile.join("deps").join(format!("libgitdep-{OTHER}.rlib")),
+            "rlib",
+        );
+        let last = donor(dir.path(), "last", Layout::Shared);
+        let new = checkout(dir.path(), "b");
+        // Most recently used first, as the store lists them.
+        let donors = [last.clone(), more.clone()];
+        assert_eq!(
+            seed(&new, VERSION, &donors, Path::new(NO_CACHE), later()),
+            Seeded {
+                units: 2,
+                donor: Some(more.workspace_root.clone()),
+            }
+        );
+        // Holding as many, the one used last goes first.
+        let other = checkout(dir.path(), "c");
+        let even = [last.clone(), donor(dir.path(), "even", Layout::Shared)];
+        assert_eq!(
+            seed(&other, VERSION, &even, Path::new(NO_CACHE), later()).donor,
+            Some(last.workspace_root.clone())
+        );
     }
 
     #[test]
