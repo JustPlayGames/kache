@@ -16836,3 +16836,151 @@ fn a_bundled_unportable_archive_keys_by_bytes_and_a_linked_one_by_path_too() {
     std::fs::write(&second, [bytes.as_slice(), b"\0"].concat()).unwrap();
     assert_ne!(bundled(&first), bundled(&second));
 }
+
+/// The units of one Cargo invocation share the workspace walk
+/// ([`crate::session_tree`]): the digest and guard walk come out as an
+/// unshared computation gives them, a later unit of the session does not walk
+/// the workspace again, and only `OUT_DIR` is walked per unit.
+#[test]
+fn a_session_shares_the_workspace_digest_it_would_have_computed() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let _cache = crate::config::tests::set_env_for_test(
+        "KACHE_CACHE_DIR",
+        Some(dir.path().join("cache").as_os_str()),
+    );
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    write_file(&root.join("assets/a.txt"), "a\n");
+    let out = root.join("target/debug/build/kt-1/out");
+    write_file(&out.join("gen.rs"), "// gen\n");
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target").canonicalize().unwrap(),
+        out_dir: Some(out.clone()),
+        vendored_package: None,
+    };
+    let hasher = FileHasher::new();
+    let guarded = || tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+
+    crate::session_tree::set_test_session(None);
+    let unshared = guarded();
+    crate::session_tree::set_test_session(Some("cargo-1"));
+    let first = guarded();
+    assert_eq!(first.digest, unshared.digest);
+    assert!(first.held());
+    let sessions = dir.path().join("cache/probes/session-trees/cargo-1");
+    assert_eq!(
+        std::fs::read_dir(&sessions)
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                !name.to_string_lossy().contains('.')
+            })
+            .count(),
+        1,
+        "one answer filed for the workspace root"
+    );
+    let second = guarded();
+    assert_eq!(second.digest, unshared.digest);
+    assert!(
+        second.held(),
+        "the shared walk is the walk of the tree as it is"
+    );
+
+    // OUT_DIR is walked by every unit, in the session too.
+    write_file(&out.join("gen.rs"), "// other\n");
+    assert_ne!(guarded().digest, unshared.digest, "OUT_DIR is not shared");
+    write_file(&out.join("gen.rs"), "// gen\n");
+    crate::session_tree::set_test_session(None);
+}
+
+/// What the session gives up, and what it keeps: an edit to a workspace file
+/// outside every closure, made while one Cargo invocation runs, is not seen by
+/// that invocation's later units, but a record made from them is refused
+/// (its guard no longer holds) and the next invocation sees the edit. An edit
+/// to a file in the closure still changes the key within the session.
+#[test]
+fn edits_still_miss_under_a_shared_workspace_walk() {
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let _cache = crate::config::tests::set_env_for_test(
+        "KACHE_CACHE_DIR",
+        Some(base.join("cache").as_os_str()),
+    );
+    let (root, args) = workspace_invocation(&base, "w", "kt");
+    std::env::set_current_dir(&root).unwrap();
+    let lib = root.join("kt/src/lib.rs");
+    write_file(&lib, "pub fn a() {}\n");
+    write_file(&root.join("kt/assets/a.txt"), "a");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    // Old times, so the edits below show on any clock.
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for path in [&lib, &root.join("kt/assets/a.txt")] {
+        filetime::set_file_mtime(path, old).unwrap();
+    }
+    let hasher = FileHasher::persistent(&base.join("local.db")).with_input_predictions(true);
+    let closure = DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let identity = rustc_prediction_identity(&args).unwrap();
+    let key = || {
+        compute_cache_key_with_outputs(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default())
+    };
+
+    crate::session_tree::set_test_session(Some("cargo-1"));
+    let mut tree = None;
+    let _ = predicted_key_inputs(&args, &hasher, &mut tree);
+    let guard = tree.expect("a workspace member is guarded");
+    hasher.record_input_prediction(&identity, Some("kt"), &closure, Some(guard.digest.clone()));
+    let (first, outputs) = key();
+    let first = first.unwrap();
+    assert!(outputs.used_prediction, "keyed from the record");
+
+    // A file rustc reads: the key moves within the same session.
+    write_file(&lib, "pub fn b() {}\n");
+    let (edited, outputs) = key();
+    assert!(outputs.used_prediction);
+    assert_ne!(edited.unwrap(), first, "an edited source misses");
+    write_file(&lib, "pub fn a() {}\n");
+    assert_eq!(key().0.unwrap(), first, "and hits again once put back");
+
+    // A file only a macro listing a directory could read, added mid-session.
+    write_file(&root.join("kt/assets/b.txt"), "b");
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None),
+        Ok(closure.clone()),
+        "the session keeps the walk its first unit took"
+    );
+    let mut tree = None;
+    let _ = predicted_key_inputs(&args, &hasher, &mut tree);
+    assert!(
+        !tree.unwrap().held(),
+        "a record made under the shared walk is refused"
+    );
+    // The next Cargo invocation walks again and sees it.
+    crate::session_tree::set_test_session(Some("cargo-2"));
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+    crate::session_tree::set_test_session(None);
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None),
+        Err(Rejection::TreeChanged),
+        "as without a session"
+    );
+}

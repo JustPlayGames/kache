@@ -1284,6 +1284,20 @@ fn tree_digest_memoised(
     if marked_recently(&together, now) {
         return None;
     }
+    if let Some(index) = roots.iter().position(|root| root.role == b"workspace")
+        && crate::session_tree::session_id().is_some()
+    {
+        return shared_workspace_digest(
+            index,
+            &roots,
+            walked,
+            &together,
+            file_hasher,
+            max_entries,
+            memo_dir,
+            now,
+        );
+    }
     let stamps = match stamp_roots(&walked, max_entries, file_hasher.cache.is_some()) {
         Ok(stamps) => stamps,
         Err(StampRefusal::TooLarge(index)) => {
@@ -1310,6 +1324,159 @@ fn tree_digest_memoised(
             stamp: stamped.stamp.digest.clone(),
         };
         // A read may spend what the other roots leave of the budget.
+        let budget = max_entries - (total - stamped.entries);
+        digests.push(root_digest(
+            root,
+            &walk,
+            &stamped,
+            budget,
+            file_hasher,
+            memo_dir,
+            now,
+        )?);
+        walks.push(walk);
+    }
+    for walk in walks {
+        file_hasher.note_tree_walk(walk);
+    }
+    if let [digest] = digests.as_slice() {
+        return Some(digest.clone());
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(TREE_ROOTS_VERSION);
+    for digest in &digests {
+        fold_field(&mut hasher, b"digest:", digest.as_bytes());
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// The bytes naming a walked root in a session ([`crate::session_tree`]):
+/// everything its stamp and digest depend on.
+fn session_root_key(walked: &WalkedRoot, max_entries: usize) -> Vec<u8> {
+    let mut key = Vec::new();
+    key.extend_from_slice(TREE_DIGEST_VERSION);
+    let mut field = |label: &[u8], value: &[u8]| {
+        key.extend_from_slice(label);
+        key.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        key.extend_from_slice(value);
+    };
+    field(b"path:", walked.path.as_os_str().as_encoded_bytes());
+    field(b"role:", &walked.role);
+    for excluded in &walked.excluded {
+        field(b"excluded:", excluded.as_os_str().as_encoded_bytes());
+    }
+    field(b"rules:", format!("{:?}", walked.rules).as_bytes());
+    field(b"max:", &max_entries.to_le_bytes());
+    key
+}
+
+/// [`tree_digest_memoised`] where `roots[index]` is the workspace: its walk
+/// and digest are taken once per Cargo invocation and shared by its units
+/// ([`crate::session_tree`]); the other roots (`OUT_DIR`) are walked as
+/// before. Same answer, markers and guard walks as the general path.
+#[allow(clippy::too_many_arguments)]
+fn shared_workspace_digest(
+    index: usize,
+    roots: &[TreeRoot<'_>],
+    walked: Vec<WalkedRoot>,
+    together: &Path,
+    file_hasher: &FileHasher<'_>,
+    max_entries: usize,
+    memo_dir: &Path,
+    now: std::time::SystemTime,
+) -> Option<String> {
+    let workspace = walked[index].clone();
+    let shared = crate::session_tree::shared_or(
+        memo_dir,
+        &session_root_key(&workspace, max_entries),
+        || {
+            let stamped = match stamp_roots(
+                std::slice::from_ref(&workspace),
+                max_entries,
+                file_hasher.cache.is_some(),
+            ) {
+                Ok(mut stamps) => stamps.pop()?,
+                Err(StampRefusal::TooLarge(_)) => {
+                    write_marker(&oversized_tree_marker(
+                        memo_dir,
+                        &workspace.path,
+                        max_entries,
+                    ));
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            let walk = GuardWalk {
+                root: workspace.clone(),
+                max_entries,
+                stamp: stamped.stamp.digest.clone(),
+            };
+            let digest = root_digest(
+                &roots[index],
+                &walk,
+                &stamped,
+                max_entries,
+                file_hasher,
+                memo_dir,
+                now,
+            )?;
+            Some(crate::session_tree::SharedRoot {
+                stamp: walk.stamp,
+                entries: stamped.entries,
+                digest,
+            })
+        },
+    )?;
+    let others: Vec<WalkedRoot> = walked
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at != index)
+        .map(|(_, root)| root.clone())
+        .collect();
+    let mut other_stamps = match stamp_roots(&others, max_entries, file_hasher.cache.is_some()) {
+        Ok(stamps) => stamps.into_iter(),
+        Err(StampRefusal::TooLarge(at)) => {
+            write_marker(&oversized_tree_marker(
+                memo_dir,
+                &others[at].path,
+                max_entries,
+            ));
+            return None;
+        }
+        Err(StampRefusal::TooLargeTogether) => {
+            write_marker(together);
+            return None;
+        }
+        Err(StampRefusal::Unwalkable) => return None,
+    };
+    let other_entries: usize = other_stamps
+        .as_slice()
+        .iter()
+        .map(|root| root.entries)
+        .sum();
+    let total = shared.entries + other_entries;
+    if total > max_entries {
+        write_marker(together);
+        return None;
+    }
+    let mut digests = Vec::with_capacity(roots.len());
+    let mut walks = Vec::with_capacity(roots.len());
+    for (at, (root, walked)) in roots.iter().zip(walked).enumerate() {
+        if at == index {
+            digests.push(shared.digest.clone());
+            walks.push(GuardWalk {
+                root: walked,
+                max_entries,
+                stamp: shared.stamp.clone(),
+            });
+            continue;
+        }
+        let stamped = other_stamps.next()?;
+        let walk = GuardWalk {
+            root: walked,
+            max_entries,
+            stamp: stamped.stamp.digest.clone(),
+        };
         let budget = max_entries - (total - stamped.entries);
         digests.push(root_digest(
             root,
