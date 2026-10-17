@@ -817,7 +817,7 @@ pub(crate) fn seed_for_lane(
             break;
         }
         let from = donor.target_dir.join(PROFILE);
-        let Some(_theirs) = try_lock(&from.join(".cargo-lock")) else {
+        let Some(_theirs) = try_lock_shared(&from.join(".cargo-lock")) else {
             continue;
         };
         let deps = match layout {
@@ -991,14 +991,29 @@ impl Drop for Held {
 /// Lock `path` exclusively without waiting, creating it if needed. `None`
 /// when another process holds it or it cannot be opened.
 fn try_lock(path: &Path) -> Option<Held> {
-    let file = std::fs::OpenOptions::new()
+    let file = open_lock(path)?;
+    file.try_lock().ok()?;
+    Some(Held(file))
+}
+
+/// Lock a donor's `path` for reading without waiting: Cargo building there
+/// holds it exclusively and keeps seeding out, while other seedings, which
+/// only read the donor, share it. An exclusive lock let one new checkout
+/// at a time read a donor: of three started together from one donor, two
+/// went unseeded and restored every unit one compiler call at a time.
+fn try_lock_shared(path: &Path) -> Option<Held> {
+    let file = open_lock(path)?;
+    file.try_lock_shared().ok()?;
+    Some(Held(file))
+}
+
+fn open_lock(path: &Path) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
-        .ok()?;
-    file.try_lock().ok()?;
-    Some(Held(file))
+        .ok()
 }
 
 fn entries(dir: &Path) -> Vec<PathBuf> {
@@ -1705,6 +1720,18 @@ source = "git+https://example.com/gitdep#abc"
         );
         assert_eq!(seeded.donor, Some(free.workspace_root.clone()));
         drop(held);
+        // Another seeding reading the donor does not keep this one out.
+        let reading = try_lock_shared(&busy.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
+        let beside = checkout(dir.path(), "beside");
+        let seeded = seed(
+            &beside,
+            VERSION,
+            std::slice::from_ref(&busy),
+            Path::new(NO_CACHE),
+            later(),
+        );
+        assert_eq!(seeded.donor, Some(busy.workspace_root.clone()));
+        drop(reading);
         // The target itself, and a donor with no units, give nothing.
         let other = checkout(dir.path(), "c");
         let own = Donor {
@@ -2777,6 +2804,29 @@ source = "git+https://example.com/gitdep#abc"
         assert!(try_lock(&path).is_some(), "the lock was not released");
         drop(duplicate);
         assert!(try_lock(&dir.path().join("missing/.cargo-lock")).is_none());
+    }
+
+    #[test]
+    fn donor_locks_are_shared_with_readers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cargo-lock");
+        let first = try_lock_shared(&path).unwrap();
+        let second = try_lock_shared(&path).unwrap();
+        assert!(
+            try_lock(&path).is_none(),
+            "a build got in while seedings read"
+        );
+        drop((first, second));
+        let building = try_lock(&path).unwrap();
+        assert!(
+            try_lock_shared(&path).is_none(),
+            "a seeding read a donor being built"
+        );
+        drop(building);
+        assert!(
+            try_lock_shared(&path).is_some(),
+            "the lock was not released"
+        );
     }
 
     #[test]
