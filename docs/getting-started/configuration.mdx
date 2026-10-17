@@ -294,7 +294,7 @@ The cleanup follows the configuration of the daemon that serves the cache direct
 
 The first build in a new checkout or worktree starts with an empty target directory. Kache fills it before Cargo decides what to build, so Cargo skips the dependencies another checkout already built instead of restoring each one from the cache.
 
-Cargo's first call through `RUSTC_WRAPPER` for a target directory it has never built is a probe of the compiler, made before it checks any unit. When it sees that probe, the wrapper copies the matching units from the most recently used target directory built by the same `rustc`, for up to 3 seconds, before it answers. Cargo then builds whatever was not copied. The wrapper does this itself, so a build is seeded whether or not the daemon runs. The log (`kache.log`) names the checkout the units came from.
+Cargo's first call through `RUSTC_WRAPPER` for a target directory it has never built is a probe of the compiler, made before it checks any unit. When it sees that probe, the wrapper copies the matching units from the most recently used target directory built by the same `rustc`, for up to 10 seconds, before it answers. Cargo then builds whatever was not copied. The wrapper does this itself, so a build is seeded whether or not the daemon runs. The log (`kache.log`) names the checkout the units came from.
 
 What is copied:
 
