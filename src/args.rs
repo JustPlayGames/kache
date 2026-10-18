@@ -760,9 +760,17 @@ impl RustcArgs {
     /// non-byte-identical `.dylib` outputs → downstream crates that
     /// `--extern` them get unstable cache keys (the e422e55 relocate
     /// failure mode).
+    ///
+    /// Only a compile that emits `link` produces one: `cargo check` and
+    /// `cargo clippy` build a binary or a test with `--emit=dep-info,metadata`,
+    /// which writes no executable (and no `.pdb`), only metadata like any
+    /// library's check, so it is cached whatever `cache_executables` says.
     pub fn is_user_facing_executable(&self) -> bool {
         // An omitted crate type can produce rustc's default binary.
-        self.is_test || self.crate_types.is_empty() || self.crate_types.iter().any(|t| t == "bin")
+        let executable = self.is_test
+            || self.crate_types.is_empty()
+            || self.crate_types.iter().any(|t| t == "bin");
+        executable && self.emits_link()
     }
 
     /// The codegen backend dylib this compile loads, when `-Zcodegen-backend`
@@ -1934,6 +1942,32 @@ mod tests {
             parsed.is_user_facing_executable(),
             "--test must count as user-facing"
         );
+    }
+
+    /// A check (`cargo check`, `cargo clippy`) of a binary or a test emits
+    /// metadata only: no executable, so nothing user-facing to keep out of
+    /// the cache. Builds of the same units still are.
+    #[test]
+    fn a_metadata_only_compile_is_not_a_user_facing_executable() {
+        let parse = |line: &str| {
+            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+            RustcArgs::parse(&args).unwrap()
+        };
+        for line in [
+            "rustc --crate-name app --crate-type bin --emit=dep-info,metadata src/main.rs",
+            "rustc --crate-name app --test --emit=dep-info,metadata src/lib.rs",
+            "rustc --crate-name smoke --test --emit=metadata tests/smoke/main.rs",
+            "rustc --crate-name app --emit=dep-info,metadata src/main.rs",
+        ] {
+            assert!(!parse(line).is_user_facing_executable(), "{line}");
+        }
+        for line in [
+            "rustc --crate-name app --crate-type bin --emit=dep-info,link src/main.rs",
+            "rustc --crate-name app --test --emit=dep-info,link src/lib.rs",
+            "rustc --crate-name app --crate-type bin src/main.rs",
+        ] {
+            assert!(parse(line).is_user_facing_executable(), "{line}");
+        }
     }
 
     #[test]

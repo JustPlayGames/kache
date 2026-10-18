@@ -772,6 +772,59 @@ fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
     assert_eq!(active["dep_info_runs"], 0, "event: {active:#}");
 }
 
+/// `cargo check` of a binary emits metadata only: no executable, so it is
+/// cached even where executables are not (`cache_executables` off, the
+/// Windows default). A second target directory restores it.
+#[test]
+fn a_check_of_an_executable_is_cached_when_executables_are_not() {
+    let project = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    fs::create_dir(project.path().join("src")).unwrap();
+    fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"adaptive-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { print!(\"checked executable\"); }\n",
+    )
+    .unwrap();
+    let check = |target: &str| {
+        let output = hermetic_command(
+            "cargo",
+            cache.path(),
+            Some(&project.path().join("missing-kache.toml")),
+        )
+        .args(["check", "--offline", "--quiet", "--bin", "adaptive-fixture"])
+        .current_dir(project.path())
+        .env("RUSTC_WRAPPER", kache_binary())
+        .env("CARGO_TARGET_DIR", project.path().join(target))
+        .env("KACHE_CACHE_EXECUTABLES", "0")
+        .env("KACHE_ADAPTIVE_INCREMENTAL", "0")
+        .env("KACHE_SEED_NEW_TARGETS", "0")
+        .env_remove("KACHE_FALLBACK")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("KACHE_DISABLED")
+        .output()
+        .expect("failed to check the executable fixture");
+        assert!(
+            output.status.success(),
+            "check failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    };
+    check("first");
+    check("second");
+    let events = fixture_events(cache.path());
+    let results: Vec<&str> = events
+        .iter()
+        .map(|event| event["result"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(results, ["miss", "local_hit"], "events: {events:#?}");
+}
+
 #[test]
 fn user_facing_executable_without_fallback_uses_default_immediate_adaptive_lane() {
     let project = tempfile::tempdir().unwrap();
