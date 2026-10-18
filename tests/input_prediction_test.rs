@@ -1493,12 +1493,13 @@ fn a_cargo_home_inside_the_workspace_keeps_the_record_guarded() {
     );
 }
 
-/// A file the closure does not name, anywhere in the workspace, could be one
-/// a macro reads, so B's extra file keeps A's record out.
+/// With the whole-workspace guard (`KACHE_WORKSPACE_GUARD=workspace`), a
+/// file the closure does not name, anywhere in the workspace, could be one a
+/// macro reads, so B's extra file keeps A's record out.
 #[test]
 fn a_new_file_anywhere_in_the_workspace_refuses_the_record() {
     for with_macro in [false, true] {
-        let unit = WorkspaceUnit::new(with_macro);
+        let unit = WorkspaceUnit::new(with_macro).with_env("KACHE_WORKSPACE_GUARD", "workspace");
         let warm = unit.build_a_then_b(|b| {
             std::fs::create_dir_all(b.join("docs")).unwrap();
             std::fs::write(b.join("docs/notes.md"), "not read\n").unwrap();
@@ -2026,4 +2027,282 @@ fn a_macro_on_the_shared_out_dir_predicts_in_another_target() {
 #[test]
 fn a_macro_expanding_a_macro_on_the_shared_out_dir_predicts_in_another_target() {
     predicts_on_the_shared_out_dir(true);
+}
+
+// ---------------------------------------------------------------------------
+// PROTOTYPE: the scoped workspace guard (`KACHE_WORKSPACE_GUARD=scoped`).
+// ---------------------------------------------------------------------------
+
+impl WorkspaceUnit {
+    /// Every build and report runs with the scoped guard on.
+    fn scoped(mut self) -> Self {
+        self.env.push(("KACHE_WORKSPACE_GUARD", "scoped".into()));
+        self
+    }
+
+    fn with_env(mut self, name: &'static str, value: &str) -> Self {
+        self.env.push((name, value.into()));
+        self
+    }
+}
+
+/// [`SCAN_MACRO`] over `shared/` at the workspace root, a sibling of the
+/// member's package: `CARGO_MANIFEST_DIR/../shared`.
+fn scan_macro_over(dir: &str) -> String {
+    SCAN_MACRO.replace(".join(\"assets\")", &format!(".join({dir:?})"))
+}
+
+/// [`SCAN_MACRO`] over `../shared` that, once a `add-late` file sits next to
+/// the checkout, adds `shared/late.txt` after it listed the directory: the
+/// compile saw a directory without it, which holds it by the time the
+/// wrapper records the closure.
+const LATE_ADDING_SCAN_MACRO: &str = r#"extern crate proc_macro;
+#[proc_macro]
+pub fn scan(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_dir = std::path::Path::new(&manifest_dir);
+    let shared = manifest_dir.join("../shared");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&shared)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    let marker = manifest_dir.join("../../add-late");
+    if marker.exists() {
+        let _ = std::fs::write(shared.join("late.txt"), "late\n");
+        let _ = std::fs::remove_file(&marker);
+    }
+    let mut code = String::from("pub const ASSETS: &[&str] = &[");
+    for file in files {
+        code.push_str(&format!("include_str!({:?}),", file.display().to_string()));
+    }
+    code.push_str("];");
+    code.parse().unwrap()
+}
+"#;
+
+/// The point of the scoped guard: a file changed or added outside the
+/// member's package, where no macro of the member looks, keeps the record,
+/// in this checkout and in another one, and the predicted key is the one the
+/// pre-pass gives.
+#[test]
+fn scoped_a_change_outside_the_package_keeps_the_record() {
+    build_kache();
+    for with_macro in [false, true] {
+        let unit = WorkspaceUnit::new(with_macro)
+            .scoped()
+            .with_file("docs/old.md", "old\n");
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        std::fs::write(a.join("docs/notes.md"), "not read\n").unwrap();
+        std::fs::write(a.join("docs/old.md"), "edited\n").unwrap();
+        let warm = unit.build(&a, true, None);
+        assert_eq!(warm.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(warm.dep_info_runs, 0, "with_macro={with_macro}");
+        let off = unit.build(&a, false, None);
+        assert_eq!(off.cache_key, warm.cache_key, "with_macro={with_macro}");
+
+        // Another checkout with its own docs uses A's portable row.
+        let b = unit.checkout("b");
+        std::fs::write(b.join("docs/other.md"), "b's own\n").unwrap();
+        let other = unit.build(&b, true, None);
+        assert_eq!(other.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(other.dep_info_runs, 0, "with_macro={with_macro}");
+        assert_eq!(other.cache_key, warm.cache_key, "with_macro={with_macro}");
+    }
+}
+
+/// Inside the package, the scoped guard is the workspace guard: a file added
+/// where a re-exported macro lists is seen, and the key is the pre-pass's.
+#[test]
+fn scoped_a_file_added_inside_the_package_where_a_macro_lists_misses() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    assert_eq!(unit.build(&a, true, None).dep_info_runs, 0);
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_eq!(added.result, "miss");
+    assert_ne!(added.cache_key, cold.cache_key);
+    let off = unit.build(&a, false, None);
+    assert_eq!(off.cache_key, added.cache_key);
+}
+
+/// Outside the package, the directory of a file the closure names is part
+/// of the guard: a file added where the macro lists `../shared` is seen, in
+/// this checkout and in another checkout that has the extra file.
+#[test]
+fn scoped_a_file_added_outside_the_package_where_a_macro_lists_misses() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade_macro(&scan_macro_over("../shared"))
+        .with_file("shared/a.txt", "a\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(
+        warm.dep_info_runs, 0,
+        "an unchanged directory keeps the record"
+    );
+
+    let b = unit.checkout("b");
+    std::fs::write(b.join("shared/b.txt"), "b\n").unwrap();
+    let other = unit.build(&b, true, None);
+    assert_eq!(other.result, "miss", "B's extra file is listed");
+    assert_ne!(other.cache_key, cold.cache_key);
+    assert_eq!(unit.build(&b, false, None).cache_key, other.cache_key);
+
+    std::fs::write(a.join("shared/b.txt"), "b\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_ne!(added.cache_key, cold.cache_key, "A sees it too");
+    assert_eq!(unit.build(&a, false, None).cache_key, added.cache_key);
+}
+
+/// A file the macro adds to a listed directory after listing it, while the
+/// unit compiles, must not leave a record that lists the directory with it:
+/// the compile did not see it. The next build discovers its closure.
+#[test]
+fn scoped_a_listed_directory_changed_while_the_unit_builds_leaves_no_record() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade_macro(LATE_ADDING_SCAN_MACRO)
+        .with_file("shared/a.txt", "a\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    // A change in the package sends the next build to the pre-pass, which
+    // runs the macro, which adds `late.txt` after listing.
+    std::fs::write(unit.root.path().join("add-late"), "").unwrap();
+    std::fs::write(a.join("kt/notes.txt"), "package change\n").unwrap();
+    unit.build(&a, true, None);
+    assert!(a.join("shared/late.txt").exists(), "the macro added it");
+    let next = unit.build(&a, true, None);
+    let off = unit.build(&a, false, None);
+    assert_eq!(
+        next.cache_key, off.cache_key,
+        "keyed as the pre-pass keys it"
+    );
+}
+
+/// A dot-directory or file at the workspace root is on the way up from the
+/// package (`.sqlx`, `.env`), so a change there refuses the record, except
+/// for the paths no build reads: by default `.agents`, `.github`, `.claude`,
+/// `AGENTS.md` and `README.md`; `KACHE_GUARD_IGNORE` replaces the list, and
+/// an empty one ignores nothing.
+#[test]
+fn scoped_a_root_change_refuses_the_record_unless_ignored() {
+    build_kache();
+    // (KACHE_GUARD_IGNORE, does a change to .agents/ refuse, to AGENTS.md, to notes.txt)
+    let cases: [(Option<&str>, bool, bool, bool); 3] = [
+        (None, false, false, true),
+        (Some(""), true, true, true),
+        (Some(" .agents/ ; notes.txt"), false, true, false),
+    ];
+    for (ignore, agents, agents_md, notes) in cases {
+        let mut unit = WorkspaceUnit::new(false).scoped();
+        if let Some(ignore) = ignore {
+            unit = unit.with_env("KACHE_GUARD_IGNORE", ignore);
+        }
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        let changes: [(&dyn Fn(), bool, &str); 4] = [
+            (
+                &|| {
+                    std::fs::create_dir_all(a.join(".agents")).unwrap();
+                    std::fs::write(a.join(".agents/skill.md"), "skill\n").unwrap();
+                },
+                agents,
+                ".agents",
+            ),
+            (
+                &|| std::fs::write(a.join("AGENTS.md"), "rules\n").unwrap(),
+                agents_md,
+                "AGENTS.md",
+            ),
+            (
+                &|| std::fs::write(a.join("notes.txt"), "notes\n").unwrap(),
+                notes,
+                "notes.txt",
+            ),
+            (
+                &|| {
+                    std::fs::create_dir_all(a.join(".sqlx")).unwrap();
+                    std::fs::write(a.join(".sqlx/query-1.json"), "{}\n").unwrap();
+                },
+                true,
+                ".sqlx",
+            ),
+        ];
+        for (change, refuses, what) in changes {
+            change();
+            let event = unit.build(&a, true, None);
+            assert_eq!(event.result, "local_hit", "{ignore:?} {what}");
+            assert_eq!(
+                event.dep_info_runs,
+                u64::from(refuses),
+                "KACHE_GUARD_IGNORE={ignore:?}: a change to {what}"
+            );
+        }
+    }
+}
+
+/// THE DOCUMENTED GAP. A macro that lists a directory outside its package
+/// that holds no file of the closure (here an empty one) finds its first
+/// file with the scoped guard unchanged: the predicted key is the old one,
+/// a false hit. The workspace guard and the pre-pass both see the file.
+#[test]
+fn scoped_gap_a_macro_listing_an_empty_directory_outside_the_package() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade_macro(&scan_macro_over("../shared"));
+    let a = unit.checkout("a");
+    std::fs::create_dir_all(a.join("shared")).unwrap();
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    std::fs::write(a.join("shared/first.txt"), "first\n").unwrap();
+    let first = unit.build(&a, true, None);
+    let off = unit.build(&a, false, None);
+    assert_ne!(off.cache_key, cold.cache_key, "the pre-pass sees the file");
+    assert_eq!(first.cache_key, cold.cache_key, "the scoped guard does not");
+}
+
+/// Clippy names the workspace manifest in its closure. The root is on the
+/// way up from the package, so its files and dot-directories are guarded,
+/// and a new directory there (a `target` Cargo made, or any other) does not
+/// refuse the record; a new file at the root does.
+#[test]
+fn scoped_a_closure_file_at_the_root_guards_the_root_files_only() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_lib("pub const MANIFEST: &str = include_str!(\"../../Cargo.toml\");\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::create_dir_all(a.join("target-2/debug")).unwrap();
+    std::fs::write(
+        a.join("target-2/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(a.join("notes")).unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(
+        warm.dep_info_runs, 0,
+        "new directories at the root keep the record"
+    );
+    std::fs::write(a.join("NEW.md"), "a new root file\n").unwrap();
+    assert_eq!(
+        unit.build(&a, true, None).dep_info_runs,
+        1,
+        "a new root file refuses it"
+    );
 }
