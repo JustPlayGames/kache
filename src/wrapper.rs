@@ -9418,6 +9418,14 @@ fn open_session_id(content: &str, at_secs: u64) -> Option<String> {
 /// concurrent trigger. Guarded on the id still matching — if a newer build
 /// re-minted the marker between our read and this refresh, we must not
 /// resurrect the old session over it.
+///
+/// A marker touched in the last [`SESSION_REFRESH_SECS`] is left as it is.
+/// Every compile, hit and passthrough of a root ends here, and each refresh
+/// creates a file in one directory and renames it over the marker: hundreds
+/// of wrappers at once queued on that directory behind any of them waiting
+/// for a journal commit, for up to 4 s each (1,971 hits of two fresh-target
+/// builds spent 745 s here, 2026-10-18). The window then measures
+/// inactivity to within that interval.
 pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &str) {
     if root.is_empty() || session_id.is_empty() {
         return;
@@ -9425,7 +9433,11 @@ pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &s
     let marker = session_marker_path(config, root);
     match std::fs::read_to_string(&marker) {
         Ok(content) => match parse_session_marker(&content) {
-            Some((_, id)) if id == session_id => {}
+            Some((touched, id)) if id == session_id => {
+                if !session_refresh_due(touched, now_epoch_secs()) {
+                    return;
+                }
+            }
             _ => return, // superseded or unreadable — never clobber
         },
         Err(_) => return,
@@ -9512,6 +9524,16 @@ pub(crate) fn prune_session_markers(
 
 /// The build-session inactivity window (shared by trigger + attribution).
 pub(crate) const BUILD_SESSION_SECS: u64 = 300;
+
+/// How old a session marker's timestamp may get before an event refreshes
+/// it ([`refresh_session_marker`]).
+pub(crate) const SESSION_REFRESH_SECS: u64 = 20;
+
+/// Whether a marker last touched at `touched` is due a refresh at `now`. A
+/// timestamp in the future (another clock) is refreshed.
+fn session_refresh_due(touched: u64, now: u64) -> bool {
+    touched > now || now - touched >= SESSION_REFRESH_SECS
+}
 
 /// Remove the directory passed as `-C incremental`. Cargo passes
 /// `<profile>/incremental`, which every unit of the profile shares. Normal
