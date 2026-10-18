@@ -4943,7 +4943,7 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
-            Self::Bundled => "static-ar-v8-bundled",
+            Self::Bundled => "static-ar-v9-bundled",
             Self::Linked => "static-ar-v8",
         }
     }
@@ -6868,6 +6868,14 @@ fn compute_static_lib_hash(path: &Path, usage: StaticLibUse) -> Result<String> {
     // was rebuilt in every checkout. A link of the archive itself keeps the
     // fallback.
     if usage == StaticLibUse::Bundled && bytes.starts_with(b"!<arch>\n") {
+        // MSVC objects record the directory they were built in (the build
+        // script's `OUT_DIR`, so the target directory): left out, the crate
+        // hits in every target directory (see [`crate::coff_archive`]).
+        if let Some(digest) = path.parent().and_then(|dir| {
+            crate::coff_archive::path_free_digest(&bytes, dir.as_os_str().as_encoded_bytes())
+        }) {
+            return Ok(format!("bundled-coff-v1:{digest}"));
+        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"kache.native-ar.bundled-content.v1\0");
         hasher.update(&bytes);

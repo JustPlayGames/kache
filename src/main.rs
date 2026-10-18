@@ -11,6 +11,7 @@ mod cargo_layout;
 mod cargo_proxy;
 mod checked_regions;
 mod cli;
+mod coff_archive;
 mod compile;
 mod compiler;
 mod config;
