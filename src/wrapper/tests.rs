@@ -828,12 +828,12 @@ fn lookup_or_miss_turns_any_other_error_into_a_miss_without_waiting() {
 }
 
 /// The real failure: another connection holds the index's write lock while a
-/// hit refreshes its access stamp. `Store::get` fails with `SQLITE_BUSY` after
-/// the connection's busy timeout; on its own that error used to make the unit
-/// a passthrough. Through `lookup_or_miss` the lookup is tried again once the
-/// writer commits, and the entry is served.
+/// hit refreshes its access stamp. The stamp gives up after
+/// `HIT_STAMP_BUSY_WAIT` and the entry is served at once, without waiting
+/// for the writer (it used to wait out the 5 s busy timeout and then retry
+/// in `lookup_or_miss` until the writer committed).
 #[test]
-fn a_hit_behind_a_held_index_write_lock_is_served_after_the_writer_commits() {
+fn a_hit_behind_a_held_index_write_lock_is_served_without_waiting_for_the_writer() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(dir.path().join("store"));
     let store = Store::open(&cfg).unwrap();
@@ -848,23 +848,23 @@ fn a_hit_behind_a_held_index_write_lock_is_served_after_the_writer_commits() {
         .unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-    // One pause means the first lookup failed as busy; the pause commits.
-    let mut writer = Some(writer);
     let mut naps = 0;
+    let started = std::time::Instant::now();
     let found = super::lookup_or_miss(
         "held",
         std::time::Duration::from_secs(30),
-        |_| {
-            naps += 1;
-            if let Some(writer) = writer.take() {
-                writer.execute_batch("COMMIT").unwrap();
-            }
-        },
+        |_| naps += 1,
         || super::lookup_local_entry(&store, &[], "held-key"),
     );
-    let (_, meta) = found.expect("served once the writer commits");
+    let waited = started.elapsed();
+    let (_, meta) = found.expect("served while the writer holds the lock");
     assert_eq!(meta.crate_name, "test-crate");
-    assert_eq!(naps, 1);
+    assert_eq!(naps, 0);
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "waited {waited:?} for a stamp"
+    );
+    writer.execute_batch("COMMIT").unwrap();
 }
 
 /// Store a small entry so the store has a nonzero size.
