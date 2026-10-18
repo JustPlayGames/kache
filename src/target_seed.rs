@@ -3415,9 +3415,10 @@ source = "git+https://example.com/gitdep#abc"
         fingerprinted_unit(&profile, "gitdep", &h(6), 16, &[], &["rmeta"]);
         fingerprinted_unit(&profile, "app", &h(7), 17, &[13, 16], &["rmeta"]);
         let donors = [tests.clone(), checks.clone()];
+        let stored = cache_storing(&dir.path().join("cache"), &["x"]);
         let check = checkout(dir.path(), "check");
         assert_eq!(
-            seed_for_lane(&check, VERSION, &donors, no_runs().path(), later(), true),
+            seed_for_lane(&check, VERSION, &donors, &stored, later(), true),
             Seeded {
                 units: 2,
                 donor: Some(checks.workspace_root.clone()),
@@ -3427,7 +3428,7 @@ source = "git+https://example.com/gitdep#abc"
         // A build still takes the donor holding the most.
         let build = checkout(dir.path(), "build");
         assert_eq!(
-            seed_for_lane(&build, VERSION, &donors, no_runs().path(), later(), false),
+            seed_for_lane(&build, VERSION, &donors, &stored, later(), false),
             Seeded {
                 units: 3,
                 donor: Some(tests.workspace_root.clone()),
