@@ -811,6 +811,11 @@ pub struct KeyOutputs {
 pub struct TreeGuard {
     pub digest: String,
     walks: Vec<GuardWalk>,
+    /// When the digest was taken, before rustc ran, on the clock file stamps
+    /// come from ([`stamp_clock_ns`]). A scoped guard's record lists the
+    /// closure's directories after the compile, and refuses one changed since
+    /// this time ([`with_closure_dirs`]).
+    pub(crate) taken: i64,
 }
 
 impl TreeGuard {
@@ -843,6 +848,7 @@ impl TreeGuard {
                 max_entries: CRATE_TREE_MAX_ENTRIES,
                 stamp,
             }],
+            taken: stamp_clock_ns(),
         }
     }
 }
@@ -1001,10 +1007,12 @@ fn tree_guard_of(
     digest: impl FnOnce() -> Option<String>,
 ) -> Option<TreeGuard> {
     file_hasher.take_tree_walks();
+    let taken = stamp_clock_ns();
     let digest = digest()?;
     Some(TreeGuard {
         digest,
         walks: file_hasher.take_tree_walks(),
+        taken,
     })
 }
 
@@ -2366,7 +2374,9 @@ fn predicted_key_inputs(
     };
     if let Some(tree) = &tree {
         match &record.tree {
-            Some(recorded) if recorded == tree => {}
+            Some(recorded)
+                if Some(recorded)
+                    == expected_tree(tree, &record.sources, workspace.as_ref()).as_ref() => {}
             Some(_) => return Err(Rejection::TreeChanged),
             None => return Err(Rejection::NoRecord),
         }
@@ -2453,7 +2463,13 @@ fn relocated_key_inputs(
         workspace: None,
         registry: registry.as_deref().and_then(Path::to_str),
     };
-    portable_key_inputs(file_hasher, &identity, args, &guard, &places)
+    portable_key_inputs(
+        file_hasher,
+        &identity,
+        args,
+        &|_| Some(guard.clone()),
+        &places,
+    )
 }
 
 /// Use this machine's row for `identity`, or failing that the remote's
@@ -2463,7 +2479,7 @@ fn portable_key_inputs(
     file_hasher: &FileHasher<'_>,
     identity: &str,
     args: &RustcArgs,
-    guard: &str,
+    guard: &dyn Fn(&[PathBuf]) -> Option<String>,
     places: &Places<'_>,
 ) -> std::result::Result<DepInfo, Rejection> {
     let validate = |record: &PortablePrediction| {
@@ -2575,7 +2591,8 @@ fn workspace_key_inputs(
         workspace_prediction_identity(args, vars, workspace).ok_or(Rejection::NoRecord)?;
     let guard = tree.ok_or(Rejection::NoRecord)?;
     let places = workspace.places().ok_or(Rejection::NoRecord)?;
-    let dep_info = portable_key_inputs(file_hasher, &identity, args, &guard, &places)?;
+    let expected = |sources: &[PathBuf]| expected_tree(&guard, sources, Some(workspace));
+    let dep_info = portable_key_inputs(file_hasher, &identity, args, &expected, &places)?;
     if !guard_covers(&dep_info.source_files, workspace) {
         return Err(Rejection::NoRecord);
     }
@@ -2632,6 +2649,11 @@ pub(crate) struct WorkspaceRoots {
     /// The package directory, for a vendored package ([`is_vendored_package`]):
     /// its guard is the package, not the workspace.
     pub(crate) vendored_package: Option<PathBuf>,
+    /// The package directory of a member below the workspace root, when the
+    /// scoped guard is on ([`scoped_workspace_guard`]): its guard is the
+    /// package, the way to the root and the closure's directories, not the
+    /// whole workspace.
+    pub(crate) scoped_package: Option<PathBuf>,
 }
 
 impl WorkspaceRoots {
@@ -2713,6 +2735,10 @@ fn workspace_roots_in(
         out_dir: env_var_in(vars, "OUT_DIR").map(PathBuf::from),
         vendored_package: vendored_source(args, manifest_dir, current_dir)
             .then(|| manifest_dir.to_path_buf()),
+        scoped_package: (scoped_workspace_guard()
+            && suffix_within(manifest_dir.as_os_str(), &root, 0)
+                .is_some_and(|rest| !rest.is_empty()))
+        .then(|| manifest_dir.to_path_buf()),
         root,
         target,
     })
@@ -2797,6 +2823,9 @@ fn workspace_tree_digest(
             &workspace.root,
             file_hasher,
         );
+    }
+    if let Some(package) = &workspace.scoped_package {
+        return scoped_package_digest(package, workspace, file_hasher);
     }
     workspace_tree_digest_within(workspace, file_hasher, CRATE_TREE_MAX_ENTRIES)
 }
@@ -2989,6 +3018,397 @@ fn workspace_tree_digest_within(
         roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
     }
     tree_digest(roots, file_hasher, max_entries)
+}
+
+/// Is the scoped workspace guard on? It is unless `KACHE_WORKSPACE_GUARD`
+/// says `workspace` (or `off`), which brings back the whole-workspace guard.
+///
+/// The workspace guard ([`workspace_tree_digest_within`]) changes
+/// with any file of the checkout, so after any commit every workspace unit
+/// whose own files did not change still pays the dep-info pre-pass on its
+/// hit. The scoped guard of a member below the workspace root covers what a
+/// macro expanded for that member plausibly lists or reads without telling
+/// rustc:
+///
+/// - the member's package directory, content and structure, and its
+///   `OUT_DIR` (as for a registry or vendored package);
+/// - on the way up to the workspace root, the files and dot-directories at
+///   the top of each directory (as for a vendored package: `.env`, `.sqlx`,
+///   config files, `Cargo.lock`), less the root-level paths no build reads
+///   ([`scoped_guard_ignored`]);
+/// - the entries (names and kinds) of every directory outside the package
+///   that holds a file of the recorded closure, so a macro that lists a
+///   sibling directory and includes what it finds (`sqlx::migrate!("../x")`,
+///   `include_dir!`) sees a new, removed or renamed file there.
+///
+/// What it gives up: a macro that lists a directory outside its package
+/// holding no file of the closure (empty, missing, or only files the macro
+/// filters out), or reads a file outside the package without telling rustc
+/// and includes something else because of it.
+pub(crate) fn scoped_workspace_guard() -> bool {
+    #[cfg(test)]
+    if let Some(scoped) = SCOPED_GUARD_IN_TEST.with(Cell::get) {
+        return scoped;
+    }
+    !std::env::var("KACHE_WORKSPACE_GUARD").is_ok_and(|mode| {
+        let mode = mode.trim();
+        mode.eq_ignore_ascii_case("workspace") || mode.eq_ignore_ascii_case("off") || mode == "0"
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The guard a unit test asked for on its own thread
+    /// ([`WorkspaceGuardForTest`]), over the environment.
+    static SCOPED_GUARD_IN_TEST: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Keeps this test thread on the whole-workspace guard (or the scoped one)
+/// until dropped, without touching the process environment other tests read.
+#[cfg(test)]
+pub(crate) struct WorkspaceGuardForTest;
+
+#[cfg(test)]
+impl WorkspaceGuardForTest {
+    pub(crate) fn whole_workspace() -> Self {
+        SCOPED_GUARD_IN_TEST.with(|cell| cell.set(Some(false)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WorkspaceGuardForTest {
+    fn drop(&mut self) {
+        SCOPED_GUARD_IN_TEST.with(|cell| cell.set(None));
+    }
+}
+
+/// The root-level paths the scoped guard leaves out when
+/// `KACHE_GUARD_IGNORE` is unset: agent and CI configuration and the
+/// top-level docs, which no build reads.
+pub(crate) const DEFAULT_GUARD_IGNORE: &[&str] =
+    &[".agents", ".github", ".claude", "AGENTS.md", "README.md"];
+
+/// The prefix of a scoped guard's digest ([`scoped_workspace_guard`]).
+const SCOPED_GUARD_TAG: &str = "scoped-v1:";
+
+/// Workspace-relative paths the scoped guard leaves out of the way to the
+/// root: what no build reads. `KACHE_GUARD_IGNORE` replaces
+/// [`DEFAULT_GUARD_IGNORE`] (entries separated by `:` or `;`; empty for
+/// none), for example through `[env]` in the workspace's
+/// `.cargo/config.toml`.
+fn scoped_guard_ignored(root: &Path) -> Vec<PathBuf> {
+    guard_ignore_entries(std::env::var("KACHE_GUARD_IGNORE").ok().as_deref())
+        .into_iter()
+        .map(|entry| root.join(entry))
+        .collect()
+}
+
+/// The entries of a `KACHE_GUARD_IGNORE` value, or the defaults without one.
+fn guard_ignore_entries(value: Option<&str>) -> Vec<String> {
+    match value {
+        None => DEFAULT_GUARD_IGNORE
+            .iter()
+            .map(|entry| entry.to_string())
+            .collect(),
+        Some(list) => list
+            .split([':', ';'])
+            .map(|entry| entry.trim().trim_matches(['/', '\\']))
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+/// The scoped guard of the member at `package` ([`scoped_workspace_guard`]),
+/// before the closure's directories join it ([`expected_tree`]).
+fn scoped_package_digest(
+    package: &Path,
+    workspace: &WorkspaceRoots,
+    file_hasher: &FileHasher<'_>,
+) -> Option<String> {
+    let mut roots = vec![
+        TreeRoot::new(
+            package.to_path_buf(),
+            b"scoped_package",
+            MANIFEST_DIR_SKIPPED,
+        )
+        .skipping_build_dirs(),
+    ];
+    if let Some(out_dir) = &workspace.out_dir {
+        roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
+    }
+    let package_digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?;
+    let ignored = scoped_guard_ignored(&workspace.root);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-scoped-guard-v1\n");
+    fold_field(&mut hasher, b"package:", package_digest.as_bytes());
+    let mut ancestor = package.parent();
+    while let Some(directory) = ancestor.filter(|directory| directory.starts_with(&workspace.root))
+    {
+        fold_field(
+            &mut hasher,
+            b"ancestor:",
+            scoped_ancestor_top_digest(directory, file_hasher, &ignored)?.as_bytes(),
+        );
+        ancestor = directory.parent();
+    }
+    Some(format!("{SCOPED_GUARD_TAG}{}", hasher.finalize().to_hex()))
+}
+
+/// [`ancestor_top_digest`] for the scoped guard: the same files, symlinks and
+/// dot-directories, less the declared `ignored` paths and the dot-directories
+/// a tool tagged as a cache (`CACHEDIR.TAG`, as the workspace walk leaves
+/// them out), and each dot-directory walked without the build directories in
+/// it.
+fn scoped_ancestor_top_digest(
+    directory: &Path,
+    file_hasher: &FileHasher<'_>,
+    ignored: &[PathBuf],
+) -> Option<String> {
+    let mut excluded = vec![directory.join(".git")];
+    excluded.extend(
+        ignored
+            .iter()
+            .filter(|path| path.parent() == Some(directory))
+            .cloned(),
+    );
+    let top = WalkedRoot {
+        path: directory.to_path_buf(),
+        role: b"ancestor".to_vec(),
+        excluded,
+        rules: crate::tree_stamp::StampRules {
+            link_text: true,
+            skip_build_dirs: true,
+            root_metadata: true,
+            unreadable_entries: true,
+            top_files_only: true,
+            unsearchable_dirs: false,
+        },
+    };
+    let stamp = stamp_root(&top, CRATE_TREE_MAX_ENTRIES)?;
+    let mut entries: Vec<_> = std::fs::read_dir(directory)
+        .ok()?
+        .collect::<std::io::Result<_>>()
+        .ok()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    file_hasher.note_tree_walk(GuardWalk {
+        root: top,
+        max_entries: CRATE_TREE_MAX_ENTRIES,
+        stamp: stamp.digest,
+    });
+    let own = own_dirs_within(directory, &file_hasher.own_dirs);
+    let mut hasher = blake3::Hasher::new();
+    for entry in entries {
+        let name = entry.file_name();
+        let path = entry.path();
+        if name == ".git" || own.contains(&path) || ignored.contains(&path) {
+            continue;
+        }
+        let unreadable = || "unreadable".to_string();
+        let content = match std::fs::symlink_metadata(&path) {
+            Err(_) => unreadable(),
+            Ok(metadata) if metadata.file_type().is_symlink() => match std::fs::read_link(&path) {
+                Ok(target) => {
+                    let found = if path.is_file() {
+                        file_hasher
+                            .hash_unkeyed(&path)
+                            .unwrap_or_else(|_| unreadable())
+                    } else {
+                        String::new()
+                    };
+                    format!("symlink:{}:{found}", target.display())
+                }
+                Err(_) => unreadable(),
+            },
+            Ok(metadata) if metadata.is_file() => match file_hasher.hash_unkeyed(&path) {
+                Ok(hash) => format!("file:{hash}"),
+                Err(_) => unreadable(),
+            },
+            Ok(metadata) if metadata.is_dir() && name.as_encoded_bytes().starts_with(b".") => {
+                if crate::tree_stamp::holds_cargo_build_tag(&path) {
+                    continue;
+                }
+                let roots =
+                    vec![TreeRoot::new(path.clone(), b"dot_dir", &[]).skipping_build_dirs()];
+                format!(
+                    "dir:{}",
+                    tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?
+                )
+            }
+            Ok(_) => continue,
+        };
+        fold_field(&mut hasher, b"name:", name.as_encoded_bytes());
+        fold_field(&mut hasher, b"entry:", content.as_bytes());
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// `path` with `.` and `..` taken out lexically, as rustc spells an include
+/// relative to its source (`crates/a/src/../../web/x.js`).
+fn lexically_normal(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The label of `directory` below `root`, written with `/` whatever the
+/// platform spells, so checkouts on Windows and Unix label it alike.
+fn portable_dir_label(directory: &Path, root: &Path) -> Option<String> {
+    let rest = directory.strip_prefix(root).ok()?;
+    let mut label = String::new();
+    for component in rest.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        if !label.is_empty() {
+            label.push('/');
+        }
+        label.push_str(name.to_str()?);
+    }
+    Some(label)
+}
+
+/// The directories of `sources` outside `package`, `OUT_DIR` and the way up
+/// from the package to the root, each by its label below the workspace root
+/// and its entries (names and kinds, `.git` and Cargo's build directories
+/// aside), digested. `None` for a source outside the workspace, a directory
+/// that cannot be listed, or, with `not_after` (a time from
+/// [`stamp_clock_ns`]), one whose stamps show a change at or after it
+/// ([`stamp_written_since`]): what rustc listed then may not be what is
+/// there now.
+fn closure_dirs_digest(
+    sources: &[PathBuf],
+    workspace: &WorkspaceRoots,
+    package: &Path,
+    not_after: Option<i64>,
+) -> Option<String> {
+    let base = workspace
+        .root
+        .join(workspace.cwd.trim_start_matches(['/', '\\']));
+    let root = lexically_normal(&workspace.root);
+    let package = lexically_normal(package);
+    let out_dir = workspace.out_dir.as_deref().map(lexically_normal);
+    let mut directories = std::collections::BTreeMap::new();
+    for source in sources {
+        let absolute = if source.has_root() {
+            lexically_normal(source)
+        } else {
+            lexically_normal(&base.join(source))
+        };
+        if absolute.starts_with(&package)
+            || out_dir
+                .as_ref()
+                .is_some_and(|out_dir| absolute.starts_with(out_dir))
+        {
+            continue;
+        }
+        let directory = absolute.parent()?.to_path_buf();
+        let label = portable_dir_label(&directory, &root)?;
+        // A directory on the way up from the package is in the guard already
+        // ([`scoped_ancestor_top_digest`]: its files and dot-directories).
+        // Its other names (`crates`, `docs`, a `target`) are not what a macro
+        // includes from: a file it includes from below one has a directory
+        // of its own here. Clippy names the workspace manifest, so without
+        // this every clippy unit would list the root.
+        if package.starts_with(&directory) {
+            continue;
+        }
+        directories.insert(label, directory);
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-closure-dirs-v1\n");
+    for (label, directory) in directories {
+        if let Some(not_after) = not_after {
+            let metadata = std::fs::metadata(&directory).ok()?;
+            let stamp = FileFingerprint {
+                path: String::new(),
+                size: 0,
+                mtime_ns: metadata_mtime_ns(&metadata),
+                ctime_ns: metadata_ctime_ns(&metadata),
+                inode: 0,
+            };
+            if stamp_written_since(&stamp, not_after) {
+                return None;
+            }
+        }
+        let mut entries: Vec<(Vec<u8>, &'static str)> = std::fs::read_dir(&directory)
+            .ok()?
+            .map(|entry| {
+                let entry = entry.ok()?;
+                let kind = entry.file_type().ok()?;
+                let kind = if kind.is_symlink() {
+                    "l"
+                } else if kind.is_dir() {
+                    "d"
+                } else {
+                    "f"
+                };
+                // A build directory Cargo tagged is output, not sources.
+                if kind == "d" && crate::tree_stamp::holds_cargo_build_tag(&entry.path()) {
+                    return Some(None);
+                }
+                Some(Some((entry.file_name().into_encoded_bytes(), kind)))
+            })
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        entries.retain(|(name, _)| name.as_slice() != b".git");
+        entries.sort();
+        fold_field(&mut hasher, b"dir:", label.as_bytes());
+        for (name, kind) in entries {
+            fold_field(&mut hasher, kind.as_bytes(), &name);
+        }
+    }
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// The guard a record of `sources` must carry: `guard` itself, or for a
+/// scoped guard ([`scoped_workspace_guard`]) `guard` with the closure's
+/// directories as they are now ([`closure_dirs_digest`]).
+fn expected_tree(
+    guard: &str,
+    sources: &[PathBuf],
+    workspace: Option<&WorkspaceRoots>,
+) -> Option<String> {
+    if !guard.starts_with(SCOPED_GUARD_TAG) {
+        return Some(guard.to_string());
+    }
+    let workspace = workspace?;
+    let package = workspace.scoped_package.as_deref()?;
+    let dirs = closure_dirs_digest(sources, workspace, package, None)?;
+    Some(format!("{guard}+dirs:{dirs}"))
+}
+
+/// The guard a record made from this invocation carries: `tree`, or for a
+/// scoped guard `tree` with the directories of `dep_info`'s closure, listed
+/// now and unchanged since `taken`, when the guard was taken. `None` when one
+/// of them changed since: the record is then not made.
+pub(crate) fn with_closure_dirs(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: String,
+    taken: i64,
+) -> Option<String> {
+    if !tree.starts_with(SCOPED_GUARD_TAG) {
+        return Some(tree);
+    }
+    let workspace = workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>())?;
+    let package = workspace.scoped_package.as_deref()?;
+    let dirs = closure_dirs_digest(&dep_info.source_files, &workspace, package, Some(taken))?;
+    Some(format!("{tree}+dirs:{dirs}"))
 }
 
 /// Join only when an eligible unit needs discovery. A peer holds the lock
@@ -6595,16 +7015,18 @@ impl PortablePrediction {
 /// computed, and the resolved closure must pass [`validate_prediction`].
 fn validate_portable_prediction(
     record: &PortablePrediction,
-    guard: &str,
+    guard: &dyn Fn(&[PathBuf]) -> Option<String>,
     places: &Places<'_>,
     stat: impl Fn(&Path) -> Option<std::fs::Metadata>,
     exists: impl Fn(&Path) -> bool,
     env_value: impl Fn(&str) -> Option<String>,
 ) -> std::result::Result<DepInfo, Rejection> {
-    if record.tree != guard {
+    let resolved = record.resolve(places).ok_or(Rejection::NoRecord)?;
+    // The guard of a scoped record names the directories of its closure, so
+    // it is known once the closure is placed in this checkout.
+    if Some(&record.tree) != guard(&resolved.sources).as_ref() {
         return Err(Rejection::TreeChanged);
     }
-    let resolved = record.resolve(places).ok_or(Rejection::NoRecord)?;
     validate_prediction(&resolved, stat, exists, env_value)
 }
 

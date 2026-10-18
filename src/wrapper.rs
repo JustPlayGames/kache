@@ -6532,7 +6532,9 @@ fn record_input_prediction(
         .tree_guard
         .as_ref()
         .filter(|guard| guard.held())
-        .map(|guard| guard.digest.clone());
+        .and_then(|guard| {
+            crate::cache_key::with_closure_dirs(args, dep_info, guard.digest.clone(), guard.taken)
+        });
     let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).

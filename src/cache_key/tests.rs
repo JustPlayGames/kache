@@ -2083,6 +2083,7 @@ fn a_record_is_only_consulted_for_an_eligible_invocation() {
         let mut tree = Some(TreeGuard {
             digest: "earlier".to_string(),
             walks: Vec::new(),
+            taken: stamp_clock_ns(),
         });
         assert_eq!(
             predicted_key_inputs(&plain, &on, &mut tree),
@@ -3492,6 +3493,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
         canonical_target: PathBuf::from("/private/w/target"),
         out_dir: Some(PathBuf::from("/w/target/debug/build/kt-1/out")),
         vendored_package: None,
+        scoped_package: None,
     }
 }
 
@@ -3567,6 +3569,8 @@ fn rlib_only_member(base: &Path) -> (PathBuf, RustcArgs) {
 /// another checkout.
 #[test]
 fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
     let mut lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
@@ -3682,6 +3686,8 @@ fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
 /// may have changed while the owner compiled.
 #[test]
 fn a_flight_waiter_digests_the_tree_again() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
     let mut lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
@@ -3706,6 +3712,7 @@ fn a_flight_waiter_digests_the_tree_again() {
     let mut tree = Some(TreeGuard {
         digest: "before".to_string(),
         walks: Vec::new(),
+        taken: stamp_clock_ns(),
     });
     assert_eq!(
         predicted_key_inputs(&args, &hasher, &mut tree),
@@ -3873,6 +3880,8 @@ fn external_targets_keep_predictions_anchored_to_the_source_workspace() {
 
 #[test]
 fn external_target_predictions_guard_sources_and_generated_inputs() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
     let dir = tempfile::tempdir().unwrap();
     let (root, mut args) = workspace_invocation(dir.path(), "source", "kt");
     let target = dir.path().join("output/target");
@@ -4184,6 +4193,7 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         target: root.join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        scoped_package: None,
     };
     let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
     let relative = PathBuf::from;
@@ -4318,6 +4328,7 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/kt-1/out")),
         vendored_package: None,
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
@@ -4372,6 +4383,7 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
         canonical_target: dir.path().join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
@@ -4415,6 +4427,7 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/foo-1/out")),
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let digest = |roots: &WorkspaceRoots| workspace_tree_digest(roots, &hasher).unwrap();
@@ -4490,6 +4503,7 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     };
     // Old times, so a name added beside the package moves them on any clock.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
@@ -4533,6 +4547,7 @@ fn vendored_workspace(root: &Path) -> WorkspaceRoots {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     }
 }
 
@@ -4644,6 +4659,7 @@ fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let readable = workspace_tree_digest(&roots, &hasher).unwrap();
@@ -4752,6 +4768,7 @@ fn the_workspace_guard_gives_up_past_its_entry_budget() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: None,
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     // Three files; `target` is skipped before it is counted.
@@ -4919,7 +4936,7 @@ fn a_relocated_record_is_checked_against_this_out_dir_and_guard() {
     let check = |guard: &str, env_out_dir: &str| {
         validate_portable_prediction(
             &record,
-            guard,
+            &|_| Some(guard.to_string()),
             &Places {
                 out_dir: Some("/u/out"),
                 workspace: None,
@@ -13495,6 +13512,7 @@ fn a_tree_guard_holds_until_its_tree_moves() {
     let unwalked = TreeGuard {
         digest: taken.digest,
         walks: Vec::new(),
+        taken: stamp_clock_ns(),
     };
     assert!(!unwalked.held(), "nothing to walk again");
 }
@@ -16863,6 +16881,7 @@ fn a_session_shares_the_workspace_digest_it_would_have_computed() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let guarded = || tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
@@ -16906,6 +16925,8 @@ fn a_session_shares_the_workspace_digest_it_would_have_computed() {
 /// to a file in the closure still changes the key within the session.
 #[test]
 fn edits_still_miss_under_a_shared_workspace_walk() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
     let mut lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
@@ -16982,5 +17003,66 @@ fn edits_still_miss_under_a_shared_workspace_walk() {
         predicted_key_inputs(&args, &hasher, &mut None),
         Err(Rejection::TreeChanged),
         "as without a session"
+    );
+}
+
+/// PROTOTYPE (scoped guard): rustc spells an include relative to its source
+/// with `..` left in; the closure's directory is labelled below the root the
+/// same way however the path was spelled.
+#[test]
+fn scoped_guard_labels_a_closure_directory_however_it_is_spelled() {
+    let root = Path::new("/w");
+    let spelled = lexically_normal(Path::new("/w/crates/a/src/../../../web/./media/x.js"));
+    assert_eq!(spelled, Path::new("/w/web/media/x.js"));
+    assert_eq!(
+        portable_dir_label(spelled.parent().unwrap(), root).as_deref(),
+        Some("web/media")
+    );
+    assert_eq!(portable_dir_label(root, root).as_deref(), Some(""));
+    assert_eq!(portable_dir_label(Path::new("/elsewhere/web"), root), None);
+    let relative = lexically_normal(&Path::new("/w").join("crates/a/../b/assets/i.png"));
+    assert_eq!(
+        portable_dir_label(relative.parent().unwrap(), root).as_deref(),
+        Some("crates/b/assets")
+    );
+}
+
+/// PROTOTYPE (scoped guard), Windows: either separator, and `..`, give the
+/// same `/` label, so a record made on one machine checks out on another; a
+/// verbatim spelling of the root does not match a plain one, which refuses
+/// the record rather than mislabel it.
+#[cfg(windows)]
+#[test]
+fn scoped_guard_labels_a_windows_closure_directory_with_slashes() {
+    let root = Path::new(r"C:\w");
+    for spelled in [
+        r"C:\w\crates\a\src\..\..\..\web\media\x.js",
+        r"C:\w/crates/a/src/../../../web\media/x.js",
+        r"C:\w\web\.\media\x.js",
+    ] {
+        let normal = lexically_normal(Path::new(spelled));
+        assert_eq!(
+            portable_dir_label(normal.parent().unwrap(), root).as_deref(),
+            Some("web/media"),
+            "{spelled}"
+        );
+    }
+    let verbatim = lexically_normal(Path::new(r"\\?\C:\w\web\x.js"));
+    assert_eq!(portable_dir_label(verbatim.parent().unwrap(), root), None);
+}
+
+/// `KACHE_GUARD_IGNORE` replaces the default list; an empty value ignores
+/// nothing; separators, spaces and slashes around an entry do not matter.
+#[test]
+fn scoped_guard_ignore_list_defaults_and_overrides() {
+    assert_eq!(
+        guard_ignore_entries(None),
+        [".agents", ".github", ".claude", "AGENTS.md", "README.md"]
+    );
+    assert!(guard_ignore_entries(Some("")).is_empty());
+    assert!(guard_ignore_entries(Some(" : ; ")).is_empty());
+    assert_eq!(
+        guard_ignore_entries(Some(" .agents/ ;docs:/notes.txt")),
+        [".agents", "docs", "notes.txt"]
     );
 }
