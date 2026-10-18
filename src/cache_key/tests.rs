@@ -7601,7 +7601,7 @@ fn hash_static_lib_memo_rows_are_per_use() {
     let fingerprint = FileFingerprint::from_path(&lib).unwrap();
     let cache = fh.cache.as_ref().expect("persistent cache opens");
     for (namespace, expected) in [
-        ("static-ar-v8-bundled", &bundled),
+        ("static-ar-v9-bundled", &bundled),
         ("static-ar-v8", &linked),
     ] {
         let key = FileFingerprint {
@@ -16964,6 +16964,23 @@ fn a_bundled_unportable_archive_keys_by_bytes_and_a_linked_one_by_path_too() {
     assert_ne!(linked(&first), linked(&second));
     std::fs::write(&second, [bytes.as_slice(), b"\0"].concat()).unwrap();
     assert_ne!(bundled(&first), bundled(&second));
+}
+
+/// An archive of MSVC objects that rustc bundles keys by its content without
+/// the directory the objects record; linked, it still keys by path.
+#[test]
+fn a_bundled_msvc_archive_keys_without_its_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("gen.lib");
+    std::fs::write(
+        &lib,
+        include_bytes!("../coff_archive/fixtures/gen-short.lib"),
+    )
+    .unwrap();
+    let bundled = compute_static_lib_hash(&lib, StaticLibUse::Bundled).unwrap();
+    assert!(bundled.starts_with("bundled-coff-v1:"), "{bundled}");
+    let linked = compute_static_lib_hash(&lib, StaticLibUse::Linked).unwrap();
+    assert!(linked.starts_with("path-ar-v1:"), "{linked}");
 }
 
 /// The units of one Cargo invocation share the workspace walk
