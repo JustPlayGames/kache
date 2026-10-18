@@ -3124,9 +3124,24 @@ impl Drop for WorkspaceGuardForTest {
 
 /// The root-level paths the scoped guard leaves out when
 /// `KACHE_GUARD_IGNORE` is unset: agent and CI configuration and the
-/// top-level docs, which no build reads.
-pub(crate) const DEFAULT_GUARD_IGNORE: &[&str] =
-    &[".agents", ".github", ".claude", "AGENTS.md", "README.md"];
+/// top-level docs, which no build reads, and `Cargo.lock` and `.env`.
+///
+/// `Cargo.lock` reaches a unit's output only through what Cargo passes it:
+/// a changed version changes the unit's `--extern` files and metadata hash,
+/// which the key already holds. Guarding its bytes made every hit in the
+/// workspace re-read its sources after each lock change (about one main
+/// commit in four) to find the same closure. A macro that reads `.env` or the
+/// lock without tracking it is invisible to that re-read as well: the guard
+/// never protected it, so leaving them out loses no safety.
+pub(crate) const DEFAULT_GUARD_IGNORE: &[&str] = &[
+    ".agents",
+    ".github",
+    ".claude",
+    "AGENTS.md",
+    "README.md",
+    "Cargo.lock",
+    ".env",
+];
 
 /// The prefix of a scoped guard's digest ([`scoped_workspace_guard`]).
 const SCOPED_GUARD_TAG: &str = "scoped-v1:";

@@ -17168,7 +17168,15 @@ fn scoped_guard_labels_a_windows_closure_directory_with_slashes() {
 fn scoped_guard_ignore_list_defaults_and_overrides() {
     assert_eq!(
         guard_ignore_entries(None),
-        [".agents", ".github", ".claude", "AGENTS.md", "README.md"]
+        [
+            ".agents",
+            ".github",
+            ".claude",
+            "AGENTS.md",
+            "README.md",
+            "Cargo.lock",
+            ".env"
+        ]
     );
     assert!(guard_ignore_entries(Some("")).is_empty());
     assert!(guard_ignore_entries(Some(" : ; ")).is_empty());
