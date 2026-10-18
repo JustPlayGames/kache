@@ -11696,3 +11696,78 @@ fn cc_failed_compile_does_not_claim_rebuilt_outputs_or_publish_handoff() {
     assert!(events[0].rebuilt_package.is_none());
     assert!(!object.exists());
 }
+
+/// With executables kept out of the cache (Windows' default), a Cargo build
+/// script built without debug info is cached all the same; one with debug
+/// info, a `[[bin]]` and a test harness are not.
+#[test]
+fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
+    let args = |extra: &[&str]| {
+        let mut args: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "build_script_build",
+            "--edition=2021",
+            "build.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "-C",
+            "strip=debuginfo",
+            "-C",
+            "extra-filename=-0123456789abcdef",
+            "--out-dir",
+            "/w/target/debug/build/foo-0123456789abcdef",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        RustcArgs::parse(&args).unwrap()
+    };
+    assert!(!skips_cache_as_user_facing(&args(&[]), false));
+    assert!(!skips_cache_as_user_facing(
+        &args(&["-C", "debuginfo=0"]),
+        false
+    ));
+    assert!(skips_cache_as_user_facing(
+        &args(&["-C", "debuginfo=2"]),
+        false
+    ));
+    assert!(!skips_cache_as_user_facing(
+        &args(&["-C", "debuginfo=2"]),
+        true
+    ));
+    let bin = RustcArgs::parse(
+        &[
+            "rustc",
+            "--crate-name",
+            "app",
+            "src/main.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "--out-dir",
+            "/w/target/debug/deps",
+        ]
+        .map(String::from),
+    )
+    .unwrap();
+    assert!(skips_cache_as_user_facing(&bin, false));
+    assert!(!skips_cache_as_user_facing(&bin, true));
+    let named_like_a_script = RustcArgs::parse(
+        &[
+            "rustc",
+            "--crate-name",
+            "build_script_build",
+            "src/main.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "--out-dir",
+            "/w/target/debug/deps",
+        ]
+        .map(String::from),
+    )
+    .unwrap();
+    assert!(skips_cache_as_user_facing(&named_like_a_script, false));
+}

@@ -3827,7 +3827,7 @@ fn run_parsed_rustc(
     let user_bypass = config
         .project_rules
         .user_bypass_reason(crate_name, &args.all_args);
-    let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
+    let skip_user_facing = skips_cache_as_user_facing(args, config.cache_executables);
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
         precompiled.is_some(),
@@ -6445,6 +6445,19 @@ fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
 fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
     let path = args.dep_info_path()?;
     crate::cache_key::dep_info_from_emitted(&path, args.source_file.as_deref()?).ok()
+}
+
+/// Whether `args` compiles an executable kept out of the cache because
+/// `cache_executables` is off (Windows by default: an `.exe` names its
+/// `.pdb`). A Cargo build script built without debug info is cached all the
+/// same: Cargo runs it, nobody debugs it, and rustc names its `.pdb` by file
+/// name alone (`/PDBALTPATH:%_PDB%`), which the store keeps and restores with
+/// it. Kept out, every new target directory compiled each build script again
+/// (92 in a Windows build of five Studio crates, 2026-10-18).
+fn skips_cache_as_user_facing(args: &RustcArgs, cache_executables: bool) -> bool {
+    args.is_user_facing_executable()
+        && !cache_executables
+        && !(crate::build_script::build_script_output(args).is_some() && !args.debuginfo_enabled())
 }
 
 /// Compile-before-key needs a miss the local store can prove, or a compile it
