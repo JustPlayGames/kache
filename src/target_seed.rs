@@ -1307,12 +1307,49 @@ fn asks_for_seed(enabled: bool, args: &[String]) -> bool {
     enabled && is_target_info_probe(args)
 }
 
+/// Does `args` name a target platform (`--target <triple>` or
+/// `--target=<triple>`)?
+fn names_a_target(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--target" || arg.starts_with("--target="))
+}
+
+/// Does the build this probe is for name a target platform? Cargo then
+/// builds that platform's units under `<target>/<triple>/` and only the
+/// units for the host (build scripts, proc macros) under `debug/`, which is
+/// all seeding fills. A cross check of a web or Windows build used none of
+/// the thousands of host units seeding copied from a donor (687 of 687
+/// units restored with and without them, 2026-10-18), and the copy took the
+/// whole [`SEED_DEADLINE`] before Cargo started. Read from the probe's own
+/// arguments (Cargo probes each platform), `CARGO_BUILD_TARGET` and, on
+/// Linux, the Cargo command line that sent the probe. Only skips a seeding,
+/// so a wrong answer costs time, never a wrong build.
+fn build_names_a_target(args: &[String]) -> bool {
+    if names_a_target(args)
+        || std::env::var_os("CARGO_BUILD_TARGET").is_some_and(|target| !target.is_empty())
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let ppid = std::os::unix::process::parent_id();
+        if let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline")) {
+            let args: Vec<String> = cmdline
+                .split(|byte| *byte == 0)
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect();
+            return names_a_target(&args);
+        }
+    }
+    false
+}
+
 /// The wrapper's side: when `args` is the probe for a target directory Cargo
 /// has not built, ask the daemon to seed it and wait for the answer.
 ///
 /// See [`asks_for_seed`] for which invocations qualify.
 pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
-    if !asks_for_seed(config.seed_new_targets, args) {
+    if !asks_for_seed(config.seed_new_targets, args) || build_names_a_target(args) {
         return;
     }
     let Ok(cwd) = std::env::current_dir() else {
@@ -1548,6 +1585,27 @@ source = "git+https://example.com/gitdep#abc"
         assert!(asks_for_seed(true, &probe));
         assert!(!asks_for_seed(false, &probe));
         assert!(!asks_for_seed(true, &args("rustc -vV")));
+    }
+
+    /// A build for a named platform is not seeded: its units are not the
+    /// host units seeding copies.
+    #[test]
+    fn a_probe_naming_a_target_is_a_cross_build() {
+        assert!(names_a_target(&args(
+            "rustc - --crate-name ___ --print=file-names --target wasm32-unknown-unknown"
+        )));
+        assert!(names_a_target(&args(
+            "cargo +nightly check -p web --target=wasm32-unknown-unknown"
+        )));
+        assert!(!names_a_target(&args(
+            "rustc - --crate-name ___ --print=file-names --crate-type bin"
+        )));
+        assert!(!names_a_target(&args(
+            "cargo clippy --workspace --all-targets"
+        )));
+        assert!(!names_a_target(&args(
+            "cargo build --target-dir target/other"
+        )));
     }
 
     #[test]
