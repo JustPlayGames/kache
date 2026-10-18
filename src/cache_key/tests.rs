@@ -17298,7 +17298,10 @@ fn out_dir_sources_key_by_their_unit_not_the_target_dir() {
         provide_dep_info(
             DepInfo {
                 source_files: vec![source.clone(), gen_rs],
-                env_deps: vec![("OUT_DIR".into(), out_dir.to_str().unwrap().to_string())],
+                env_deps: vec![(
+                    "OUT_DIR".into(),
+                    Some(out_dir.to_str().unwrap().to_string()),
+                )],
             },
             None,
         );

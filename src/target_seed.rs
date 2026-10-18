@@ -2182,7 +2182,7 @@ source = "git+https://example.com/gitdep#abc"
             &beside,
             VERSION,
             std::slice::from_ref(&busy),
-            Path::new(NO_CACHE),
+            no_runs().path(),
             later(),
         );
         assert_eq!(seeded.donor, Some(busy.workspace_root.clone()));
@@ -2854,7 +2854,14 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join("out/include/rdkafka.h"), "h");
         std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
         let to = dir.path().join("copy");
-        place_tree(&from, &to, no_runs().path(), &FileCounts::default(), later()).unwrap();
+        place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &FileCounts::default(),
+            later(),
+        )
+        .unwrap();
         let link = to.join("out/src/librdkafka.so");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -3001,10 +3008,24 @@ source = "git+https://example.com/gitdep#abc"
         let from = dir.path().join("unit");
         write(&from.join("a/file"), "x");
         let to = dir.path().join("copy");
-        let error = place_tree(&from, &to, no_runs().path(), &FileCounts::default(), Instant::now()).unwrap_err();
+        let error = place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &FileCounts::default(),
+            Instant::now(),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(entries(dir.path()), vec![from.clone()]);
-        place_tree(&from, &to, no_runs().path(), &FileCounts::default(), later()).unwrap();
+        place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &FileCounts::default(),
+            later(),
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
     }
 
@@ -3396,7 +3417,7 @@ source = "git+https://example.com/gitdep#abc"
         let donors = [tests.clone(), checks.clone()];
         let check = checkout(dir.path(), "check");
         assert_eq!(
-            seed_for_lane(&check, VERSION, &donors, Path::new(NO_CACHE), later(), true),
+            seed_for_lane(&check, VERSION, &donors, no_runs().path(), later(), true),
             Seeded {
                 units: 2,
                 donor: Some(checks.workspace_root.clone()),
@@ -3406,14 +3427,7 @@ source = "git+https://example.com/gitdep#abc"
         // A build still takes the donor holding the most.
         let build = checkout(dir.path(), "build");
         assert_eq!(
-            seed_for_lane(
-                &build,
-                VERSION,
-                &donors,
-                Path::new(NO_CACHE),
-                later(),
-                false
-            ),
+            seed_for_lane(&build, VERSION, &donors, no_runs().path(), later(), false),
             Seeded {
                 units: 3,
                 donor: Some(tests.workspace_root.clone()),
