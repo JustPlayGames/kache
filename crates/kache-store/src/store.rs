@@ -1200,6 +1200,10 @@ impl SweepOrigin {
 /// the index's write lock.
 pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Longest a hit waits for the index to stamp its access time
+/// ([`Store::get`]).
+pub const HIT_STAMP_BUSY_WAIT: Duration = Duration::from_millis(100);
+
 /// Write-lock time an eviction sweep may spend on removals before it pauses.
 ///
 /// SQLite's write lock is not fair. A build's `put` that finds it taken
@@ -2592,12 +2596,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 |row| row.get(0),
             )
             .optional()?;
+        //
+        // The stamp waits at most [`HIT_STAMP_BUSY_WAIT`] for the index:
+        // a writer that holds it while the filesystem commits its journal
+        // under heavy writes held every hit of every build behind it for
+        // seconds (and this lookup failing busy was retried for up to 30 s).
+        // A hit that cannot stamp still restores; it only counts one hit
+        // fewer and keeps its older access time.
         if age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64) {
-            self.db.execute(
+            let _ = self.db.busy_timeout(HIT_STAMP_BUSY_WAIT);
+            let stamped = self.db.execute(
                 "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 \
                  WHERE cache_key = ?1",
                 params![cache_key],
-            )?;
+            );
+            let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
+            if let Err(error) = stamped {
+                tracing::debug!(
+                    "hit on {} not stamped (index busy): {error}",
+                    cache_key.get(..16).unwrap_or(cache_key)
+                );
+            }
         }
 
         Ok(Some(meta))
