@@ -10214,6 +10214,18 @@ fn refresh_session_marker_extends_own_session_but_never_clobbers_newer() {
     assert_eq!(id, "mine");
     assert!(ts > 1000, "timestamp must be refreshed");
 
+    // Touched moments ago: left alone, nothing written.
+    let fresh = now_epoch_secs() - 1;
+    std::fs::write(&marker, format!("v1 {fresh} mine")).unwrap();
+    refresh_session_marker(&config, root, "mine");
+    assert_eq!(
+        parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap(),
+        (fresh, "mine".to_string())
+    );
+    assert!(!session_refresh_due(100, 100 + SESSION_REFRESH_SECS - 1));
+    assert!(session_refresh_due(100, 100 + SESSION_REFRESH_SECS));
+    assert!(session_refresh_due(200, 100));
+
     // A newer session re-minted the marker: our refresh must not
     // resurrect the old id over it.
     std::fs::write(&marker, format!("v1 {} newer", now_epoch_secs())).unwrap();
