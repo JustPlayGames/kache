@@ -823,9 +823,11 @@ pub(crate) fn seed(
     seed_for_lane(target, rustc_version, donors, cache_dir, deadline, false)
 }
 
-/// [`seed`], and for a build that only checks (`check_lane`), only the units
-/// a check of the donor's workspace used ([`check_demand`]). Without such a
-/// record in the donor, every unit, as [`seed`].
+/// Copy the registry units a build of `target` may use: of a donor's units,
+/// only those the donor's own builds of the same kind used
+/// ([`lane_demand`]): its checks' for a build that only checks
+/// (`check_lane`), its full builds' otherwise. A donor whose fingerprints say
+/// nothing about that gives every unit.
 pub(crate) fn seed_for_lane(
     target: &NewTarget,
     rustc_version: &str,
@@ -869,15 +871,16 @@ pub(crate) fn seed_for_lane(
             Layout::PerUnit => HashMap::new(),
         };
         let mut units = units(&from, layout, &packages);
-        if check_lane
-            && layout == Layout::Shared
-            && let Some(demand) = check_demand(&from, &packages, &deps)
+        if layout == Layout::Shared
+            && let Some(demand) = lane_demand(&from, &packages, &deps, check_lane)
         {
             let all = units.len();
             units.retain(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)));
             tracing::info!(
-                "check build: seeding {} of {all} registry units the donor's check used",
-                units.len()
+                "{} build: seeding {} of {all} registry units the donor's {} used",
+                if check_lane { "check" } else { "full" },
+                units.len(),
+                if check_lane { "check" } else { "builds" },
             );
         }
         let next = AtomicUsize::new(0);
@@ -981,8 +984,7 @@ const RANKED_DONORS: usize = 8;
 /// The donors that can give `target` units, in the order seeding tries them:
 /// of the [`RANKED_DONORS`] most recently used, the one that can give the
 /// most first (the more recent of two that give as many), then every other
-/// in order of use. A build gets every unit of `packages` a donor holds; a
-/// check (`check_lane`) only those [`check_units`] counts.
+/// in order of use. What a donor can give is what [`lane_units`] counts.
 ///
 /// The checkout used last may have built a small part of the workspace: a
 /// `cargo xtask` command builds the dependencies of one crate, 361 units of
@@ -1013,10 +1015,10 @@ fn ranked_donors<'a>(
             .map(|&(donor, layout)| {
                 scope.spawn(move || {
                     let profile = donor.target_dir.join(PROFILE);
-                    if check_lane && layout == Layout::Shared {
-                        check_units(&profile, packages)
+                    if layout == Layout::Shared {
+                        lane_units(&profile, packages, check_lane)
                     } else {
-                        units(&profile, layout, packages).len()
+                        (false, units(&profile, layout, packages).len())
                     }
                 })
             })
@@ -1024,40 +1026,59 @@ fn ranked_donors<'a>(
         candidates
             .iter()
             .zip(counts)
-            .map(|(&(donor, layout), count)| (donor, layout, count.join().unwrap_or(0)))
+            .map(|(&(donor, layout), count)| (donor, layout, count.join().unwrap_or((false, 0))))
             .collect()
     });
-    // Stable: equals keep their order of use.
-    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+    // Stable: equals keep their order of use. A full build tries a donor
+    // whose builds say what it needs before one that would give everything.
+    ranked.sort_by_key(|entry| {
+        let (known, count) = entry.2;
+        std::cmp::Reverse((known && !check_lane, count))
+    });
     ranked
         .into_iter()
         .map(|(donor, layout, _)| (donor, layout))
         .chain(usable)
 }
 
-/// The units of `packages` in a donor's shared-layout `profile` a check
-/// build is given ([`seed_for_lane`]): those a check of the donor's
-/// workspace used ([`check_demand`]). A donor without a checked workspace
-/// unit gives every unit, but a check uses only those it compiled itself,
-/// which are metadata alone; only they count.
+/// The units of `packages` in a donor's shared-layout `profile` a build in
+/// the lane is given ([`seed_for_lane`]), and whether the donor's own builds
+/// said which ([`lane_demand`]): those its builds of the lane used. A donor
+/// without a workspace unit of the lane gives every unit; for a check only
+/// those it compiled itself count, which are metadata alone.
 ///
 /// Ranked by every unit they hold, a workspace clippy in a new target was
 /// seeded from a checkout's test-build target, whose checks had used 808 to
 /// 1,000 registry units, while another checkout's workspace check, which
-/// used 1,285, held fewer units in all.
-fn check_units(profile: &Path, packages: &BTreeSet<String>) -> usize {
+/// used 1,285, held fewer units in all. A full build in turn copied about
+/// 4,000 units (9.8 GiB, of which seeding copied what it could in 10 s) from
+/// pool checkouts whose own builds used 1,000 to 1,450 of them: each
+/// seeding had passed on everything its donor held, checks and old lockfile
+/// versions included.
+fn lane_units(profile: &Path, packages: &BTreeSet<String>, check_lane: bool) -> (bool, usize) {
     let deps = deps_by_hash(&profile.join("deps"));
     let held = units(profile, Layout::Shared, packages);
-    match check_demand(profile, packages, &deps) {
-        Some(demand) => held
-            .iter()
-            .filter(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)))
-            .count(),
-        None => held
-            .iter()
-            .filter(|unit| metadata_only(&deps, &unit.hash))
-            .count(),
+    match lane_demand(profile, packages, &deps, check_lane) {
+        Some(demand) => (
+            true,
+            held.iter()
+                .filter(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)))
+                .count(),
+        ),
+        None if check_lane => (
+            false,
+            held.iter()
+                .filter(|unit| metadata_only(&deps, &unit.hash))
+                .count(),
+        ),
+        None => (false, held.len()),
     }
+}
+
+/// [`lane_units`] of a check.
+#[cfg(test)]
+fn check_units(profile: &Path, packages: &BTreeSet<String>) -> usize {
+    lane_units(profile, packages, true).1
 }
 
 /// Are the unit's `deps/` outputs metadata alone (`.rmeta`, `.d`), as a
@@ -1186,21 +1207,24 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The unit directories (`<package>-<hash>`) a check build of the donor's
-/// workspace reads, from Cargo's own fingerprints in the `profile` directory
-/// of the shared layout: every unit reachable from a workspace unit Cargo
-/// checked (one whose outputs are metadata only) through the `deps` of each
-/// unit's fingerprint. A dependency is named there by its fingerprint hash,
-/// the one the dependency's own hash file holds.
+/// The unit directories (`<package>-<hash>`) a build of the donor's
+/// workspace in `lane` reads, from Cargo's own fingerprints in the `profile`
+/// directory of the shared layout: every unit reachable from a workspace
+/// unit of that lane through the `deps` of each unit's fingerprint. A check
+/// starts from the workspace units Cargo checked (outputs metadata only), a
+/// build from those it built (any other). A dependency is named there by its
+/// fingerprint hash, the one the dependency's own hash file holds.
 ///
-/// `None` when the donor holds no checked workspace unit or a fingerprint
-/// cannot be read: then nothing says what a check needs. Only ever a filter
-/// on what is copied: a unit left out is restored by the wrapper when Cargo
-/// asks for it, as without seeding.
-fn check_demand(
+/// `None` when the donor holds no workspace unit of the lane, or a unit it
+/// reaches has a fingerprint that cannot be read or lists no dependencies:
+/// then nothing says what the build needs. Only
+/// ever a filter on what is copied: a unit left out is restored by the
+/// wrapper when Cargo asks for it, as without seeding.
+fn lane_demand(
     profile: &Path,
     registry: &BTreeSet<String>,
     deps: &HashMap<String, Vec<PathBuf>>,
+    check_lane: bool,
 ) -> Option<std::collections::HashSet<String>> {
     let mut by_fingerprint: HashMap<String, String> = HashMap::new();
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
@@ -1211,9 +1235,11 @@ fn check_demand(
             continue;
         };
         let mut wants = Vec::new();
+        let mut described = false;
         for file in entries(&unit) {
             let file_name = file_name(&file);
             if file_name.ends_with(".json") {
+                described = true;
                 let text = std::fs::read_to_string(&file).ok()?;
                 let json: serde_json::Value = serde_json::from_str(&text).ok()?;
                 for dep in json.get("deps")?.as_array()? {
@@ -1228,10 +1254,13 @@ fn check_demand(
                 by_fingerprint.insert(fingerprint.trim().to_owned(), name.clone());
             }
         }
-        if !registry.contains(package) && metadata_only(deps, hash) {
+        if !registry.contains(package) && metadata_only(deps, hash) == check_lane {
             roots.push(name.clone());
         }
-        edges.insert(name, wants);
+        // A unit whose fingerprint lists no dependencies says nothing.
+        if described {
+            edges.insert(name, wants);
+        }
     }
     if roots.is_empty() {
         return None;
@@ -1241,13 +1270,23 @@ fn check_demand(
         if !reached.insert(unit.clone()) {
             continue;
         }
-        for fingerprint in edges.get(&unit).into_iter().flatten() {
+        for fingerprint in edges.get(&unit)? {
             if let Some(dep) = by_fingerprint.get(fingerprint) {
                 roots.push(dep.clone());
             }
         }
     }
     Some(reached)
+}
+
+/// [`lane_demand`] of a check.
+#[cfg(test)]
+fn check_demand(
+    profile: &Path,
+    registry: &BTreeSet<String>,
+    deps: &HashMap<String, Vec<PathBuf>>,
+) -> Option<std::collections::HashSet<String>> {
+    lane_demand(profile, registry, deps, true)
 }
 
 /// A fingerprint as Cargo's hash files spell it: the little-endian bytes of
@@ -3483,13 +3522,110 @@ source = "git+https://example.com/gitdep#abc"
                 ..Seeded::default()
             }
         );
-        // A build still takes the donor holding the most.
+        // A full build takes what the test build used: not the checked `dep`.
         let build = checkout(dir.path(), "build");
         assert_eq!(
             seed_for_lane(&build, VERSION, &donors, &stored, later(), false),
             Seeded {
-                units: 3,
+                units: 2,
                 donor: Some(tests.workspace_root.clone()),
+                ..Seeded::default()
+            }
+        );
+    }
+
+    /// A full build needs what the donor's built workspace units reach, and
+    /// not what only a checked workspace unit, or nothing at all, reaches.
+    #[test]
+    fn a_build_needs_what_the_built_workspace_units_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let h = |n: u8| format!("{n:016x}");
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "mac_dep", &h(3), 13, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "mac", &h(4), 14, &[13], &["so"]);
+        fingerprinted_unit(&profile, "only_test", &h(5), 15, &[12], &["rlib", "rmeta"]);
+        // An older version nothing uses any more.
+        fingerprinted_unit(&profile, "old", &h(8), 18, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(6), 16, &[11, 14], &["rmeta"]);
+        fingerprinted_unit(
+            &profile,
+            "app",
+            &h(7),
+            17,
+            &[12, 14, 15],
+            &["rlib", "rmeta"],
+        );
+        let registry: BTreeSet<String> = ["dep", "mac", "mac_dep", "only_test", "old"]
+            .map(String::from)
+            .into();
+        let deps = deps_by_hash(&profile.join("deps"));
+        let demand = lane_demand(&profile, &registry, &deps, false).unwrap();
+        for wanted in [
+            format!("dep-{}", h(2)),
+            format!("mac-{}", h(4)),
+            format!("mac_dep-{}", h(3)),
+            format!("only_test-{}", h(5)),
+        ] {
+            assert!(demand.contains(&wanted), "{wanted}");
+        }
+        for unwanted in [format!("dep-{}", h(1)), format!("old-{}", h(8))] {
+            assert!(!demand.contains(&unwanted), "{unwanted}");
+        }
+        assert_eq!(lane_units(&profile, &registry, false), (true, 4));
+    }
+
+    /// A full build tries a donor whose builds say what they used before a
+    /// fuller one whose fingerprints say nothing, and takes everything from
+    /// such a donor when it is the only one.
+    #[test]
+    fn a_build_prefers_a_donor_whose_builds_say_what_they_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        // Used last: three registry units, no workspace unit (a seeded
+        // checkout whose own units are gone).
+        let seeded = empty_donor(dir.path(), "seeded");
+        let profile = seeded.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "gitdep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(3), 13, &[], &["rlib", "rmeta"]);
+        // Used before: a test build that used one unit.
+        let built = empty_donor(dir.path(), "built");
+        let profile = built.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "gitdep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(4), 14, &[11], &["rlib", "rmeta"]);
+        let stored = cache_storing(&dir.path().join("cache"), &["x"]);
+        let build = checkout(dir.path(), "build");
+        assert_eq!(
+            seed_for_lane(
+                &build,
+                VERSION,
+                &[seeded.clone(), built.clone()],
+                &stored,
+                later(),
+                false
+            ),
+            Seeded {
+                units: 1,
+                donor: Some(built.workspace_root.clone()),
+                ..Seeded::default()
+            }
+        );
+        let alone = checkout(dir.path(), "alone");
+        assert_eq!(
+            seed_for_lane(
+                &alone,
+                VERSION,
+                std::slice::from_ref(&seeded),
+                &stored,
+                later(),
+                false
+            ),
+            Seeded {
+                units: 3,
+                donor: Some(seeded.workspace_root.clone()),
                 ..Seeded::default()
             }
         );
