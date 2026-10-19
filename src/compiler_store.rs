@@ -30,6 +30,25 @@ impl ArtifactPolicy for CompilerArtifactPolicy {
             crate::compiler::ArtifactKind::DepInfo
         )
     }
+    /// A test binary: Cargo compiles a test target with `--test` and no
+    /// `--crate-type` (a `harness = false` test with neither), so its entry
+    /// records no crate type. Cargo runs it and nothing else touches it: a
+    /// test is never uplifted out of `deps/`, and the post-build `strip` or
+    /// re-sign that keeps binaries and dylibs private copies is for what
+    /// ships. Its restore stays a private copy. A test binary is most of what
+    /// a build stores by copy: tens to hundreds of MB each, all written
+    /// again at once when a shared crate changes. Linux only, where it was
+    /// measured: macOS clones on APFS before any hardlink is tried, and may
+    /// re-sign a loadable in place.
+    fn allow_executable_hardlink(name: &str, crate_types: &[String]) -> bool {
+        use crate::compiler::{ArtifactKind, classify_by_filename};
+        cfg!(target_os = "linux")
+            && crate_types.is_empty()
+            && matches!(
+                classify_by_filename(name),
+                ArtifactKind::Executable | ArtifactKind::Other("extensionless")
+            )
+    }
 }
 
 pub trait StoreHashExt {
@@ -80,6 +99,43 @@ mod tests {
             "foo.dsym.tar",
         ] {
             assert!(CompilerArtifactPolicy::allow_hardlink(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn compiler_policy_shares_the_inode_of_test_binaries_alone() {
+        let test: &[String] = &[];
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(
+            CompilerArtifactPolicy::allow_executable_hardlink("tests-0123456789abcdef", test),
+            linux
+        );
+        assert_eq!(
+            CompilerArtifactPolicy::allow_executable_hardlink("tests-0123456789abcdef.exe", test),
+            linux
+        );
+        for name in [
+            "libfoo.so",
+            "libfoo.dylib",
+            "foo.dll",
+            "foo.wasm",
+            "foo.d",
+            "foo.rlib",
+        ] {
+            assert!(
+                !CompilerArtifactPolicy::allow_executable_hardlink(name, test),
+                "{name}"
+            );
+        }
+        // Binaries, build scripts, dylibs and proc-macros keep their rules.
+        for kind in ["bin", "cdylib", "dylib", "proc-macro", "lib"] {
+            assert!(
+                !CompilerArtifactPolicy::allow_executable_hardlink(
+                    "app-0123456789abcdef",
+                    &[kind.into()]
+                ),
+                "{kind}"
+            );
         }
     }
 
