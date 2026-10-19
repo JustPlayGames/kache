@@ -2396,8 +2396,20 @@ fn predicted_key_inputs(
     // Filled when the record came from the remote, so a record that checks
     // out is kept here and not asked for again.
     let mut from_remote = None;
-    let Some(record) = file_hasher
-        .input_prediction(&identity)
+    // This checkout's row made under another tree (another commit checked
+    // out here, an edit since) is passed over, not the end of the lookup:
+    // the shared row and another checkout's row are tried as if it were
+    // absent, each under the same guard. Only when none of them fits does
+    // the unit take the pre-pass, still reported as `tree-changed`.
+    let local = file_hasher.input_prediction(&identity);
+    let stale_local = match (&tree, &local) {
+        (Some(tree), Some(record)) => record.tree.as_ref().is_some_and(|recorded| {
+            Some(recorded) != expected_tree(tree, &record.sources, workspace.as_ref()).as_ref()
+        }),
+        _ => false,
+    };
+    let local = local.filter(|_| !stale_local);
+    let Some(record) = local
         .or_else(|| file_hasher.input_prediction(shared.as_deref()?))
         .or_else(|| {
             let shared = shared.as_deref()?;
@@ -2406,10 +2418,17 @@ fn predicted_key_inputs(
             Some(record)
         })
     else {
-        return match &workspace {
+        let elsewhere = match &workspace {
             Some(workspace) => workspace_key_inputs(args, file_hasher, workspace, vars, tree),
             None => relocated_key_inputs(args, file_hasher, tree, tree_guard),
         };
+        return elsewhere.map_err(|rejection| {
+            if stale_local {
+                Rejection::TreeChanged
+            } else {
+                rejection
+            }
+        });
     };
     if let Some(tree) = &tree {
         match &record.tree {

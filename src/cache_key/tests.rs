@@ -17419,3 +17419,93 @@ fn a_read_of_a_redated_output_is_memoised_before_it_settles() {
     first.flush_memo();
     assert_eq!(lookups_read(&other), 1, "bytes kache did not record stay unmemoised");
 }
+
+/// N6: this checkout's row made under another tree (another commit checked
+/// out here, as agents' pool worktrees do) no longer ends the lookup. The
+/// shared row and another checkout's row are tried as if it were absent,
+/// under the same guard; only when none fits does the unit take the
+/// pre-pass, still reported as `tree-changed`. It used to take the pre-pass
+/// whenever its own row was stale (99 % of the hit pre-pass on the real
+/// store, 2026-10-19).
+#[test]
+fn a_stale_local_row_gives_way_to_a_row_made_under_this_tree() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "facade::scan!();\n");
+    write_file(&root.join("kt/assets/a.txt"), "a");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    let hasher = |name: &str| FileHasher::persistent(&base.join(name)).with_input_predictions(true);
+    let inside = DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs"), root.join("kt/assets/a.txt")],
+        env_deps: Vec::new(),
+    };
+    let identity = rustc_prediction_identity(&args).unwrap();
+    let mut tree = None;
+    let _ = predicted_key_inputs(&args, &hasher("probe.db"), &mut tree);
+    let guard = tree.expect("an rlib-only member is digested").digest;
+
+    // Nothing else recorded: the stale row still means the pre-pass.
+    let alone = hasher("alone.db");
+    alone.record_input_prediction(&identity, Some("kt"), &inside, Some("older-tree".into()));
+    assert_eq!(
+        predicted_key_inputs(&args, &alone, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+
+    // The shared row, made under this tree in another target directory.
+    let shared_rows = hasher("shared.db");
+    shared_rows.record_input_prediction(&identity, Some("kt"), &inside, Some("older-tree".into()));
+    let shared = rustc_shared_prediction_identity(&args).unwrap();
+    shared_rows.record_input_prediction(&shared, Some("kt"), &inside, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &shared_rows, &mut None),
+        Ok(inside.clone())
+    );
+
+    // Another checkout's row, made under this tree; one made under another
+    // tree is refused like this checkout's.
+    let portable_rows = hasher("portable.db");
+    portable_rows.record_input_prediction(&identity, Some("kt"), &inside, Some("older-tree".into()));
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let roots = workspace_roots(&args, &vars).unwrap();
+    let portable = workspace_prediction_identity(&args, vars, &roots).unwrap();
+    let record = |tree: &str| PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources: vec![
+            Portable::Literal("kt/src/lib.rs".to_string()),
+            Portable::Workspace("/kt/assets/a.txt".to_string()),
+        ],
+        env_deps: Vec::new(),
+        tree: tree.to_string(),
+    };
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record("another-tree"));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record(&guard));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Ok(inside.clone())
+    );
+
+    // The tree changes again: every row is stale, the pre-pass runs.
+    write_file(&root.join("kt/assets/b.txt"), "b");
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Err(Rejection::TreeChanged),
+        "a file joins the directory a macro lists"
+    );
+}
