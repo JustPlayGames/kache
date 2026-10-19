@@ -13882,3 +13882,26 @@ fn eviction_keeps_an_entry_whose_stamp_is_pending() {
     assert_eq!(stats.entries_evicted, 1, "unpinned, the old entry goes");
     assert!(!store.contains("pending"));
 }
+
+/// Removing an entry whose blob a build output still links (a test binary
+/// stored by hardlink, an rlib restored by one) must not leave that output
+/// writable for everyone: the mode is the inode's, shared by both names.
+#[cfg(unix)]
+#[test]
+fn unlinking_a_blob_leaves_the_mode_of_an_output_sharing_its_inode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob");
+    fs::write(&blob, b"shared bytes").unwrap();
+    let output = dir.path().join("output");
+    fs::hard_link(&blob, &output).unwrap();
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+
+    unlink_blob(&blob);
+
+    assert!(!blob.exists());
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o555
+    );
+}
