@@ -7921,14 +7921,19 @@ impl<'db> FileHasher<'db> {
     /// hashes those files again.
     pub fn flush_memo(&self) {
         let mut pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
-        pending.retain(|(observed, _)| observed.settled());
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        // An unsettled stamp may still be memoised when it is Cargo's
+        // re-date of an output kache restored or stored with these bytes
+        // (`FILE_HASH_RULE_REDATED`).
+        pending.retain(|(observed, hash)| {
+            observed.settled() || cache.redated_pin(&observed.fingerprint, hash)
+        });
         if pending.is_empty() {
             return;
         }
         let _trace = crate::phase_trace::phase("memo_flush");
-        let Some(cache) = &self.cache else {
-            return;
-        };
         let db = cache.db();
         let _ = db.busy_timeout(std::time::Duration::from_millis(100));
         let written = (|| -> rusqlite::Result<()> {

@@ -2414,6 +2414,37 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
     }
 
+    /// [`Self::record_verified_file_hashes`] for outputs whose mtime was just
+    /// set to the time Cargo re-dates them to after the unit
+    /// ([`crate::file_hash::FILE_HASH_RULE_REDATED`]). Same short wait: the
+    /// rows only save later reads.
+    pub fn record_redated_file_hashes(
+        &self,
+        redated: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        if self.read_only || redated.is_empty() {
+            return;
+        }
+        let _ = self.db.busy_timeout(std::time::Duration::from_millis(100));
+        let written = (|| -> rusqlite::Result<()> {
+            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            for (fingerprint, hash) in redated {
+                self.file_hash_cache().put_redated(fingerprint, hash)?;
+            }
+            self.db.execute_batch("COMMIT")
+        })();
+        let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
+        if let Err(error) = written {
+            let _ = self.db.execute_batch("ROLLBACK");
+            tracing::debug!("re-dated output hashes not memoised (index busy): {error}");
+        }
+    }
+
+    /// The memoised hash for `path` at its current stamp, read-only.
+    pub fn file_hash_at(&self, fingerprint: &crate::file_hash::FileFingerprint) -> Option<String> {
+        self.file_hash_cache().get(fingerprint).ok().flatten()
+    }
+
     /// Associate a stable file with its already-known content hash, avoiding a
     /// redundant read when it becomes a compiler input. Call this only after
     /// every store-side operation that may change the file's fingerprint and

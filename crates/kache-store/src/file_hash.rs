@@ -238,6 +238,33 @@ impl<'db> FileHashCache<'db> {
             .optional()
     }
 
+    /// Whether `hash`, just read from the file at `fingerprint` before its
+    /// stamp settled, may be memoised all the same: a
+    /// [`FILE_HASH_RULE_REDATED`] row holds that hash for the same path,
+    /// size, inode and mtime, at a ctime at most [`REDATE_CTIME_WINDOW_NS`]
+    /// earlier. The stamp is then Cargo's re-date of bytes kache wrote.
+    pub fn redated_pin(&self, fingerprint: &FileFingerprint, hash: &str) -> bool {
+        self.db()
+            .query_row(
+                "SELECT 1 FROM file_hashes
+                 WHERE path = ?1 AND size = ?2 AND mtime_ns = ?3 AND inode = ?4 AND rule = ?5
+                   AND hash = ?6 AND ctime_ns <= ?7 AND ?7 - ctime_ns <= ?8",
+                params![
+                    fingerprint.path,
+                    fingerprint.size,
+                    fingerprint.mtime_ns,
+                    fingerprint.inode,
+                    FILE_HASH_RULE_REDATED,
+                    hash,
+                    fingerprint.ctime_ns,
+                    REDATE_CTIME_WINDOW_NS
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .is_ok_and(|row| row.is_some())
+    }
+
     /// Memoised hashes for many files in one statement per chunk, keyed by
     /// path. A row counts only when its whole stamp matches, so a file that
     /// changed since it was recorded reads as absent, exactly as with [`get`].
@@ -282,6 +309,24 @@ impl<'db> FileHashCache<'db> {
     }
 
     pub fn put(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
+        self.put_under_rule(fingerprint, hash, FILE_HASH_RULE)
+    }
+
+    /// [`Self::put`] for an output whose mtime kache has already set to the
+    /// time Cargo will re-date it to ([`FILE_HASH_RULE_REDATED`]).
+    pub fn put_redated(&self, fingerprint: &FileFingerprint, hash: &str) -> rusqlite::Result<()> {
+        if fingerprint.size < MIN_PERSISTED_HASH_BYTES {
+            return Ok(());
+        }
+        self.put_under_rule(fingerprint, hash, FILE_HASH_RULE_REDATED)
+    }
+
+    fn put_under_rule(
+        &self,
+        fingerprint: &FileFingerprint,
+        hash: &str,
+        rule: i64,
+    ) -> rusqlite::Result<()> {
         self.db().execute(
             "INSERT OR REPLACE INTO file_hashes
              (path, size, mtime_ns, ctime_ns, inode, hash, updated_at, rule)
@@ -293,7 +338,7 @@ impl<'db> FileHashCache<'db> {
                 fingerprint.ctime_ns,
                 fingerprint.inode,
                 hash,
-                FILE_HASH_RULE
+                rule
             ],
         )?;
         Ok(())
@@ -574,6 +619,37 @@ const FILE_HASHES_COLUMNS: &str = "
 /// 1: a hash read from a file is memoised only if the file's stamp had
 ///    settled when it was read ([`stamp_is_settled`]).
 pub const FILE_HASH_RULE: i64 = 1;
+
+/// The rule of a row kache recorded for an output Cargo re-dates after the
+/// unit ends. It is [`FILE_HASH_RULE`] with a marker bit, so a release that
+/// knows only the plain rule serves it as an ordinary exact-stamp row.
+///
+/// Since Cargo 1.90 a `cargo check` (or `clippy`) unit's outputs get their
+/// mtime set to the unit's invocation time once the unit's process has
+/// exited (`invoked.timestamp` in the unit's fingerprint folder). That
+/// `utimensat` cannot keep the ctime, so a row recorded while the unit ran
+/// never matched again, and every dependent that started within the settle
+/// window read the `.rmeta` again: the read could not be memoised, since the
+/// re-date had just changed the stamp. kache sets the same mtime itself
+/// before it records the row, so Cargo's own call changes only the ctime.
+///
+/// Such a row is never served for another stamp. It lets a reader that hashed
+/// the file memoise what it read before the stamp has settled
+/// ([`FileHashCache::redated_pin`]): when the bytes hash to the row's hash and
+/// the stamp differs from the row's only by a ctime up to
+/// [`REDATE_CTIME_WINDOW_NS`] later. The settle window guards against a second
+/// write in the same timestamp tick, which keeps the stamp. Here that write
+/// would have to come after the read, within the tick of Cargo's re-date, and
+/// set the mtime back to the unit's invocation time to the nanosecond: an
+/// ordinary write stamps the current time. So the first dependent reads the
+/// `.rmeta` and every later one is served its row.
+pub const FILE_HASH_RULE_REDATED: i64 = FILE_HASH_RULE | (1 << 16);
+
+/// How long after a [`FILE_HASH_RULE_REDATED`] row was recorded a ctime still
+/// counts as Cargo's re-date: the time from the unit's exit to Cargo's
+/// `utimensat` (under 1 s measured on a loaded machine), with room to spare.
+/// Later, the settle window has passed for that stamp anyway.
+pub const REDATE_CTIME_WINDOW_NS: i64 = 10_000_000_000;
 
 fn file_hashes_have_rule(db: &Connection) -> rusqlite::Result<bool> {
     db.query_row(
@@ -995,6 +1071,72 @@ mod tests {
             ctime_ns,
             inode: 7,
         }
+    }
+
+    #[test]
+    fn a_redated_row_is_served_for_its_own_stamp_only() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let mut recorded = stamp("/deps/libdemo.rmeta", 5, 10);
+        recorded.size = MIN_PERSISTED_HASH_BYTES;
+        cache.put_redated(&recorded, "h").unwrap();
+        assert_eq!(cache.get(&recorded).unwrap().as_deref(), Some("h"));
+        let mut redated = recorded.clone();
+        redated.ctime_ns += 1;
+        assert_eq!(
+            cache.get(&redated).unwrap(),
+            None,
+            "Cargo's re-date is never served without a read"
+        );
+    }
+
+    #[test]
+    fn a_redated_row_lets_a_read_of_cargos_re_date_be_memoised() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let mut recorded = stamp("/deps/libdemo.rmeta", 5, 10);
+        recorded.size = MIN_PERSISTED_HASH_BYTES;
+        cache.put_redated(&recorded, "h").unwrap();
+        let later = |ctime_ns| {
+            let mut fingerprint = recorded.clone();
+            fingerprint.ctime_ns = ctime_ns;
+            fingerprint
+        };
+        assert!(cache.redated_pin(&later(11), "h"));
+        assert!(cache.redated_pin(&later(10 + REDATE_CTIME_WINDOW_NS), "h"));
+        assert!(!cache.redated_pin(&later(11 + REDATE_CTIME_WINDOW_NS), "h"), "window");
+        assert!(!cache.redated_pin(&later(9), "h"), "an earlier ctime");
+        assert!(!cache.redated_pin(&later(11), "other"), "other bytes");
+        for change in [
+            |f: &mut FileFingerprint| f.mtime_ns += 1,
+            |f: &mut FileFingerprint| f.size += 1,
+            |f: &mut FileFingerprint| f.inode += 1,
+            |f: &mut FileFingerprint| f.path.push('x'),
+        ] {
+            let mut other = later(11);
+            change(&mut other);
+            assert!(!cache.redated_pin(&other, "h"), "{other:?}");
+        }
+        let ordinary = stamp("/deps/libplain.rmeta", 5, 10);
+        cache.put(&ordinary, "h").unwrap();
+        let mut ordinary_later = ordinary.clone();
+        ordinary_later.ctime_ns = 11;
+        assert!(
+            !cache.redated_pin(&ordinary_later, "h"),
+            "an ordinary row grants nothing"
+        );
+    }
+
+    #[test]
+    fn a_small_redated_row_is_not_recorded() {
+        let db = Connection::open_in_memory().unwrap();
+        ensure_file_hash_cache_schema(&db).unwrap();
+        let cache = FileHashCache::Borrowed(&db);
+        let small = stamp("/deps/libsmall.rmeta", 5, 10);
+        cache.put_redated(&small, "h").unwrap();
+        assert_eq!(cache.get(&small).unwrap(), None);
     }
 
     #[test]
