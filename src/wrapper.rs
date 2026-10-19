@@ -5704,7 +5704,12 @@ fn materialize_cached_artifact(
         None => {
             // A large executable may already sit beside its destination,
             // copied by the daemon while the build ran (crate::prestage).
-            if store.is_read_only() && blob_strategy == link::LinkStrategy::Hardlink {
+            if output_already_holds(store, cached_file, target_path, &store_path, blob_strategy) {
+                tracing::debug!(
+                    "{context}: {} already holds the entry's bytes; kept",
+                    target_path.display()
+                );
+            } else if store.is_read_only() && blob_strategy == link::LinkStrategy::Hardlink {
                 link::prepare_writable_target_from_file(&store_path, target_path)?
                     .publish_replacing()
                     .with_context(|| format!("{context}: copying {}", target_path.display()))?;
@@ -5807,6 +5812,102 @@ fn materialize_cached_artifact(
     } else {
         RestoredBytes::Rewritten
     })
+}
+
+/// Whether the file at `target_path` already holds `cached_file`'s bytes, as
+/// when Cargo runs a unit again whose output an earlier restore of the same
+/// entry left in place (a third of all restores, measured over 6 h of this
+/// machine's builds). The restore then keeps the file and only stamps it, as
+/// it stamps a fresh link or copy, instead of writing the blob's bytes again.
+///
+/// Either the file is the blob itself, linked here by an earlier restore and
+/// linked nowhere else (so the stamp re-dates no other target, #794), or it is
+/// a file of its own whose memo row at its current stamp holds the blob's
+/// hash: the proof a cache key accepts for an input. An executable must also
+/// still run.
+fn output_already_holds(
+    store: &Store,
+    cached_file: &crate::store::CachedFile,
+    target_path: &Path,
+    store_path: &Path,
+    strategy: link::LinkStrategy,
+) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::symlink_metadata(target_path) else {
+            return false;
+        };
+        if !metadata.file_type().is_file() || metadata.len() != cached_file.size {
+            return false;
+        }
+        let runs = matches!(
+            strategy,
+            link::LinkStrategy::Copy | link::LinkStrategy::ExecutableHardlink
+        );
+        if (runs || cached_file.executable) && metadata.mode() & 0o111 != 0o111 {
+            return false;
+        }
+        if let Ok(blob) = std::fs::metadata(store_path)
+            && blob.dev() == metadata.dev()
+            && blob.ino() == metadata.ino()
+        {
+            return metadata.nlink() == 2;
+        }
+        if metadata.nlink() != 1 && !(metadata.nlink() == 2 && cargo_uplift_shares(target_path, &metadata)) {
+            return false;
+        }
+        let Ok(before) = crate::cache_key::FileFingerprint::from_path(target_path) else {
+            return false;
+        };
+        if let Some(hash) = store.file_hash_at(&before) {
+            return hash == cached_file.hash;
+        }
+        // No row (Cargo re-dated a check output after its restore, say):
+        // reading it is still cheaper than writing the blob's bytes again,
+        // and the read is the proof, as long as the file did not move while
+        // it was read.
+        crate::cache_key::hash_file(target_path).is_ok_and(|hash| hash == cached_file.hash)
+            && crate::cache_key::FileFingerprint::from_path(target_path)
+                .is_ok_and(|after| after == before)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store, cached_file, target_path, store_path, strategy);
+        false
+    }
+}
+
+/// Whether the second name of `output` (a `deps/<name>-<hash>` file) is the
+/// copy Cargo uplifts it to, `<profile>/<name>`: Cargo links that name again
+/// after the unit, so stamping the shared inode affects nothing else.
+#[cfg(unix)]
+fn cargo_uplift_shares(output: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Some(deps), Some(name)) = (output.parent(), output.file_name().and_then(|n| n.to_str()))
+    else {
+        return false;
+    };
+    if deps.file_name().is_none_or(|dir| dir != "deps") {
+        return false;
+    }
+    let (stem, extension) = match name.split_once('.') {
+        Some((stem, extension)) => (stem, Some(extension)),
+        None => (name, None),
+    };
+    let Some((base, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let uplifted = match extension {
+        Some(extension) => format!("{base}.{extension}"),
+        None => base.to_string(),
+    };
+    deps.parent()
+        .and_then(|profile| std::fs::symlink_metadata(profile.join(uplifted)).ok())
+        .is_some_and(|other| other.dev() == metadata.dev() && other.ino() == metadata.ino())
 }
 
 /// The memo that one store blob, restored unchanged, passed this host's

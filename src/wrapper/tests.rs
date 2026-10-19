@@ -11820,3 +11820,53 @@ fn only_a_check_unit_is_redated() {
     assert!(cargo_check_redate_ns(&args("--emit=dep-info,metadata")).is_some());
     assert!(cargo_check_redate_ns(&args("--emit=dep-info,metadata,link")).is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn an_output_is_kept_only_when_it_already_holds_the_entrys_bytes() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let deps = dir.path().join("t/debug/deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    let bytes = vec![7u8; 100_000];
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let blob = dir.path().join("blob");
+    std::fs::write(&blob, &bytes).unwrap();
+    let cached = crate::store::CachedFile {
+        name: "libdemo-0123456789abcdef.rlib".into(),
+        size: bytes.len() as u64,
+        hash: hash.clone(),
+        executable: false,
+    };
+    let output = deps.join(&cached.name);
+    let holds = |strategy| output_already_holds(&store, &cached, &output, &blob, strategy);
+    let hardlink = link::LinkStrategy::Hardlink;
+
+    std::fs::write(&output, &bytes).unwrap();
+    assert!(holds(hardlink), "same bytes, read");
+    let mut other = bytes.clone();
+    other[50_000] = 8;
+    std::fs::write(&output, &other).unwrap();
+    assert!(!holds(hardlink), "other bytes of the same size");
+    std::fs::write(&output, &bytes[..99_999]).unwrap();
+    assert!(!holds(hardlink), "another size");
+
+    std::fs::write(&output, &bytes).unwrap();
+    let second = dir.path().join("t/elsewhere");
+    std::fs::hard_link(&output, &second).unwrap();
+    assert!(!holds(hardlink), "a name in another target shares the inode");
+    std::fs::remove_file(&second).unwrap();
+    std::fs::hard_link(&output, dir.path().join("t/debug/libdemo.rlib")).unwrap();
+    assert!(holds(hardlink), "Cargo's uplifted name is fine");
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!holds(link::LinkStrategy::Copy), "an executable that cannot run");
+
+    std::fs::remove_file(dir.path().join("t/debug/libdemo.rlib")).unwrap();
+    std::fs::remove_file(&output).unwrap();
+    std::fs::hard_link(&blob, &output).unwrap();
+    assert!(holds(hardlink), "the blob itself, linked here only");
+}
