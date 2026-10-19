@@ -620,17 +620,31 @@ fn place_tree(
     deadline: Instant,
 ) -> std::io::Result<()> {
     let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
+    let placed = std::sync::Mutex::new(Vec::new());
     let tree = Placing {
         from,
         to,
         cache_dir,
         counts,
+        placed: &placed,
     };
     // Held past the rename, so a sweep keeps each run the tree links to until
     // its recorded `OUT_DIR` does.
     let mut runs = Vec::new();
     let copied = copy_tree(from, &staging, tree, &mut runs, deadline)
         .and_then(|()| std::fs::rename(&staging, to));
+    if copied.is_ok() {
+        let placed = placed.into_inner().unwrap_or_default();
+        let mut all = counts.placed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        all.extend(placed.into_iter().map(|mut file: PlacedFile| {
+            file.at = match file.at.strip_prefix(&staging) {
+                Ok(below) if below.as_os_str().is_empty() => to.to_path_buf(),
+                Ok(below) => to.join(below),
+                Err(_) => file.at,
+            };
+            file
+        }));
+    }
     if copied.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_file(&staging);
@@ -647,6 +661,67 @@ struct Placing<'a> {
     to: &'a Path,
     cache_dir: &'a Path,
     counts: &'a FileCounts,
+    /// Files placed under the staging path, before the tree's rename.
+    placed: &'a std::sync::Mutex<Vec<PlacedFile>>,
+}
+
+/// A donor file a seeding placed, large enough for the hash memo: the donor
+/// path and its stamp before it was linked or copied, and where it went. The
+/// donor's memo row for that stamp is the placed file's hash too, so the
+/// seeding can memoise it ([`PlacedFile::memo_rows`]) and the first build in
+/// the new target does not read it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacedFile {
+    pub(crate) from: PathBuf,
+    pub(crate) before: kache_store::file_hash::FileFingerprint,
+    pub(crate) at: PathBuf,
+}
+
+impl PlacedFile {
+    /// The memo rows this placement earns, given `hash`, the donor's memo
+    /// row for its stamp before the seeding, and `since_ns`, read from
+    /// [`kache_store::file_hash::stamp_clock_ns`] before the seeding began.
+    ///
+    /// A link shares the donor's inode, which nobody may write
+    /// ([`shares_inode`]): the link itself changes the ctime, and nothing
+    /// else did when the size, mtime and inode are the donor's and the ctime
+    /// moved only during the seeding. That stamp then holds for the donor
+    /// path too. A copy is a new inode with the donor's mtime; its bytes are
+    /// the donor's when the donor's whole stamp did not move while it was
+    /// copied.
+    pub(crate) fn memo_rows(
+        &self,
+        since_ns: i64,
+    ) -> Vec<kache_store::file_hash::FileFingerprint> {
+        use kache_store::file_hash::FileFingerprint;
+        let (Ok(from), Ok(at)) = (
+            FileFingerprint::from_path(&self.from),
+            FileFingerprint::from_path(&self.at),
+        ) else {
+            return Vec::new();
+        };
+        let before = &self.before;
+        let content_kept = |now: &FileFingerprint| {
+            now.size == before.size && now.mtime_ns == before.mtime_ns
+        };
+        if before.inode != 0 && at.inode == before.inode {
+            let linked_now = |now: &FileFingerprint| {
+                now.inode == before.inode
+                    && content_kept(now)
+                    && now.ctime_ns >= before.ctime_ns
+                    && (now.ctime_ns == before.ctime_ns
+                        || kache_store::file_hash::stamp_written_since(now, since_ns))
+            };
+            if linked_now(&at) && linked_now(&from) {
+                return vec![at, from];
+            }
+            return Vec::new();
+        }
+        if from == *before && content_kept(&at) {
+            return vec![at];
+        }
+        Vec::new()
+    }
 }
 
 /// Copy `from`, a file or directory in `tree`, to `to`, keeping every file's
@@ -699,7 +774,25 @@ fn copy_tree(
         )));
     }
     let below = from.strip_prefix(tree.from).unwrap_or(Path::new(""));
-    place_file(from, below, to, &metadata, tree.counts)
+    place_file(from, below, to, &metadata, tree.counts)?;
+    if metadata.len() >= crate::target_dedup::MIN_BYTES {
+        let before = kache_store::file_hash::FileFingerprint {
+            path: from.to_string_lossy().into_owned(),
+            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            mtime_ns: kache_store::file_hash::metadata_mtime_ns(&metadata),
+            ctime_ns: kache_store::file_hash::metadata_ctime_ns(&metadata),
+            inode: kache_store::file_hash::metadata_inode(&metadata),
+        };
+        tree.placed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(PlacedFile {
+                from: from.to_path_buf(),
+                before,
+                at: to.to_path_buf(),
+            });
+    }
+    Ok(())
 }
 
 /// Give a cloned or copied file `metadata`'s modification time and
@@ -718,6 +811,8 @@ fn stamp(to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
 struct FileCounts {
     linked: AtomicUsize,
     copied: AtomicUsize,
+    /// Files placed for good, at their final paths.
+    placed: std::sync::Mutex<Vec<PlacedFile>>,
 }
 
 /// Give `to` the donor file `from` (`below` is its path inside the unit's
@@ -797,6 +892,8 @@ pub(crate) struct Seeded {
     pub(crate) donor: Option<PathBuf>,
     /// Files given as hard links rather than copies ([`shares_inode`]).
     pub(crate) linked: usize,
+    /// Files large enough for the hash memo, for [`PlacedFile::memo_rows`].
+    pub(crate) placed: Vec<PlacedFile>,
 }
 
 /// Editor and check targets reuse only the same lane in another checkout.
@@ -921,6 +1018,7 @@ pub(crate) fn seed_for_lane(
                 units: copied,
                 donor: Some(donor.workspace_root.clone()),
                 linked: files.linked.into_inner(),
+                placed: files.placed.into_inner().unwrap_or_default(),
             };
         }
     }
@@ -1422,6 +1520,56 @@ fn rustc_version(rustc: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn a_placed_file_earns_memo_rows_only_while_it_holds_the_donors_bytes() {
+        use kache_store::file_hash::{FileFingerprint, stamp_clock_ns};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let donor = dir.path().join("donor.rlib");
+        std::fs::write(&donor, vec![3u8; 70_000]).unwrap();
+        std::fs::set_permissions(&donor, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let placed = |at: &std::path::Path| PlacedFile {
+            from: donor.clone(),
+            before: FileFingerprint::from_path(&donor).unwrap(),
+            at: at.to_path_buf(),
+        };
+        let since = stamp_clock_ns();
+
+        let linked = dir.path().join("linked.rlib");
+        let file = placed(&linked);
+        std::fs::hard_link(&donor, &linked).unwrap();
+        let rows = file.memo_rows(since);
+        assert_eq!(rows.len(), 2, "the link and the donor: {rows:?}");
+        assert!(rows.iter().all(|row| row.ctime_ns >= file.before.ctime_ns));
+
+        let copy = |to: &std::path::Path, mtime_ns: i64| {
+            std::fs::copy(&donor, to).unwrap();
+            filetime::set_file_mtime(
+                to,
+                filetime::FileTime::from_unix_time(
+                    mtime_ns.div_euclid(1_000_000_000),
+                    mtime_ns.rem_euclid(1_000_000_000) as u32,
+                ),
+            )
+            .unwrap();
+        };
+        let copied = dir.path().join("copied.rlib");
+        let file = placed(&copied);
+        copy(&copied, file.before.mtime_ns);
+        assert_eq!(file.memo_rows(since).len(), 1, "the copy only");
+
+        let late = dir.path().join("late.rlib");
+        let file = placed(&late);
+        copy(&late, file.before.mtime_ns);
+        std::fs::set_permissions(&donor, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&donor, vec![4u8; 70_000]).unwrap();
+        assert!(
+            file.memo_rows(since).is_empty(),
+            "the donor changed while it was copied"
+        );
+    }
     use super::*;
 
     const HASH: &str = "0123456789abcdef";

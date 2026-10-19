@@ -9278,9 +9278,11 @@ pub(crate) fn seed_new_target(
     note: bool,
 ) -> Result<crate::target_seed::Seeded> {
     let started = std::time::Instant::now();
+    let since_ns = kache_store::file_hash::stamp_clock_ns();
     let deadline = started + crate::target_seed::SEED_DEADLINE;
-    let tracked = Store::open(config)
-        .and_then(|store| store.tracked_target_roots(0))
+    let store = Store::open(config).context("reading tracked targets")?;
+    let tracked = store
+        .tracked_target_roots(0)
         .context("reading tracked targets")?;
     let donors: Vec<_> = tracked
         .into_iter()
@@ -9300,6 +9302,7 @@ pub(crate) fn seed_new_target(
         deadline,
         check_lane,
     );
+    memoise_seeded_files(&store, &seeded.placed, since_ns);
     if let Some(donor) = &seeded.donor {
         let line = format!(
             "seeded {} registry units ({} files hard-linked) into {} from {} in {} ms",
@@ -9315,6 +9318,30 @@ pub(crate) fn seed_new_target(
         }
     }
     Ok(seeded)
+}
+
+/// Memoise the hashes of the files a seeding placed, from the donors' rows
+/// ([`crate::target_seed::PlacedFile::memo_rows`]), so the new target's first
+/// build does not read them again, and the donors' links keep their rows.
+fn memoise_seeded_files(store: &Store, placed: &[crate::target_seed::PlacedFile], since_ns: i64) {
+    if placed.is_empty() {
+        return;
+    }
+    let _trace = crate::phase_trace::phase("memo_seeded");
+    let mut rows: Vec<(kache_store::file_hash::FileFingerprint, String)> = Vec::new();
+    for file in placed {
+        let Some(hash) = store.file_hash_at(&file.before) else {
+            continue;
+        };
+        for fingerprint in file.memo_rows(since_ns) {
+            rows.push((fingerprint, hash.clone()));
+        }
+    }
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
+        .collect();
+    store.record_verified_file_hashes(&rows);
 }
 
 /// Hint the daemon to stage `target_dir`'s recorded executables.
