@@ -463,6 +463,11 @@ pub(crate) enum Request {
     Health,
     BatchRemoteCheck(BatchRemoteCheckRequest),
     HashFiles(HashFilesRequest),
+    /// A wrapper's hit hands its access stamp to the daemon, which pins the
+    /// entry against its sweeps and writes the stamps in batches
+    /// ([`Daemon::flush_hit_stamps`]). Older daemons reject the unknown
+    /// variant and the wrapper stamps the index itself.
+    StampHits(StampHitsRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),
@@ -1098,6 +1103,14 @@ impl StatsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BatchRemoteCheckRequest {
     pub checks: Vec<RemoteCheckRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StampHitsRequest {
+    /// The cache directory of the store the hits were served from. The
+    /// daemon stamps only its own store and refuses any other.
+    pub cache_dir: String,
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2794,6 +2807,13 @@ pub(crate) struct Daemon {
     /// File-hash rows HashFiles learned, written in one batch by
     /// [`Daemon::flush_file_hash_records`].
     pending_file_hashes: Mutex<Vec<(crate::cache_key::FileFingerprint, String)>>,
+    /// Hits' access stamps taken by StampHits and not yet written, with the
+    /// number of hits each, written by [`Daemon::flush_hit_stamps`]. Until
+    /// then the daemon's sweeps keep these entries ([`Daemon::pending_pins`]).
+    pending_hit_stamps: Arc<Mutex<HashMap<String, u32>>>,
+    /// The connection [`Daemon::flush_hit_stamps`] writes through: a batch
+    /// may wait for the index's write lock, and nobody waits for it.
+    stamp_store: OnceLock<Mutex<Store>>,
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
     request_clock: Arc<crate::maintenance::RequestClock>,
@@ -2941,6 +2961,8 @@ impl Daemon {
             hash_store: OnceLock::new(),
             checkpoint_store: OnceLock::new(),
             pending_file_hashes: Mutex::new(Vec::new()),
+            pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
+            stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
@@ -3619,6 +3641,7 @@ impl Daemon {
             Request::Stats(sr) => self.handle_stats(sr),
             Request::Health => self.handle_health(),
             Request::HashFiles(req) => self.handle_hash_files(req),
+            Request::StampHits(req) => self.handle_stamp_hits(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
@@ -3917,6 +3940,93 @@ impl Daemon {
         }) {
             tracing::debug!("file hash rows not written: {error:#}");
         }
+    }
+
+    /// Take hits' access stamps: the entries stay pinned against this
+    /// daemon's sweeps until [`Self::flush_hit_stamps`] writes them. Refused
+    /// for another store, or when [`MAX_PENDING_HIT_STAMPS`] are waiting (an
+    /// index that has refused writes for that long): the wrapper then stamps
+    /// the index itself, as without a daemon.
+    pub fn handle_stamp_hits(&self, req: &StampHitsRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("hit stamps for another store");
+        }
+        let Ok(mut pending) = self.pending_hit_stamps.lock() else {
+            return Response::err("hit stamp queue poisoned");
+        };
+        if pending.len() + req.keys.len() > MAX_PENDING_HIT_STAMPS {
+            return Response::err("hit stamp queue full");
+        }
+        for key in &req.keys {
+            *pending.entry(key.clone()).or_insert(0) += 1;
+        }
+        Response::ok()
+    }
+
+    /// Write the hit stamps taken since the last call in one transaction on
+    /// the stamp connection. A stamp leaves the pending set only once its
+    /// transaction committed, so the sweeps' pin never has a gap; a batch the
+    /// index refused stays for the next call.
+    pub(crate) fn flush_hit_stamps(&self) {
+        let batch: Vec<(String, u32)> = match self.pending_hit_stamps.lock() {
+            Ok(pending) if !pending.is_empty() => {
+                pending.iter().map(|(k, n)| (k.clone(), *n)).collect()
+            }
+            _ => return,
+        };
+        let written = (|| -> Result<()> {
+            let lock = match self.stamp_store.get() {
+                Some(lock) => lock,
+                None => {
+                    let store = Store::open(&self.config)?;
+                    defer_checkpoints_under_mutex(&store);
+                    let _ = self.stamp_store.set(Mutex::new(store));
+                    self.stamp_store
+                        .get()
+                        .ok_or_else(|| anyhow::anyhow!("daemon stamp store failed to initialize"))?
+                }
+            };
+            let store = lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon stamp store mutex poisoned"))?;
+            store.stamp_hits(&batch)
+        })();
+        if let Err(error) = written {
+            tracing::debug!("hit stamps not written yet: {error:#}");
+            return;
+        }
+        if let Ok(mut pending) = self.pending_hit_stamps.lock() {
+            for (key, count) in batch {
+                if let std::collections::hash_map::Entry::Occupied(mut slot) = pending.entry(key) {
+                    let left = slot.get().saturating_sub(count);
+                    if left == 0 {
+                        slot.remove();
+                    } else {
+                        *slot.get_mut() = left;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pin a sweep of the daemon's own store takes from the hit stamps
+    /// not yet written ([`Store::pin_entries_with`]).
+    fn pending_pins(&self) -> crate::store::PendingPins {
+        let pending = Arc::clone(&self.pending_hit_stamps);
+        Arc::new(move |key: &str| pending.lock().map_or(true, |p| p.contains_key(key)))
+    }
+
+    /// Open `config`'s store for a sweep. The daemon's own store first gets
+    /// the hit stamps taken so far, and keeps every entry whose stamp arrives
+    /// while it sweeps.
+    fn open_sweep_store(&self, config: &Config) -> Result<Store> {
+        if config.cache_dir != self.config.cache_dir {
+            return Store::open(config);
+        }
+        self.flush_hit_stamps();
+        let mut store = Store::open(config)?;
+        store.pin_entries_with(self.pending_pins());
+        Ok(store)
     }
 
     pub fn handle_hash_files(&self, req: &HashFilesRequest) -> Response {
@@ -6899,7 +7009,7 @@ impl Daemon {
             return Ok(());
         }
         // Under gc.lock like every driver, so the totals cannot race.
-        let store = Store::open(config)?;
+        let store = self.open_sweep_store(config)?;
         let stats = self.automatic_size_pass(config, &store, size)?;
         if let Err(e) = crate::report::record_gc_run(
             config,
@@ -6985,7 +7095,7 @@ impl Daemon {
         // GC may scan and remove thousands of entries. Use its own connection
         // so daemon lookups and uploads can still reach the main Store mutex.
         // SQLite and gc.lock continue to serialize the actual writes.
-        let gc_store = Store::open(config)?;
+        let gc_store = self.open_sweep_store(config)?;
         let _gc_lock = match driver {
             GcDriver::Requested => gc_store.acquire_gc_lock()?,
             GcDriver::Periodic => match gc_store.try_gc_lock()? {
@@ -7602,6 +7712,19 @@ async fn server_main(
         }
     });
 
+    // Hits' access stamps: one transaction a quarter second, on the stamp
+    // connection, so a hit never waits for the index's write lock.
+    let hit_stamps_daemon = daemon.clone();
+    let hit_stamps_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let daemon = hit_stamps_daemon.clone();
+            let _ = tokio::task::spawn_blocking(move || daemon.flush_hit_stamps()).await;
+        }
+    });
+
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -7793,6 +7916,8 @@ async fn server_main(
     config_watch_handle.abort();
     hash_rows_handle.abort();
     daemon.flush_file_hash_records();
+    hit_stamps_handle.abort();
+    daemon.flush_hit_stamps();
 
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
     // then give the entire enqueue + worker drain one shared 30s budget. The
@@ -8861,6 +8986,7 @@ async fn handle_connection_started_at(
                 let d = Arc::clone(daemon);
                 offload(move || d.handle_hash_files(&req)).await
             }
+            Ok(Request::StampHits(req)) => daemon.handle_stamp_hits(&req),
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
@@ -9292,6 +9418,44 @@ pub fn send_prediction_publish(
     });
     if let Err(error) = send_request_fire_and_forget(&config.socket_path(), &req) {
         tracing::debug!("prediction row publish not sent: {error}");
+    }
+}
+
+/// Hit stamps the daemon holds before it refuses more ([`Daemon::handle_stamp_hits`]).
+const MAX_PENDING_HIT_STAMPS: usize = 1 << 16;
+
+/// How long a hit waits for the daemon's answer to its access stamp
+/// ([`send_hit_stamp`]). A daemon that refuses (an older release, another
+/// store) answers well within it; one slower than this still reads the
+/// request and takes the stamp, so the hit does not wait for it.
+const HIT_STAMP_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Hand a hit's access stamp to the daemon ([`Request::StampHits`]). True
+/// when the daemon took it, or will (no answer within
+/// [`HIT_STAMP_HANDOFF_WAIT`]: the request is in its socket; at worst, like
+/// a stamp the index refused before, it is lost). False when no daemon took it: none runs, or one that refused (an
+/// older release, another store, a full queue); the hit then stamps the
+/// index itself.
+#[cfg(unix)]
+pub fn send_hit_stamp(socket_path: &Path, cache_dir: &Path, key: &str) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::StampHits(StampHitsRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        keys: vec![key.to_string()],
+    });
+    match send_request_with_timeout(socket_path, &req, HIT_STAMP_HANDOFF_WAIT) {
+        Ok(line) => serde_json::from_str::<Response>(&line).is_ok_and(|resp| resp.ok),
+        // Written, no answer in time: the daemon may hold it.
+        Err(error) => error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            })
+        }),
     }
 }
 

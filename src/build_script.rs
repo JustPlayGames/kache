@@ -442,7 +442,8 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         anyhow::bail!("kache is disabled");
     }
     let environment = Environment::capture()?;
-    let store = Store::open(&config)?;
+    let mut store = Store::open(&config)?;
+    crate::wrapper::send_hit_stamps_to_daemon(&config, &mut store);
     let binary_hash = stored_binary_hash(real)?;
     let run = Run {
         config,
