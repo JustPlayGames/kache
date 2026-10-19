@@ -1015,6 +1015,9 @@ fn run_main() -> Result<()> {
     // installed. Decided on the environment alone: argv is the script's own.
     if build_script::is_shim_invocation() {
         init_logging(LogMode::Wrapper);
+        // On Cargo's path like a compiler wrapper: its build-script cache
+        // commits leave routine checkpoints to the daemon too.
+        kache_store::defer_wal_checkpoints();
         std::process::exit(build_script::run_shim());
     }
 
