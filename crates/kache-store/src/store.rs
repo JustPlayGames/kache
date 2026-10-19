@@ -1204,6 +1204,10 @@ pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
 /// ([`Store::get`]).
 pub const HIT_STAMP_BUSY_WAIT: Duration = Duration::from_millis(100);
 
+/// How long a registered incremental directory's row counts as fresh, so the
+/// units of a build do not rewrite it ([`Store::remember_incremental_dir`]).
+pub const INCREMENTAL_DIR_REFRESH: Duration = Duration::from_secs(300);
+
 /// Write-lock time an eviction sweep may spend on removals before it pauses.
 ///
 /// SQLite's write lock is not fair. A build's `put` that finds it taken
@@ -4519,6 +4523,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn remember_incremental_dir(&self, path: &Path) -> Result<()> {
         self.refuse_write("record an incremental directory")?;
         let path = path.to_string_lossy().into_owned();
+        // Every unit of a profile passes the same directory, so all but the
+        // first wrapper of a build would rewrite one row; even a write that
+        // changes nothing takes the index's write lock, and on a shared store
+        // each waited behind whichever miss was storing. A row seen within
+        // [`INCREMENTAL_DIR_REFRESH`] is left as it is: read first. A sweep
+        // that removed the row (and the directory) makes the next unit
+        // register it again.
+        let fresh: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM incremental_dirs WHERE path = ?1 \
+             AND last_seen > datetime('now', ?2))",
+            params![
+                path,
+                format!("-{} seconds", INCREMENTAL_DIR_REFRESH.as_secs())
+            ],
+            |row| row.get(0),
+        )?;
+        if fresh {
+            return Ok(());
+        }
         self.db.execute(
             "INSERT OR REPLACE INTO incremental_dirs (path, last_seen) VALUES (?1, datetime('now'))",
             params![path],

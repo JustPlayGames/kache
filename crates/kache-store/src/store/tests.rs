@@ -4573,6 +4573,46 @@ fn remove_entry_ignores_recency_guard() {
     assert!(!store.contains("rk"));
 }
 
+/// A directory registered moments ago is not written again: the second call
+/// reads its fresh row and returns without the index's write lock, so it
+/// succeeds even while another connection holds that lock.
+#[test]
+fn a_freshly_registered_incremental_dir_is_not_written_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let incremental_dir = dir.path().join("target/debug/incremental");
+    std::fs::create_dir_all(&incremental_dir).unwrap();
+    store.remember_incremental_dir(&incremental_dir).unwrap();
+
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let _ = store.db.busy_timeout(std::time::Duration::from_millis(10));
+    store
+        .remember_incremental_dir(&incremental_dir)
+        .expect("a fresh row needs no write");
+    writer.execute_batch("COMMIT").unwrap();
+
+    // A stale row is written again.
+    store
+        .db
+        .execute(
+            "UPDATE incremental_dirs SET last_seen = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    store.remember_incremental_dir(&incremental_dir).unwrap();
+    let fresh: bool = store
+        .db
+        .query_row(
+            "SELECT last_seen > datetime('now', '-60 seconds') FROM incremental_dirs",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(fresh);
+}
+
 #[test]
 fn test_incremental_dir_registry_deduplicates_and_cleans() {
     let dir = tempfile::tempdir().unwrap();
