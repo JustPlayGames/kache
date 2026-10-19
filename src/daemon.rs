@@ -2786,6 +2786,14 @@ pub(crate) struct Daemon {
     transfer_counters: TransferCounters,
     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
+    /// HashFiles' own index connection ([`Daemon::with_hash_store`]): a
+    /// wrapper's prefetch never queues behind the store mutex.
+    hash_store: OnceLock<Mutex<Store>>,
+    /// The connection [`Daemon::checkpoint_index`] checkpoints through.
+    checkpoint_store: OnceLock<Mutex<Store>>,
+    /// File-hash rows HashFiles learned, written in one batch by
+    /// [`Daemon::flush_file_hash_records`].
+    pending_file_hashes: Mutex<Vec<(crate::cache_key::FileFingerprint, String)>>,
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
     request_clock: Arc<crate::maintenance::RequestClock>,
@@ -2930,6 +2938,9 @@ impl Daemon {
             transfer_counters: TransferCounters::new(),
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
+            hash_store: OnceLock::new(),
+            checkpoint_store: OnceLock::new(),
+            pending_file_hashes: Mutex::new(Vec::new()),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
@@ -3779,14 +3790,39 @@ impl Daemon {
     /// Flush a batch of entries stored without an fsync. Uses its own store
     /// connection, as GC does, so a sweep of slow writes never holds the
     /// mutex a lookup needs.
+    /// Copy the WAL into the index without waiting for anyone (a passive
+    /// checkpoint), on a connection kept for it, every durability tick (2 s).
+    /// Every connection of the daemon and of the wrappers defers its own
+    /// checkpoints until the log reaches 256 MiB. Running it more often (every
+    /// 500 ms) synced the index four times as often, and each sync commits
+    /// the filesystem's journal: wrappers' restores, links and unlinks waited
+    /// for it, and kache's own time per rig round doubled. Returns the log's frames and how many are in the index.
+    pub(crate) fn checkpoint_index(&self) -> Option<(i64, i64)> {
+        let checkpointed = (|| -> Result<(i64, i64)> {
+            let lock = match self.checkpoint_store.get() {
+                Some(lock) => lock,
+                None => {
+                    let store = Store::open(&self.config)?;
+                    defer_checkpoints_under_mutex(&store);
+                    let _ = self.checkpoint_store.set(Mutex::new(store));
+                    self.checkpoint_store.get().ok_or_else(|| {
+                        anyhow::anyhow!("daemon checkpoint store failed to initialize")
+                    })?
+                }
+            };
+            let guard = lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon checkpoint store mutex poisoned"))?;
+            guard.checkpoint_wal()
+        })();
+        checkpointed
+            .inspect_err(|error| tracing::debug!("index checkpoint skipped: {error:#}"))
+            .ok()
+    }
+
     fn flush_pending_durability(&self) {
         let flushed = (|| -> Result<usize> {
             let store = Store::open(&self.config)?;
-            // Wrappers leave routine checkpoints to the daemon
-            // (`defer_wal_checkpoints`); this tick keeps the log short.
-            if let Err(error) = store.checkpoint_wal() {
-                tracing::debug!("index checkpoint skipped: {error:#}");
-            }
             if store.pending_durability()? == 0 {
                 return Ok(0);
             }
@@ -3838,6 +3874,49 @@ impl Daemon {
         // Oldest first — the entry a user is most likely waiting on.
         entries.sort_by_key(|e| std::cmp::Reverse(e.elapsed_s));
         entries
+    }
+
+    /// The index connection HashFiles reads and writes its memo rows
+    /// through. The store mutex is held by commits that may wait seconds for
+    /// the index's write lock (a publish, an entry), and a wrapper's prefetch
+    /// gives up after 3 s, so HashFiles keeps out of it.
+    fn with_hash_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let lock = match self.hash_store.get() {
+            Some(lock) => lock,
+            None => {
+                let store = Store::open(&self.config)?;
+                defer_checkpoints_under_mutex(&store);
+                let _ = self.hash_store.set(Mutex::new(store));
+                self.hash_store
+                    .get()
+                    .ok_or_else(|| anyhow::anyhow!("daemon hash store failed to initialize"))?
+            }
+        };
+        let guard = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon hash store mutex poisoned"))?;
+        f(&guard)
+    }
+
+    /// Write the file-hash rows HashFiles requests learned since the last
+    /// call, in one transaction with a short wait. The rows only save later
+    /// reads (settled hashes are in the in-memory cache already), so a busy
+    /// index drops them rather than holding anyone up.
+    pub(crate) fn flush_file_hash_records(&self) {
+        let batch = match self.pending_file_hashes.lock() {
+            Ok(mut pending) if !pending.is_empty() => std::mem::take(&mut *pending),
+            _ => return,
+        };
+        let rows: Vec<(crate::cache_key::FileFingerprint, &str)> = batch
+            .iter()
+            .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
+            .collect();
+        if let Err(error) = self.with_hash_store(|store| {
+            store.record_verified_file_hashes(&rows);
+            Ok(())
+        }) {
+            tracing::debug!("file hash rows not written: {error:#}");
+        }
     }
 
     pub fn handle_hash_files(&self, req: &HashFilesRequest) -> Response {
@@ -3927,12 +4006,12 @@ impl Daemon {
                 observed_ns,
             );
 
-            // #281: hold the store mutex only for the cheap cache lookup and
-            // record; run the blake3 read of the whole file OUTSIDE the lock so
-            // it can't stall a concurrent RemoteCheck's `import_restored_entry`.
+            // #281: hold the hash store only for the cheap cache lookup; run
+            // the blake3 read of the whole file OUTSIDE the lock, and leave the
+            // record to the batched flush, so nothing here waits for a writer.
             let path = Path::new(&file.path);
             let computed: anyhow::Result<(String, bool, u64)> =
-                match self.with_store(|store| Ok(store.file_hash_lookup(path))) {
+                match self.with_hash_store(|store| Ok(store.file_hash_lookup(path))) {
                     Ok(crate::cache_key::FileHashLookup::Hit(hash)) => Ok((hash, true, 0)),
                     Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
                         crate::cache_key::hash_file(path).map(|hash| {
@@ -3941,16 +4020,16 @@ impl Daemon {
                             // output kache wrote with these bytes.
                             if crate::cache_key::stamp_is_settled(&fp, observed_ns)
                                 || self
-                                    .with_store(|store| {
+                                    .with_hash_store(|store| {
                                         Ok(store.file_hash_cache().redated_pin(&fp, &hash))
                                     })
                                     .unwrap_or(false)
                             {
-                                // Brief re-lock just to persist the result.
-                                let _ = self.with_store(|store| {
-                                    store.file_hash_record(&fp, &hash);
-                                    Ok(())
-                                });
+                                // Written in a batch by the flush tick, off
+                                // this request's path.
+                                if let Ok(mut pending) = self.pending_file_hashes.lock() {
+                                    pending.push((fp.clone(), hash.clone()));
+                                }
                             }
                             (hash, false, file.size.max(0) as u64)
                         })
@@ -7220,7 +7299,7 @@ impl Daemon {
 /// commit that takes the WAL past 1,000 pages checkpoints it, fsync
 /// included, while every request needing that mutex waits: on a busy shared
 /// store that was nearly every commit, and wrappers' file-hash prefetches
-/// ran into their 3 s timeout. The durability tick checkpoints instead, on
+/// ran into their 3 s timeout. [`Daemon::checkpoint_index`] checkpoints instead, on
 /// a connection of its own.
 fn defer_checkpoints_under_mutex(store: &Store) {
     if let Err(error) = store.defer_wal_checkpoints_here() {
@@ -7510,6 +7589,19 @@ async fn server_main(
     // Short interval: until an entry is flushed every hit on it re-reads its
     // blobs to verify them, and the wrapper hands the work here precisely so
     // the build does not wait for the disk.
+    // File-hash rows HashFiles learned: one short transaction a quarter
+    // second, on the hash store's connection.
+    let hash_rows_daemon = daemon.clone();
+    let hash_rows_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let daemon = hash_rows_daemon.clone();
+            let _ = tokio::task::spawn_blocking(move || daemon.flush_file_hash_records()).await;
+        }
+    });
+
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -7518,7 +7610,13 @@ async fn server_main(
             interval.tick().await;
             let daemon = durability_daemon.clone();
             // Blocking: fsync per blob, off the async workers (#281).
-            let _ = tokio::task::spawn_blocking(move || daemon.flush_pending_durability()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                // Wrappers and the daemon's own connections defer routine
+                // checkpoints; this keeps the log short.
+                daemon.checkpoint_index();
+                daemon.flush_pending_durability();
+            })
+            .await;
         }
     });
 
@@ -7693,6 +7791,8 @@ async fn server_main(
     }
     heartbeat_handle.abort();
     config_watch_handle.abort();
+    hash_rows_handle.abort();
+    daemon.flush_file_hash_records();
 
     // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
     // then give the entire enqueue + worker drain one shared 30s budget. The

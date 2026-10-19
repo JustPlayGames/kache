@@ -4733,6 +4733,72 @@ fn test_handle_hash_files_uses_memory_cache() {
     assert_eq!(second_result.bytes_hashed, 0);
 }
 
+/// A HashFiles request is on a wrapper's key path with a 3 s timeout. It
+/// must not queue behind the daemon's store mutex, which a publish or any
+/// other commit holds while it waits for the index's write lock: its memo
+/// reads and writes go through a connection of their own, and the rows it
+/// learns are written in one batch afterwards
+/// ([`Daemon::flush_file_hash_records`]).
+#[test]
+fn hash_files_do_not_wait_for_the_store_mutex() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = std::sync::Arc::new(Daemon::new(config.clone()));
+    let file = dir.path().join("held.rlib");
+    std::fs::write(&file, vec![9u8; 90 * 1024]).unwrap();
+    let (req, settles_at) = hash_files_request(&file);
+    let expected = crate::cache_key::hash_file(&file).unwrap();
+
+    let (held_tx, held_rx) = mpsc::channel();
+    let holder = {
+        let daemon = std::sync::Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _guard = daemon.store_lock().unwrap().lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        })
+    };
+    held_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    let resp = daemon.handle_hash_files_at(&req, || settles_at);
+    let waited = started.elapsed();
+    holder.join().unwrap();
+
+    assert!(resp.ok);
+    let result = &resp.hash_results.as_ref().unwrap()[0];
+    assert_eq!(result.hash.as_deref(), Some(expected.as_str()));
+    assert!(
+        waited < std::time::Duration::from_millis(1000),
+        "the request waited {waited:?} for the store mutex"
+    );
+
+    daemon.flush_file_hash_records();
+    assert!(matches!(
+        crate::store::Store::open(&config).unwrap().file_hash_lookup(&file),
+        crate::cache_key::FileHashLookup::Hit(hash) if hash == expected
+    ));
+}
+
+/// The daemon's checkpoint loop copies what deferring connections left in
+/// the WAL into the index.
+#[test]
+fn checkpoint_index_copies_the_log_a_deferring_writer_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let writer = crate::store::Store::open(&config).unwrap();
+    writer.defer_wal_checkpoints_here().unwrap();
+    let file = dir.path().join("rows.rlib");
+    std::fs::write(&file, vec![1u8; 70 * 1024]).unwrap();
+    let (req, settles_at) = hash_files_request(&file);
+    daemon.handle_hash_files_at(&req, || settles_at);
+    daemon.flush_file_hash_records();
+
+    let (frames, copied) = daemon.checkpoint_index().unwrap();
+    assert!(frames > 0, "the deferring writer left the rows in the log");
+    assert_eq!(frames, copied, "the passive checkpoint copied all of it");
+}
+
 /// A stamp still inside the settle window when the daemon observes it gets
 /// its hash back, but neither cache keeps it: a second write in the same
 /// timestamp tick would leave the stamp as it is. From the moment the
@@ -4759,6 +4825,7 @@ fn handle_hash_files_remembers_a_hash_only_if_its_stamp_had_settled() {
         assert!(!result.cache_hit, "{attempt}: neither cache kept it");
         assert!(result.bytes_hashed > 0, "{attempt}");
     }
+    daemon.flush_file_hash_records();
     assert!(matches!(
         memoised(),
         crate::cache_key::FileHashLookup::NeedsHash(_)
@@ -4767,14 +4834,15 @@ fn handle_hash_files_remembers_a_hash_only_if_its_stamp_had_settled() {
     daemon.handle_hash_files_at(&req, || settles_at);
     let resp = daemon.handle_hash_files_at(&req, || settles_at);
     assert!(resp.hash_results.as_ref().unwrap()[0].cache_hit);
+    daemon.flush_file_hash_records();
     assert!(matches!(
         memoised(),
         crate::cache_key::FileHashLookup::Hit(hash) if hash == expected
     ));
 }
 
-/// #281: the lock-narrowed HashFiles path (cache lookup under the store
-/// lock, blake3 outside it, record under the lock) must preserve the
+/// #281: the lock-narrowed HashFiles path (cache lookup on the hash store,
+/// blake3 outside its lock, the row written by the flush) must preserve the
 /// PERSISTENT cache. A second daemon with a fresh in-memory cache but the
 /// same `index.db` gets a hit without re-hashing, and every hash matches
 /// the canonical `hash_file`.
@@ -4795,6 +4863,8 @@ fn handle_hash_files_persistent_cache_hit_across_daemons() {
     assert_eq!(ra.hash.as_deref(), Some(expected.as_str()));
     assert!(!ra.cache_hit, "first hash is a persistent-cache miss");
     assert!(ra.bytes_hashed > 0);
+    // Its rows are written by the flush tick, off the request's path.
+    a.flush_file_hash_records();
 
     // Daemon B: fresh in-memory cache, same store — must hit the PERSISTENT
     // cache via the lock-narrowed lookup rather than re-hashing.
