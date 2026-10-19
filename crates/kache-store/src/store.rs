@@ -268,9 +268,14 @@ fn is_blob_hash_name(name: &str) -> bool {
             .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
-/// Best-effort unlink of a blob file (clears read-only first).
+/// Best-effort unlink of a blob file (on Windows, clears read-only first).
+///
+/// Unix unlinks a read-only file as it does any other, and the mode belongs
+/// to the inode: a blob that shares one with a build output (a hardlink
+/// ingest or restore) would leave that output writable for everyone.
 fn unlink_blob(blob: &Path) {
     if blob.exists() {
+        #[cfg(windows)]
         if let Ok(meta) = fs::metadata(blob) {
             let mut perms = meta.permissions();
             perms.set_readonly(false);
