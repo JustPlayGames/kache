@@ -1850,6 +1850,9 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             args.first()
         );
     };
+    // A wrapper's commits are on Cargo's critical path: leave routine WAL
+    // checkpoints (and their fsync) to the daemon.
+    kache_store::defer_wal_checkpoints();
     let exit_code = match wrapper_target(adapter) {
         Some(WrapperTarget::Rustc) => {
             // Cargo's first call for a target directory it has not built:

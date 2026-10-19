@@ -6,7 +6,7 @@ use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, para
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::Config;
@@ -1908,6 +1908,29 @@ fn record_entry_blobs(
     Ok(())
 }
 
+/// WAL pages ([`defer_wal_checkpoints`]) a compiler wrapper's connection lets
+/// the log grow to before it checkpoints it itself: 64 MiB of 4 KiB pages.
+pub const DEFERRED_AUTOCHECKPOINT_PAGES: i64 = 16_384;
+
+static DEFER_WAL_CHECKPOINTS: AtomicBool = AtomicBool::new(false);
+
+/// Leave this process's routine WAL checkpoints to the daemon.
+///
+/// SQLite checkpoints the log in whichever connection's commit takes it past
+/// `wal_autocheckpoint` pages (1,000 by default), inside that commit: the
+/// committing process copies the pages into the index and fsyncs it before
+/// its statement returns. A compiler wrapper commits a hit's access stamp, its
+/// memo rows and a miss's entry, so on a shared store about every
+/// thousandth page written made some wrapper wait for the filesystem's
+/// journal, 0.3-2 s on a busy disk, while Cargo waited for that unit.
+/// Connections a process opens after this call checkpoint only once the log
+/// reaches [`DEFERRED_AUTOCHECKPOINT_PAGES`]; the daemon checkpoints it
+/// passively every few seconds ([`ArtifactStore::checkpoint_wal`]), so without
+/// a daemon the log is still bounded.
+pub fn defer_wal_checkpoints() {
+    DEFER_WAL_CHECKPOINTS.store(true, Ordering::Relaxed);
+}
+
 pub fn open_index_db(db_path: &Path) -> Result<Connection> {
     open_index_db_reporting_recovery(db_path).map(|(db, _)| db)
 }
@@ -2002,6 +2025,9 @@ fn try_open_index_db(db_path: &Path) -> std::result::Result<Connection, SqlError
     for attempt in 1..=STORE_OPEN_MAX_ATTEMPTS {
         match Connection::open(db_path).and_then(|db| {
             initialize_db(&db)?;
+            if DEFER_WAL_CHECKPOINTS.load(Ordering::Relaxed) {
+                db.pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
+            }
             Ok(db)
         }) {
             Ok(db) => {
@@ -4363,6 +4389,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             [],
             |row| row.get::<_, i64>(0),
         )? as u64)
+    }
+
+    /// Copy the WAL's committed pages into the index without waiting for
+    /// readers or writers (a passive checkpoint), so the log stays short while
+    /// compiler wrappers defer theirs ([`defer_wal_checkpoints`]). Returns the
+    /// log's frames and how many of them are now in the index.
+    pub fn checkpoint_wal(&self) -> Result<(i64, i64)> {
+        self.refuse_write("checkpoint the index")?;
+        Ok(self.db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(1)?, row.get(2)?))
+        })?)
     }
 
     /// Flush up to `limit` entries stored without an fsync: every blob and
