@@ -13772,3 +13772,113 @@ fn deferred_checkpoints_raise_the_threshold_and_the_daemon_checkpoints() {
     assert!(frames > 0);
     assert_eq!(frames, copied);
 }
+
+/// The stamp of an hour-old entry, read back.
+fn access_of(store: &Store, key: &str) -> (i64, i64) {
+    store
+        .db
+        .query_row(
+            "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), hit_count \
+             FROM entries WHERE cache_key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// N3: a hit whose stamp is due hands it to the sink and writes nothing, so
+/// a writer holding the index's write lock does not hold the hit (it waited
+/// up to `HIT_STAMP_BUSY_WAIT`, 2.8-6.2 % of hits in busy minutes, and then
+/// lost the stamp).
+#[test]
+fn a_hit_hands_its_due_stamp_to_the_sink_and_waits_for_no_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, config) = store_with_one_evictable_entry(dir.path(), "sunk");
+    let taken = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink_taken = std::sync::Arc::clone(&taken);
+    store.send_hit_stamps_to(Box::new(move |key| {
+        sink_taken.lock().unwrap().push(key.to_string());
+        true
+    }));
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let started = std::time::Instant::now();
+    let meta = store.get("sunk").unwrap().expect("served");
+    let waited = started.elapsed();
+    writer.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(meta.cache_key, "sunk");
+    assert!(
+        waited < HIT_STAMP_BUSY_WAIT / 2,
+        "the hit waited {waited:?} for the writer"
+    );
+    assert_eq!(*taken.lock().unwrap(), vec!["sunk".to_string()]);
+    let (age, hits) = access_of(&store, "sunk");
+    assert!(age >= 3500, "the hit wrote its own stamp (age {age} s)");
+    assert_eq!(hits, 0);
+}
+
+/// A stamp the sink refuses (no daemon, an older one) is written by the
+/// hit, as without a sink; a fresh stamp is not handed off at all.
+#[test]
+fn a_hit_stamps_the_index_itself_when_the_sink_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _config) = store_with_one_evictable_entry(dir.path(), "refused");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink_calls = std::sync::Arc::clone(&calls);
+    store.send_hit_stamps_to(Box::new(move |_| {
+        sink_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        false
+    }));
+
+    store.get("refused").unwrap().expect("served");
+    let (age, hits) = access_of(&store, "refused");
+    assert!(age < 60, "stamped by the hit (age {age} s)");
+    assert_eq!(hits, 1);
+
+    store.get("refused").unwrap().expect("served");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a fresh stamp is not due, so nothing is handed off"
+    );
+    assert_eq!(access_of(&store, "refused").1, 1);
+}
+
+#[test]
+fn stamp_hits_writes_access_times_and_adds_the_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _config) = store_with_one_evictable_entry(dir.path(), "batched");
+
+    store
+        .stamp_hits(&[("batched".to_string(), 3), ("gone".to_string(), 1)])
+        .unwrap();
+
+    let (age, hits) = access_of(&store, "batched");
+    assert!(age < 60, "stamped (age {age} s)");
+    assert_eq!(hits, 3);
+    assert!(!store.contains("gone"), "a key no longer stored stays absent");
+}
+
+/// A stamp taken and not yet written pins its entry against eviction like
+/// a written one: the hit may be restoring the entry's blobs right now.
+#[test]
+fn eviction_keeps_an_entry_whose_stamp_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _config) = store_with_one_evictable_entry(dir.path(), "pending");
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(vec!["pending".to_string()]));
+    let pins = std::sync::Arc::clone(&pending);
+    store.pin_entries_with(std::sync::Arc::new(move |key: &str| {
+        pins.lock().unwrap().iter().any(|k| k == key)
+    }));
+
+    let stats = store.evict().unwrap();
+    assert_eq!(stats.entries_evicted, 0, "a pending stamp pins the entry");
+    assert!(store.contains("pending"));
+
+    pending.lock().unwrap().clear();
+    let stats = store.evict().unwrap();
+    assert_eq!(stats.entries_evicted, 1, "unpinned, the old entry goes");
+    assert!(!store.contains("pending"));
+}

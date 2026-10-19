@@ -1001,11 +1001,16 @@ fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
 fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Vec<Store>)> {
     crate::link::set_mapped_target(config.volume_store_for(route).is_some());
     let routed = config.routed_for_path(route);
-    let primary = Store::open(&routed)?;
+    let mut primary = Store::open(&routed)?;
     let mut fallbacks = Vec::new();
-    if !volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
+    if volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
+        send_hit_stamps_to_daemon(config, &mut primary);
+    } else {
         match Store::open(config) {
-            Ok(store) => fallbacks.push(store),
+            Ok(mut store) => {
+                send_hit_stamps_to_daemon(config, &mut store);
+                fallbacks.push(store);
+            }
             Err(e) => tracing::warn!(
                 "main store unavailable for volume-shard fallback ({}): {e:#}",
                 config.cache_dir.display()
@@ -1014,6 +1019,23 @@ fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Ve
     }
     fallbacks.extend(open_readonly_store(config));
     Ok((primary, fallbacks))
+}
+
+/// Hand the main store's hit stamps to the daemon, so a hit never waits for
+/// the index's write lock to stamp its access time (`Store::get`). The
+/// daemon stamps only its own store (a volume shard's hits stamp the shard
+/// themselves), and with no daemon the hit stamps the index itself.
+pub(crate) fn send_hit_stamps_to_daemon(config: &Config, store: &mut Store) {
+    #[cfg(unix)]
+    {
+        let socket = config.socket_path();
+        let cache_dir = config.cache_dir.clone();
+        store.send_hit_stamps_to(Box::new(move |key| {
+            crate::daemon::send_hit_stamp(&socket, &cache_dir, key)
+        }));
+    }
+    #[cfg(not(unix))]
+    let _ = (config, store);
 }
 
 /// Retry budget for a busy store index, including time spent in lookups.

@@ -15129,3 +15129,171 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     .unwrap()
     .unwrap();
 }
+
+fn put_aged_entry(config: &Config, dir: &Path, key: &str) {
+    let src_file = dir.join(format!("{key}.rlib"));
+    std::fs::write(&src_file, vec![0u8; 200]).unwrap();
+    let store = Store::open(config).unwrap();
+    store
+        .put(
+            key,
+            "testcrate",
+            &["lib".into()],
+            &[],
+            "host",
+            "dev",
+            &[(src_file.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src_file);
+    store.set_last_accessed_for_test(key, "-1 hour");
+}
+
+fn access_of(config: &Config, key: &str) -> (i64, i64) {
+    rusqlite::Connection::open(config.index_db_path())
+        .unwrap()
+        .query_row(
+            "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), hit_count \
+             FROM entries WHERE cache_key = ?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn stamp_request(config: &Config, keys: &[&str]) -> StampHitsRequest {
+    StampHitsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        keys: keys.iter().map(|k| k.to_string()).collect(),
+    }
+}
+
+/// N3: a stamp the daemon took pins its entry until it is written, and a
+/// sweep writes the stamps taken so far before it ranks entries, so an
+/// hour-old entry a build just hit survives a sweep that wants its space.
+#[test]
+fn hit_stamps_pin_their_entries_until_written_and_sweeps_write_them_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    put_aged_entry(&config, dir.path(), "hit-key");
+    config.max_size = 100;
+    let daemon = Daemon::new(config.clone());
+
+    let resp = daemon.handle_stamp_hits(&stamp_request(&config, &["hit-key", "hit-key"]));
+    assert!(resp.ok, "{:?}", resp.error);
+    assert!(daemon.pending_pins()("hit-key"));
+    assert!(!daemon.pending_pins()("other-key"));
+    assert!(access_of(&config, "hit-key").0 >= 3500, "not written yet");
+
+    let stats = daemon
+        .run_gc(
+            GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            },
+            GcDriver::Requested,
+        )
+        .unwrap();
+    assert_eq!(stats.total.entries_evicted, 0, "the hit's entry stays");
+    let (age, hits) = access_of(&config, "hit-key");
+    assert!(age < 60, "the sweep wrote the stamp first (age {age} s)");
+    assert_eq!(hits, 2);
+    assert!(!daemon.pending_pins()("hit-key"), "written, so no longer pending");
+}
+
+/// Stamps written by the tick leave the pending set; a batch the index
+/// refuses stays pending (and pinned) for the next tick.
+#[test]
+fn hit_stamps_stay_pending_while_the_index_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    put_aged_entry(&config, dir.path(), "busy-key");
+    let daemon = Daemon::new(config.clone());
+    assert!(daemon.handle_stamp_hits(&stamp_request(&config, &["busy-key"])).ok);
+
+    // Open the stamp connection first, then hold the write lock longer
+    // than its busy timeout would allow a test to wait: use a short one.
+    daemon.flush_hit_stamps();
+    assert!(!daemon.pending_pins()("busy-key"));
+    assert!(daemon.handle_stamp_hits(&stamp_request(&config, &["busy-key"])).ok);
+    {
+        let store = daemon.stamp_store.get().unwrap().lock().unwrap();
+        store.set_busy_timeout_for_test(std::time::Duration::from_millis(20));
+    }
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    daemon.flush_hit_stamps();
+    assert!(daemon.pending_pins()("busy-key"), "refused, still pending");
+    writer.execute_batch("COMMIT").unwrap();
+    daemon.flush_hit_stamps();
+    assert!(!daemon.pending_pins()("busy-key"));
+    assert_eq!(access_of(&config, "busy-key").1, 2);
+}
+
+#[test]
+fn hit_stamps_for_another_store_or_past_the_queue_bound_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+
+    let mut other = stamp_request(&config, &["k"]);
+    other.cache_dir = dir.path().join("elsewhere").to_string_lossy().into_owned();
+    assert!(!daemon.handle_stamp_hits(&other).ok);
+    assert!(!daemon.pending_pins()("k"));
+
+    let keys: Vec<String> = (0..MAX_PENDING_HIT_STAMPS).map(|n| format!("k{n}")).collect();
+    let full = StampHitsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        keys,
+    };
+    assert!(daemon.handle_stamp_hits(&full).ok);
+    assert!(
+        !daemon.handle_stamp_hits(&stamp_request(&config, &["one-more"])).ok,
+        "a full queue sends the hit back to stamping the index itself"
+    );
+}
+
+/// The wrapper's side: a stamp counts as handed off only when a daemon took
+/// it (or may have: no answer in time). No daemon, or one that refuses it
+/// (an older release answers an unknown request with an error), leaves the
+/// stamp to the hit.
+#[cfg(unix)]
+#[test]
+fn a_hit_stamp_is_handed_off_only_to_a_daemon_that_takes_it() {
+    use std::io::{BufRead, Write};
+    use interprocess::local_socket::traits::ListenerExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    assert!(!send_hit_stamp(&dir.path().join("none.sock"), &cache_dir, "k"));
+
+    let answer = |reply: Option<&'static str>| {
+        let socket = fresh_endpoint(&dir.path().join("daemon.sock"));
+        let listener = bind_sync_listener(&socket);
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.incoming().next().unwrap().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            assert!(line.contains("stamp_hits"), "{line}");
+            match reply {
+                Some(reply) => stream.write_all(reply.as_bytes()).unwrap(),
+                None => std::thread::sleep(std::time::Duration::from_millis(300)),
+            }
+        });
+        let started = std::time::Instant::now();
+        let taken = send_hit_stamp(&socket, &cache_dir, "k");
+        let waited = started.elapsed();
+        server.join().unwrap();
+        (taken, waited)
+    };
+    let refused = serde_json::to_string(&Response::err("invalid request: unknown variant")).unwrap() + "\n";
+    let ok = serde_json::to_string(&Response::ok()).unwrap() + "\n";
+    assert!(!answer(Some(Box::leak(refused.into_boxed_str()))).0, "an older daemon refuses");
+    assert!(answer(Some(Box::leak(ok.into_boxed_str()))).0, "a daemon that takes it");
+    let (taken, waited) = answer(None);
+    assert!(taken, "no answer in time: the daemon may hold it");
+    assert!(
+        waited < std::time::Duration::from_millis(250),
+        "the hit waited {waited:?}"
+    );
+}

@@ -1159,7 +1159,25 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     eviction_pacing: (Duration, Duration),
     /// Opened by [`Self::open_read_only`]: lookups and restores only.
     read_only: bool,
+    /// Where [`Self::get`] sends a hit's access stamp instead of writing it
+    /// ([`Self::send_hit_stamps_to`]).
+    hit_stamps: Option<HitStampSink>,
+    /// Entries whose access stamp someone holds and has not written yet
+    /// ([`Self::pin_entries_with`]); eviction keeps them like freshly
+    /// stamped ones.
+    pending_pins: Option<PendingPins>,
 }
+
+/// Takes a hit's access stamp off the hit path: called with the entry's key
+/// when [`ArtifactStore::get`] would stamp it, and returns `true` when it has
+/// taken the stamp and will write it ([`ArtifactStore::stamp_hits`]), so the
+/// hit writes nothing. `false` makes the hit stamp the index itself.
+pub type HitStampSink = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Says whether an entry's access stamp is taken but not yet written: such an
+/// entry may be mid-restore, so eviction must keep it
+/// ([`ArtifactStore::pin_entries_with`]).
+pub type PendingPins = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// How recently an entry must have been accessed for eviction to treat it as
 /// "pinned by a live build" and skip it (kunobi-ninja/kache#326, #182).
@@ -2261,6 +2279,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
             read_only: false,
+            hit_stamps: None,
+            pending_pins: None,
         };
 
         // A quarantined index comes back empty, but the blobs and every entry's
@@ -2348,6 +2368,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
             read_only: true,
+            hit_stamps: None,
+            pending_pins: None,
         })
     }
 
@@ -2644,7 +2666,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // seconds (and this lookup failing busy was retried for up to 30 s).
         // A hit that cannot stamp still restores; it only counts one hit
         // fewer and keeps its older access time.
-        if age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64) {
+        //
+        // With a sink ([`Self::send_hit_stamps_to`]) the stamp leaves the hit
+        // path altogether: the sink holds it, pins the entry against its own
+        // sweeps until it is written, and writes it in a batch.
+        if age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64)
+            && !self.hit_stamps.as_ref().is_some_and(|sink| sink(cache_key))
+        {
             let _ = self.db.busy_timeout(HIT_STAMP_BUSY_WAIT);
             let stamped = self.db.execute(
                 "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 \
@@ -2661,6 +2689,45 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
 
         Ok(Some(meta))
+    }
+
+    /// Send the access stamps of this store's hits to `sink` instead of
+    /// writing them on the hit path ([`HitStampSink`]). The sink must write
+    /// them to this store's index ([`Self::stamp_hits`]) and pin them against
+    /// its own sweeps meanwhile ([`Self::pin_entries_with`]).
+    pub fn send_hit_stamps_to(&mut self, sink: HitStampSink) {
+        self.hit_stamps = Some(sink);
+    }
+
+    /// Keep the entries `pending` names, as if stamped just now, in this
+    /// store's eviction sweeps: their stamps are taken and not written yet.
+    pub fn pin_entries_with(&mut self, pending: PendingPins) {
+        self.pending_pins = Some(pending);
+    }
+
+    /// Write access stamps that hits handed off ([`HitStampSink`]): each key
+    /// gets `last_accessed = now` and its hits added to `hit_count`, in one
+    /// transaction. A key no longer in the index is skipped.
+    pub fn stamp_hits(&self, hits: &[(String, u32)]) -> Result<()> {
+        self.refuse_write("stamp hits")?;
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        {
+            let mut stamp = tx.prepare_cached(
+                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + ?2 \
+                 WHERE cache_key = ?1",
+            )?;
+            for (key, count) in hits {
+                stamp.execute(params![key, i64::from(*count)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Acquire a build lock for a cache key. Returns None if another process holds it.
@@ -6425,7 +6492,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 params![cache_key, format!("-{} seconds", grace.as_secs())],
                 |row| row.get(0),
             )?;
-            if recently_accessed != 0 {
+            // A stamp taken and not yet written pins the entry the same way.
+            if recently_accessed != 0
+                || self
+                    .pending_pins
+                    .as_ref()
+                    .is_some_and(|pending| pending(cache_key))
+            {
                 return Ok(RemovalAttempt::Done(None));
             }
         }
@@ -6625,6 +6698,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 params![cache_key],
             )
             .expect("test entry row insert");
+    }
+
+    /// Test-only: how long this connection waits for a lock held elsewhere.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_busy_timeout_for_test(&self, wait: Duration) {
+        self.db.busy_timeout(wait).unwrap();
     }
 
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
