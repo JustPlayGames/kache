@@ -1263,6 +1263,177 @@ fn zero_byte_refusal_cleans_up_staged_snapshot() {
     }
 }
 
+/// Snapshots staged beside their blob that are still in the shards.
+fn shard_stage_leftovers(store: &Store) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Ok(shards) = fs::read_dir(store.config.store_dir().join("blobs")) {
+        for shard in shards.flatten() {
+            for file in fs::read_dir(shard.path()).unwrap().flatten() {
+                if file.file_name().to_string_lossy().starts_with(SHARD_STAGE_PREFIX) {
+                    found.push(file.path());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A put stages each output in the shard its blob goes to, so publishing
+/// is a rename within that directory: nothing goes through `staging/`,
+/// whose renames into a shard take the filesystem-wide rename lock.
+#[test]
+fn put_stages_beside_the_blob_and_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let rlib = dir.path().join("libout.rlib");
+    fs::write(&rlib, b"rlib bytes staged beside their blob").unwrap();
+    let rmeta = dir.path().join("libout.rmeta");
+    fs::write(&rmeta, b"rmeta bytes staged beside their blob").unwrap();
+    store
+        .put(
+            "beside_key",
+            "out",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[
+                (rlib.clone(), "libout.rlib".to_string()),
+                (rmeta, "libout.rmeta".to_string()),
+            ],
+            "",
+            "",
+        )
+        .unwrap();
+
+    assert!(
+        !store.staging_dir().exists(),
+        "a put whose outputs are readable never stages in staging/"
+    );
+    assert!(shard_stage_leftovers(&store).is_empty());
+    let hash = crate::file_hash::hash_file(&rlib).unwrap();
+    assert_eq!(
+        fs::read(store.blob_path(&hash)).unwrap(),
+        b"rlib bytes staged beside their blob"
+    );
+}
+
+/// An output that changes between the digest read up front and its
+/// snapshot is staged in the wrong shard. The snapshot's own digest still
+/// decides where it is published, and the wrong shard keeps nothing.
+#[test]
+fn a_snapshot_staged_in_the_wrong_shard_is_published_under_its_own_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let source = dir.path().join("out.rlib");
+    fs::write(&source, b"changed after its digest was read").unwrap();
+    let stale = "ab".repeat(32);
+    let (staged, ingest) = store.stage_blob_beside(&source, false, &stale).unwrap();
+    assert_eq!(staged.parent(), store.blob_path(&stale).parent());
+    assert!(
+        staged
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(SHARD_STAGE_PREFIX)
+    );
+
+    let hash = crate::file_hash::hash_file(&staged).unwrap();
+    assert_ne!(hash, stale);
+    let size = fs::metadata(&staged).unwrap().len();
+    assert!(store.publish_staged_blob(&staged, ingest, &hash, size).unwrap());
+    assert_eq!(
+        fs::read(store.blob_path(&hash)).unwrap(),
+        b"changed after its digest was read"
+    );
+    assert!(!store.blob_path(&stale).exists());
+    assert!(shard_stage_leftovers(&store).is_empty());
+}
+
+/// A put killed between staging beside its blob and publishing leaves a
+/// dot-named snapshot in the shard. The staging sweep reclaims it once it
+/// is past the grace; blobs, other temps and fresh snapshots stay.
+#[test]
+fn staging_sweep_reclaims_old_snapshots_in_the_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let hash = "cd".repeat(32);
+    let blob = store.blob_path(&hash);
+    let shard = blob.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(&blob, b"a blob").unwrap();
+    let stale = shard.join(format!("{SHARD_STAGE_PREFIX}1-0.tmp"));
+    let fresh = shard.join(format!("{SHARD_STAGE_PREFIX}1-1.tmp"));
+    let other = shard.join(format!(".{hash}.1.0.tmp"));
+    for path in [&stale, &fresh, &other] {
+        fs::write(path, b"snapshot").unwrap();
+    }
+    let old = filetime::FileTime::from_unix_time(0, 0);
+    for path in [&stale, &other] {
+        filetime::set_file_mtime(path, old).unwrap();
+    }
+    filetime::set_file_mtime(&blob, old).unwrap();
+
+    let stats = store.sweep_stale_staging(Duration::from_secs(3600));
+    assert_eq!(stats.removed, 1);
+    assert!(!stale.exists());
+    assert!(fresh.exists(), "an in-flight snapshot survives");
+    assert!(other.exists(), "only staged snapshots are the staging sweep's");
+    assert!(blob.exists(), "blobs are never the staging sweep's");
+}
+
+/// A staged snapshot is never a blob to the orphan sweep: its name is not
+/// a hash, so an in-flight put's snapshot is not reclaimed under it.
+#[test]
+fn orphan_sweep_leaves_snapshots_staged_in_the_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let shard = store.blob_path(&"ef".repeat(32)).parent().unwrap().to_path_buf();
+    fs::create_dir_all(&shard).unwrap();
+    let staged = shard.join(format!("{SHARD_STAGE_PREFIX}1-0.tmp"));
+    fs::write(&staged, b"snapshot").unwrap();
+    filetime::set_file_mtime(&staged, filetime::FileTime::from_unix_time(0, 0)).unwrap();
+
+    store.sweep_orphan_blobs(Duration::ZERO).unwrap();
+    assert!(staged.exists());
+}
+
+/// A leftover that shares an inode with a blob (a hardlink ingest of an
+/// output that was itself restored from the store) is removed without
+/// making the blob writable.
+#[cfg(unix)]
+#[test]
+fn staging_sweep_leaves_a_blob_sharing_a_leftover_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let source = dir.path().join("out.rlib");
+    fs::write(&source, b"restored then staged").unwrap();
+    let (staged, _ingest) = store.stage_blob_from_source(&source, false).unwrap();
+    let hash = crate::file_hash::hash_file(&staged).unwrap();
+    let blob = store.blob_path(&hash);
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::hard_link(&staged, &blob).unwrap();
+    set_blob_readonly(&blob);
+
+    let stats = store.sweep_stale_staging(Duration::ZERO);
+    assert_eq!(stats.removed, 1);
+    assert!(!staged.exists());
+    assert!(
+        fs::metadata(&blob).unwrap().permissions().readonly(),
+        "the sweep made a published blob writable"
+    );
+}
+
 /// Publishing onto an already-present blob discards the staged snapshot
 /// and reports `false` — same-digest means same-bytes, so losing the
 /// publish race is benign and must not double-count ingest.
