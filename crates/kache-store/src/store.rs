@@ -310,6 +310,33 @@ fn source_hardlink_allowed<P: ArtifactPolicy>(
     allow_source_hardlinks && hardlink_eligible::<P>(store_name, executable)
 }
 
+/// Whether an executable output may share its inode with its blob
+/// ([`ArtifactPolicy::allow_executable_hardlink`]). Unix only: NTFS keeps the
+/// read-only attribute in the record every link shares, and Windows refuses
+/// to delete or replace a read-only file.
+fn executable_hardlink_eligible<P: ArtifactPolicy>(
+    allow_source_hardlinks: bool,
+    store_name: &str,
+    executable: bool,
+    crate_types: &[String],
+) -> bool {
+    allow_source_hardlinks
+        && executable
+        && cfg!(unix)
+        && P::allow_executable_hardlink(store_name, crate_types)
+}
+
+/// Whether a hit must make sure the blob of `file` still holds its bytes
+/// before they are restored: an executable that may have been stored by
+/// hardlink ([`executable_hardlink_eligible`]) shares its inode with a build
+/// output, which a writer that ignores the read-only bit could rewrite.
+fn blob_may_share_an_executable<P: ArtifactPolicy>(
+    file: &CachedFile,
+    crate_types: &[String],
+) -> bool {
+    executable_hardlink_eligible::<P>(true, &file.name, file.executable, crate_types)
+}
+
 /// How a new blob was staged into the store before publish. Counters are
 /// recorded only when this call actually publishes (`atomic_write_and_replace`
 /// returns `true`); a concurrent winner already accounted for their ingest,
@@ -763,6 +790,27 @@ fn paths_share_inode(a: &Path, b: &Path) -> bool {
 
 fn metadata_is_readonly_regular(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file() && metadata.permissions().readonly()
+}
+
+/// After a hardlink snapshot that was not published, give `source` back the
+/// `permissions` it had before the snapshot made it read-only, unless it
+/// shares its inode with the published `blob` (read-only is then the shared
+/// state, as after a hardlink restore). Discarding the snapshot may have made
+/// the shared inode writable for everyone on the way out.
+fn restore_source_permissions_if_unshared(
+    source: &Path,
+    blob: Option<&Path>,
+    permissions: &fs::Permissions,
+) {
+    if blob.is_some_and(|blob| paths_share_inode(source, blob)) {
+        return;
+    }
+    if let Err(error) = fs::set_permissions(source, permissions.clone()) {
+        tracing::debug!(
+            "could not restore the mode of {} after an unpublished snapshot: {error}",
+            source.display()
+        );
+    }
 }
 
 /// After a hardlink ingest that did not publish, clear read-only on `source`
@@ -2423,8 +2471,41 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             {
                 return Ok(None);
             }
+            if !verify_content
+                && blob_may_share_an_executable::<P>(cached_file, &meta.crate_types)
+                && !self.shared_blob_holds(&blob, &cached_file.hash)
+            {
+                return Ok(None);
+            }
         }
         Ok(Some(meta))
+    }
+
+    /// Whether `blob`, which may share its inode with a build output
+    /// ([`ArtifactPolicy::allow_executable_hardlink`]), still holds `hash`'s
+    /// bytes. A writer that ignores the read-only bit changes the inode's
+    /// ctime, which nothing can set back, so the file-hash memo's row for the
+    /// blob's exact fingerprint vouches for it without a read. Otherwise the
+    /// blob is read; when it matches and its fingerprint had settled and did
+    /// not move during the read, the row is written for the next hit (with a
+    /// short wait: a busy index only costs that hit the read again).
+    fn shared_blob_holds(&self, blob: &Path, hash: &str) -> bool {
+        let observed = crate::file_hash::wall_clock_ns();
+        let Ok(before) = crate::file_hash::FileFingerprint::from_path(blob) else {
+            return false;
+        };
+        if self.file_hash_at(&before).as_deref() == Some(hash) {
+            return true;
+        }
+        if !matches!(crate::file_hash::hash_file(blob), Ok(ref actual) if actual == hash) {
+            return false;
+        }
+        if crate::file_hash::stamp_is_settled(&before, observed)
+            && crate::file_hash::FileFingerprint::from_path(blob).is_ok_and(|after| after == before)
+        {
+            self.record_verified_file_hashes(&[(before, hash)]);
+        }
+        true
     }
 
     /// Persistent-cache lookup for one file's content hash — DB read only, no
@@ -2647,6 +2728,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         return Ok(None);
                     }
                 }
+            } else if blob_may_share_an_executable::<P>(cached_file, &meta.crate_types)
+                && !self.shared_blob_holds(&blob, &cached_file.hash)
+            {
+                tracing::warn!(
+                    "cache entry {} file {}: its blob shares an inode with a build output \
+                     and no longer holds its bytes, evicting",
+                    cache_key.get(..16).unwrap_or(cache_key),
+                    cached_file.name,
+                );
+                let _ = self.remove_entry(cache_key);
+                return Ok(None);
             }
         }
 
@@ -2961,11 +3053,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // A failed stat is an error rather than a silent `false`, because
             // `false` is precisely the wrong value this guards against — and
             // staging opens the same path one line below regardless.
-            let executable = fs::metadata(source_path)
-                .map(|meta| crate::filesystem::is_executable(&meta))
+            let source_meta = fs::metadata(source_path)
                 .with_context(|| format!("stating compiler output for {store_name}"))?;
+            let executable = crate::filesystem::is_executable(&source_meta);
             let use_source_hardlink =
-                source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable);
+                source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable)
+                    || executable_hardlink_eligible::<P>(
+                        allow_source_hardlinks,
+                        store_name,
+                        executable,
+                        crate_types,
+                    );
+            // A hardlinked snapshot turns the output read-only with it. When
+            // the snapshot is not what gets published, the output gets back
+            // the mode it had, not a guess at it.
+            let source_permissions = source_meta.permissions();
 
             // The output's digest, read before any snapshot. When a blob
             // already holds these bytes there is nothing to stage or publish:
@@ -3004,10 +3106,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
                 None => self.stage_blob_from_source(source_path, use_source_hardlink)?,
             };
+            let unshare = |blob: Option<&Path>| {
+                if matches!(ingest, StoreIngest::Hardlink) {
+                    restore_source_permissions_if_unshared(source_path, blob, &source_permissions);
+                }
+            };
             let staged_meta = match fs::metadata(&staged) {
                 Ok(meta) => meta,
                 Err(e) => {
                     Self::discard_staged_blob(&staged);
+                    unshare(None);
                     return Err(anyhow::Error::new(e)
                         .context(format!("stating staged blob for {store_name}")));
                 }
@@ -3015,6 +3123,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let size = staged_meta.len();
             if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
                 Self::discard_staged_blob(&staged);
+                unshare(None);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
             total_size += size;
@@ -3029,7 +3138,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
 
-            self.publish_staged_blob(&staged, ingest, &hash, size)?;
+            if !self.publish_staged_blob(&staged, ingest, &hash, size)? {
+                unshare(Some(&self.blob_path(&hash)));
+            }
 
             cached_files.push(CachedFile {
                 name: store_name.clone(),

@@ -13883,6 +13883,205 @@ fn eviction_keeps_an_entry_whose_stamp_is_pending() {
     assert!(!store.contains("pending"));
 }
 
+// ── test binaries stored by hardlink (tasty.17) ─────────────────────
+
+/// [`TestPolicy`], plus executables that may share their inode with their
+/// blob: an entry with no crate type, as Cargo compiles a test.
+struct TestBinaryPolicy;
+impl ArtifactPolicy for TestBinaryPolicy {
+    fn allow_hardlink(name: &str) -> bool {
+        TestPolicy::allow_hardlink(name)
+    }
+    fn allow_empty(name: &str, kinds: &[String]) -> bool {
+        TestPolicy::allow_empty(name, kinds)
+    }
+    fn emit_kind(name: &str) -> Option<&'static str> {
+        TestPolicy::emit_kind(name)
+    }
+    fn stable_after_store(name: &str) -> bool {
+        TestPolicy::stable_after_store(name)
+    }
+    fn allow_executable_hardlink(name: &str, crate_types: &[String]) -> bool {
+        crate_types.is_empty() && !name.contains('.')
+    }
+}
+type TestBinaryStore = ArtifactStore<TestBinaryPolicy>;
+
+#[cfg(unix)]
+fn put_executable(store: &TestBinaryStore, key: &str, output: &Path, crate_types: &[String]) {
+    store
+        .put(
+            key,
+            "tbin",
+            crate_types,
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(
+                output.to_path_buf(),
+                output.file_name().unwrap().to_str().unwrap().to_string(),
+            )],
+            "",
+            "",
+        )
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_test_binary_is_stored_by_hardlink_and_keeps_its_execute_bits() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("tbin-0123456789abcdef");
+    fs::write(&output, b"\x7fELF test binary bytes").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let _force = ForceStoreHardlink::enable();
+    let copied = crate::opcounts::store_copied_bytes();
+    put_executable(&store, "tbin-entry", &output, &[]);
+
+    let meta = store.get("tbin-entry").unwrap().unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    assert!(meta.files[0].executable);
+    assert_eq!(
+        fs::metadata(&blob).unwrap().ino(),
+        fs::metadata(&output).unwrap().ino(),
+        "a test binary must be stored by hardlink, not copied"
+    );
+    assert_eq!(crate::opcounts::store_copied_bytes(), copied);
+    let mode = fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o222,
+        0,
+        "the shared inode must be read-only: {mode:o}"
+    );
+    assert_eq!(mode & 0o111, 0o111, "the test must still run: {mode:o}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_executable_with_a_crate_type_is_still_copied() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("app-0123456789abcdef");
+    fs::write(&output, b"\x7fELF a binary that ships").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let _force = ForceStoreHardlink::enable();
+    put_executable(&store, "bin-entry", &output, &["bin".to_string()]);
+
+    let meta = store.get("bin-entry").unwrap().unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    assert_ne!(
+        fs::metadata(&blob).unwrap().ino(),
+        fs::metadata(&output).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+/// A writer that ignores the read-only bit (root, or anyone after a chmod)
+/// rewrites a test binary in place while its blob shares the inode. The hit
+/// must not serve those bytes under the old address.
+#[cfg(unix)]
+#[test]
+fn a_hit_evicts_a_test_binary_whose_shared_blob_was_rewritten_in_place() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("tbin-fedcba9876543210");
+    fs::write(&output, b"\x7fELF original test bytes").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+    put_executable(&store, "rewritten-entry", &output, &[]);
+    let meta = store.stored_meta("rewritten-entry").unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+
+    // The shared state, however the store took the snapshot: a name outside
+    // the store on the blob's inode, then an in-place write of the same size.
+    let outside = dir.path().join("strip-target");
+    fs::hard_link(&blob, &outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut file = fs::OpenOptions::new().write(true).open(&outside).unwrap();
+    file.write_all(b"\x7fELF stripped test bytes").unwrap();
+    drop(file);
+
+    assert!(
+        store.get("rewritten-entry").unwrap().is_none(),
+        "a blob rewritten through a shared inode must not be served"
+    );
+    assert!(!store.contains("rewritten-entry"), "the entry is evicted");
+}
+
+/// Once a hit has read a shared test binary's blob and found its bytes, the
+/// memo vouches for that exact fingerprint, so later hits skip the read.
+#[cfg(unix)]
+#[test]
+fn a_shared_test_binary_blob_read_once_is_vouched_for_by_the_memo() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("tbin-00112233445566778899");
+    // Past the memo's size floor.
+    fs::write(&output, vec![7u8; 128 * 1024]).unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+    let _force = ForceStoreHardlink::enable();
+    put_executable(&store, "vouched-entry", &output, &[]);
+    let meta = store.stored_meta("vouched-entry").unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    let fingerprint = crate::file_hash::FileFingerprint::from_path(&blob).unwrap();
+    assert_eq!(store.file_hash_at(&fingerprint), None);
+
+    // Unsettled (changed just now): read, but not recorded.
+    assert!(store.get("vouched-entry").unwrap().is_some());
+    assert_eq!(store.file_hash_at(&fingerprint), None);
+
+    std::thread::sleep(std::time::Duration::from_nanos(
+        crate::file_hash::HASH_SETTLE_NS as u64 + 100_000_000,
+    ));
+    assert!(store.get("vouched-entry").unwrap().is_some());
+    assert_eq!(
+        store.file_hash_at(&fingerprint).as_deref(),
+        Some(meta.files[0].hash.as_str())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unpublished_hardlinked_snapshot_gives_the_output_its_own_mode_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("tbin-out");
+    fs::write(&output, b"bytes").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o750)).unwrap();
+    let before = fs::metadata(&output).unwrap().permissions();
+    // Read-only through the snapshot, then writable for everyone by the
+    // discard (`unlink_blob`), as a lost race leaves it.
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let blob = dir.path().join("blob");
+    fs::write(&blob, b"bytes").unwrap();
+    restore_source_permissions_if_unshared(&output, Some(&blob), &before);
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+
+    // Still sharing the published blob: read-only stays.
+    let shared = dir.path().join("shared-blob");
+    fs::hard_link(&output, &shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o550)).unwrap();
+    restore_source_permissions_if_unshared(&output, Some(&shared), &before);
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o550
+    );
+}
+
 /// Removing an entry whose blob a build output still links (a test binary
 /// stored by hardlink, an rlib restored by one) must not leave that output
 /// writable for everyone: the mode is the inode's, shared by both names.

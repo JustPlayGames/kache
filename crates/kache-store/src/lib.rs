@@ -29,4 +29,14 @@ pub trait ArtifactPolicy {
     fn allow_empty(name: &str, output_types: &[String]) -> bool;
     fn emit_kind(name: &str) -> Option<&'static str>;
     fn stable_after_store(name: &str) -> bool;
+    /// Whether the executable `name` of an entry compiled as `crate_types` may
+    /// be stored by hardlink where the filesystem has no reflink, sharing the
+    /// read-only inode with the build output. Only an executable nothing
+    /// rewrites in place qualifies. Such a blob is content-checked on a hit
+    /// unless the file-hash memo vouches for its current fingerprint
+    /// ([`ArtifactStore::get`]): a writer that ignores the read-only bit (root,
+    /// or anyone after a chmod) could reach it through the output.
+    fn allow_executable_hardlink(_name: &str, _crate_types: &[String]) -> bool {
+        false
+    }
 }
