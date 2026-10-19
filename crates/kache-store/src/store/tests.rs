@@ -1320,6 +1320,55 @@ fn put_stages_beside_the_blob_and_leaves_nothing_behind() {
     );
 }
 
+/// An output whose bytes are already a blob is neither staged nor
+/// published: the entry references the blob, and the output keeps its
+/// inode and mode (staging it hardlinked it, made it read-only and then
+/// writable for everyone when the lost race discarded the snapshot).
+#[cfg(unix)]
+#[test]
+fn put_of_bytes_already_in_the_store_stages_nothing() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let put = |key: &str, path: &Path| {
+        store
+            .put(
+                key,
+                "out",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(path.to_path_buf(), "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap()
+    };
+
+    let first = dir.path().join("first.rlib");
+    fs::write(&first, b"the same output twice").unwrap();
+    put("first_key", &first);
+
+    let second = dir.path().join("second.rlib");
+    fs::write(&second, b"the same output twice").unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).unwrap();
+    let result = put("second_key", &second);
+    assert_eq!((result.duplicate_blobs, result.new_blobs), (1, 0));
+
+    let meta = fs::metadata(&second).unwrap();
+    assert_eq!(meta.nlink(), 1, "the output was linked into the store");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    assert!(shard_stage_leftovers(&store).is_empty());
+    let hash = crate::file_hash::hash_file(&second).unwrap();
+    assert_eq!(
+        fs::read(store.blob_path(&hash)).unwrap(),
+        b"the same output twice"
+    );
+}
+
 /// An output that changes between the digest read up front and its
 /// snapshot is staged in the wrong shard. The snapshot's own digest still
 /// decides where it is published, and the wrong shard keeps nothing.

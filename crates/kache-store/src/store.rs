@@ -2895,15 +2895,42 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let use_source_hardlink =
                 source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable);
 
-            // The output's digest read up front names the shard its snapshot
-            // is staged in (`stage_blob_beside`); the snapshot's own digest
-            // below is still the address. An unreadable output stages in
-            // `staging/` as before.
-            let (staged, ingest) = match crate::file_hash::hash_file(source_path) {
-                Ok(predicted) => {
-                    self.stage_blob_beside(source_path, use_source_hardlink, &predicted)?
+            // The output's digest, read before any snapshot. When a blob
+            // already holds these bytes there is nothing to stage or publish:
+            // the entry references that blob, whose bytes are by its address
+            // exactly the ones just read (a snapshot would only be discarded
+            // as a lost race). Otherwise the digest names the shard the
+            // snapshot is staged in (`stage_blob_beside`), and the snapshot's
+            // own digest below is still the address. An unreadable output
+            // stages in `staging/` as before.
+            let predicted = crate::file_hash::hash_file(source_path).ok();
+            if let Some(hash) = &predicted
+                && let Ok(blob_meta) = fs::metadata(self.blob_path(hash))
+                && blob_meta.is_file()
+            {
+                let size = blob_meta.len();
+                if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
+                    anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
                 }
-                Err(_) => self.stage_blob_from_source(source_path, use_source_hardlink)?,
+                total_size += size;
+                if seen_output_blobs.insert(hash.clone()) {
+                    put_result.output_blobs += 1;
+                    put_result.duplicate_blobs += 1;
+                }
+                cached_files.push(CachedFile {
+                    name: store_name.clone(),
+                    size,
+                    hash: hash.clone(),
+                    executable,
+                });
+                sources.push((source_path.clone(), use_source_hardlink));
+                continue;
+            }
+            let (staged, ingest) = match &predicted {
+                Some(predicted) => {
+                    self.stage_blob_beside(source_path, use_source_hardlink, predicted)?
+                }
+                None => self.stage_blob_from_source(source_path, use_source_hardlink)?,
             };
             let staged_meta = match fs::metadata(&staged) {
                 Ok(meta) => meta,
