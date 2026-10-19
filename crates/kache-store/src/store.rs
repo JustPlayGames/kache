@@ -516,6 +516,12 @@ fn materialize_blob(source: &Path, blob: &Path, allow_hardlink: bool) -> Result<
 /// does not exist yet — see the warning there.
 static STAGE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Name prefix of a snapshot staged inside a blob shard
+/// ([`Store::stage_blob_beside`]). A dot name is never a blob hash, so the
+/// orphan sweep and every hash-named lookup pass it by; the staging sweep
+/// reclaims a leftover.
+const SHARD_STAGE_PREFIX: &str = ".stage-";
+
 /// How many nonces to try before giving up on finding a free staging name.
 /// Only stale leftovers from a crashed process whose pid has since been
 /// recycled can occupy one, so a handful of attempts is already generous;
@@ -2889,7 +2895,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let use_source_hardlink =
                 source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable);
 
-            let (staged, ingest) = self.stage_blob_from_source(source_path, use_source_hardlink)?;
+            // The output's digest read up front names the shard its snapshot
+            // is staged in (`stage_blob_beside`); the snapshot's own digest
+            // below is still the address. An unreadable output stages in
+            // `staging/` as before.
+            let (staged, ingest) = match crate::file_hash::hash_file(source_path) {
+                Ok(predicted) => {
+                    self.stage_blob_beside(source_path, use_source_hardlink, &predicted)?
+                }
+                Err(_) => self.stage_blob_from_source(source_path, use_source_hardlink)?,
+            };
             let staged_meta = match fs::metadata(&staged) {
                 Ok(meta) => meta,
                 Err(e) => {
@@ -4008,14 +4023,45 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         source: &Path,
         allow_hardlink: bool,
     ) -> Result<(PathBuf, StoreIngest)> {
-        let dir = self.staging_dir();
-        fs::create_dir_all(&dir)
+        self.stage_blob_in(source, allow_hardlink, &self.staging_dir(), "stage-")
+    }
+
+    /// [`Self::stage_blob_from_source`] into the shard directory `hash`'s
+    /// blob goes to, under a [`SHARD_STAGE_PREFIX`] name. `hash` is the
+    /// output's digest read before the snapshot: when the snapshot hashes the
+    /// same (the output did not change in between), publishing is a rename
+    /// within one directory, which on Linux takes only that directory's lock.
+    /// A rename from `staging/` into a shard takes the filesystem-wide rename
+    /// mutex for its whole run, journal waits included, and on a busy shared
+    /// volume every put queued behind every other cross-directory rename on
+    /// it (puts sat in `do_renameat2` for up to 50 s on the build machine).
+    /// The snapshot's own digest still decides the address, so an output
+    /// that changed only costs that one cross-directory rename.
+    fn stage_blob_beside(
+        &self,
+        source: &Path,
+        allow_hardlink: bool,
+        hash: &str,
+    ) -> Result<(PathBuf, StoreIngest)> {
+        let blob = self.blob_path(hash);
+        let shard = blob.parent().context("blob path has no shard directory")?;
+        self.stage_blob_in(source, allow_hardlink, shard, SHARD_STAGE_PREFIX)
+    }
+
+    fn stage_blob_in(
+        &self,
+        source: &Path,
+        allow_hardlink: bool,
+        dir: &Path,
+        prefix: &str,
+    ) -> Result<(PathBuf, StoreIngest)> {
+        fs::create_dir_all(dir)
             .with_context(|| format!("creating staging directory {}", dir.display()))?;
 
         // Unique by construction (pid + process-wide nonce), so the path can
         // be left free for the zero-copy ingests below.
         let pid = std::process::id();
-        let tmp = free_staging_path(|nonce| dir.join(format!("stage-{pid}-{nonce}.tmp")))
+        let tmp = free_staging_path(|nonce| dir.join(format!("{prefix}{pid}-{nonce}.tmp")))
             .with_context(|| format!("reserving a staging name in {}", dir.display()))?;
 
         let stage = |tmp: &Path, allow_hardlink: bool| -> Result<(StoreIngest, bool)> {
@@ -4059,7 +4105,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                             // tree and the cache are on different mounts.
                             crate::link::warn_hardlink_fallback_once(
                                 source,
-                                &self.staging_dir(),
+                                dir,
                                 io_reason,
                                 &io_err,
                             );
@@ -4097,7 +4143,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 // source writable if the blob never got published under it, and
                 // restage as an independent copy.
                 Self::drop_tmp_restore_source(source, &tmp);
-                self.stage_blob_from_source(source, false).map_err(|_| {
+                self.stage_blob_in(source, false, dir, prefix).map_err(|_| {
                     anyhow::anyhow!("read-only guard failed on hardlinked staging temp")
                 })
             }
@@ -4219,7 +4265,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Reclaim crash-orphaned staging files older than `min_age`. A put killed
+    /// Reclaim crash-orphaned staging files older than `min_age`, in `staging/`
+    /// and the snapshots staged beside their blob in the shards. A put killed
     /// between staging and publish leaves its snapshot here; unlike an orphaned
     /// blob it has no DB row to consult, so age is the only liveness signal —
     /// see [`STAGING_SWEEP_GRACE`] for why every caller wants the same one.
@@ -4228,12 +4275,39 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return OrphanSweepStats::default();
         }
         let mut stats = OrphanSweepStats::default();
-        let dir = self.staging_dir();
-        let Ok(entries) = fs::read_dir(&dir) else {
-            return stats;
-        };
         let now = std::time::SystemTime::now();
+        Self::sweep_stale_staging_in(&self.staging_dir(), |_| true, min_age, now, &mut stats);
+        // Snapshots staged beside their blob ([`Store::stage_blob_beside`]).
+        if let Ok(shards) = fs::read_dir(self.config.store_dir().join("blobs")) {
+            for shard in shards.flatten() {
+                Self::sweep_stale_staging_in(
+                    &shard.path(),
+                    |name| name.starts_with(SHARD_STAGE_PREFIX) && name.ends_with(".tmp"),
+                    min_age,
+                    now,
+                    &mut stats,
+                );
+            }
+        }
+        stats
+    }
+
+    /// Reclaim the files in `dir` whose name `wanted` accepts and that are
+    /// older than `min_age`.
+    fn sweep_stale_staging_in(
+        dir: &Path,
+        wanted: impl Fn(&str) -> bool,
+        min_age: Duration,
+        now: std::time::SystemTime,
+        stats: &mut OrphanSweepStats,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
+            if !entry.file_name().to_str().is_some_and(&wanted) {
+                continue;
+            }
             let Ok(meta) = entry.metadata() else { continue };
             if !meta.is_file() {
                 continue;
@@ -4252,6 +4326,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // that before unlinking. Counted only when the file is really gone,
             // so Windows sharing violations don't over-claim reclaimed bytes.
             let removed = (|| -> std::io::Result<()> {
+                // A leftover that shares its inode (a hardlink ingest of an
+                // output that is itself a restored blob) keeps its mode:
+                // clearing it would make every name on the inode writable,
+                // the blob included. Unix unlinks without it.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() > 1 {
+                        return fs::remove_file(entry.path());
+                    }
+                }
                 let mut perms = meta.permissions();
                 perms.set_readonly(false);
                 // Another account's temp in a shared store cannot be
@@ -4268,7 +4353,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 stats.bytes_reclaimed += size;
             }
         }
-        stats
     }
 
     /// Unlink key lock files nobody needs: no entry row for the key, unused
