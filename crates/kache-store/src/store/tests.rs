@@ -13492,3 +13492,37 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
         1
     );
 }
+
+/// A process that defers WAL checkpoints (a compiler wrapper) opens its
+/// index connections with the larger threshold; the daemon's passive
+/// checkpoint copies the log into the index.
+#[test]
+fn deferred_checkpoints_raise_the_threshold_and_the_daemon_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let before = Store::open(&config).unwrap();
+    let default: i64 = before
+        .db
+        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(default, 1000);
+
+    crate::defer_wal_checkpoints();
+    let wrapper = Store::open(&config).unwrap();
+    let deferred: i64 = wrapper
+        .db
+        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(deferred, crate::DEFERRED_AUTOCHECKPOINT_PAGES);
+
+    wrapper
+        .db
+        .execute(
+            "INSERT INTO entries (cache_key, crate_name) VALUES ('ck', 'c')",
+            [],
+        )
+        .unwrap();
+    let (frames, copied) = before.checkpoint_wal().unwrap();
+    assert!(frames > 0);
+    assert_eq!(frames, copied);
+}

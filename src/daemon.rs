@@ -3780,6 +3780,11 @@ impl Daemon {
     fn flush_pending_durability(&self) {
         let flushed = (|| -> Result<usize> {
             let store = Store::open(&self.config)?;
+            // Wrappers leave routine checkpoints to the daemon
+            // (`defer_wal_checkpoints`); this tick keeps the log short.
+            if let Err(error) = store.checkpoint_wal() {
+                tracing::debug!("index checkpoint skipped: {error:#}");
+            }
             if store.pending_durability()? == 0 {
                 return Ok(0);
             }
