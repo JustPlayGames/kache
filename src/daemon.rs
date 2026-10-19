@@ -3930,7 +3930,15 @@ impl Daemon {
                     Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
                         crate::cache_key::hash_file(path).map(|hash| {
                             // The lookup took its own stamp, after `observed_ns`.
-                            if crate::cache_key::stamp_is_settled(&fp, observed_ns) {
+                            // An unsettled one may be Cargo's re-date of an
+                            // output kache wrote with these bytes.
+                            if crate::cache_key::stamp_is_settled(&fp, observed_ns)
+                                || self
+                                    .with_store(|store| {
+                                        Ok(store.file_hash_cache().redated_pin(&fp, &hash))
+                                    })
+                                    .unwrap_or(false)
+                            {
                                 // Brief re-lock just to persist the result.
                                 let _ = self.with_store(|store| {
                                     store.file_hash_record(&fp, &hash);

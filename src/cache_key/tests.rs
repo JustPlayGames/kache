@@ -17377,3 +17377,45 @@ fn out_dir_source_identity_needs_a_file_below_an_absolute_out_dir() {
     );
     assert_eq!(id("/out/b.rs", Some("/out")), None, "no unit dir");
 }
+
+/// Cargo re-dates a check unit's outputs once the unit ends, which leaves a
+/// fresh stamp nobody may memoise until it settles. A read of bytes kache
+/// itself restored there under the re-date rule is memoised at once, so the
+/// next dependent is served; a read of other bytes is not.
+#[test]
+fn a_read_of_a_redated_output_is_memoised_before_it_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let write = |name: &str, byte: u8| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, vec![byte; MIN_PERSISTED_HASH_BYTES as usize]).unwrap();
+        path
+    };
+    let redated_row = |path: &Path, hash: &str| {
+        // As kache records it: the same mtime, the ctime before Cargo's call.
+        let mut recorded = FileFingerprint::from_path(path).unwrap();
+        recorded.ctime_ns -= 1;
+        FileHashCache::open(&db).unwrap().put_redated(&recorded, hash).unwrap();
+    };
+    let lookups_read = |path: &Path| {
+        let hasher = FileHasher::persistent(&db);
+        hasher.hash(path).unwrap();
+        hasher.stats().cache_misses
+    };
+
+    let kept = write("libkept.rmeta", 1);
+    let kept_hash = hash_file(&kept).unwrap();
+    redated_row(&kept, &kept_hash);
+    let first = FileHasher::persistent(&db);
+    assert_eq!(first.hash(&kept).unwrap(), kept_hash);
+    assert_eq!(first.stats().cache_misses, 1, "the first reader reads");
+    first.flush_memo();
+    assert_eq!(lookups_read(&kept), 0, "the next one is served");
+
+    let other = write("libother.rmeta", 2);
+    redated_row(&other, &kept_hash);
+    let first = FileHasher::persistent(&db);
+    first.hash(&other).unwrap();
+    first.flush_memo();
+    assert_eq!(lookups_read(&other), 1, "bytes kache did not record stay unmemoised");
+}

@@ -4961,6 +4961,7 @@ fn run_parsed_rustc(
                     shared_inode_loadable(args, platform::current().may_share_restored_loadables());
                 remember_prestaged_executables(config, compiler, args, &output_dir, shared, &meta);
             }
+            redate_stored_check_outputs(&store, args, &prepared_store.files);
             flush_or_hand_off_durability(config, &store, &cache_key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
@@ -7111,6 +7112,126 @@ fn record_known_file_hashes(store: &Store, restored: &[(crate::cache_key::FileFi
     store.record_verified_file_hashes(&restored);
 }
 
+/// The time Cargo will set this unit's outputs' mtime to once the unit ends,
+/// when this rustc runs a `cargo check` (or `clippy`) unit: since Cargo 1.90
+/// a check unit's outputs are re-dated to its invocation time, the mtime of
+/// `invoked.timestamp` in the unit's fingerprint folder, which Cargo writes
+/// just before it starts the unit. `None` when this is not a check unit, the
+/// folder is not where Cargo keeps it, or the stamp is not from this run.
+fn cargo_check_redate_ns(args: &RustcArgs) -> Option<i64> {
+    if args.emits_link() || !args.emit.iter().any(|kind| kind == "metadata") {
+        return None;
+    }
+    let stamp = cargo_invocation_stamp(args)?;
+    let metadata = std::fs::metadata(stamp).ok()?;
+    let invoked = kache_store::file_hash::metadata_mtime_ns(&metadata);
+    // Written for this unit's run: not in the future, and not from a run
+    // long gone (a unit waits for a job slot, but not for an hour).
+    let age = kache_store::file_hash::wall_clock_ns().saturating_sub(invoked);
+    (0..3_600_000_000_000).contains(&age).then_some(invoked)
+}
+
+/// Set `path`'s mtime to `invoked_ns`, as Cargo is about to, when it still
+/// holds the bytes `known` was observed with; returns the fingerprint after.
+/// Cargo's own call that follows then changes only the ctime, which a
+/// [`FILE_HASH_RULE_REDATED`](kache_store::file_hash::FILE_HASH_RULE_REDATED)
+/// row tolerates.
+fn redate_like_cargo(
+    path: &Path,
+    known: &crate::cache_key::FileFingerprint,
+    invoked_ns: i64,
+) -> Option<crate::cache_key::FileFingerprint> {
+    let before = crate::cache_key::FileFingerprint::from_path(path).ok()?;
+    if before != *known {
+        return None;
+    }
+    if before.mtime_ns != invoked_ns {
+        let seconds = invoked_ns.div_euclid(1_000_000_000);
+        let nanos = invoked_ns.rem_euclid(1_000_000_000) as u32;
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, nanos)).ok()?;
+    }
+    let after = crate::cache_key::FileFingerprint::from_path(path).ok()?;
+    (after.inode == before.inode && after.size == before.size && after.mtime_ns == invoked_ns)
+        .then_some(after)
+}
+
+/// Where Cargo keeps this unit's `invoked.timestamp`: in the shared layout
+/// `<profile>/deps` holds the outputs and `<profile>/.fingerprint/<package>-<hash>`
+/// the stamp; in the per-unit layout (`-Zbuild-dir-new-layout`, nightly's
+/// default) `build/<package>/<hash>/out` holds the outputs beside
+/// `build/<package>/<hash>/fingerprint`.
+fn cargo_invocation_stamp(args: &RustcArgs) -> Option<PathBuf> {
+    let out_dir = args.out_dir.as_deref()?;
+    let extra = args.extra_filename.as_deref()?;
+    let unit_hash = extra.strip_prefix('-')?;
+    let parent = out_dir.parent()?;
+    let folder = match out_dir.file_name()?.to_str()? {
+        "deps" => {
+            let package = std::env::var("CARGO_PKG_NAME").ok()?;
+            parent.join(".fingerprint").join(format!("{package}{extra}"))
+        }
+        "out" if parent.file_name()? == unit_hash => parent.join("fingerprint"),
+        _ => return None,
+    };
+    Some(folder.join("invoked.timestamp"))
+}
+
+fn is_rmeta(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rmeta")
+}
+
+/// For a check unit, re-date its restored `.rmeta` files as Cargo will and
+/// record their hashes under the re-date rule; returns the restores left for
+/// the ordinary rows.
+fn redate_check_outputs<'a>(
+    store: &Store,
+    args: &RustcArgs,
+    restored: Vec<(crate::cache_key::FileFingerprint, &'a str)>,
+) -> Vec<(crate::cache_key::FileFingerprint, &'a str)> {
+    let Some(invoked) = cargo_check_redate_ns(args) else {
+        return restored;
+    };
+    let mut redated = Vec::new();
+    let mut rest = Vec::with_capacity(restored.len());
+    for (fingerprint, hash) in restored {
+        let path = PathBuf::from(&fingerprint.path);
+        match is_rmeta(&path)
+            .then(|| redate_like_cargo(&path, &fingerprint, invoked))
+            .flatten()
+        {
+            Some(after) => redated.push((after, hash)),
+            None => rest.push((fingerprint, hash)),
+        }
+    }
+    store.record_redated_file_hashes(&redated);
+    rest
+}
+
+/// [`redate_check_outputs`] for a check unit's freshly stored `.rmeta`
+/// files, whose hashes `Store::put` has just memoised at their stamp.
+fn redate_stored_check_outputs(store: &Store, args: &RustcArgs, files: &[(PathBuf, String)]) {
+    let Some(invoked) = cargo_check_redate_ns(args) else {
+        return;
+    };
+    let mut redated: Vec<(crate::cache_key::FileFingerprint, String)> = Vec::new();
+    for (path, _) in files.iter().filter(|(path, _)| is_rmeta(path)) {
+        let Ok(stored) = crate::cache_key::FileFingerprint::from_path(path) else {
+            continue;
+        };
+        let Some(hash) = store.file_hash_at(&stored) else {
+            continue;
+        };
+        if let Some(after) = redate_like_cargo(path, &stored, invoked) {
+            redated.push((after, hash));
+        }
+    }
+    let redated: Vec<_> = redated
+        .iter()
+        .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
+        .collect();
+    store.record_redated_file_hashes(&redated);
+}
+
 /// Replay cached compiler diagnostics to the given sinks, exactly as a fresh
 /// compile would emit them — so a cache hit, or a coalesced restore, never
 /// swallows the original warnings and notes. Empty streams write nothing.
@@ -7585,6 +7706,7 @@ fn restore_from_cache_with_memo_store(
         restored_paths.push((cached_file.name.clone(), target_path));
     }
 
+    let exact_restores = redate_check_outputs(memo_store, args, exact_restores);
     record_known_file_hashes(memo_store, &exact_restores);
 
     maybe_verify_restored_hit(compiler, args, &restored_paths);

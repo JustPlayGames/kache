@@ -11771,3 +11771,52 @@ fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
     .unwrap();
     assert!(skips_cache_as_user_facing(&named_like_a_script, false));
 }
+
+
+#[test]
+fn the_invocation_stamp_of_a_check_unit_is_found_in_both_cargo_layouts() {
+    let shared = rustc_args(&[
+        "rustc", "src/lib.rs", "--crate-name", "demo", "--emit=dep-info,metadata",
+        "-C", "extra-filename=-0123456789abcdef", "--out-dir", "/t/debug/deps",
+    ]);
+    let _lock = crate::test_support::process_state_test_lock();
+    // SAFETY: serialised by the process-state lock above.
+    unsafe { std::env::set_var("CARGO_PKG_NAME", "demo-pkg") };
+    assert_eq!(
+        cargo_invocation_stamp(&shared),
+        Some(PathBuf::from("/t/debug/.fingerprint/demo-pkg-0123456789abcdef/invoked.timestamp"))
+    );
+    unsafe { std::env::remove_var("CARGO_PKG_NAME") };
+    let per_unit = rustc_args(&[
+        "rustc", "src/lib.rs", "--crate-name", "demo", "--emit=dep-info,metadata",
+        "-C", "extra-filename=-0123456789abcdef",
+        "--out-dir", "/t/debug/build/demo-pkg/0123456789abcdef/out",
+    ]);
+    assert_eq!(
+        cargo_invocation_stamp(&per_unit),
+        Some(PathBuf::from("/t/debug/build/demo-pkg/0123456789abcdef/fingerprint/invoked.timestamp"))
+    );
+    let elsewhere = rustc_args(&[
+        "rustc", "src/lib.rs", "--crate-name", "demo", "--emit=dep-info,metadata",
+        "-C", "extra-filename=-0123456789abcdef", "--out-dir", "/t/somewhere",
+    ]);
+    assert_eq!(cargo_invocation_stamp(&elsewhere), None);
+}
+
+#[test]
+fn only_a_check_unit_is_redated() {
+    let dir = tempfile::tempdir().unwrap();
+    let unit = dir.path().join("debug/build/demo/0123456789abcdef");
+    std::fs::create_dir_all(unit.join("fingerprint")).unwrap();
+    std::fs::create_dir_all(unit.join("out")).unwrap();
+    std::fs::write(unit.join("fingerprint/invoked.timestamp"), "").unwrap();
+    let out = unit.join("out").to_string_lossy().into_owned();
+    let args = |emit: &str| {
+        rustc_args(&[
+            "rustc", "src/lib.rs", "--crate-name", "demo", emit,
+            "-C", "extra-filename=-0123456789abcdef", "--out-dir", &out,
+        ])
+    };
+    assert!(cargo_check_redate_ns(&args("--emit=dep-info,metadata")).is_some());
+    assert!(cargo_check_redate_ns(&args("--emit=dep-info,metadata,link")).is_none());
+}
