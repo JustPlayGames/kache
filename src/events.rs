@@ -169,6 +169,14 @@ pub struct BuildEvent {
     /// comparison. Always zero with verification off, which is the default.
     #[serde(default)]
     pub prediction_mismatches: u32,
+    /// How the input closure was decided, in order, comma-separated:
+    /// `validated` (prediction used), `emitted`, `deferred-new-crate`, or why
+    /// the dep-info pre-pass ran instead (`no-record`, `tree-changed`,
+    /// `env-changed`, `disabled`, ...). `validated,disabled` is a predicted
+    /// key that missed and was derived again. Empty when no rustc key was
+    /// derived. `serde(default)`, no schema bump.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prediction: String,
     /// Time blocked joining a machine-wide flight another process already
     /// owned for the same compile (ms). Zero on a hit served at first
     /// lookup; a hit taken on the recheck after the owner finished carries
@@ -1929,6 +1937,7 @@ impl BuildEvent {
             dep_info_ms: 0,
             dep_info_runs: 0,
             prediction_mismatches: 0,
+            prediction: String::new(),
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,
@@ -2098,6 +2107,7 @@ mod tests {
             dep_info_ms: 0,
             dep_info_runs: 0,
             prediction_mismatches: 0,
+            prediction: String::new(),
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,
@@ -2353,6 +2363,23 @@ mod tests {
         assert_eq!(legacy.flight_wait_ms, 0);
         assert_eq!(legacy.permit_wait_ms, 0);
         assert_eq!(legacy.wait_ms(), 0);
+    }
+
+    /// The prediction outcome rides in the event, and an event without one
+    /// (cc, passthrough, an older kache) neither writes nor needs the field.
+    #[test]
+    fn prediction_outcome_round_trips_and_is_omitted_when_empty() {
+        let mut event = BuildEvent::new_for_test("foo", EventResult::LocalHit);
+        let value = serde_json::to_value(&event).unwrap();
+        assert!(value.get("prediction").is_none());
+        let legacy: BuildEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.prediction, "");
+
+        event.prediction = "validated,disabled".to_string();
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["prediction"], "validated,disabled");
+        let round_trip: BuildEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.prediction, "validated,disabled");
     }
 
     #[test]

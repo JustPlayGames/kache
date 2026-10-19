@@ -173,6 +173,38 @@ pub fn dep_info_ms() -> u64 {
 
 static PREDICTION_MISMATCHES: AtomicU64 = AtomicU64::new(0);
 
+/// Longest outcome sequence kept: one invocation decides at most a few
+/// times (a predicted key that misses is derived again with predictions
+/// off), so this only bounds a pathological loop.
+const PREDICTION_OUTCOMES_MAX: usize = 120;
+
+static PREDICTION_OUTCOMES: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Record how this invocation's input closure was decided (`validated`,
+/// `no-record`, `tree-changed`, ...), in order. A key derived twice records
+/// both decisions, so `validated,disabled` is a predicted key that missed
+/// and was derived again by the dep-info pre-pass.
+pub fn record_prediction_outcome(outcome: &str) {
+    let mut outcomes = PREDICTION_OUTCOMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if outcomes.len() + outcome.len() < PREDICTION_OUTCOMES_MAX {
+        if !outcomes.is_empty() {
+            outcomes.push(',');
+        }
+        outcomes.push_str(outcome);
+    }
+}
+
+/// The prediction outcomes recorded so far in this process, comma-separated;
+/// empty when no rustc key was derived.
+pub fn prediction_outcomes() -> String {
+    PREDICTION_OUTCOMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// Record a sampled verification where the predicted closure differed from
 /// the pre-pass closure. The pre-pass result won; the record was refreshed
 /// from it downstream.
@@ -241,6 +273,18 @@ mod tests {
         let before = probe_runs();
         record_probe_run();
         assert!(probe_runs() > before);
+    }
+
+    #[test]
+    fn prediction_outcomes_keep_their_order_and_stay_bounded() {
+        record_prediction_outcome("validated");
+        record_prediction_outcome("disabled");
+        let outcomes = prediction_outcomes();
+        assert!(outcomes.ends_with("validated,disabled"), "{outcomes}");
+        for _ in 0..100 {
+            record_prediction_outcome("tree-changed");
+        }
+        assert!(prediction_outcomes().len() < PREDICTION_OUTCOMES_MAX);
     }
 
     #[test]
