@@ -13493,6 +13493,32 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
     );
 }
 
+/// A burst of builds can write more than 64 MiB to the log between two of
+/// the daemon's checkpoints, whose readers keep it from being reset. A
+/// deferring connection must not checkpoint inside its commit then (an
+/// fsync on a compiler wrapper's path, and every commit after it tried
+/// again): the threshold leaves the daemon's tick a burst's worth of room.
+#[test]
+fn a_deferring_commit_leaves_a_72_mib_burst_to_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    db.pragma_update(None, "wal_autocheckpoint", crate::DEFERRED_AUTOCHECKPOINT_PAGES)
+        .unwrap();
+    db.execute_batch("CREATE TABLE burst (x BLOB)").unwrap();
+    db.execute_batch("BEGIN").unwrap();
+    for _ in 0..18_000 {
+        db.execute("INSERT INTO burst (x) VALUES (zeroblob(4000))", [])
+            .unwrap();
+    }
+    db.execute_batch("COMMIT").unwrap();
+    // The wal-index header's nBackfill (offset 96): frames a checkpoint
+    // has copied into the index.
+    let shm = std::fs::read(dir.path().join("index.db-shm")).unwrap();
+    let backfilled = u32::from_ne_bytes(shm[96..100].try_into().unwrap());
+    assert_eq!(backfilled, 0, "the commit checkpointed the log itself");
+}
+
 /// A process that defers WAL checkpoints (a compiler wrapper) opens its
 /// index connections with the larger threshold; the daemon's passive
 /// checkpoint copies the log into the index.

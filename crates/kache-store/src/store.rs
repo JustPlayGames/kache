@@ -1909,8 +1909,13 @@ fn record_entry_blobs(
 }
 
 /// WAL pages ([`defer_wal_checkpoints`]) a compiler wrapper's connection lets
-/// the log grow to before it checkpoints it itself: 64 MiB of 4 KiB pages.
-pub const DEFERRED_AUTOCHECKPOINT_PAGES: i64 = 16_384;
+/// the log grow to before it checkpoints it itself: 256 MiB of 4 KiB pages.
+/// The daemon checkpoints every 2 s, but readers can keep the log from being
+/// reset for a minute, and a burst of builds wrote past 64 MiB between two
+/// checkpoints on the build machine: with that threshold every commit then
+/// checkpointed and fsynced again, in wrappers (374 times in 30 minutes). A
+/// larger log costs nothing until something copies it.
+pub const DEFERRED_AUTOCHECKPOINT_PAGES: i64 = 65_536;
 
 static DEFER_WAL_CHECKPOINTS: AtomicBool = AtomicBool::new(false);
 
