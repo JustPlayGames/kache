@@ -4667,6 +4667,28 @@ fn test_daemon_reuses_store_handle() {
     assert_eq!(first, second);
 }
 
+/// The daemon commits under its store mutex (file-hash records, published
+/// entries). A commit that takes the WAL past the threshold checkpoints it
+/// inside that commit, fsync included, and every request needing the mutex
+/// (a wrapper's file-hash prefetch, 3 s timeout) waits behind it. The
+/// daemon's connections defer like a wrapper's; its durability tick
+/// checkpoints on a connection of its own.
+#[test]
+fn test_daemon_store_connections_defer_wal_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config);
+
+    let pages = daemon
+        .with_store(|store| store.wal_autocheckpoint_pages())
+        .unwrap();
+    assert_eq!(pages, kache_store::DEFERRED_AUTOCHECKPOINT_PAGES);
+
+    let shard = daemon.shard_store_lock(dir.path()).unwrap();
+    let shard_pages = shard.lock().unwrap().wal_autocheckpoint_pages().unwrap();
+    assert_eq!(shard_pages, kache_store::DEFERRED_AUTOCHECKPOINT_PAGES);
+}
+
 /// A request for `file` as it is on disk, and the clock at which its stamp
 /// settles: [`crate::cache_key::HASH_SETTLE_NS`] after its last change.
 fn hash_files_request(file: &Path) -> (HashFilesRequest, i64) {

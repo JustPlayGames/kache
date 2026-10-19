@@ -2943,6 +2943,7 @@ impl Daemon {
         }
 
         let store = Store::open(&self.config)?;
+        defer_checkpoints_under_mutex(&store);
         let _ = self.store.set(Mutex::new(store));
 
         self.store
@@ -2971,6 +2972,7 @@ impl Daemon {
         let mut cfg = self.config.clone();
         cfg.cache_dir = cache_dir.to_path_buf();
         let store = Store::open(&cfg)?;
+        defer_checkpoints_under_mutex(&store);
         let lock = Arc::new(Mutex::new(store));
         let mut map = self
             .shard_stores
@@ -7213,6 +7215,19 @@ impl Daemon {
 // ── Server (thin I/O shell) ──────────────────────────────────────
 
 /// Run the daemon server (foreground, blocking).
+/// A connection the daemon shares behind a mutex commits for many requests
+/// (file-hash records, published entries). Left at SQLite's default, the
+/// commit that takes the WAL past 1,000 pages checkpoints it, fsync
+/// included, while every request needing that mutex waits: on a busy shared
+/// store that was nearly every commit, and wrappers' file-hash prefetches
+/// ran into their 3 s timeout. The durability tick checkpoints instead, on
+/// a connection of its own.
+fn defer_checkpoints_under_mutex(store: &Store) {
+    if let Err(error) = store.defer_wal_checkpoints_here() {
+        tracing::debug!("daemon store keeps automatic checkpoints: {error:#}");
+    }
+}
+
 pub fn run_server(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
@@ -7235,6 +7250,9 @@ pub fn run_server(
         tracing::info!("another daemon holds the run lock, exiting");
         return Ok(());
     };
+    // Every connection this process opens (GC, publishes, the durability
+    // tick's) leaves routine checkpoints to that tick's explicit passive one.
+    kache_store::defer_wal_checkpoints();
     #[cfg(unix)]
     match crate::platform::raise_open_file_limit() {
         Ok(Some((before, after))) => {

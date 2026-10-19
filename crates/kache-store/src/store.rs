@@ -4391,6 +4391,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         )? as u64)
     }
 
+    /// Leave routine checkpoints to an explicit [`Self::checkpoint_wal`] on
+    /// this connection too, as [`defer_wal_checkpoints`] does for every
+    /// connection a process opens afterwards: its commits checkpoint only
+    /// once the log reaches [`DEFERRED_AUTOCHECKPOINT_PAGES`].
+    pub fn defer_wal_checkpoints_here(&self) -> Result<()> {
+        self.db
+            .pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
+        Ok(())
+    }
+
+    /// The log size, in pages, at which this connection's own commits
+    /// checkpoint the WAL (`PRAGMA wal_autocheckpoint`).
+    pub fn wal_autocheckpoint_pages(&self) -> Result<i64> {
+        Ok(self
+            .db
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
+    }
+
     /// Copy the WAL's committed pages into the index without waiting for
     /// readers or writers (a passive checkpoint), so the log stays short while
     /// compiler wrappers defer theirs ([`defer_wal_checkpoints`]). Returns the
