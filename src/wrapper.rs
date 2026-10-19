@@ -8951,6 +8951,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         dep_info_runs: crate::opcounts::dep_info_runs(),
         prediction_mismatches: u32::try_from(crate::opcounts::prediction_mismatches())
             .unwrap_or(u32::MAX),
+        prediction: crate::opcounts::prediction_outcomes(),
         flight_wait_ms: crate::opcounts::flight_wait_ms(),
         permit_wait_ms: crate::opcounts::permit_wait_ms(),
         store_output_blobs: store_put.output_blobs,

@@ -3509,7 +3509,7 @@ fn resolve_key_inputs(
 ) -> Result<Option<DepInfo>> {
     if let Some((provided, tree)) = PROVIDED_DEP_INFO.with(|cell| cell.borrow_mut().take()) {
         out.tree_guard = tree;
-        crate::phase_trace::decision("prediction", "emitted");
+        prediction_decision("emitted");
         tracing::trace!("[key:{}] inputs=emitted-dep-info", crate_name);
         return Ok(Some(provided));
     }
@@ -3537,14 +3537,14 @@ fn resolve_key_inputs(
         }
         match prediction {
             Ok(dep_info) => {
-                crate::phase_trace::decision("prediction", "validated");
+                prediction_decision("validated");
                 let mode =
                     parse_verify_predictions(env.var("KACHE_VERIFY_INPUT_PREDICTIONS").as_deref());
                 // Verification is the exceptional path: it runs the pre-pass
                 // anyway and uses ITS answer, so a disagreement is reported
                 // rather than acted on.
                 if verifies_prediction(mode, args, env.cwd(), |var| env.var_os(var)) {
-                    crate::phase_trace::decision("prediction", "verify-sampled");
+                    prediction_decision("verify-sampled");
                     let discovered = dep_info_pre_pass(args)?;
                     if discovered
                         .as_ref()
@@ -3577,7 +3577,7 @@ fn resolve_key_inputs(
                         args.get_codegen_opt("metadata").unwrap_or(""),
                     ) =>
             {
-                crate::phase_trace::decision("prediction", "deferred-new-crate");
+                prediction_decision("deferred-new-crate");
                 tracing::trace!("[key:{}] inputs=deferred(new crate)", crate_name);
                 return Err(anyhow::Error::new(DeferredDiscovery { miss_certain: true }));
             }
@@ -3586,7 +3586,7 @@ fn resolve_key_inputs(
                     && DEFER_DISCOVERY.with(std::cell::Cell::get)
                     && COMPILE_WHILE_KEYING.with(std::cell::Cell::get) =>
             {
-                crate::phase_trace::decision("prediction", reason.as_str());
+                prediction_decision(reason.as_str());
                 tracing::trace!(
                     "[key:{}] inputs=compile-while-keying({})",
                     crate_name,
@@ -3597,12 +3597,20 @@ fn resolve_key_inputs(
                 }));
             }
             Err(reason) => {
-                crate::phase_trace::decision("prediction", reason.as_str());
+                prediction_decision(reason.as_str());
                 tracing::trace!("[key:{}] inputs=dep-info({})", crate_name, reason.as_str())
             }
         }
     }
     dep_info_pre_pass(args)
+}
+
+/// Note how the input closure was decided, in the phase trace and in this
+/// invocation's build event (`prediction`), so real builds say why they ran
+/// the dep-info pre-pass.
+fn prediction_decision(outcome: &str) {
+    crate::phase_trace::decision("prediction", outcome);
+    crate::opcounts::record_prediction_outcome(outcome);
 }
 
 /// Spawn rustc to enumerate the closure. The slow, authoritative answer.
