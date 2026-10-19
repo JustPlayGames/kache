@@ -3219,10 +3219,11 @@ fn scoped_package_digest(
     let mut ancestor = package.parent();
     while let Some(directory) = ancestor.filter(|directory| directory.starts_with(&workspace.root))
     {
+        let manifest = (directory == workspace.root.as_path()).then_some(ROOT_MANIFEST);
         fold_field(
             &mut hasher,
             b"ancestor:",
-            scoped_ancestor_top_digest(directory, file_hasher, &ignored)?.as_bytes(),
+            scoped_ancestor_top_digest(directory, file_hasher, &ignored, manifest)?.as_bytes(),
         );
         ancestor = directory.parent();
     }
@@ -3238,6 +3239,7 @@ fn scoped_ancestor_top_digest(
     directory: &Path,
     file_hasher: &FileHasher<'_>,
     ignored: &[PathBuf],
+    manifest: Option<&str>,
 ) -> Option<String> {
     let mut excluded = vec![directory.join(".git")];
     excluded.extend(
@@ -3295,6 +3297,9 @@ fn scoped_ancestor_top_digest(
                 Err(_) => unreadable(),
             },
             Ok(metadata) if metadata.is_file() => match file_hasher.hash_unkeyed(&path) {
+                Ok(hash) if manifest.is_some_and(|manifest| name == manifest) => {
+                    root_manifest_entry(&path, &hash)
+                }
                 Ok(hash) => format!("file:{hash}"),
                 Err(_) => unreadable(),
             },
@@ -3315,6 +3320,106 @@ fn scoped_ancestor_top_digest(
         fold_field(&mut hasher, b"entry:", content.as_bytes());
     }
     Some(hasher.finalize().to_hex().to_string())
+}
+
+/// The workspace manifest's name at the workspace root, which the scoped
+/// guard folds as [`root_manifest_entry`] does.
+const ROOT_MANIFEST: &str = "Cargo.toml";
+
+/// The scoped guard's entry for the workspace root's `Cargo.toml`, whose
+/// bytes are `hash`: the manifest as TOML, less what only tells Cargo where
+/// the workspace's own packages are. Comments and layout, the `members`,
+/// `exclude` and `default-members` lists of `[workspace]`, and the entries
+/// of `[workspace.dependencies]` that name a `path` are left out; everything
+/// else counts as it is. A manifest that does not parse counts by its bytes.
+///
+/// A member added to the workspace changes these places of the root
+/// manifest and nothing else in it, and on a busy workspace that is most of
+/// what moves it: with them every member's record went stale on any commit
+/// that added a crate, its own files unchanged. What they hold reaches a
+/// unit only through Cargo, as its arguments (`--extern`, `-L`) and
+/// environment, which the key and the record identity read; a macro that
+/// listed the workspace's packages from them could read the same from
+/// `Cargo.lock`, which the guard leaves out already
+/// ([`DEFAULT_GUARD_IGNORE`]). A unit that names the manifest in its closure
+/// (Clippy's, an `include_str!`) keys its bytes, every byte, as before.
+fn root_manifest_entry(path: &Path, hash: &str) -> String {
+    let memo = crate::config::probe_memo_dir()
+        .join("root-manifest")
+        .join(format!("v1-{hash}"));
+    if let Ok(digest) = std::fs::read_to_string(&memo)
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return format!("manifest:{digest}");
+    }
+    let Some(digest) = std::fs::read_to_string(path)
+        .ok()
+        .filter(|text| blake3::hash(text.as_bytes()).to_hex().as_str() == hash)
+        .and_then(|text| root_manifest_digest(&text))
+    else {
+        return format!("file:{hash}");
+    };
+    if let Some(parent) = memo.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+    {
+        let _ = crate::atomic::atomic_replace(&memo, digest.as_bytes());
+    }
+    format!("manifest:{digest}")
+}
+
+/// The digest [`root_manifest_entry`] folds for a manifest's `text`, or
+/// `None` when it does not parse.
+fn root_manifest_digest(text: &str) -> Option<String> {
+    let mut manifest: toml::Table = toml::from_str(text).ok()?;
+    if let Some(toml::Value::Table(workspace)) = manifest.get_mut("workspace") {
+        for list in ["members", "exclude", "default-members"] {
+            workspace.remove(list);
+        }
+        if let Some(toml::Value::Table(dependencies)) = workspace.get_mut("dependencies") {
+            dependencies.retain(|_, dependency| {
+                !matches!(dependency, toml::Value::Table(spec) if spec.contains_key("path"))
+            });
+            // A table left empty reads as no table: the first path entry
+            // adds one.
+            if dependencies.is_empty() {
+                workspace.remove("dependencies");
+            }
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache-root-manifest-v1\n");
+    fold_toml(&mut hasher, &toml::Value::Table(manifest));
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+/// Fold a TOML value, tables by sorted key, so the digest depends on what
+/// the manifest says and not on how it is laid out.
+fn fold_toml(hasher: &mut blake3::Hasher, value: &toml::Value) {
+    match value {
+        toml::Value::String(text) => fold_field(hasher, b"s:", text.as_bytes()),
+        toml::Value::Integer(number) => fold_field(hasher, b"i:", &number.to_le_bytes()),
+        toml::Value::Float(number) => fold_field(hasher, b"f:", &number.to_bits().to_le_bytes()),
+        toml::Value::Boolean(flag) => fold_field(hasher, b"b:", &[u8::from(*flag)]),
+        toml::Value::Datetime(datetime) => {
+            fold_field(hasher, b"d:", datetime.to_string().as_bytes())
+        }
+        toml::Value::Array(items) => {
+            fold_field(hasher, b"a:", &(items.len() as u64).to_le_bytes());
+            for item in items {
+                fold_toml(hasher, item);
+            }
+        }
+        toml::Value::Table(table) => {
+            let mut keys: Vec<&String> = table.keys().collect();
+            keys.sort();
+            fold_field(hasher, b"t:", &(keys.len() as u64).to_le_bytes());
+            for key in keys {
+                fold_field(hasher, b"k:", key.as_bytes());
+                fold_toml(hasher, &table[key]);
+            }
+        }
+    }
 }
 
 /// `path` with `.` and `..` taken out lexically, as rustc spells an include

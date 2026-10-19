@@ -2253,6 +2253,54 @@ fn scoped_a_root_change_refuses_the_record_unless_ignored() {
     }
 }
 
+/// The workspace manifest at the root counts by what it says, less where the
+/// workspace's packages are: a comment, a new member and its path entry in
+/// `[workspace.dependencies]` (what a commit adding a crate changes) keep the
+/// record; a registry dependency or `[workspace.metadata]` refuses it, and so
+/// does any change to a manifest that does not parse.
+#[test]
+fn scoped_a_root_manifest_change_that_only_places_packages_keeps_the_record() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false).scoped();
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let manifest = a.join("Cargo.toml");
+    let changes: [(&str, bool, &str); 6] = [
+        (
+            "# The workspace.\n[workspace]\nmembers = [\"kt\"]\n",
+            false,
+            "a comment",
+        ),
+        (
+            "[workspace]\nmembers = [\"kt\", \"new\"]\nexclude = [\"old\"]\n\n\
+             [workspace.dependencies]\nnew = { path = \"new\" }\n",
+            false,
+            "a member and its path dependency",
+        ),
+        (
+            "[workspace]\nmembers = [\"kt\", \"new\"]\nexclude = [\"old\"]\n\n\
+             [workspace.dependencies]\nnew = { path = \"new\" }\nserde = \"1\"\n",
+            true,
+            "a registry dependency",
+        ),
+        (
+            "[workspace]\nmembers = [\"kt\", \"new\"]\nexclude = [\"old\"]\n\n\
+             [workspace.dependencies]\nnew = { path = \"new\" }\nserde = \"1\"\n\n\
+             [workspace.metadata.assets]\ndir = \"web\"\n",
+            true,
+            "workspace metadata",
+        ),
+        ("[workspace\n", true, "a manifest that does not parse"),
+        ("[workspace\n# still broken\n", true, "its bytes"),
+    ];
+    for (text, refuses, what) in changes {
+        std::fs::write(&manifest, text).unwrap();
+        let event = unit.build(&a, true, None);
+        assert_eq!(event.result, "local_hit", "{what}");
+        assert_eq!(event.dep_info_runs, u64::from(refuses), "a change to {what}");
+    }
+}
+
 /// THE DOCUMENTED GAP. A macro that lists a directory outside its package
 /// that holds no file of the closure (here an empty one) finds its first
 /// file with the scoped guard unchanged: the predicted key is the old one,
