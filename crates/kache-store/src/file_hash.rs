@@ -496,6 +496,29 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
+    /// The names of the rows named `prefix` and something after it, most
+    /// recently used or written first, at most `limit` of them. Reads only:
+    /// the caller reads the row it wants with [`Self::get_input_prediction`].
+    pub fn input_prediction_names_under(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<String>> {
+        let upper = format!("{prefix}\u{10FFFF}");
+        let mut statement = self.db().prepare(
+            "SELECT identity FROM input_predictions
+             WHERE identity > ?1 AND identity < ?2
+             ORDER BY last_used DESC, updated_at DESC
+             LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![prefix, upper, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )?
+            .collect()
+    }
+
     /// Is any row named `prefix` and something after it recorded?
     pub fn has_input_predictions_under(&self, prefix: &str) -> rusqlite::Result<bool> {
         let upper = format!("{prefix}\u{10FFFF}");

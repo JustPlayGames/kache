@@ -2541,3 +2541,34 @@ fn inputs_a_declared_extra_input_edit_misses() {
     assert_ne!(added.result, "local_hit");
     assert_ne!(added.cache_key, edited.cache_key);
 }
+
+/// A checkout that moves between two states whose closure directories
+/// differ by a name no closure reads (`src/notes_a.txt`, then
+/// `src/notes_b.txt`, as two commits would) keeps a row for each: the inputs
+/// guard files a row under its closure directories too, so going back finds
+/// the first state's row instead of the pre-pass. The checkout's own row
+/// holds only the last state.
+#[test]
+fn inputs_a_checkout_moving_between_names_beside_the_closure_keeps_a_row_each() {
+    build_kache();
+    let unit = module_tree_unit(true).inputs();
+    let a = unit.checkout("a");
+    let notes_a = a.join("kt/src/notes_a.txt");
+    let notes_b = a.join("kt/src/notes_b.txt");
+    std::fs::write(&notes_a, "notes\n").unwrap();
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    std::fs::rename(&notes_a, &notes_b).unwrap();
+    let moved = unit.build(&a, true, None);
+    assert_eq!(moved.result, "local_hit");
+    assert_eq!(moved.dep_info_runs, 1, "this state was never recorded");
+    for round in 0..2 {
+        for (from, to) in [(&notes_b, &notes_a), (&notes_a, &notes_b)] {
+            std::fs::rename(from, to).unwrap();
+            let back = unit.build(&a, true, None);
+            assert_eq!(back.result, "local_hit", "round {round} {}", to.display());
+            assert_eq!(back.dep_info_runs, 0, "round {round} {}: its row stayed", to.display());
+            assert_eq!(back.cache_key, cold.cache_key);
+        }
+    }
+}
