@@ -6654,9 +6654,12 @@ fn compile_before_key(
 /// to report its dep-info as a JSON artifact. A compile that links only where
 /// the stop can prove its linker never runs on after it
 /// ([`crate::compile::STOPS_LINKING_COMPILES`]): a linker outliving rustc
-/// could write over the restored output.
+/// could write over the restored output. Never with the parallel frontend:
+/// its threads hold jobserver tokens from before the dep-info, which a
+/// stopped compile never returns (Cargo's `-j` shrinks with every stop).
 fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
     args.reports_artifacts()
+        && !args.runs_parallel_frontend()
         && (!args.invokes_linker() || crate::compile::STOPS_LINKING_COMPILES)
 }
 
