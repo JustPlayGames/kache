@@ -11117,6 +11117,40 @@ fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
     }
 }
 
+/// No compile with rustc's parallel frontend starts before its key to be
+/// stopped on a hit: its frontend threads hold jobserver tokens from before
+/// the dep-info, and a stopped compile never gives them back (measured with
+/// rustc nightly-2026-09-20, `-Zthreads=8`: 7 of 16 tokens gone per stop).
+#[test]
+fn a_parallel_frontend_compile_is_never_stopped_on_a_hit() {
+    let parse = |crate_type: &str, extra: &[&str]| {
+        let mut argv = vec![
+            "rustc",
+            "--crate-name",
+            "x",
+            "src/lib.rs",
+            "--crate-type",
+            crate_type,
+            "--emit=dep-info,metadata,link",
+            "--error-format=json",
+            "--json=artifacts",
+        ];
+        argv.extend_from_slice(extra);
+        RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+    };
+    for crate_type in ["lib", "bin"] {
+        assert!(
+            !stop_on_hit_allowed(&parse(crate_type, &["-Zthreads=8"])),
+            "{crate_type}"
+        );
+        assert!(
+            !stop_on_hit_allowed(&parse(crate_type, &["-Z", "threads=0"])),
+            "{crate_type}"
+        );
+    }
+    assert!(stop_on_hit_allowed(&parse("lib", &["-Zthreads=1"])));
+}
+
 #[test]
 fn a_rederivation_never_waits_on_a_discovery_flight() {
     let dir = tempfile::tempdir().unwrap();

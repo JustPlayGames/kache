@@ -785,6 +785,19 @@ impl RustcArgs {
         codegen_backend_name(&self.unstable_flags)
     }
 
+    /// Does this compile run rustc's parallel frontend (`-Z threads=N`, the
+    /// last one winning, any N but 1; 0 means one thread per CPU)? Its
+    /// threads take jobserver tokens long before codegen, and a compile
+    /// killed then never gives them back: Cargo loses that much of `-j` for
+    /// the rest of the build.
+    pub fn runs_parallel_frontend(&self) -> bool {
+        self.unstable_flags
+            .iter()
+            .rev()
+            .find_map(|flag| flag.strip_prefix("threads="))
+            .is_some_and(|threads| threads.trim() != "1")
+    }
+
     /// Derive the workspace root from `--out-dir`. Cargo invokes
     /// rustc with `--out-dir <workspace>/target/<profile>/deps`, so
     /// three `parent()` steps land on the workspace root.
@@ -2034,6 +2047,26 @@ mod tests {
         let dep = parse_extern("noprelude:std=/path/to/libstd.rlib");
         assert_eq!(dep.name, "std");
         assert!(dep.path.is_some());
+    }
+
+    #[test]
+    fn parallel_frontend_follows_the_last_threads_option() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rustc", "--crate-name", "foo", "src/lib.rs"];
+            argv.extend_from_slice(extra);
+            RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        assert!(!parse(&[]).runs_parallel_frontend());
+        assert!(!parse(&["-Zthreads=1"]).runs_parallel_frontend());
+        assert!(parse(&["-Zthreads=8"]).runs_parallel_frontend());
+        assert!(parse(&["-Z", "threads=8"]).runs_parallel_frontend());
+        assert!(
+            parse(&["-Zthreads=0"]).runs_parallel_frontend(),
+            "0 is one per CPU"
+        );
+        assert!(!parse(&["-Zthreads=8", "-Zthreads=1"]).runs_parallel_frontend());
+        assert!(parse(&["-Zthreads=1", "-Z", "threads=4"]).runs_parallel_frontend());
+        assert!(!parse(&["-Zshare-generics=y"]).runs_parallel_frontend());
     }
 
     #[test]
