@@ -4066,8 +4066,11 @@ fn run_parsed_rustc(
     // ([`compile_before_key_after_miss`]).
     // A learning unit has no graph to reuse. Reserve a cold private compile
     // before discovery, then qualify its seed from rustc's emitted closure.
+    // Never a unit that links: its seed would compile to the end before
+    // keying, as it always has.
     let mut deferred_seed = if adaptive_policy_for_invocation
         && precompiled.is_none()
+        && !args.invokes_linker()
         && stop_on_hit_allowed(args)
         && deferral_allowed(config, args, false, extra_inputs)
     {
@@ -6392,6 +6395,8 @@ fn adaptive_compile_before_key(
         &compiler_args,
         &mut on_dep_info,
     );
+    // A compile the stop let go on ran to its end: not a hit.
+    let hit_closure = hit_closure.filter(|_| stopped_on_hit(&executed));
     if hit_closure.is_none() && executed.is_ok() {
         permit.record_compile_rss(ctx.crate_name);
     }
@@ -6526,6 +6531,9 @@ fn compile_before_key(
     } else {
         compiler.execute_streaming(args)
     };
+    // A compile the stop let go on (it had started its linker or codegen)
+    // ran to its end and is keyed and stored as any other compile.
+    let hit_closure = hit_closure.filter(|_| stopped_on_hit(&executed));
     if hit_closure.is_none() {
         miss_guard.record_compile_rss(crate_name);
     }
@@ -6643,11 +6651,20 @@ fn compile_before_key(
 }
 
 /// May this compile start before its key and be stopped on a hit? rustc has
-/// to report its dep-info as a JSON artifact, and must not link: stopping
-/// kills rustc alone, and a linker it had already started could still write
-/// over the restored output.
+/// to report its dep-info as a JSON artifact. A compile that links only where
+/// the stop can prove its linker never runs on after it
+/// ([`crate::compile::STOPS_LINKING_COMPILES`]): a linker outliving rustc
+/// could write over the restored output.
 fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
-    args.reports_artifacts() && !args.invokes_linker()
+    args.reports_artifacts()
+        && (!args.invokes_linker() || crate::compile::STOPS_LINKING_COMPILES)
+}
+
+/// Did the compile stop at its dep-info, as the hit asked? One that went on
+/// instead, or failed to run, is no hit: its outputs may be there, or a
+/// child it started may still be writing them.
+fn stopped_on_hit(executed: &Result<crate::compile::CompileResult>) -> bool {
+    executed.as_ref().is_ok_and(|result| result.stopped)
 }
 
 /// The closure the running compile wrote to its dep-info, once rustc has
@@ -7184,8 +7201,9 @@ fn owes_rederivation(predicted: bool, already_rederived: bool) -> bool {
 ///
 /// A predicted key must be re-derived before anything is stored, and the
 /// running compile writes the closure the pre-pass would. A compile that
-/// links cannot stop on a hit, so a guess is re-derived through the pre-pass
-/// first, where a lookup can still find the entry under the real key.
+/// cannot stop on a hit (one that links, off Linux) re-derives a guess
+/// through the pre-pass first, where a lookup can still find the entry under
+/// the real key.
 ///
 /// A unit that keyed first did so only so that its miss could take an
 /// incremental lane, and none did. Its key was taken before the compile, and

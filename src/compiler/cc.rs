@@ -7768,6 +7768,7 @@ impl CcCompiler {
             CompileResult {
                 exit_code,
                 signaled: output.status.code().is_none(),
+                stopped: false,
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 pending_stderr: None,

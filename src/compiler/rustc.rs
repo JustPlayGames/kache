@@ -274,6 +274,7 @@ impl RustcCompiler {
             incremental_mode,
             metadata_sink,
             on_dep_info,
+            compile::StopRule::for_compile(parsed.invokes_linker()),
         )
     }
 }
