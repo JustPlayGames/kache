@@ -3879,6 +3879,8 @@ fn save_manifest_config(
         clean_incremental: true,
         preserve_incremental: false,
         adaptive_incremental: true,
+        incremental_seed_from: None,
+        unstable: Default::default(),
         event_log_max_size: 1024 * 1024,
         event_log_keep_lines: 1000,
         compression_level: 3,
@@ -8124,6 +8126,21 @@ fn the_targets_table_totals_and_points_at_deleted_worktrees() {
 }
 
 #[test]
+fn target_rows_sort_by_reclaimable_bytes_and_allow_ties() {
+    let mut rows = [
+        row("/small", TargetState::Live, 10),
+        row("/large", TargetState::Live, 100),
+        row("/tie", TargetState::WorktreeDeleted, 10),
+        row("/empty", TargetState::Live, 0),
+        row("/medium", TargetState::Live, 50),
+    ];
+    rows[0].apparent_bytes = 10_000;
+    rows[0].cached_bytes = 9_000;
+    sort_target_rows(&mut rows);
+    assert_eq!(rows.map(|row| row.reclaimable_bytes), [100, 50, 10, 10, 0]);
+}
+
+#[test]
 fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::test_support::test_config(dir.path().join("cache"));
@@ -8177,11 +8194,14 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
     let now = kache_store::markers::now_epoch_secs() as i64 + 120;
     let rows = target_rows(&config, now).unwrap();
     assert_eq!(rows.len(), 2, "a replaced target is not listed: {rows:?}");
-    assert!(rows[0].path.ends_with("large") && rows[1].path.ends_with("small"));
-    assert_eq!(rows[0].state, TargetState::WorktreeDeleted);
-    assert_eq!(rows[1].state, TargetState::Live);
+    let large = rows.iter().find(|row| row.path.ends_with("large")).unwrap();
+    let small = rows.iter().find(|row| row.path.ends_with("small")).unwrap();
+    assert_eq!(large.state, TargetState::WorktreeDeleted);
+    assert_eq!(small.state, TargetState::Live);
+    // ZFS may report equal allocation even for these different file sizes.
+    // Ordering with distinct measurements is covered separately above.
     assert!(
-        rows[0].reclaimable_bytes > rows[1].reclaimable_bytes,
+        rows[0].reclaimable_bytes >= rows[1].reclaimable_bytes,
         "{rows:?}"
     );
     assert!(
@@ -8190,7 +8210,7 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
             .is_some_and(|secs| (120..=125).contains(&secs))),
         "{rows:?}"
     );
-    assert_eq!(rows[1].profiles, ["debug"]);
+    assert_eq!(small.profiles, ["debug"]);
     assert!(rows.iter().all(|row| row.next_pass.remove.is_none()));
     // Target liveness is off by default, so no row previews receipt cleanup.
     assert!(
@@ -8200,8 +8220,14 @@ fn target_rows_report_each_worktree_and_sort_by_what_frees_most() {
     #[cfg(unix)]
     {
         let mut pressure = config.clone();
-        pressure.auto_recover_min_free_bytes =
-            kache_fs::volume_usage(&targets[0].1).unwrap().total - 1;
+        let _volume = kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(kache_fs::VolumeUsage {
+                total: 1000,
+                free: 10,
+            }),
+        );
+        pressure.auto_recover_min_free_bytes = 100;
         pressure.auto_recover_targets = true;
         let empty_workspace = dir.path().join("wt/empty");
         let empty_target = dir.path().join("targets/empty");
@@ -10393,5 +10419,19 @@ fn a_declined_store_is_the_latest_compile_and_a_fallback_run_is_not() {
     assert!(
         lines.contains(&"  Why       compiled, not stored: admission-threshold".to_string()),
         "{lines:?}"
+    );
+}
+
+#[test]
+fn compile_time_backfill_message_does_not_claim_completion_or_hide_errors() {
+    assert_eq!(
+        compile_time_backfill_message(Ok(0)),
+        " no positive costs recovered this pass."
+    );
+    assert_eq!(compile_time_backfill_message(Ok(1)), " 1 entry updated.");
+    assert_eq!(compile_time_backfill_message(Ok(2)), " 2 entries updated.");
+    assert_eq!(
+        compile_time_backfill_message(Err(anyhow::anyhow!("index busy"))),
+        " deferred: index busy"
     );
 }
