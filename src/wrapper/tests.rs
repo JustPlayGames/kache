@@ -11105,8 +11105,15 @@ fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
     assert!(stop_on_hit_allowed(&parse("lib", true)));
     assert!(stop_on_hit_allowed(&parse("rlib", true)));
     assert!(!stop_on_hit_allowed(&parse("lib", false)));
+    // A compile that links stops only where the stop can prove its linker
+    // never runs on after it (Linux).
     for linked in ["bin", "proc-macro", "cdylib", "dylib"] {
-        assert!(!stop_on_hit_allowed(&parse(linked, true)), "{linked}");
+        assert_eq!(
+            stop_on_hit_allowed(&parse(linked, true)),
+            cfg!(target_os = "linux"),
+            "{linked}"
+        );
+        assert!(!stop_on_hit_allowed(&parse(linked, false)), "{linked}");
     }
 }
 

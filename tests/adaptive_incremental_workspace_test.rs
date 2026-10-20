@@ -430,9 +430,16 @@ impl RaceWorkspace {
 /// under it.
 #[cfg(unix)]
 fn assert_unstored_after_a_save(event: &Value) {
+    assert_unstored_after_a_save_keyed(event, 1);
+}
+
+/// [`assert_unstored_after_a_save`] for a unit whose key came from the
+/// pre-pass (`dep_info_runs` 1) or from its own compile's dep-info (0).
+#[cfg(unix)]
+fn assert_unstored_after_a_save_keyed(event: &Value, dep_info_runs: u64) {
     assert_eq!(
-        event["dep_info_runs"], 1,
-        "the key came from the pre-pass: {event:#}"
+        event["dep_info_runs"], dep_info_runs,
+        "where the key came from: {event:#}"
     );
     assert_eq!(event["result"], "skipped", "event: {event:#}");
     assert_eq!(event["skip_reason"], "inputs-changed", "event: {event:#}");
@@ -502,10 +509,11 @@ fn a_save_while_a_binary_with_policy_state_compiles_is_not_stored() {
 }
 
 /// A binary whose predicted key missed, as after an eviction, re-derives
-/// that key with the pre-pass first, because its compile cannot be stopped
-/// on a hit. When the key comes out the same and no seed can start, since
-/// the unit was last built under it, the binary still compiles before keying
-/// again.
+/// that key from its own compile's dep-info on Linux, where a compile that
+/// links can be stopped on a hit; elsewhere with the pre-pass first, and when
+/// the key comes out the same and no seed can start, since the unit was last
+/// built under it, the binary still compiles before keying again. Either
+/// way a save during the compile is not stored.
 #[cfg(unix)]
 #[test]
 fn a_save_while_a_binary_re_derives_its_key_is_not_stored() {
@@ -523,7 +531,10 @@ fn a_save_while_a_binary_re_derives_its_key_is_not_stored() {
     purge_crate(&fixture.project, fixture.cache.path(), "race_app");
     let (printed, app_event) = build(Some(&main("new")));
     assert_eq!(printed, "new", "rustc read the saved source");
-    assert_unstored_after_a_save(&app_event);
+    assert_unstored_after_a_save_keyed(
+        &app_event,
+        if cfg!(target_os = "linux") { 0 } else { 1 },
+    );
 
     fs::write(fixture.project.join("app/src/main.rs"), main("old")).unwrap();
     let (printed, app_event) = build(None);

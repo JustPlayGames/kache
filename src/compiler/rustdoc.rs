@@ -121,6 +121,7 @@ impl Compiler for RustdocCompiler {
         Ok(super::CompileResult {
             exit_code: exit_code(&output.status),
             signaled: output.status.code().is_none(),
+            stopped: false,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             pending_stderr: None,

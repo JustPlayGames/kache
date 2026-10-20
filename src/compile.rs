@@ -20,6 +20,10 @@ pub struct CompileResult {
     /// A Unix signal ended the compiler. `exit_code` then reads 1, as for a
     /// compile error.
     pub signaled: bool,
+    /// Kache stopped the compiler at its dep-info, as asked: its outputs are
+    /// not there. A compile asked to stop that [`stop_compile`] let go on
+    /// ran to its end and reads `false`.
+    pub stopped: bool,
     pub stdout: String,
     /// Complete compiler stderr, retained for cache storage.
     pub stderr: String,
@@ -106,6 +110,7 @@ pub fn run_rustc(
     incremental_mode: IncrementalMode,
     metadata_sink: Option<&mut dyn Write>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    stop_rule: StopRule,
 ) -> Result<CompileResult> {
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
@@ -212,6 +217,7 @@ pub fn run_rustc(
         child_stderr,
         metadata_sink,
         on_dep_info,
+        stop_rule,
     );
     drop(compiler_trace);
     drop(response_file);
@@ -280,6 +286,7 @@ pub fn run_rustc(
     Ok(CompileResult {
         exit_code,
         signaled: status.code().is_none(),
+        stopped: captured_stderr.stopped,
         stdout,
         stderr: stderr.into_owned(),
         pending_stderr: forwarding_metadata
@@ -296,19 +303,28 @@ fn capture_rustc_output(
     stderr: impl Read,
     metadata_sink: Option<&mut dyn Write>,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
-    capture_rustc_output_with(child, stdout, stderr, metadata_sink, None)
+    capture_rustc_output_with(child, stdout, stderr, metadata_sink, None, StopRule::Kill)
 }
 
 /// Drain both pipes. `on_dep_info` is asked, when rustc reports its dep-info
-/// written, whether to let the compile go on; `false` stops rustc there.
+/// written, whether to let the compile go on; `false` stops rustc there as
+/// `stop_rule` allows ([`stop_compile`]), and the compile goes on otherwise
+/// (`CapturedStderr::stopped` says which).
 fn capture_rustc_output_with(
     child: &mut Child,
     mut stdout: impl Read + Send,
     stderr: impl Read,
     metadata_sink: Option<&mut dyn Write>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    stop_rule: StopRule,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
     let child = std::sync::Mutex::new(child);
+    let child_ref = &child;
+    let mut gated = on_dep_info
+        .map(|decide| move || decide() || !stop_compile(&mut child_ref.lock().unwrap(), stop_rule));
+    let on_dep_info = gated
+        .as_mut()
+        .map(|gated| gated as &mut dyn FnMut() -> bool);
     std::thread::scope(|scope| {
         let stdout = scope.spawn(|| {
             let mut bytes = Vec::new();
@@ -336,6 +352,67 @@ fn capture_rustc_output_with(
         ))
     })
 }
+
+/// How a compile asked to stop at its dep-info is stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopRule {
+    /// Kill rustc at once: it does not link, so it starts no process that
+    /// could outlive it.
+    Kill,
+    /// It links: stop it only once it is proven alone ([`stop_compile`]).
+    WhenAlone,
+}
+
+impl StopRule {
+    pub fn for_compile(links: bool) -> Self {
+        if links { Self::WhenAlone } else { Self::Kill }
+    }
+}
+
+/// Stop a compile Kache no longer needs (its entry was found while it ran).
+/// `true` once it is stopped; `false` leaves it running to its end.
+///
+/// A compile that links ([`StopRule::WhenAlone`]) is frozen first (SIGSTOP,
+/// Linux) and killed only while it has no child process and has not started
+/// codegen. A child is rustc's linker (nothing else in rustc spawns one),
+/// which would outlive a kill of rustc alone and could write the output
+/// after Kache restored it. Codegen comes before the linker; stopping only
+/// ahead of it also keeps the jobserver tokens it takes and the object files
+/// it writes out of reach of the kill. A frozen process can start neither,
+/// and the kill reaches it before it runs again, so nothing it started is
+/// left writing once it is reaped. Anything unsure (it would not stop in
+/// time, it is traced, /proc is unreadable) lets it go on, which is always
+/// correct. Elsewhere it always goes on; the wrapper does not ask there
+/// ([`STOPS_LINKING_COMPILES`]).
+fn stop_compile(child: &mut Child, rule: StopRule) -> bool {
+    if rule == StopRule::Kill {
+        let _ = child.kill();
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match freeze::stop_if_alone(child) {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::debug!("not stopping the linking compile at its dep-info: {reason}");
+                false
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Whether a compile that links may be stopped on a hit: only where
+/// [`stop_compile`] can prove its linker never runs on after the stop.
+/// Windows would need rustc in a job object from its creation, which
+/// `std::process::Command` cannot do.
+pub const STOPS_LINKING_COMPILES: bool = cfg!(target_os = "linux");
+
+#[cfg(target_os = "linux")]
+mod freeze;
 
 struct CapturedStderr {
     verbatim: Vec<u8>,
@@ -840,14 +917,137 @@ mod tests {
         let stderr = child.stderr.take().unwrap();
         let started = std::time::Instant::now();
         let mut stop = || false;
-        let (status, _, captured) =
-            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop)).unwrap();
+        let (status, _, captured) = capture_rustc_output_with(
+            &mut child,
+            stdout,
+            stderr,
+            None,
+            Some(&mut stop),
+            StopRule::Kill,
+        )
+        .unwrap();
         assert!(captured.stopped);
         assert!(!status.success());
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "the compiler was left running: {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A compile asked to stop while it runs a child (rustc's linker) is not
+    /// stopped: killing rustc alone would orphan the linker, which could then
+    /// write the output after Kache restored it. It goes on, and returns only
+    /// once that child is done, so nothing it started writes afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_never_leaves_a_linker_writing_after_the_compile_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("linked");
+        // The "linker" starts before the dep-info line, so it runs when the
+        // stop is asked for; its output goes nowhere near rustc's pipes, as a
+        // real linker's does.
+        let script = "(sleep 0.4; echo linked > \"$1\") >/dev/null 2>&1 & \
+             printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; \
+             wait";
+        let mut child = Command::new("sh")
+            .args(["-c", script, "sh"])
+            .arg(&out)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut stop = || false;
+        let (status, _, captured) = capture_rustc_output_with(
+            &mut child,
+            stdout,
+            stderr,
+            None,
+            Some(&mut stop),
+            StopRule::WhenAlone,
+        )
+        .unwrap();
+        let at_return = fs::read(&out).ok();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        assert_eq!(
+            fs::read(&out).ok(),
+            at_return,
+            "a child of the stopped compile wrote its output after the compile returned"
+        );
+        assert!(
+            !captured.stopped,
+            "a compile with a running child must go on"
+        );
+        assert!(status.success());
+    }
+
+    /// The thread state follows the last ')' of the stat line, whatever the
+    /// command name holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_state_is_read_after_the_command_name() {
+        assert_eq!(freeze::parse_state(b"42 (rustc) T 1 42"), Some('T'));
+        assert_eq!(freeze::parse_state(b"42 (a) b) R 1 42"), Some('R'));
+        assert_eq!(freeze::parse_state(b"42 (rustc)"), None);
+        assert_eq!(freeze::parse_state(b"garbage"), None);
+    }
+
+    /// rustc's codegen threads, as rustc 1.99 names them; the frontend's
+    /// threads are not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codegen_threads_are_known_by_name() {
+        for codegen in [
+            "coordinator",
+            "opt cgu.00",
+            "opt regex.1f2e3",
+            "lto fat",
+            "copy x",
+        ] {
+            assert!(freeze::is_codegen_thread(codegen), "{codegen}");
+        }
+        for frontend in ["rustc", "ctrl-c", "tokio-rt-worker", "optimizer", ""] {
+            assert!(!freeze::is_codegen_thread(frontend), "{frontend}");
+        }
+    }
+
+    /// A compile with no child is stopped and reaped at once; the stop
+    /// leaves no process of it behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_compile_without_a_child_is_stopped_and_reaped() {
+        let script = "printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; \
+             while :; do :; done";
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let started = std::time::Instant::now();
+        let mut stop = || false;
+        let (status, _, captured) = capture_rustc_output_with(
+            &mut child,
+            stdout,
+            stderr,
+            None,
+            Some(&mut stop),
+            StopRule::WhenAlone,
+        )
+        .unwrap();
+        assert!(captured.stopped);
+        assert!(!status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the stopped compile was not reaped"
         );
     }
 
@@ -1024,6 +1224,7 @@ mod tests {
             let result = CompileResult {
                 exit_code: 0,
                 signaled: false,
+                stopped: false,
                 stdout: String::new(),
                 stderr: "complete stderr".to_owned(),
                 pending_stderr: pending.map(str::to_owned),
