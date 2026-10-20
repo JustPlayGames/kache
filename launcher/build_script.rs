@@ -67,6 +67,13 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}
 
+/// Newer compilers mangle the personality with their version. The build
+/// probes that compiler's IR and supplies its export name without guessing
+/// the hash. Older compilers keep the legacy definition above.
+#[cfg(kache_mangled_personality)]
+#[unsafe(export_name = env!("KACHE_LAUNCHER_PERSONALITY"))]
+extern "C" fn rustc_eh_personality() {}
+
 /// # Safety
 ///
 /// Called by the C runtime with the process's own `argc`, `argv` and `envp`.

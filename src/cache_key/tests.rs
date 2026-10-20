@@ -9643,34 +9643,40 @@ fn residual_args_are_order_independent() {
     assert_eq!(a, b, "residual argv order must not change the key");
 }
 
-/// kunobi-ninja/kache#324: diagnostics / lint / query / already-keyed path
-/// flags are stripped during parsing, so they must NOT reach the residual
-/// fold and over-key the result. Guards the same invariant as the
-/// `key_matrix_*_does_not_change_key` tests for flags cargo passes routinely.
-///
-/// Outcome-affecting lint configuration is deliberately NOT in this list:
-/// every lint level and `--check-cfg` must change the key —
-/// see `key_matrix_outcome_lint_configuration_changes_key`.
 #[test]
-fn residual_strips_diagnostic_and_query_flags() {
+fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
     std::fs::write(&source, b"pub fn hello() {}").unwrap();
-
     let base = key_of_flags(&flag_base(&source, &[]));
-    for extra in [
-        vec!["--diagnostic-width=80"],
-        vec!["--json=artifacts"],
-        vec!["--color", "always"],
-        vec!["--verbose"],
+    assert!(
+        outputs_of_flags(&flag_base(&source, &[]))
+            .fields
+            .unwrap()
+            .contains_key("diagnostics"),
+        "implicit diagnostics need a namespace distinct from older entries"
+    );
+    for (flag, value, other) in [
+        ("--error-format", "json", "human"),
+        ("--json", "artifacts", "diagnostic-rendered-ansi"),
+        ("--color", "always", "never"),
+        ("--diagnostic-width", "80", "120"),
     ] {
-        assert_eq!(
-            base,
-            key_of_flags(&flag_base(&source, &extra)),
-            "diagnostics/query flag {extra:?} must not change the key"
+        let attached = format!("{flag}={value}");
+        let first = key_of_flags(&flag_base(&source, &[&attached]));
+        let separated = key_of_flags(&flag_base(&source, &[flag, value]));
+        let different = key_of_flags(&flag_base(&source, &[flag, other]));
+        assert_ne!(base, first, "{flag} changes cached diagnostics");
+        assert_eq!(first, separated, "both spellings of {flag} agree");
+        assert_ne!(first, different, "{flag} values must not collide");
+        assert_ne!(
+            key_of_flags(&flag_base(&source, &[flag, value, flag, other])),
+            key_of_flags(&flag_base(&source, &[flag, other, flag, value])),
+            "{flag} occurrence order must be preserved"
         );
     }
+    assert_eq!(base, key_of_flags(&flag_base(&source, &["--verbose"])));
 }
 
 /// kunobi-ninja/kache#399: lexical `.`/`..` collapse + separator unification.
@@ -13453,7 +13459,14 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
     let memo = dir.path().join("memo");
     let (workspace, out) = (dir.path().join("w"), dir.path().join("out"));
     write_file(&workspace.join("Cargo.toml"), "[workspace]\n");
-    write_file(&workspace.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    let source = workspace.join("kt/src/lib.rs");
+    write_file(&source, "pub fn a() {}\n");
+    // Same-size edits must move the stamp even on coarse filesystem clocks.
+    filetime::set_file_mtime(
+        &source,
+        filetime::FileTime::from_unix_time(1_000_000_000, 0),
+    )
+    .unwrap();
     write_file(&out.join("gen.rs"), "// gen\n");
     // Recreating a file can reuse its inode and coarse times. Give the two
     // identical files distinct mtimes so the OUT_DIR entry stamp must move.
@@ -13499,7 +13512,12 @@ fn each_root_of_a_tree_digest_is_memoised_alone() {
     assert_eq!(guard(true).1, 0);
     assert!(!taken.held(), "the OUT_DIR moved");
     assert!(again.held());
-    write_file(&workspace.join("kt/src/lib.rs"), "pub fn b() {}\n");
+    write_file(&source, "pub fn b() {}\n");
+    filetime::set_file_mtime(
+        &source,
+        filetime::FileTime::from_unix_time(1_000_000_001, 0),
+    )
+    .unwrap();
     assert!(!again.held(), "the workspace moved");
 }
 
@@ -16209,16 +16227,8 @@ fn key_matrix_rustflags_whitespace_does_not_change_key() {
     );
 }
 
-// ── "should NOT change" cases — diagnostics-only inputs ──
-//
-// These flags steer only what rustc *prints*, never the emitted
-// artifact bytes. If the key changes for one of them, that is
-// over-keying (a missed hit) — the test will fail and surface it
-// rather than silently weakening the key.
-//
-// All lint configuration is deliberately absent from this section: it
-// cannot change successful artifact bytes, but it can change whether the
-// compile FAILS, and a hit replays success. See the tests below.
+// Diagnostic presentation and lint outcomes are part of the cached result.
+// These tests distinguish them from flags that leave that result unchanged.
 
 #[test]
 fn key_matrix_outcome_lint_configuration_changes_key() {
@@ -16393,10 +16403,8 @@ fn key_matrix_outcome_lint_gates_key_by_pairing_not_multiset() {
 }
 
 #[test]
-fn key_matrix_error_format_does_not_change_key() {
-    // `--error-format=json` changes how diagnostics are rendered
-    // (cargo always passes it) — never the artifact. The key must
-    // not move.
+fn key_matrix_error_format_changes_key() {
+    // Hits replay diagnostics as well as artifact bytes.
     if !rustc_available() {
         return;
     }
@@ -16409,11 +16417,10 @@ fn key_matrix_error_format_does_not_change_key() {
     let mut with_fmt = base_args(&source);
     with_fmt.push("--error-format=json".to_string());
 
-    assert_eq!(
+    assert_ne!(
         key_for(&base),
         key_for(&with_fmt),
-        "`--error-format` is diagnostics-only and must NOT change \
-             the key — a change here is over-keying"
+        "`--error-format` must key the diagnostics a hit replays"
     );
 }
 
