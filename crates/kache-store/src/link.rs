@@ -305,15 +305,6 @@ pub(crate) fn warn_hardlink_fallback_once(
 ///   execute bit, because the shared inode cannot be chmod'ed. Any other blob,
 ///   and every Windows restore, is copied as `Copy` would. The caller decides
 ///   which artifacts qualify.
-/// - `SharedExecutableHardlink`: an executable that is a leaf of the build
-///   graph and that nothing rewrites in place: a test binary. On Unix it
-///   shares the blob's inode under the same read-only, every-execute-bit
-///   rule as `ExecutableHardlink`, but with any number of consumers: the
-///   restore's mtime stamp re-dates the file in every target sharing it,
-///   and only a newer mtime, never an older one, which cannot make anything
-///   stale because nothing depends on a test binary. The blob must also be
-///   this user's, since only the owner may stamp a read-only file. Any other
-///   blob, and every Windows restore, is copied as `Copy` would.
 /// - `SharedLibHardlink`: an `.rlib` whose unit also emits an `.rmeta` that
 ///   the same restore writes and stamps beside it. Cargo judges a library
 ///   unit by the newest of its outputs, or by its `.rmeta` alone where a
@@ -329,17 +320,13 @@ pub enum LinkStrategy {
     Hardlink,
     Copy,
     ExecutableHardlink,
-    SharedExecutableHardlink,
     SharedLibHardlink,
 }
 
 impl LinkStrategy {
     /// Whether the restored file must run or load: it gets every execute bit.
     pub fn is_executable(self) -> bool {
-        matches!(
-            self,
-            Self::Copy | Self::ExecutableHardlink | Self::SharedExecutableHardlink
-        )
+        matches!(self, Self::Copy | Self::ExecutableHardlink)
     }
 }
 
@@ -379,9 +366,7 @@ fn link_to_target_via(
                         set_owner_write_permission(target_path)?
                     }
                     // Executables and loadable libraries also need execute bits.
-                    LinkStrategy::Copy
-                    | LinkStrategy::ExecutableHardlink
-                    | LinkStrategy::SharedExecutableHardlink => {
+                    LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
                         set_executable_permissions(target_path)?
                     }
                 }
@@ -456,18 +441,7 @@ fn link_to_target_via(
             {
                 executable_hardlink_or_copy(store_path, target_path, bytes)
             }
-            // A test binary: every consumer may share the inode.
-            #[cfg(unix)]
-            LinkStrategy::SharedExecutableHardlink
-                if test_binary_blob_is_shareable(fs::metadata(store_path).ok().as_ref(), unsafe {
-                    libc::geteuid()
-                }) =>
-            {
-                shared_executable_hardlink_or_copy(store_path, target_path, bytes)
-            }
-            LinkStrategy::Copy
-            | LinkStrategy::ExecutableHardlink
-            | LinkStrategy::SharedExecutableHardlink => {
+            LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
                 // Copying here is by design (executables/dylibs may be mutated after
                 // the build), so no storage-layout advice — but a large artifact that
                 // failed to block-clone on a CoW volume is still a real fault and is
@@ -535,21 +509,6 @@ fn executable_blob_is_shareable(blob_mode: Option<u32>) -> bool {
     blob_mode.is_some_and(|mode| mode & 0o111 == 0o111 && mode & 0o222 == 0)
 }
 
-/// Whether a `SharedExecutableHardlink` restore may share the blob's inode:
-/// shareable as for [`executable_blob_is_shareable`], and owned by `euid`,
-/// because the restore stamps the inode's mtime and only the owner may stamp
-/// a file it cannot write (a store shared through a group holds other
-/// users' blobs).
-#[cfg(unix)]
-fn test_binary_blob_is_shareable(blob: Option<&fs::Metadata>, euid: u32) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    blob.is_some_and(|meta| {
-        meta.is_file()
-            && meta.uid() == euid
-            && executable_blob_is_shareable(Some(meta.permissions().mode()))
-    })
-}
-
 /// Whether a `SharedLibHardlink` restore may share the blob's inode: a
 /// regular file nobody can write through a link, whose mtime is not later
 /// than `now`. The restore leaves that mtime alone, so it must not be newer
@@ -584,34 +543,6 @@ fn shared_lib_hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64
     }
     tracing::debug!(
         "hardlinked rlib {} -> {}",
-        store_path.display(),
-        target_path.display()
-    );
-    crate::opcounts::record_hardlinked(bytes);
-    Ok(())
-}
-
-/// Hardlink fallback for `SharedExecutableHardlink`: link the blob whatever
-/// else links it (see [`LinkStrategy::SharedExecutableHardlink`]), or copy
-/// it, runnable, when the link fails (another filesystem, say).
-#[cfg(unix)]
-fn shared_executable_hardlink_or_copy(
-    store_path: &Path,
-    target_path: &Path,
-    bytes: u64,
-) -> Result<()> {
-    if let Err(e) = try_hard_link(store_path, target_path) {
-        let reason = classify_hardlink_io_error(e.kind());
-        match reason {
-            HardlinkIoReason::CrossDevice => crate::opcounts::record_restore_copy_cross_device(bytes),
-            HardlinkIoReason::Permission => crate::opcounts::record_restore_copy_permission(bytes),
-            HardlinkIoReason::Other => crate::opcounts::record_restore_copy_other(bytes),
-        }
-        warn_hardlink_fallback_once(store_path, target_path, reason, &e);
-        return copy_hardlink_fallback(store_path, target_path, bytes, true);
-    }
-    tracing::debug!(
-        "hardlinked test binary {} -> {}",
         store_path.display(),
         target_path.display()
     );
@@ -5009,70 +4940,6 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             std::time::SystemTime::now()
         ));
         assert!(!lib_blob_is_shareable(None, std::time::SystemTime::now()));
-    }
-
-    // ── SharedExecutableHardlink: test binaries ───────────────────────────
-
-    /// Without CoW, a test binary's runnable read-only blob is linked by every
-    /// target that restores it, not only the first: the stamp a restore gives
-    /// the shared inode only moves its mtime forward, and nothing depends on
-    /// a test binary.
-    #[cfg(unix)]
-    #[test]
-    fn a_test_binary_blob_is_shared_by_every_consumer() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let blob = dir.path().join("blob");
-        fs::write(&blob, b"test binary").unwrap();
-        fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
-        let (tree_a, tree_b) = (dir.path().join("a/t-1"), dir.path().join("b/t-1"));
-        for tree in [&tree_a, &tree_b] {
-            link_to_target_via(&blob, tree, LinkStrategy::SharedExecutableHardlink, no_reflink)
-                .unwrap();
-            touch_mtime_write_clock(tree).unwrap();
-        }
-        assert_eq!(ino_of(&tree_a), ino_of(&blob));
-        assert_eq!(ino_of(&tree_b), ino_of(&blob));
-        assert_eq!(mode_of(&tree_b), 0o555, "runs, and no writer reaches the blob");
-        assert_eq!(fs::read(&tree_b).unwrap(), b"test binary");
-    }
-
-    /// A writable or not-runnable blob is copied, runnable and private, as
-    /// `Copy` would; the blob keeps its mode.
-    #[cfg(unix)]
-    #[test]
-    fn a_test_binary_blob_that_cannot_be_shared_is_copied() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        for (name, mode) in [("writable", 0o755), ("not-runnable", 0o444)] {
-            let blob = dir.path().join(name);
-            fs::write(&blob, b"test binary").unwrap();
-            fs::set_permissions(&blob, fs::Permissions::from_mode(mode)).unwrap();
-            let target = dir.path().join(format!("out-{name}"));
-            link_to_target_via(&blob, &target, LinkStrategy::SharedExecutableHardlink, no_reflink)
-                .unwrap();
-            assert_ne!(ino_of(&target), ino_of(&blob), "{name}");
-            assert_eq!(mode_of(&target) & 0o111, 0o111, "{name}");
-            assert_eq!(mode_of(&blob), mode, "{name}");
-        }
-    }
-
-    /// Only the owner may stamp a read-only file, so another user's blob (a
-    /// store shared through a group) is never shared.
-    #[cfg(unix)]
-    #[test]
-    fn a_test_binary_blob_is_shared_only_by_its_owner() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
-        let blob = dir.path().join("blob");
-        fs::write(&blob, b"test binary").unwrap();
-        fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
-        let meta = fs::metadata(&blob).unwrap();
-        assert!(test_binary_blob_is_shareable(Some(&meta), meta.uid()));
-        assert!(!test_binary_blob_is_shareable(Some(&meta), meta.uid().wrapping_add(1)));
-        assert!(!test_binary_blob_is_shareable(None, meta.uid()));
-        let directory = fs::metadata(dir.path()).unwrap();
-        assert!(!test_binary_blob_is_shareable(Some(&directory), directory.uid()));
     }
 
     /// Without CoW, a runnable read-only blob is shared like an rlib. The link

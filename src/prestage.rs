@@ -273,29 +273,6 @@ pub(crate) fn remember(cache_dir: &Path, target_dir: &Path, dest: &Path, blob: &
     }
 }
 
-/// Drop what was recorded or staged for the artifact at `dest`, when its
-/// restore no longer copies it (a test binary, restored by link since
-/// tasty.18): a record left from an earlier version would be staged for
-/// nothing. A record of another file under the same artifact name (a
-/// binary and its unit tests are both `deps/<name>-<hash>`) is kept. Usually
-/// a failed open and a failed unlink.
-pub(crate) fn forget(cache_dir: &Path, target_dir: &Path, dest: &Path, blob: &str) {
-    let Ok(rel) = dest.strip_prefix(target_dir) else {
-        return;
-    };
-    let path = records_dir(cache_dir, target_dir).join(short_hash(artifact_key(rel).as_bytes()));
-    let ours = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
-        .is_some_and(|record| record.dest == dest || record.blob == blob);
-    if ours {
-        let _ = std::fs::remove_file(path);
-    }
-    if let Some(staged) = staged_path(dest, blob) {
-        remove_staged(&staged);
-    }
-}
-
 fn remove_staged(staged: &Path) {
     let _ = std::fs::remove_file(staged);
     let _ = std::fs::remove_file(fingerprint_path(staged));
@@ -1292,30 +1269,6 @@ mod tests {
             .map(|dest| staged_path(dest, &hash).unwrap().is_file())
             .collect();
         assert_eq!(staged, [false, false, true, true, true, true]);
-    }
-
-    /// `forget` drops the record and any staged copy of an artifact that is
-    /// no longer restored by copy.
-    #[test]
-    fn forget_drops_the_record_and_the_staged_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("cache");
-        let target = target(dir.path(), "a");
-        let (blob_path, hash) = blob(dir.path(), b"an executable");
-        let dest = target.join("debug/deps/app-0123456789abcdef");
-        remember(&cache, &target, &dest, &hash, MIN_BYTES);
-        stage_ok(&cache, &target, &blob_path);
-        forget(&cache, &target, &dest, &hash);
-        assert!(recorded_dests(&cache).is_empty());
-        let staged = staged_path(&dest, &hash).unwrap();
-        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
-
-        // A binary's record survives its unit tests (same artifact name,
-        // another metadata hash and blob) being forgotten.
-        remember(&cache, &target, &dest, &hash, MIN_BYTES);
-        let tests = target.join("debug/deps/app-fedcba9876543210");
-        forget(&cache, &target, &tests, &"b".repeat(64));
-        assert_eq!(recorded_dests(&cache), vec![dest]);
     }
 
     /// A record with no misses reads and writes as before tasty.18, so the
