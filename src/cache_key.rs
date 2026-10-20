@@ -2553,7 +2553,23 @@ fn portable_key_inputs(
             |var| std::env::var_os(var),
         )
     };
-    if let Some(record) = file_hasher.portable_prediction_under(identity, tree) {
+    if tree.starts_with(INPUTS_GUARD_TAG) {
+        // Each row of this guard names its own closure directories: the
+        // first one whose directories and closure still hold is used.
+        let mut refused = None;
+        for name in file_hasher.portable_prediction_names(&inputs_rows_prefix(identity, tree)) {
+            let Some(record) = file_hasher.portable_prediction(&name) else {
+                continue;
+            };
+            match validate(&record) {
+                Ok(dep_info) => return Ok(dep_info),
+                Err(rejection) => refused = refused.or(Some(rejection)),
+            }
+        }
+        if let Some(rejection) = refused {
+            return Err(rejection);
+        }
+    } else if let Some(record) = file_hasher.portable_prediction_under(identity, tree) {
         return validate(&record);
     }
     // Rows of other trees only: what one row of another tree said before
@@ -7490,8 +7506,22 @@ fn tree_keyed_prefix(identity: &str) -> String {
 /// what a record must pass: the row found is validated in full, its tree
 /// included, as before.
 pub(crate) fn tree_keyed_identity(identity: &str, tree: &str) -> String {
+    // An inputs guard ([`inputs_workspace_guard`]) holds most of the package
+    // in the closure's directories: checkouts that differ by a name in
+    // `src/` share the rest, so its rows are filed under the whole tree and
+    // found by [`inputs_rows_prefix`].
+    if tree.starts_with(INPUTS_GUARD_TAG) {
+        return format!("{}{tree}", tree_keyed_prefix(identity));
+    }
     let guard = tree.split_once("+dirs:").map_or(tree, |(guard, _)| guard);
     format!("{}{guard}", tree_keyed_prefix(identity))
+}
+
+/// What the rows of `identity` made under the inputs guard `guard` (before
+/// the closure's directories join it) are named first: one row for each
+/// state of those directories a checkout recorded.
+fn inputs_rows_prefix(identity: &str, guard: &str) -> String {
+    format!("{}{guard}+dirs:", tree_keyed_prefix(identity))
 }
 
 fn validate_portable_prediction(
@@ -8674,6 +8704,20 @@ impl<'db> FileHasher<'db> {
     ) -> Option<PortablePrediction> {
         self.portable_prediction(&tree_keyed_identity(identity, guard))
             .or_else(|| self.portable_prediction(identity))
+    }
+
+    /// The names of the rows under `prefix`, most recently used first, at
+    /// most [`TREE_ROWS_KEPT`]; none when the store cannot say.
+    pub(crate) fn portable_prediction_names(&self, prefix: &str) -> Vec<String> {
+        let _trace = crate::phase_trace::phase("prediction_read");
+        self.cache.as_ref().map_or_else(Vec::new, |cache| {
+            cache
+                .input_prediction_names_under(prefix, TREE_ROWS_KEPT)
+                .unwrap_or_else(|error| {
+                    tracing::debug!("portable prediction listing failed: {error}");
+                    Vec::new()
+                })
+        })
     }
 
     /// Does `identity` have a row for any tree ([`tree_keyed_identity`])?
