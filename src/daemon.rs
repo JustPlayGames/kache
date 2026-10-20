@@ -7743,6 +7743,25 @@ async fn server_main(
         }
     });
 
+    // Copies staged for builds that did not come to take them (prestage).
+    let sweep_cache_dir = daemon.config.cache_dir.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crate::prestage::SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cache_dir = sweep_cache_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let removed =
+                    crate::prestage::sweep_staged(&cache_dir, std::time::SystemTime::now());
+                if removed > 0 {
+                    tracing::info!(removed, "prestage: swept untaken copies");
+                }
+            })
+            .await;
+        }
+    });
+
     let gc_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

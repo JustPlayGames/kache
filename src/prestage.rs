@@ -27,6 +27,17 @@
 //! - The restore renames a staged copy into place when the copy still has the
 //!   fingerprint the daemon wrote. Anything else is removed and the blob is
 //!   copied as before.
+//! - A guess costs a copy's worth of disk writes and space, so it is kept
+//!   small (tasty.18: of the copies staged on one machine over 32 hours, at
+//!   least as many bytes were left untaken as were taken, most for
+//!   destinations no build wrote again). A pass stages the newest records
+//!   first, up to [`PASS_MAX_BYTES`]. A copy nobody took within
+//!   [`STALE_AFTER`] is removed by the daemon's sweep ([`sweep_staged`])
+//!   and its record muted: it is not staged again until a build stores or
+//!   restores that artifact in a target again, which rewrites the record. A
+//!   copy whose destination a build wrote some other way is removed by the
+//!   next pass. Test binaries are not staged at all: they are restored by
+//!   link ([`forget`]).
 //!
 //! What lands at the destination is the blob's bytes in a file of its own,
 //! exactly what the restore's copy would have produced. The fingerprint is
@@ -46,9 +57,16 @@ pub(crate) const MIN_BYTES: u64 = 16 << 20;
 /// How often a target directory's builds hint the daemon.
 const HINT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// A staged copy nobody took within this long is removed by the next staging
-/// pass in its directory.
-const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+/// A staged copy nobody took within this long is removed, and its record
+/// muted, by the daemon's sweep or the next staging pass. A copy is staged
+/// when a build starts and taken when that build restores it.
+const STALE_AFTER: Duration = Duration::from_secs(20 * 60);
+
+/// How many bytes one staging pass copies at most, newest records first.
+const PASS_MAX_BYTES: u64 = 4 << 30;
+
+/// How often the daemon sweeps untaken copies ([`sweep_staged`]).
+pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// A record no build has rewritten for this long is dropped by the daemon's
 /// GC; the next store or restore of the artifact records it again.
@@ -58,6 +76,9 @@ const STAGED_PREFIX: &str = ".kache-prestage-";
 const FINGERPRINT_SUFFIX: &str = ".fp";
 const HINT_MARKER: &str = ".hinted";
 const STAGING_LOCK: &str = ".staging.lock";
+/// The target directory a records directory belongs to, for the sweep to
+/// find copies staged from borrowed records.
+const TARGET_FILE: &str = ".target";
 /// `latest-<project>` names the target directory of the project that
 /// recorded last.
 const LATEST_PREFIX: &str = "latest-";
@@ -70,6 +91,14 @@ struct Record {
     rel: PathBuf,
     blob: String,
     size: u64,
+    /// How many staged copies of this record went untaken. One mutes the
+    /// record until a build records it again.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    misses: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// What the daemon wrote about a staged copy.
@@ -179,8 +208,9 @@ pub(crate) fn stage_for_test(dest: &Path, blob_path: &Path, blob: &str) {
         rel: PathBuf::from(dest.file_name().unwrap()),
         blob: blob.to_string(),
         size: MIN_BYTES,
+        misses: 0,
     };
-    stage_one(&record, blob_path).unwrap();
+    stage_one(None, &record, blob_path, SystemTime::now(), &mut { u64::MAX }).unwrap();
 }
 
 /// Every destination recorded under `cache_dir`.
@@ -210,6 +240,7 @@ pub(crate) fn remember(cache_dir: &Path, target_dir: &Path, dest: &Path, blob: &
         rel: rel.to_path_buf(),
         blob: blob.to_string(),
         size,
+        misses: 0,
     };
     // Paths that are not UTF-8 cannot go into a record; such a target just
     // copies as before.
@@ -270,6 +301,24 @@ fn remove_staged(staged: &Path) {
     let _ = std::fs::remove_file(fingerprint_path(staged));
 }
 
+/// Count a staged copy of the record at `path` that went untaken, unless a
+/// build rewrote the record for another blob since it was read.
+fn note_miss(path: &Path, blob: &str) {
+    let Some(mut record) = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+    else {
+        return;
+    };
+    if record.blob != blob {
+        return;
+    }
+    record.misses = record.misses.saturating_add(1);
+    if let Ok(bytes) = serde_json::to_vec(&record) {
+        let _ = write_atomic(path, &bytes);
+    }
+}
+
 /// The target directory of `target_dir`'s project that recorded last, when
 /// it is not `target_dir`.
 fn lender(cache_dir: &Path, target_dir: &Path) -> Option<PathBuf> {
@@ -293,26 +342,55 @@ fn read_records(directory: &Path) -> Vec<(PathBuf, Record)> {
         .collect()
 }
 
-/// What to stage for `target_dir`: its own records, or else those of the
-/// project's target directory that recorded last, moved under `target_dir`.
-fn records_for(cache_dir: &Path, target_dir: &Path) -> Vec<Record> {
-    let own: Vec<Record> = read_records(&records_dir(cache_dir, target_dir))
-        .into_iter()
-        .map(|(_, record)| record)
-        .collect();
-    if !own.is_empty() {
-        return own;
-    }
-    let Some(other) = lender(cache_dir, target_dir) else {
-        return Vec::new();
+/// What to stage for `target_dir`, each with the file it was read from,
+/// newest first: its own records, or else those of the project's target
+/// directory that recorded last, moved under `target_dir`.
+fn records_for(cache_dir: &Path, target_dir: &Path) -> Vec<(PathBuf, Record)> {
+    let own = read_records(&records_dir(cache_dir, target_dir));
+    let mut records = if own.is_empty()
+        && let Some(other) = lender(cache_dir, target_dir)
+    {
+        read_records(&records_dir(cache_dir, &other))
+            .into_iter()
+            .map(|(path, record)| {
+                let dest = target_dir.join(&record.rel);
+                (path, Record { dest, ..record })
+            })
+            .collect()
+    } else {
+        own
     };
-    read_records(&records_dir(cache_dir, &other))
-        .into_iter()
-        .map(|(_, record)| Record {
-            dest: target_dir.join(&record.rel),
-            ..record
-        })
-        .collect()
+    let written = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    };
+    records.sort_by_cached_key(|(path, _)| std::cmp::Reverse(written(path)));
+    records
+}
+
+/// Remember which target directory `directory` holds records for.
+fn note_target(directory: &Path, target_dir: &Path) {
+    let path = directory.join(TARGET_FILE);
+    if !path.exists() {
+        let _ = write_atomic(&path, target_dir.as_os_str().as_encoded_bytes());
+    }
+}
+
+/// The target directory a records directory belongs to: its `.target`
+/// file, or else where its first record's destination lies.
+fn target_of(directory: &Path) -> Option<PathBuf> {
+    if let Some(target) = std::fs::read(directory.join(TARGET_FILE))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        return Some(PathBuf::from(target));
+    }
+    read_records(directory).into_iter().find_map(|(_, record)| {
+        let dest = record.dest.to_string_lossy().into_owned();
+        dest.strip_suffix(&*record.rel.to_string_lossy())
+            .map(|target| PathBuf::from(target.trim_end_matches(['/', '\\'])))
+    })
 }
 
 /// Whether a build of `target_dir` should hint the daemon now: something is
@@ -324,10 +402,12 @@ fn hint_due(cache_dir: &Path, target_dir: &Path, now: SystemTime) -> bool {
         return false;
     }
     let directory = records_dir(cache_dir, target_dir);
-    if !directory.is_dir()
-        && (lender(cache_dir, target_dir).is_none() || std::fs::create_dir_all(&directory).is_err())
-    {
-        return false;
+    if !directory.is_dir() {
+        if lender(cache_dir, target_dir).is_none() || std::fs::create_dir_all(&directory).is_err()
+        {
+            return false;
+        }
+        note_target(&directory, target_dir);
     }
     let marker = directory.join(HINT_MARKER);
     // A marker newer than `now` (clock skew, or written after `now` was
@@ -407,19 +487,34 @@ fn stage_pass(
 ) -> std::io::Result<Vec<(PathBuf, anyhow::Result<()>)>> {
     let directory = records_dir(cache_dir, target_dir);
     std::fs::create_dir_all(&directory)?;
+    note_target(&directory, target_dir);
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(directory.join(STAGING_LOCK))?;
     lock.try_lock().map_err(std::io::Error::from)?;
-    let results = records_for(cache_dir, target_dir)
-        .into_iter()
-        .map(|record| {
-            let result = stage_one(&record, &blob_path(&record.blob));
-            (record.dest, result)
+    let now = SystemTime::now();
+    let mut budget = PASS_MAX_BYTES;
+    let records = records_for(cache_dir, target_dir);
+    let results = records
+        .iter()
+        .map(|(path, record)| {
+            let result = stage_one(
+                Some(path),
+                record,
+                &blob_path(&record.blob),
+                now,
+                &mut budget,
+            );
+            (record.dest.clone(), result)
         })
         .collect();
+    // Then anything else left in those directories past its time: copies
+    // for records rewritten since, or written by an older version.
+    for directory in dest_dirs(&records) {
+        sweep_stale(&directory, now);
+    }
     // Unlock rather than only drop: a child forked while the file is open
     // shares its lock until the child execs, and would make the next pass
     // skip.
@@ -427,24 +522,66 @@ fn stage_pass(
     Ok(results)
 }
 
-fn stage_one(record: &Record, blob: &Path) -> anyhow::Result<()> {
+fn dest_dirs(records: &[(PathBuf, Record)]) -> std::collections::BTreeSet<PathBuf> {
+    records
+        .iter()
+        .filter_map(|(_, record)| record.dest.parent().map(Path::to_path_buf))
+        .collect()
+}
+
+/// Stage one record, read from `record_path`, within `budget` bytes. A copy
+/// already staged is left to be taken until [`STALE_AFTER`], then removed
+/// and counted as a miss; one whose destination exists is removed at once;
+/// a muted record is not staged.
+fn stage_one(
+    record_path: Option<&Path>,
+    record: &Record,
+    blob: &Path,
+    now: SystemTime,
+    budget: &mut u64,
+) -> anyhow::Result<()> {
     let Some(directory) = record.dest.parent() else {
         return Ok(());
     };
-    sweep_stale(directory, SystemTime::now());
-    if !record.dest.is_absolute() || record.dest.exists() || !directory.is_dir() || !blob.is_file()
-    {
-        return Ok(());
-    }
     let staged = staged_path(&record.dest, &record.blob)
         .ok_or_else(|| anyhow::anyhow!("no staging name"))?;
     let fingerprint = fingerprint_path(&staged);
-    if fingerprint.is_file() {
-        if staged.is_file() {
+    if record.dest.exists() {
+        // The build wrote it some other way; this copy is never taken.
+        remove_staged(&staged);
+        return Ok(());
+    }
+    if let Ok(metadata) = std::fs::metadata(&staged) {
+        let complete = fingerprint.is_file();
+        if complete && !older_than(&metadata, STALE_AFTER, now) {
             return Ok(());
         }
+        remove_staged(&staged);
+        if complete {
+            // A finished copy that went untaken.
+            if let Some(path) = record_path {
+                note_miss(path, &record.blob);
+            }
+            return Ok(());
+        }
+    } else if fingerprint.is_file() {
         std::fs::remove_file(&fingerprint)?;
     }
+    if record.misses > 0
+        || !record.dest.is_absolute()
+        || !directory.is_dir()
+        || !blob.is_file()
+    {
+        return Ok(());
+    }
+    if record.size > *budget {
+        tracing::debug!(
+            "not staging {}: past the pass's {PASS_MAX_BYTES} bytes",
+            record.dest.display()
+        );
+        return Ok(());
+    }
+    *budget -= record.size;
     // A fresh name the restore never looks at, materialized the way the
     // restore would: clone or copy, writable, executable.
     let temporary = tempfile::Builder::new()
@@ -468,26 +605,85 @@ fn stage_one(record: &Record, blob: &Path) -> anyhow::Result<()> {
 }
 
 /// Remove staged copies and fingerprints in `directory` that nobody took
-/// within [`STALE_AFTER`].
-fn sweep_stale(directory: &Path, now: SystemTime) {
+/// within [`STALE_AFTER`]; returns how many copies (not fingerprints).
+fn sweep_stale(directory: &Path, now: SystemTime) -> usize {
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+        return 0;
     };
+    let mut removed = 0;
     for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(STAGED_PREFIX)
-        {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(STAGED_PREFIX) {
             continue;
         }
         if entry
             .metadata()
             .is_ok_and(|metadata| older_than(&metadata, STALE_AFTER, now))
+            && std::fs::remove_file(entry.path()).is_ok()
+            && !name.ends_with(FINGERPRINT_SUFFIX)
         {
-            let _ = std::fs::remove_file(entry.path());
+            removed += 1;
         }
     }
+    removed
+}
+
+/// Remove the copies nobody took within [`STALE_AFTER`] in every target
+/// directory something is recorded for or borrowed by, and mute their
+/// records. A target whose staging pass runs is left to that pass. Run by
+/// the daemon every [`SWEEP_INTERVAL`] and by its GC, so a copy no later
+/// build of its target comes to take does not sit there; returns how many
+/// copies it removed.
+pub(crate) fn sweep_staged(cache_dir: &Path, now: SystemTime) -> usize {
+    let Ok(entries) = std::fs::read_dir(prestage_dir(cache_dir)) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let directory = entry.path();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(LATEST_PREFIX)
+            || !directory.is_dir()
+        {
+            continue;
+        }
+        // No lock file: no pass ever ran for this target, so nothing is staged.
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.join(STAGING_LOCK))
+        else {
+            continue;
+        };
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        if let Some(target) = target_of(&directory) {
+            let records = records_for(cache_dir, &target);
+            for (path, record) in &records {
+                let Some(staged) = staged_path(&record.dest, &record.blob) else {
+                    continue;
+                };
+                let stale = std::fs::metadata(&staged)
+                    .is_ok_and(|metadata| older_than(&metadata, STALE_AFTER, now));
+                if stale {
+                    let complete = fingerprint_path(&staged).is_file();
+                    remove_staged(&staged);
+                    removed += 1;
+                    if complete {
+                        note_miss(path, &record.blob);
+                    }
+                }
+            }
+            for directory in dest_dirs(&records) {
+                removed += sweep_stale(&directory, now);
+            }
+        }
+        let _ = lock.unlock();
+    }
+    removed
 }
 
 /// Whether a target directory no longer exists. One this account cannot
@@ -499,14 +695,15 @@ fn target_is_gone(target: &Path) -> bool {
     }
 }
 
-/// Drop records no build rewrote within [`RECORD_TTL`] or whose target
-/// directory is gone, and `latest` pointers to missing target directories.
-/// Called from the daemon's GC; returns how many files it removed.
+/// Sweep untaken copies ([`sweep_staged`]), then drop records no build
+/// rewrote within [`RECORD_TTL`] or whose target directory is gone, and
+/// `latest` pointers to missing target directories. Called from the
+/// daemon's GC; returns how many files it removed.
 pub(crate) fn prune(cache_dir: &Path, now: SystemTime) -> usize {
+    let mut removed = sweep_staged(cache_dir, now);
     let Ok(entries) = std::fs::read_dir(prestage_dir(cache_dir)) else {
-        return 0;
+        return removed;
     };
-    let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         if entry
@@ -537,7 +734,11 @@ pub(crate) fn prune(cache_dir: &Path, now: SystemTime) -> usize {
                 removed += 1;
             }
         }
-        if read_records(&path).is_empty() {
+        // A borrower's directory holds no records, only which target it is
+        // for; it stays while that target does, so the sweep finds its copies.
+        if read_records(&path).is_empty()
+            && target_of(&path).is_none_or(|target| target_is_gone(&target))
+        {
             let _ = std::fs::remove_dir_all(&path);
         }
     }
@@ -714,7 +915,9 @@ mod tests {
     fn durations_are_pinned() {
         assert_eq!(MIN_BYTES, 16 * 1024 * 1024);
         assert_eq!(HINT_INTERVAL, Duration::from_secs(30));
-        assert_eq!(STALE_AFTER, Duration::from_secs(3600));
+        assert_eq!(STALE_AFTER, Duration::from_secs(1200));
+        assert_eq!(PASS_MAX_BYTES, 4 * 1024 * 1024 * 1024);
+        assert_eq!(SWEEP_INTERVAL, Duration::from_secs(300));
         assert_eq!(RECORD_TTL, Duration::from_secs(2_592_000));
     }
 
@@ -742,8 +945,10 @@ mod tests {
             rel: PathBuf::from("debug/deps/app-0123456789abcdef"),
             blob: "a".repeat(64),
             size: MIN_BYTES,
+            misses: 0,
         };
-        assert!(stage_one(&record, &dir.path().join("gone")).is_ok());
+        let now = SystemTime::now();
+        assert!(stage_one(None, &record, &dir.path().join("gone"), now, &mut { u64::MAX }).is_ok());
         assert_eq!(std::fs::read_dir(&deps).unwrap().count(), 0);
     }
 
@@ -966,5 +1171,168 @@ mod tests {
         assert!(!gone, "permission denied is not gone");
         std::fs::remove_dir_all(&home).unwrap();
         assert!(target_is_gone(&target));
+    }
+
+    /// The daemon's sweep removes a copy no build came to take within
+    /// [`STALE_AFTER`], even with no later pass in its directory, and mutes
+    /// its record: later passes do not copy it again until a build records
+    /// the artifact again.
+    #[test]
+    fn an_untaken_copy_is_swept_and_its_record_muted_until_recorded_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let dest = target.join("debug/deps/app-0123456789abcdef");
+        remember(&cache, &target, &dest, &hash, MIN_BYTES);
+        stage_ok(&cache, &target, &blob_path);
+        let staged = staged_path(&dest, &hash).unwrap();
+        assert!(staged.is_file());
+
+        let later = SystemTime::now() + STALE_AFTER + Duration::from_secs(1);
+        assert_eq!(sweep_staged(&cache, SystemTime::now()), 0, "not stale yet");
+        assert_eq!(sweep_staged(&cache, later), 1);
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+
+        stage(&cache, &target, |_| blob_path.clone());
+        assert!(!staged.exists(), "a muted record is not staged again");
+
+        remember(&cache, &target, &dest, &hash, MIN_BYTES);
+        stage_ok(&cache, &target, &blob_path);
+        assert!(staged.is_file(), "recorded again, staged again");
+        assert!(take(&dest, &hash));
+    }
+
+    /// The GC sweeps untaken copies too.
+    #[test]
+    fn prune_sweeps_untaken_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let dest = target.join("debug/deps/app-0123456789abcdef");
+        remember(&cache, &target, &dest, &hash, MIN_BYTES);
+        stage_ok(&cache, &target, &blob_path);
+        prune(&cache, SystemTime::now() + STALE_AFTER + Duration::from_secs(1));
+        assert!(!staged_path(&dest, &hash).unwrap().exists());
+        assert_eq!(read_records(&records_dir(&cache, &target)).len(), 1);
+    }
+
+    /// A copy staged in a new target from borrowed records is swept as well,
+    /// though that target records nothing of its own, and the GC keeps the
+    /// borrower's directory while its target exists.
+    #[test]
+    fn a_copy_staged_from_borrowed_records_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let first = target(dir.path(), "a");
+        let second = target(dir.path(), "b");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let rel = Path::new("debug/deps/app-0123456789abcdef");
+        remember(&cache, &first, &first.join(rel), &hash, MIN_BYTES);
+        assert!(hint_due(&cache, &second, SystemTime::now()));
+        stage(&cache, &second, |_| blob_path.clone());
+        let staged = staged_path(&second.join(rel), &hash).unwrap();
+        assert!(staged.is_file());
+
+        prune(&cache, SystemTime::now());
+        assert!(records_dir(&cache, &second).is_dir(), "kept while its target exists");
+        prune(&cache, SystemTime::now() + STALE_AFTER + Duration::from_secs(1));
+        assert!(!staged.exists());
+    }
+
+    /// A copy whose destination a build wrote some other way (it compiled,
+    /// or restored another blob) can never be taken; the next pass removes
+    /// it rather than leaving it to age.
+    #[test]
+    fn a_copy_whose_destination_appeared_is_removed_by_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let dest = target.join("debug/deps/app-0123456789abcdef");
+        remember(&cache, &target, &dest, &hash, MIN_BYTES);
+        stage_ok(&cache, &target, &blob_path);
+        std::fs::write(&dest, b"compiled here").unwrap();
+        stage_ok(&cache, &target, &blob_path);
+        let staged = staged_path(&dest, &hash).unwrap();
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"compiled here");
+    }
+
+    /// One pass copies at most [`PASS_MAX_BYTES`], the newest records first:
+    /// a target with dozens of large executables recorded does not get them
+    /// all copied on a guess.
+    #[test]
+    fn a_pass_stages_the_newest_records_within_its_byte_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let each = 1 << 30;
+        let dests: Vec<PathBuf> = (0..6)
+            .map(|i| target.join(format!("debug/deps/app{i}-0123456789abcdef")))
+            .collect();
+        for (i, dest) in dests.iter().enumerate() {
+            remember(&cache, &target, dest, &hash, each);
+            let record = records_dir(&cache, &target).join(short_hash(
+                artifact_key(dest.strip_prefix(&target).unwrap()).as_bytes(),
+            ));
+            let at = SystemTime::now() - Duration::from_secs(600 - 60 * i as u64);
+            std::fs::File::options()
+                .write(true)
+                .open(&record)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        }
+        stage(&cache, &target, |_| blob_path.clone());
+        let staged: Vec<bool> = dests
+            .iter()
+            .map(|dest| staged_path(dest, &hash).unwrap().is_file())
+            .collect();
+        assert_eq!(staged, [false, false, true, true, true, true]);
+    }
+
+    /// `forget` drops the record and any staged copy of an artifact that is
+    /// no longer restored by copy.
+    #[test]
+    fn forget_drops_the_record_and_the_staged_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let target = target(dir.path(), "a");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let dest = target.join("debug/deps/app-0123456789abcdef");
+        remember(&cache, &target, &dest, &hash, MIN_BYTES);
+        stage_ok(&cache, &target, &blob_path);
+        forget(&cache, &target, &dest, &hash);
+        assert!(recorded_dests(&cache).is_empty());
+        let staged = staged_path(&dest, &hash).unwrap();
+        assert!(!staged.exists() && !fingerprint_path(&staged).exists());
+
+        // A binary's record survives its unit tests (same artifact name,
+        // another metadata hash and blob) being forgotten.
+        remember(&cache, &target, &dest, &hash, MIN_BYTES);
+        let tests = target.join("debug/deps/app-fedcba9876543210");
+        forget(&cache, &target, &tests, &"b".repeat(64));
+        assert_eq!(recorded_dests(&cache), vec![dest]);
+    }
+
+    /// A record with no misses reads and writes as before tasty.18, so the
+    /// versions share records.
+    #[test]
+    fn a_record_without_misses_keeps_the_old_format() {
+        let record = Record {
+            dest: PathBuf::from("/t/debug/deps/app"),
+            rel: PathBuf::from("debug/deps/app"),
+            blob: "a".repeat(64),
+            size: 1,
+            misses: 0,
+        };
+        let bytes = serde_json::to_string(&record).unwrap();
+        assert!(!bytes.contains("misses"), "{bytes}");
+        let muted = Record { misses: 1, ..record };
+        let read: Record = serde_json::from_str(&serde_json::to_string(&muted).unwrap()).unwrap();
+        assert_eq!(read.misses, 1);
     }
 }
