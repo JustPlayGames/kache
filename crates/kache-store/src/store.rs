@@ -1716,8 +1716,15 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     // added or changed below. It cannot vouch for the memo rule columns
     // ([`crate::file_hash::has_rule_columns`]), so those are checked too.
     // Both checks only read.
+    //
+    // A higher generation is a newer release's stamp. Its schema holds every
+    // statement below (they only ever add), so this release skips them as on
+    // a current index, and never stamps its own generation over the newer
+    // one: a build-script launcher keeps running the kache that installed it
+    // until the script is rebuilt, so two releases open one store for a
+    // while, and a downward stamp makes the newer one run its DDL again.
     let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if generation == INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
+    if generation >= INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
         return Ok(());
     }
 
@@ -1874,7 +1881,7 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
         .execute_batch("ALTER TABLE target_roots ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0");
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
-    db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
+    db.pragma_update(None, "user_version", generation.max(INDEX_SCHEMA_GENERATION))?;
 
     Ok(())
 }
@@ -1900,6 +1907,10 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    a release records is served. An index can carry 9 and still lack a
 ///    column (`file_hash::has_rule_columns`), so the open checks them too.
 /// 10: persistent compile-cost backfill state and its pending-work index.
+///
+/// A release that finds a higher number leaves it (and skips the DDL): the
+/// stamp only ever goes up. Releases before this rule stamp their own number
+/// back, so a newer one runs its DDL once more after such an open.
 const INDEX_SCHEMA_GENERATION: i64 = 10;
 
 /// Raise the refcount of every blob `cache_key` maps to at least the
