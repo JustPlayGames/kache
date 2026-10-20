@@ -8322,6 +8322,7 @@ struct PrefetchedHash {
 struct RecentHash {
     hash: String,
     fingerprint: Option<FileFingerprint>,
+    header_scan: Option<(i64, String)>,
 }
 
 /// [`hash_file`], for a read that follows a stat of the same file.
@@ -8644,7 +8645,9 @@ impl<'db> FileHasher<'db> {
         })
     }
 
-    fn note_too_new(&self, fingerprint: &FileFingerprint) {
+    /// Include availability can change the read set even when the newly
+    /// available header was not read. Its stamp uses the same write guard.
+    pub(crate) fn note_too_new(&self, fingerprint: &FileFingerprint) {
         if self.too_new.invocation_start_ns > 0 {
             let since = self
                 .too_new
@@ -8900,10 +8903,16 @@ impl<'db> FileHasher<'db> {
             .preprocessed_hash
             .strip_prefix("pb:")
             .unwrap_or(&record.preprocessed_hash);
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        // New C memos append the include-resolution digest after `@`.
+        // Older callers still store a single digest. Validate both parts;
+        // the compiler checks the resolution before trusting the read set.
+        if digest.split('@').count() > 2
+            || !digest.split('@').all(|part| {
+                part.len() == 64
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
         {
             tracing::debug!("cc preprocess memo hash is invalid");
             return None;
@@ -8916,8 +8925,13 @@ impl<'db> FileHasher<'db> {
         // would have discovered by preprocessing, and the caller needs them to
         // resolve include shadowing without a fresh dependency capture.
         let mut satisfied = Vec::with_capacity(inputs.len());
-        for expected in &inputs {
-            satisfied.push(self.memo_input_is_unchanged(expected, &resolve, mapped_content)?);
+        for (expected, scan) in inputs.iter().zip(&record.header_scans) {
+            satisfied.push(self.memo_input_is_unchanged(
+                expected,
+                scan,
+                &resolve,
+                mapped_content,
+            )?);
         }
         if record.needs_touch
             && let Err(error) = cache.touch_cc_preprocess_memo(memo_key)
@@ -8936,6 +8950,7 @@ impl<'db> FileHasher<'db> {
     fn memo_input_is_unchanged(
         &self,
         expected: &CcPreprocessMemoInput,
+        header_scan: &Option<(i64, String)>,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<PathBuf> {
@@ -8966,6 +8981,7 @@ impl<'db> FileHasher<'db> {
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
+                        header_scan: header_scan.clone(),
                     },
                 );
                 return Some(path.clone());
@@ -9103,6 +9119,79 @@ impl<'db> FileHasher<'db> {
         Some(inputs)
     }
 
+    /// Scan the input content already selected for this key, reusing results
+    /// across wrapper processes. Memo validation and hashing register the
+    /// snapshot for the write guard; do not stat every input a second time.
+    /// A new scan must report the hash of its bytes so a racing save cannot
+    /// poison the content-addressed result.
+    pub(crate) fn cc_header_scans(
+        &self,
+        paths: &[PathBuf],
+        version: i64,
+        scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut contents = Vec::with_capacity(paths.len());
+        let mut known = std::collections::HashMap::new();
+        for path in paths {
+            let selected = {
+                let recent = self.recent_hashes.borrow();
+                recent.get(&absolute_path(path)).and_then(|recent| {
+                    recent
+                        .fingerprint
+                        .as_ref()
+                        .map(|_| (recent.hash.clone(), recent.header_scan.clone()))
+                })
+            };
+            let content = match selected {
+                Some((content, analysis)) => {
+                    if let Some((scan_version, scan)) = analysis
+                        && scan_version == version
+                    {
+                        known.insert(content.clone(), scan);
+                    }
+                    content
+                }
+                None => self.hash(path)?,
+            };
+            contents.push(content);
+        }
+        let missing: Vec<_> = contents
+            .iter()
+            .filter(|content| !known.contains_key(*content))
+            .map(String::as_str)
+            .collect();
+        if let Some(cache) = &self.cache {
+            match cache.get_cc_header_scans(version, &missing) {
+                Ok(found) => known.extend(found),
+                Err(error) => tracing::debug!("cc header scan lookup failed: {error}"),
+            }
+        }
+        let mut learned = Vec::new();
+        let mut results = Vec::with_capacity(paths.len());
+        for (path, content) in paths.iter().zip(contents) {
+            let result = if let Some(result) = known.get(&content) {
+                result.clone()
+            } else {
+                let (raw, result) = scan(path)?;
+                anyhow::ensure!(
+                    raw == content,
+                    "cc: input changed while scanning header probes: {}",
+                    path.display()
+                );
+                known.insert(content.clone(), result.clone());
+                learned.push((content, result.clone()));
+                result
+            };
+            results.push(result);
+        }
+        if let Some(cache) = &self.cache
+            && let Err(error) = cache.put_cc_header_scans(version, &learned)
+        {
+            tracing::debug!("cc header scan update failed: {error}");
+        }
+        Ok(results)
+    }
+
     /// The first input whose raw text hides a file the assembler would read,
     /// scanning each distinct content once: the verdict is memoised by raw
     /// content hash, so a header shared by many units is read once. `scan`
@@ -9194,6 +9283,7 @@ impl<'db> FileHasher<'db> {
             if self
                 .memo_input_is_unchanged(
                     expected,
+                    &None,
                     &|_: &str| vec![recorded_path.clone()],
                     mapped_content,
                 )
@@ -9276,6 +9366,7 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: observed.map(|observed| observed.fingerprint),
+                header_scan: None,
             },
         );
         Ok(hash)
@@ -9754,6 +9845,7 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),
+                header_scan: None,
             },
         );
         Ok(hash)
