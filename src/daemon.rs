@@ -9447,6 +9447,7 @@ const MAX_PENDING_HIT_STAMPS: usize = 1 << 16;
 /// ([`send_hit_stamp`]). A daemon that refuses (an older release, another
 /// store) answers well within it; one slower than this still reads the
 /// request and takes the stamp, so the hit does not wait for it.
+#[cfg(unix)]
 const HIT_STAMP_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Hand a hit's access stamp to the daemon ([`Request::StampHits`]). True

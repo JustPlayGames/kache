@@ -13886,8 +13886,11 @@ fn eviction_keeps_an_entry_whose_stamp_is_pending() {
 // ── test binaries stored by hardlink (tasty.17) ─────────────────────
 
 /// [`TestPolicy`], plus executables that may share their inode with their
-/// blob: an entry with no crate type, as Cargo compiles a test.
+/// blob: an entry with no crate type, as Cargo compiles a test. Unix only,
+/// as the hardlinked test binaries its tests check.
+#[cfg(unix)]
 struct TestBinaryPolicy;
+#[cfg(unix)]
 impl ArtifactPolicy for TestBinaryPolicy {
     fn allow_hardlink(name: &str) -> bool {
         TestPolicy::allow_hardlink(name)
@@ -13905,6 +13908,7 @@ impl ArtifactPolicy for TestBinaryPolicy {
         crate_types.is_empty() && !name.contains('.')
     }
 }
+#[cfg(unix)]
 type TestBinaryStore = ArtifactStore<TestBinaryPolicy>;
 
 #[cfg(unix)]
