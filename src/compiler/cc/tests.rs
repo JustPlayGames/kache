@@ -4290,6 +4290,17 @@ fn a_memo_key_from_before_the_settle_rules_is_never_todays() {
         today, content_only,
         "a memo storing a content-only digest must not answer the current read-set key"
     );
+    let unguarded = cc_preprocess_memo_key_as(
+        b"cc-preprocess-memo-v7",
+        &parsed,
+        &[],
+        "test compiler version",
+    )
+    .unwrap();
+    assert_ne!(
+        today, unguarded,
+        "an old memo has no include-resolution proof"
+    );
 }
 
 #[test]
@@ -6814,6 +6825,384 @@ fn include_shadowing_covers_headers_read_from_outside_the_user_dirs() {
     );
 }
 
+/// A unit in `root` that includes `source_text`, parsed with `-I root/inc`.
+fn probing_unit(root: &Path, source_text: &str) -> (CcArgs, PathBuf, PathBuf) {
+    let include = root.join("inc");
+    fs::create_dir_all(&include).unwrap();
+    let source = root.join("unit.c");
+    fs::write(&source, source_text).unwrap();
+    let parsed = CcArgs::parse(&s(&[
+        "cc",
+        "-c",
+        source.to_str().unwrap(),
+        "-I",
+        include.to_str().unwrap(),
+    ]))
+    .unwrap();
+    (parsed, source, include)
+}
+
+/// Whether `header` appearing in `include` changes the shadowing digest of
+/// `inputs`. The header is removed again afterwards.
+fn probed_header_moves_the_key(parsed: &CcArgs, inputs: &[PathBuf], header: &Path) -> bool {
+    let before = digest_cc_include_shadowing(parsed, inputs).unwrap();
+    fs::write(header, "#define VALUE 23\n").unwrap();
+    let after = digest_cc_include_shadowing(parsed, inputs).unwrap();
+    fs::remove_file(header).unwrap();
+    before != after
+}
+
+/// The bug: a header that `__has_include` found absent was never read, so
+/// its later appearance in a user directory left the key unchanged. Every
+/// literal form of the probe must key the header it names.
+#[test]
+fn include_shadowing_keys_every_literal_probe_form() {
+    for probe in [
+        "__has_include(<optional.h>)",
+        "__has_include(\"optional.h\")",
+        "__has_include_next(<optional.h>)",
+        "__has_include_next\t( \"optional.h\" )",
+        "__has_include ( <optional.h> )",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, source, include) =
+            probing_unit(temp.path(), &format!("#if {probe}\n#endif\nint x;\n"));
+        assert!(
+            probed_header_moves_the_key(&parsed, &[source], &include.join("optional.h")),
+            "{probe}: the probed header appearing must change the key"
+        );
+    }
+}
+
+#[test]
+fn an_absolute_header_probe_tracks_availability_without_search_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("unit.c");
+    let optional = temp.path().join("optional.h");
+    fs::write(
+        &source,
+        format!(
+            "#if __has_include(<{}>)\n#endif\nint x;\n",
+            optional.display()
+        ),
+    )
+    .unwrap();
+    let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
+    let before = digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source)).unwrap();
+    fs::write(&optional, "#define VALUE 23\n").unwrap();
+    let after = digest_cc_include_shadowing(&parsed, std::slice::from_ref(&source)).unwrap();
+    assert_ne!(
+        before, after,
+        "an absolute probe needs no include search root"
+    );
+    fs::remove_file(optional).unwrap();
+    assert_eq!(
+        before,
+        digest_cc_include_shadowing(&parsed, &[source]).unwrap()
+    );
+}
+
+/// The preprocessor joins a backslash-newline before it reads the probe, so
+/// a probe split across lines still tests its header.
+#[test]
+fn include_shadowing_keys_a_probe_split_by_line_continuations() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(
+        temp.path(),
+        "#if __has_inc\\\r\nlude(\\\n<optional.h>)\n#endif\nint x;\n",
+    );
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source],
+        &include.join("optional.h")
+    ));
+}
+
+/// A quoted probe in a header searches that header's own directory first,
+/// and that directory need not be a user directory itself.
+#[test]
+fn include_shadowing_keys_a_quoted_probe_beside_its_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(temp.path(), "#include \"sub/avail.h\"\nint x;\n");
+    let sub = include.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let header = sub.join("avail.h");
+    fs::write(&header, "#if __has_include(\"optional.h\")\n#endif\n").unwrap();
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source, header],
+        &sub.join("optional.h")
+    ));
+}
+
+/// Feature tests on the operator and a fallback definition of it, as the
+/// macOS SDK's `sys/cdefs.h` carries, are no probes. A header with them
+/// still keys the probe it makes, and is not refused.
+#[test]
+fn include_shadowing_keys_a_probe_beside_fallback_definitions() {
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) = probing_unit(
+        temp.path(),
+        "#ifndef __has_include\n\
+         #  define __has_include(x) 0\n\
+         #define __has_include_next(__x) 0\n\
+         #endif\n\
+         #ifdef __has_include\n\
+         #error \"the __has_include check should move\"\n\
+         #endif\n\
+         #define HAVE_OPTIONAL __has_include(<optional.h>)\n\
+         #if defined(__has_include) && HAVE_OPTIONAL\n\
+         #endif\n\
+         int x;\n",
+    );
+    assert!(probed_header_moves_the_key(
+        &parsed,
+        &[source],
+        &include.join("optional.h")
+    ));
+}
+
+/// A probe that names its header through a macro tests a name only that
+/// macro's definition decides. The key cannot follow it, so the unit is
+/// refused.
+#[test]
+fn include_shadowing_refuses_a_probe_through_a_macro() {
+    for text in [
+        "#if __has_include(HEADER)\n#endif\n",
+        "#define HAS(h) __has_include_next(h)\n",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (parsed, source, _) = probing_unit(temp.path(), text);
+        assert!(
+            digest_cc_include_shadowing(&parsed, &[source]).is_err(),
+            "{text}: a probe through a macro must refuse the key"
+        );
+    }
+}
+
+#[test]
+fn header_probe_scanner_keeps_each_probe_in_an_expression() {
+    for text in [
+        "#if __has_include(\"first.h\") || __has_include(<second.h>)\n",
+        "#if __has_include_next(\"first.h\") && __has_include(<second.h>)\n",
+    ] {
+        assert_eq!(
+            cc_header_probes(text.as_bytes()),
+            Some(vec![
+                CcHeaderProbe {
+                    name: "first.h".into(),
+                    quoted: true,
+                },
+                CcHeaderProbe {
+                    name: "second.h".into(),
+                    quoted: false,
+                },
+            ]),
+            "{text}",
+        );
+    }
+}
+
+#[test]
+fn header_probe_scanner_does_not_treat_arithmetic_as_comments() {
+    for text in [
+        "#if 4 / 2 && __has_include(<optional.h>)\n",
+        "#if 2*2 && __has_include(<optional.h>)\n",
+    ] {
+        assert_eq!(
+            cc_header_probes(text.as_bytes()),
+            Some(vec![CcHeaderProbe {
+                name: "optional.h".into(),
+                quoted: false,
+            }]),
+            "{text}",
+        );
+    }
+}
+
+#[test]
+fn header_probe_scanner_refuses_empty_or_multiline_names() {
+    for text in [
+        "#if __has_include(\"\")\n",
+        "#if __has_include(<>)\n",
+        "#if __has_include(\"first\nsecond.h\")\n",
+        "#if __has_include(<first\nsecond.h>)\n",
+    ] {
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{text}");
+    }
+}
+
+#[test]
+fn header_probe_scanner_reads_tokens_and_comments() {
+    let text = br##"// __has_include(MACRO)
+        /* __has_include(OTHER) */
+        const char *s = "__has_include(STRING)";
+        const char *r = R"tag(__has_include(RAW))tag";
+        int prefix__has_include(int);
+        # /* comment */ define __has_include(x) 0
+        #if defined /* feature */ (__has_include)
+        #if __has_include /* gap */ ( /* arg */ <a.h> /* close */ )
+        #elif __has_include_next("b.h")
+        #endif
+    "##;
+    assert_eq!(
+        cc_header_probes(text),
+        Some(vec![
+            CcHeaderProbe {
+                name: "a.h".into(),
+                quoted: false
+            },
+            CcHeaderProbe {
+                name: "b.h".into(),
+                quoted: true
+            },
+        ])
+    );
+    for text in [
+        "#define CHECK __has_include\n#if CHECK(HEADER)\n",
+        "#if __has_include(/* comment */ HEADER)\n",
+        "#if __has_include(\"unterminated)\n",
+        "#if __has_include(<bad.h> EXTRA)\n",
+        "#if __has_inc??/\nlude(<optional.h>)\n",
+    ] {
+        assert_eq!(cc_header_probes(text.as_bytes()), None, "{text}");
+    }
+}
+
+#[test]
+fn quoted_probe_outside_user_dirs_and_relocated_probe_have_the_same_resolution() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let mut digests = Vec::new();
+    for copy in ["a", "b"] {
+        let root = temp.path().join(copy);
+        fs::create_dir_all(&root).unwrap();
+        let (parsed, source, _) = probing_unit(&root, "int x;\n");
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let header = elsewhere.join("probe.h");
+        fs::write(&header, "#if __has_include(\"optional.h\")\n#endif\n").unwrap();
+        let inputs = [source, header];
+        let names =
+            cc_shadowing_names(&parsed, &inputs, &crate::cache_key::FileHasher::new()).unwrap();
+        let before = digest_cc_shadowing_names(&parsed, &names).unwrap();
+        let optional = elsewhere.join("optional.h");
+        fs::write(&optional, "#define VALUE 23\n").unwrap();
+        let after = digest_cc_shadowing_names(&parsed, &names).unwrap();
+        assert_ne!(
+            before, after,
+            "quoted probes search the enclosing header's directory"
+        );
+        fs::write(&optional, "#define VALUE 31\n").unwrap();
+        assert_eq!(
+            after,
+            digest_cc_shadowing_names(&parsed, &names).unwrap(),
+            "availability alone does not depend on header contents"
+        );
+        digests.push((before, after));
+    }
+    assert_eq!(
+        digests[0], digests[1],
+        "local lookup paths must not bind a portable key"
+    );
+}
+
+#[test]
+fn include_next_notices_a_later_candidate_even_when_the_first_still_exists() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let (mut parsed, source, first) = probing_unit(
+        temp.path(),
+        "#if __has_include_next(<optional.h>)\n#endif\n",
+    );
+    let later = temp.path().join("later");
+    fs::create_dir(&later).unwrap();
+    parsed.includes.push(later.clone());
+    fs::write(first.join("optional.h"), "int x;\n").unwrap();
+    let names =
+        cc_shadowing_names(&parsed, &[source], &crate::cache_key::FileHasher::new()).unwrap();
+    let before = digest_cc_shadowing_names(&parsed, &names).unwrap();
+    fs::write(later.join("optional.h"), "int y;\n").unwrap();
+    assert_ne!(before, digest_cc_shadowing_names(&parsed, &names).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_probe_rechecks_a_symlink_whose_target_appears_after_the_key() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let (parsed, source, include) =
+        probing_unit(temp.path(), "#if __has_include(<optional.h>)\n#endif\n");
+    let target = temp.path().join("target");
+    std::os::unix::fs::symlink(&target, include.join("optional.h")).unwrap();
+    let names =
+        cc_shadowing_names(&parsed, &[source], &crate::cache_key::FileHasher::new()).unwrap();
+    let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names, None).unwrap();
+    assert!(
+        stamps.is_none(),
+        "a directory stamp cannot prove symlink target availability"
+    );
+    let compiler = CcCompiler::new();
+    compiler
+        .pending_include_dir_digest
+        .replace(Some(PendingIncludeDirDigest {
+            digest,
+            names: Some(names),
+            stamps,
+        }));
+    assert!(compiler.include_dir_names_still_match(&parsed));
+    fs::write(&target, "int value;\n").unwrap();
+    assert!(!compiler.include_dir_names_still_match(&parsed));
+}
+
+#[cfg(unix)]
+#[test]
+fn header_probe_availability_preserves_filesystem_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let link = temp.path().join("loop");
+    std::os::unix::fs::symlink(&link, &link).unwrap();
+    let nested = link.join("optional.h");
+    for candidate in [&link, &nested] {
+        assert!(
+            cc_header_probe_available(candidate, None).is_err(),
+            "a symlink loop is not a missing header: {}",
+            candidate.display(),
+        );
+    }
+}
+
+#[test]
+fn a_header_appearing_during_key_discovery_blocks_publication_without_reading_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("optional.h");
+    let mut hasher = crate::cache_key::FileHasher::new();
+    hasher.arm_too_new_guard(1, 0);
+    assert!(!cc_header_probe_available(&path, Some(&hasher)).unwrap());
+    assert!(!hasher.inputs_changed_since_keyed());
+    fs::write(&path, "#define VALUE 23\n").unwrap();
+    assert!(cc_header_probe_available(&path, Some(&hasher)).unwrap());
+    assert!(hasher.inputs_changed_since_keyed());
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_new_symlink_to_an_old_header_also_blocks_memo_publication() {
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("old.h");
+    let link = temp.path().join("optional.h");
+    fs::write(&target, "int value;\n").unwrap();
+    crate::test_support::settle_writes(&[&target]);
+    let mut hasher = crate::cache_key::FileHasher::new();
+    hasher.arm_too_new_guard(crate::cache_key::stamp_clock_ns(), 0);
+    assert!(cc_header_probe_available(&target, Some(&hasher)).unwrap());
+    assert!(!hasher.inputs_changed_since_keyed());
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert!(cc_header_probe_available(&link, Some(&hasher)).unwrap());
+    assert!(hasher.inputs_changed_since_keyed());
+    assert_eq!(hasher.stats().bytes_hashed, 0);
+}
+
 #[test]
 fn include_dir_digest_changes_when_an_earlier_dir_gains_a_header() {
     let temp = tempfile::tempdir().unwrap();
@@ -6968,6 +7357,10 @@ fn joined_quote_and_after_dirs_can_start_with_a_hyphen() {
 #[test]
 fn joined_quote_dir_with_a_hyphen_tracks_shadowing() {
     let _lock = crate::test_support::process_state_test_lock();
+    let shadowing_digest = |parsed: &CcArgs, inputs: &[PathBuf]| {
+        let names = cc_shadowing_names(parsed, inputs, &crate::cache_key::FileHasher::new())?;
+        digest_cc_shadowing_names(parsed, &names)
+    };
     // A relative joined value must begin with `-` to exercise this spelling.
     // Use a unique directory in the current directory without changing the
     // process cwd, which would race other tests.
@@ -6994,13 +7387,13 @@ fn joined_quote_dir_with_a_hyphen_tracks_shadowing() {
     .unwrap();
     assert!(parsed.refuse_reasons(&[]).is_empty());
     let inputs = vec![source.clone(), read.clone()];
-    let before = digest_cc_include_shadowing(&parsed, &inputs).unwrap();
+    let before = shadowing_digest(&parsed, &inputs).unwrap();
     let walked_before = digest_cc_include_dir_names(&parsed).unwrap();
 
     let shadow = quote.path().join("header.h");
     fs::write(&shadow, "#define VALUE 2\n").unwrap();
     assert_ne!(
-        digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
+        shadowing_digest(&parsed, &inputs).unwrap(),
         before,
         "a joined quote directory must invalidate an old header resolution"
     );
@@ -7011,10 +7404,7 @@ fn joined_quote_dir_with_a_hyphen_tracks_shadowing() {
     );
     assert_eq!(fs::read_to_string(&read).unwrap(), "#define VALUE 1\n");
     fs::remove_file(shadow).unwrap();
-    assert_eq!(
-        digest_cc_include_shadowing(&parsed, &inputs).unwrap(),
-        before
-    );
+    assert_eq!(shadowing_digest(&parsed, &inputs).unwrap(), before);
     assert_eq!(digest_cc_include_dir_names(&parsed).unwrap(), walked_before);
 }
 
@@ -7417,6 +7807,7 @@ fn settle(dir: &Path) {
 #[cfg(unix)]
 #[test]
 fn a_stamped_recheck_notices_a_header_added_after_the_key() {
+    let _lock = crate::test_support::process_state_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let first = temp.path().join("first");
     let second = temp.path().join("second");
@@ -7436,10 +7827,15 @@ fn a_stamped_recheck_notices_a_header_added_after_the_key() {
         second.to_str().unwrap(),
     ]))
     .unwrap();
-    let names = cc_shadowing_names(&parsed, &[source.clone(), read]);
+    let names = cc_shadowing_names(
+        &parsed,
+        &[source.clone(), read],
+        &crate::cache_key::FileHasher::new(),
+    )
+    .unwrap();
     let compiler = CcCompiler::new();
     let key = |compiler: &CcCompiler| {
-        let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names).unwrap();
+        let (digest, stamps) = digest_cc_shadowing_names_stamped(&parsed, &names, None).unwrap();
         let stamped = stamps.is_some();
         compiler
             .pending_include_dir_digest
