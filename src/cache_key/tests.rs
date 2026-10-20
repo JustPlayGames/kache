@@ -17945,3 +17945,74 @@ fn conditional_include_proof_still_requires_a_rust_source() {
         );
     }
 }
+
+/// A workspace at `root` with the member `crates/kt`, and the roots of a
+/// unit of it under the scoped (or inputs) guard.
+fn member_workspace(root: &Path) -> WorkspaceRoots {
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join("crates/kt/Cargo.toml"), "[package]\n");
+    write_file(&root.join("crates/kt/src/lib.rs"), "pub mod a;\n");
+    write_file(&root.join("crates/kt/src/a.rs"), "pub mod b;\n");
+    write_file(&root.join("crates/kt/src/a/b.rs"), "");
+    write_file(&root.join("crates/kt/tests/t.rs"), "");
+    write_file(&root.join("crates/kt/benches/b.rs"), "");
+    WorkspaceRoots {
+        root: root.to_path_buf(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: None,
+        scoped_package: Some(root.join("crates/kt")),
+    }
+}
+
+/// The inputs guard leaves the package's other directories out and names
+/// the closure's own, with every directory up to the package: an edit or a
+/// new file in `tests/` keeps the guard a record of the lib must carry, and
+/// a new name beside a module file, or a new module directory, moves it.
+/// The scoped guard moves on all of them.
+#[test]
+fn the_inputs_guard_names_the_closures_directories_in_the_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = member_workspace(&root);
+    let sources = [
+        PathBuf::from("crates/kt/src/lib.rs"),
+        PathBuf::from("crates/kt/src/a.rs"),
+        PathBuf::from("crates/kt/src/a/b.rs"),
+    ];
+    let hasher = FileHasher::new();
+    let guard = |inputs: bool| {
+        let _mode = if inputs {
+            WorkspaceGuardForTest::inputs()
+        } else {
+            WorkspaceGuardForTest::scoped()
+        };
+        let tree = workspace_tree_digest(&roots, &hasher).unwrap();
+        assert_eq!(tree.starts_with(INPUTS_GUARD_TAG), inputs);
+        expected_tree(&tree, &sources, Some(&roots)).unwrap()
+    };
+    let (inputs, scoped) = (guard(true), guard(false));
+    assert_ne!(inputs, scoped);
+
+    write_file(&root.join("crates/kt/tests/t.rs"), "#[test]\nfn t() {}\n");
+    write_file(&root.join("crates/kt/tests/new.rs"), "");
+    write_file(&root.join("crates/kt/benches/b.rs"), "fn main() {}\n");
+    assert_eq!(guard(true), inputs, "tests/ and benches/ are not read");
+    assert_ne!(guard(false), scoped, "the scoped guard digests them");
+
+    for (what, path) in [
+        ("a module file beside a.rs", "crates/kt/src/c.rs"),
+        ("a module directory beside b.rs", "crates/kt/src/a/b/mod.rs"),
+        ("a file at the top of the package", "crates/kt/macro.cfg"),
+    ] {
+        let before = guard(true);
+        write_file(&root.join(path), "");
+        assert_ne!(guard(true), before, "{what}");
+    }
+    let before = guard(true);
+    write_file(&root.join("crates/kt/macro.cfg"), "edited");
+    assert_ne!(guard(true), before, "a top file counts by content");
+}

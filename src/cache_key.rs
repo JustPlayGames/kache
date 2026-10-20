@@ -3111,6 +3111,9 @@ fn workspace_tree_digest_within(
 /// holding no file of the closure (empty, missing, or only files the macro
 /// filters out), or reads a file outside the package without telling rustc
 /// and includes something else because of it.
+///
+/// `KACHE_WORKSPACE_GUARD=inputs` narrows the package part further
+/// ([`inputs_workspace_guard`]).
 pub(crate) fn scoped_workspace_guard() -> bool {
     #[cfg(test)]
     if let Some(scoped) = SCOPED_GUARD_IN_TEST.with(Cell::get) {
@@ -3122,11 +3125,49 @@ pub(crate) fn scoped_workspace_guard() -> bool {
     })
 }
 
+/// Is the inputs guard on (`KACHE_WORKSPACE_GUARD=inputs`, opt-in)? It is
+/// the scoped guard ([`scoped_workspace_guard`]) with the member's package
+/// directory replaced by what can change the closure rustc reports for the
+/// unit:
+///
+/// - the files and dot-directories at the top of the package (`Cargo.toml`,
+///   `build.rs`, `kache.toml`, `.sqlx`, config files), by content;
+/// - the entries (names and kinds) of every directory of the package that
+///   holds a file of the recorded closure, and of each directory between it
+///   and the package, so a module file that appears, goes or moves next to
+///   the closure (`foo/mod.rs` beside `foo.rs`, a renamed module) and a file
+///   added where a macro lists and includes are seen;
+/// - `OUT_DIR`, the way up to the workspace root and the closure's
+///   directories outside the package, as the scoped guard has them.
+///
+/// The closure's own files are checked by their fingerprints as always, and
+/// `kache.toml` `extra_inputs` and the package's build-script
+/// `rerun-if-changed` paths are in the key itself. So an edit in `tests/`,
+/// `benches/`, `examples/` or any file no unit's closure names keeps the
+/// records of the units that do not read it.
+///
+/// What it gives up, on top of the scoped guard: a proc macro that reads a
+/// file of its package that rustc is not told about (not `include_*!`d,
+/// not declared in `kache.toml`) and includes something else because of it,
+/// or that lists a package directory holding no file of the closure, or
+/// probes for a file there. Only a workspace whose macros declare what they
+/// read (`kache.toml` `extra_inputs`) should turn it on.
+pub(crate) fn inputs_workspace_guard() -> bool {
+    #[cfg(test)]
+    if let Some(inputs) = INPUTS_GUARD_IN_TEST.with(Cell::get) {
+        return inputs;
+    }
+    std::env::var("KACHE_WORKSPACE_GUARD")
+        .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("inputs"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// The guard a unit test asked for on its own thread
     /// ([`WorkspaceGuardForTest`]), over the environment.
     static SCOPED_GUARD_IN_TEST: Cell<Option<bool>> = const { Cell::new(None) };
+    /// The inputs guard a unit test asked for on its own thread.
+    static INPUTS_GUARD_IN_TEST: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Keeps this test thread on the whole-workspace guard (or the scoped one)
@@ -3138,6 +3179,19 @@ pub(crate) struct WorkspaceGuardForTest;
 impl WorkspaceGuardForTest {
     pub(crate) fn whole_workspace() -> Self {
         SCOPED_GUARD_IN_TEST.with(|cell| cell.set(Some(false)));
+        INPUTS_GUARD_IN_TEST.with(|cell| cell.set(Some(false)));
+        Self
+    }
+
+    pub(crate) fn scoped() -> Self {
+        SCOPED_GUARD_IN_TEST.with(|cell| cell.set(Some(true)));
+        INPUTS_GUARD_IN_TEST.with(|cell| cell.set(Some(false)));
+        Self
+    }
+
+    pub(crate) fn inputs() -> Self {
+        SCOPED_GUARD_IN_TEST.with(|cell| cell.set(Some(true)));
+        INPUTS_GUARD_IN_TEST.with(|cell| cell.set(Some(true)));
         Self
     }
 }
@@ -3146,6 +3200,7 @@ impl WorkspaceGuardForTest {
 impl Drop for WorkspaceGuardForTest {
     fn drop(&mut self) {
         SCOPED_GUARD_IN_TEST.with(|cell| cell.set(None));
+        INPUTS_GUARD_IN_TEST.with(|cell| cell.set(None));
     }
 }
 
@@ -3172,6 +3227,10 @@ pub(crate) const DEFAULT_GUARD_IGNORE: &[&str] = &[
 
 /// The prefix of a scoped guard's digest ([`scoped_workspace_guard`]).
 const SCOPED_GUARD_TAG: &str = "scoped-v1:";
+
+/// The prefix of an inputs guard's digest ([`inputs_workspace_guard`]): a
+/// scoped guard, whose closure directories inside the package count too.
+const INPUTS_GUARD_TAG: &str = "scoped-v1:inputs-v1:";
 
 /// Workspace-relative paths the scoped guard leaves out of the way to the
 /// root: what no build reads. `KACHE_GUARD_IGNORE` replaces
@@ -3208,22 +3267,42 @@ fn scoped_package_digest(
     workspace: &WorkspaceRoots,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
-    let mut roots = vec![
-        TreeRoot::new(
-            package.to_path_buf(),
-            b"scoped_package",
-            MANIFEST_DIR_SKIPPED,
-        )
-        .skipping_build_dirs(),
-    ];
-    if let Some(out_dir) = &workspace.out_dir {
-        roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
-    }
-    let package_digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?;
     let ignored = scoped_guard_ignored(&workspace.root);
+    let inputs = inputs_workspace_guard();
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kache-scoped-guard-v1\n");
-    fold_field(&mut hasher, b"package:", package_digest.as_bytes());
+    if inputs {
+        // The package's top files and dot-directories; its directories join
+        // as the closure names them ([`closure_dirs_digest`]).
+        hasher.update(b"kache-inputs-guard-v1\n");
+        fold_field(
+            &mut hasher,
+            b"package_top:",
+            scoped_ancestor_top_digest(package, file_hasher, &ignored, None)?.as_bytes(),
+        );
+        if let Some(out_dir) = &workspace.out_dir {
+            let roots = vec![TreeRoot::new(out_dir.clone(), b"out_dir", &[])];
+            fold_field(
+                &mut hasher,
+                b"out_dir:",
+                tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?.as_bytes(),
+            );
+        }
+    } else {
+        let mut roots = vec![
+            TreeRoot::new(
+                package.to_path_buf(),
+                b"scoped_package",
+                MANIFEST_DIR_SKIPPED,
+            )
+            .skipping_build_dirs(),
+        ];
+        if let Some(out_dir) = &workspace.out_dir {
+            roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
+        }
+        let package_digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?;
+        hasher.update(b"kache-scoped-guard-v1\n");
+        fold_field(&mut hasher, b"package:", package_digest.as_bytes());
+    }
     let mut ancestor = package.parent();
     while let Some(directory) = ancestor.filter(|directory| directory.starts_with(&workspace.root))
     {
@@ -3235,7 +3314,12 @@ fn scoped_package_digest(
         );
         ancestor = directory.parent();
     }
-    Some(format!("{SCOPED_GUARD_TAG}{}", hasher.finalize().to_hex()))
+    let tag = if inputs {
+        INPUTS_GUARD_TAG
+    } else {
+        SCOPED_GUARD_TAG
+    };
+    Some(format!("{tag}{}", hasher.finalize().to_hex()))
 }
 
 /// [`ancestor_top_digest`] for the scoped guard: the same files, symlinks and
@@ -3474,11 +3558,16 @@ fn portable_dir_label(directory: &Path, root: &Path) -> Option<String> {
 /// [`stamp_clock_ns`]), one whose stamps show a change at or after it
 /// ([`stamp_written_since`]): what rustc listed then may not be what is
 /// there now.
+///
+/// With `in_package` (the inputs guard, [`inputs_workspace_guard`]), the
+/// directories of the sources inside the package count too, each with every
+/// directory between it and the package, the package's own included.
 fn closure_dirs_digest(
     sources: &[PathBuf],
     workspace: &WorkspaceRoots,
     package: &Path,
     not_after: Option<i64>,
+    in_package: bool,
 ) -> Option<String> {
     let base = workspace
         .root
@@ -3493,11 +3582,24 @@ fn closure_dirs_digest(
         } else {
             lexically_normal(&base.join(source))
         };
-        if absolute.starts_with(&package)
-            || out_dir
-                .as_ref()
-                .is_some_and(|out_dir| absolute.starts_with(out_dir))
+        if out_dir
+            .as_ref()
+            .is_some_and(|out_dir| absolute.starts_with(out_dir))
         {
+            continue;
+        }
+        if absolute.starts_with(&package) {
+            if in_package {
+                // Where rustc looks for a module file (`foo.rs`,
+                // `foo/mod.rs`, `a/b.rs` for `mod b` in `a.rs`) and where a
+                // macro that includes what it lists looks: every directory
+                // from the source's own up to the package.
+                let mut directory = absolute.parent();
+                while let Some(dir) = directory.filter(|dir| dir.starts_with(&package)) {
+                    directories.insert(portable_dir_label(dir, &root)?, dir.to_path_buf());
+                    directory = dir.parent();
+                }
+            }
             continue;
         }
         let directory = absolute.parent()?.to_path_buf();
@@ -3574,7 +3676,8 @@ fn expected_tree(
     }
     let workspace = workspace?;
     let package = workspace.scoped_package.as_deref()?;
-    let dirs = closure_dirs_digest(sources, workspace, package, None)?;
+    let in_package = guard.starts_with(INPUTS_GUARD_TAG);
+    let dirs = closure_dirs_digest(sources, workspace, package, None, in_package)?;
     Some(format!("{guard}+dirs:{dirs}"))
 }
 
@@ -3593,7 +3696,14 @@ pub(crate) fn with_closure_dirs(
     }
     let workspace = workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>())?;
     let package = workspace.scoped_package.as_deref()?;
-    let dirs = closure_dirs_digest(&dep_info.source_files, &workspace, package, Some(taken))?;
+    let in_package = tree.starts_with(INPUTS_GUARD_TAG);
+    let dirs = closure_dirs_digest(
+        &dep_info.source_files,
+        &workspace,
+        package,
+        Some(taken),
+        in_package,
+    )?;
     Some(format!("{tree}+dirs:{dirs}"))
 }
 

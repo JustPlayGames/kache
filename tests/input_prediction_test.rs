@@ -2354,3 +2354,190 @@ fn scoped_a_closure_file_at_the_root_guards_the_root_files_only() {
         "a new root file refuses it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The inputs guard (`KACHE_WORKSPACE_GUARD=inputs`, opt-in).
+// ---------------------------------------------------------------------------
+
+impl WorkspaceUnit {
+    /// Every build and report runs with the inputs guard on.
+    fn inputs(mut self) -> Self {
+        self.env.push(("KACHE_WORKSPACE_GUARD", "inputs".into()));
+        self
+    }
+}
+
+/// A member whose lib has a module tree: `lib.rs` -> `a.rs` -> `a/b.rs`.
+fn module_tree_unit(with_macro: bool) -> WorkspaceUnit {
+    let mut lib = String::new();
+    if with_macro {
+        lib.push_str("pm::answer!();\n");
+    }
+    lib.push_str("pub mod a;\n");
+    lib.push_str("pub const SHARED: &str = include_str!(\"../../assets/shared.txt\");\n");
+    lib.push_str("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n");
+    WorkspaceUnit::new(with_macro)
+        .with_lib(&lib)
+        .with_file("kt/src/a.rs", "pub mod b;\n")
+        .with_file("kt/src/a/b.rs", "pub const B: u32 = 1;\n")
+        .with_file("kt/tests/t.rs", "#[test]\nfn t() {}\n")
+        .with_file("kt/benches/b.rs", "fn main() {}\n")
+        .with_file("kt/examples/e.rs", "fn main() {}\n")
+}
+
+/// The point of the inputs guard: an edit, a new file or a rename in
+/// `tests/`, `benches/` or `examples/` of the member keeps the lib's record,
+/// in this checkout and in another one, where the scoped guard sends the
+/// unit to the pre-pass. The predicted key is the pre-pass's.
+#[test]
+fn inputs_an_edit_outside_the_closure_inside_the_package_keeps_the_record() {
+    build_kache();
+    for with_macro in [false, true] {
+        let unit = module_tree_unit(with_macro).inputs();
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        std::fs::write(a.join("kt/tests/t.rs"), "#[test]\nfn t2() {}\n").unwrap();
+        std::fs::write(a.join("kt/benches/new.rs"), "fn main() {}\n").unwrap();
+        std::fs::rename(a.join("kt/examples/e.rs"), a.join("kt/examples/f.rs")).unwrap();
+        let warm = unit.build(&a, true, None);
+        assert_eq!(warm.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(warm.dep_info_runs, 0, "with_macro={with_macro}");
+        assert_eq!(
+            unit.build(&a, false, None).cache_key,
+            warm.cache_key,
+            "with_macro={with_macro}"
+        );
+
+        let b = unit.checkout("b");
+        std::fs::write(b.join("kt/tests/other.rs"), "// b's own\n").unwrap();
+        let other = unit.build(&b, true, None);
+        assert_eq!(other.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(other.dep_info_runs, 0, "with_macro={with_macro}");
+        assert_eq!(other.cache_key, warm.cache_key, "with_macro={with_macro}");
+    }
+}
+
+/// The same edit under the scoped guard (the default) refuses the record:
+/// the inputs guard is what keeps it.
+#[test]
+fn scoped_an_edit_in_tests_refuses_the_record() {
+    build_kache();
+    let unit = module_tree_unit(true).scoped();
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::write(a.join("kt/tests/t.rs"), "#[test]\nfn t2() {}\n").unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 1);
+}
+
+/// A name that comes, goes or moves in a directory of the closure, or in a
+/// directory between one and the package, refuses the record: rustc looks
+/// there for module files (`a/b/mod.rs` beside `a/b.rs`, `src/c.rs`), and a
+/// macro that lists and includes looks there too.
+#[test]
+fn inputs_a_name_change_next_to_the_closure_refuses_the_record() {
+    build_kache();
+    type Change = fn(&Path);
+    let changes: [(&str, Change); 5] = [
+        ("new file beside a.rs", |a| {
+            std::fs::write(a.join("kt/src/c.rs"), "pub const C: u32 = 3;\n").unwrap()
+        }),
+        ("new file in a/", |a| {
+            std::fs::write(a.join("kt/src/a/c.rs"), "pub const C: u32 = 3;\n").unwrap()
+        }),
+        ("new directory in a/", |a| {
+            std::fs::create_dir_all(a.join("kt/src/a/c")).unwrap()
+        }),
+        ("rename of an unused file in src/", |a| {
+            std::fs::rename(a.join("kt/src/unused.rs"), a.join("kt/src/moved.rs")).unwrap()
+        }),
+        ("new top-level directory of the package", |a| {
+            std::fs::create_dir_all(a.join("kt/assets2")).unwrap()
+        }),
+    ];
+    for (what, change) in changes {
+        let unit = module_tree_unit(true)
+            .inputs()
+            .with_file("kt/src/unused.rs", "// not a module\n");
+        let a = unit.checkout("a");
+        let cold = unit.build(&a, true, None);
+        assert_eq!(cold.result, "miss", "{what}");
+        assert_eq!(unit.build(&a, true, None).dep_info_runs, 0, "{what}");
+        change(&a);
+        let changed = unit.build(&a, true, None);
+        assert_eq!(changed.dep_info_runs, 1, "{what}: the record is refused");
+        assert_eq!(changed.cache_key, cold.cache_key, "{what}: same closure");
+        assert_eq!(
+            unit.build(&a, false, None).cache_key,
+            changed.cache_key,
+            "{what}"
+        );
+    }
+}
+
+/// A file at the top of the package (`Cargo.toml`, a config a macro reads)
+/// and `OUT_DIR` stay in the inputs guard by content.
+#[test]
+fn inputs_a_top_file_or_out_dir_change_refuses_the_record() {
+    build_kache();
+    for top in [true, false] {
+        let unit = module_tree_unit(true)
+            .inputs()
+            .with_file("kt/macro.cfg", "one\n");
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        if top {
+            std::fs::write(a.join("kt/macro.cfg"), "two\n").unwrap();
+        } else {
+            std::fs::write(out_dir_in(&unit.target(&a)).join("other.txt"), "x\n").unwrap();
+        }
+        let changed = unit.build(&a, true, None);
+        assert_eq!(changed.dep_info_runs, 1, "top={top}");
+    }
+}
+
+/// Inside the package, a file added where a re-exported macro lists and
+/// includes is seen by the inputs guard (the directory holds a file of the
+/// closure), and the key is the pre-pass's.
+#[test]
+fn inputs_a_file_added_inside_the_package_where_a_macro_lists_misses() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .inputs()
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    assert_eq!(unit.build(&a, true, None).dep_info_runs, 0);
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_eq!(added.result, "miss");
+    assert_ne!(added.cache_key, cold.cache_key);
+    assert_eq!(unit.build(&a, false, None).cache_key, added.cache_key);
+}
+
+/// A file a macro reads without telling rustc, declared in the member's
+/// `kache.toml`, is in the key: under the inputs guard an edit to it misses,
+/// though its directory is no directory of the closure.
+#[test]
+fn inputs_a_declared_extra_input_edit_misses() {
+    build_kache();
+    let unit = module_tree_unit(true)
+        .inputs()
+        .with_file("kt/kache.toml", "extra_inputs = [\"conf/**/*\"]\n")
+        .with_file("kt/conf/sel.txt", "one\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_ne!(cold.result, "local_hit");
+    std::fs::write(a.join("kt/conf/sel.txt"), "two\n").unwrap();
+    let edited = unit.build(&a, true, None);
+    assert_ne!(edited.result, "local_hit");
+    assert_ne!(edited.cache_key, cold.cache_key);
+    assert_eq!(unit.build(&a, false, None).cache_key, edited.cache_key);
+    std::fs::write(a.join("kt/conf/new.txt"), "new\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_ne!(added.result, "local_hit");
+    assert_ne!(added.cache_key, edited.cache_key);
+}
