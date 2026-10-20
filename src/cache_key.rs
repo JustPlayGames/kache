@@ -2525,18 +2525,21 @@ fn relocated_key_inputs(
         file_hasher,
         &identity,
         args,
+        &guard,
         &|_| Some(guard.clone()),
         &places,
     )
 }
 
-/// Use this machine's row for `identity`, or failing that the remote's
+/// Use this machine's row for `identity` under `tree` (the guard taken for
+/// this invocation, [`tree_keyed_identity`]), or failing that the remote's
 /// ([`set_remote_rows`]), checked the same way. A remote row that passes is
 /// kept locally, so the next build does not ask again.
 fn portable_key_inputs(
     file_hasher: &FileHasher<'_>,
     identity: &str,
     args: &RustcArgs,
+    tree: &str,
     guard: &dyn Fn(&[PathBuf]) -> Option<String>,
     places: &Places<'_>,
 ) -> std::result::Result<DepInfo, Rejection> {
@@ -2550,8 +2553,13 @@ fn portable_key_inputs(
             |var| std::env::var_os(var),
         )
     };
-    if let Some(record) = file_hasher.portable_prediction(identity) {
+    if let Some(record) = file_hasher.portable_prediction_under(identity, tree) {
         return validate(&record);
+    }
+    // Rows of other trees only: what one row of another tree said before
+    // rows were kept per tree, without asking the remote.
+    if file_hasher.has_portable_rows_of_other_trees(identity) {
+        return Err(Rejection::TreeChanged);
     }
     let record = remote_portable_row(identity).ok_or(Rejection::NoRecord)?;
     let validated = validate(&record);
@@ -2650,7 +2658,7 @@ fn workspace_key_inputs(
     let guard = tree.ok_or(Rejection::NoRecord)?;
     let places = workspace.places().ok_or(Rejection::NoRecord)?;
     let expected = |sources: &[PathBuf]| expected_tree(&guard, sources, Some(workspace));
-    let dep_info = portable_key_inputs(file_hasher, &identity, args, &expected, &places)?;
+    let dep_info = portable_key_inputs(file_hasher, &identity, args, &guard, &expected, &places)?;
     if !guard_covers(&dep_info.source_files, workspace) {
         return Err(Rejection::NoRecord);
     }
@@ -7256,6 +7264,33 @@ impl PortablePrediction {
 
 /// Use a relocated record: its digest must equal the guard this invocation
 /// computed, and the resolved closure must pass [`validate_prediction`].
+/// How many trees of one unit keep a portable row: the commits the
+/// checkouts of a workspace sit at, at once. A row each, so the checkouts
+/// stop replacing one another's row; more than this, and the row nobody
+/// used for longest goes.
+pub(crate) const TREE_ROWS_KEPT: usize = 8;
+
+/// What every tree-keyed row of `identity` is named first.
+fn tree_keyed_prefix(identity: &str) -> String {
+    format!("{identity}\u{1f}tree:")
+}
+
+/// The row a portable record of `identity` made under `tree` is filed
+/// under: the identity and the tree's guard, less the closure's directories
+/// a scoped guard adds ([`expected_tree`]), which only the record knows.
+///
+/// One row per identity made every checkout that built the unit replace it:
+/// with checkouts at different commits, the next one at the first commit
+/// found the other commit's tree, refused it as `tree-changed` and ran rustc
+/// to its dep-info again, though a record of its own tree had been written
+/// minutes before. Choosing among rows by the guard changes nothing about
+/// what a record must pass: the row found is validated in full, its tree
+/// included, as before.
+pub(crate) fn tree_keyed_identity(identity: &str, tree: &str) -> String {
+    let guard = tree.split_once("+dirs:").map_or(tree, |(guard, _)| guard);
+    format!("{}{guard}", tree_keyed_prefix(identity))
+}
+
 fn validate_portable_prediction(
     record: &PortablePrediction,
     guard: &dyn Fn(&[PathBuf]) -> Option<String>,
@@ -8408,13 +8443,47 @@ impl<'db> FileHasher<'db> {
                 return;
             }
         };
-        if let Err(error) = cache.put_input_prediction(identity, record.schema, crate_name, &json) {
+        // Filed under its tree, beside the rows of the unit's other trees: a
+        // checkout at another commit no longer replaces the row the next
+        // checkout at this one needs (see [`tree_keyed_identity`]).
+        let prefix = tree_keyed_prefix(identity);
+        let keyed = tree_keyed_identity(identity, &record.tree);
+        if let Err(error) = cache.put_input_prediction_keeping(
+            &prefix,
+            &keyed,
+            record.schema,
+            crate_name,
+            &json,
+            TREE_ROWS_KEPT,
+        ) {
             tracing::debug!("portable prediction record failed: {error}");
         }
     }
 
-    /// The relocated closure recorded for `identity`, read under the same
-    /// rules as [`FileHasher::input_prediction`].
+    /// The relocated closure recorded for `identity` under the tree whose
+    /// guard is `guard` (before the closure's directories join it), or else
+    /// the row an older kache filed under `identity` alone, whatever its
+    /// tree. Either is validated in full by the caller.
+    pub(crate) fn portable_prediction_under(
+        &self,
+        identity: &str,
+        guard: &str,
+    ) -> Option<PortablePrediction> {
+        self.portable_prediction(&tree_keyed_identity(identity, guard))
+            .or_else(|| self.portable_prediction(identity))
+    }
+
+    /// Does `identity` have a row for any tree ([`tree_keyed_identity`])?
+    pub(crate) fn has_portable_rows_of_other_trees(&self, identity: &str) -> bool {
+        self.cache.as_ref().is_some_and(|cache| {
+            cache
+                .has_input_predictions_under(&tree_keyed_prefix(identity))
+                .unwrap_or(false)
+        })
+    }
+
+    /// The relocated closure recorded under the row `identity`, read under
+    /// the same rules as [`FileHasher::input_prediction`].
     pub(crate) fn portable_prediction(&self, identity: &str) -> Option<PortablePrediction> {
         let _trace = crate::phase_trace::phase("prediction_read");
         let cache = self.cache.as_ref()?;

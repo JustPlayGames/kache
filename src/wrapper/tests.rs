@@ -249,7 +249,7 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     );
     let hasher = store.file_hasher();
     assert!(hasher.input_prediction(&shared).is_none());
-    let record = hasher.portable_prediction(&relocatable).unwrap();
+    let record = hasher.portable_prediction_under(&relocatable, "tree").unwrap();
     assert_eq!(record.tree, "tree");
 
     let package_only = crate::cache_key::DepInfo {
@@ -387,6 +387,7 @@ fn a_record_keeps_no_guard_once_its_tree_moved() {
     let shared = crate::cache_key::rustc_shared_prediction_identity(&args).unwrap();
     let (portable, _) = crate::cache_key::workspace_record(&args, &dep_info, Some("tree")).unwrap();
     let record = |guard: crate::cache_key::TreeGuard| {
+        let digest = guard.digest.clone();
         let key = crate::cache_key::KeyOutputs {
             dep_info: Some(dep_info.clone()),
             tree_guard: Some(guard),
@@ -398,7 +399,9 @@ fn a_record_keeps_no_guard_once_its_tree_moved() {
         (
             tree(&local),
             tree(&shared),
-            hasher.portable_prediction(&portable).map(|row| row.tree),
+            hasher
+                .portable_prediction_under(&portable, &digest)
+                .map(|row| row.tree),
         )
     };
 
