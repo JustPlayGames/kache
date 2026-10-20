@@ -14219,3 +14219,38 @@ fn unlinking_a_blob_leaves_the_mode_of_an_output_sharing_its_inode() {
         0o555
     );
 }
+
+/// A store's write lock held past one busy timeout (a burst of stores on a
+/// stalled journal) is asked for again, so registering the entry waits for
+/// it instead of failing the store; held past every attempt, it fails.
+#[test]
+fn entry_registration_asks_again_for_a_lock_held_past_one_busy_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    store.set_busy_timeout_for_test(Duration::from_millis(60));
+    let hold = |held: Duration| {
+        let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (taken, wait) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            taken.send(()).unwrap();
+            std::thread::sleep(held);
+            writer.execute_batch("COMMIT").unwrap();
+        });
+        wait.recv().unwrap();
+        holder
+    };
+
+    let holder = hold(Duration::from_millis(150));
+    let tx = store.begin_entry_registration();
+    assert!(tx.is_ok(), "held for 2.5 timeouts: {:?}", tx.err());
+    tx.unwrap().commit().unwrap();
+    holder.join().unwrap();
+
+    let holder = hold(Duration::from_millis(60 * u64::from(STORE_LOCK_ATTEMPTS) + 400));
+    let refused = store.begin_entry_registration();
+    assert!(refused.as_ref().is_err_and(is_sqlite_busy), "{:?}", refused.err());
+    drop(refused);
+    holder.join().unwrap();
+}

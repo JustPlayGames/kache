@@ -1042,6 +1042,20 @@ pub fn is_sqlite_contention(err: &anyhow::Error) -> bool {
     })
 }
 
+/// How many times [`Store::begin_entry_registration`] waits out the busy
+/// timeout for the write lock before the store fails: about 20 s with the
+/// 5 s timeout every store connection sets.
+const STORE_LOCK_ATTEMPTS: u32 = 4;
+
+/// Whether `err` is SQLite's busy or locked answer.
+fn is_sqlite_busy(err: &SqlError) -> bool {
+    matches!(
+        err,
+        SqlError::SqliteFailure(code, _)
+            if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
 pub fn is_sqlite_busy_snapshot(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
@@ -3197,7 +3211,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // its refcounts until doctor or an index rebuild.
         let crate_type_str = crate_types.join(",");
         let num_features = features.len() as i64;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin_entry_registration()?;
         // A prior generation of this cache_key may still hold blob
         // references, most commonly a stranded row whose removal was
         // refused (#276) and that this put is about to overwrite via
@@ -3264,6 +3278,29 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
 
         Ok(put_result)
+    }
+
+    /// Open the write transaction that registers a stored entry, the write
+    /// lock taken at once (`BEGIN IMMEDIATE`) so no statement inside it can
+    /// find the index busy. A lock still held elsewhere after the busy
+    /// timeout is asked for again, up to [`STORE_LOCK_ATTEMPTS`] times: a
+    /// burst of stores on a disk whose journal stalls can keep the lock
+    /// queued past one timeout, and the entry is worth more than the wait
+    /// (its next build would compile it again).
+    fn begin_entry_registration(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        let mut attempt = 1;
+        loop {
+            match rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            ) {
+                Err(error) if attempt < STORE_LOCK_ATTEMPTS && is_sqlite_busy(&error) => {
+                    tracing::debug!(attempt, "index busy registering an entry; asking again");
+                    attempt += 1;
+                }
+                started => return started,
+            }
+        }
     }
 
     /// Import a remotely downloaded entry into the database.
