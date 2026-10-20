@@ -5422,12 +5422,6 @@ fn rustc_debuginfo_enabled(args: &RustcArgs) -> bool {
     args.debuginfo_enabled()
 }
 
-/// Store-time gate for [`crate::compiler::Platform::package_debug_bundle`]:
-/// only user-facing executables (`bin` / `--test`) reach the executable cache
-/// path, and only debug-carrying ones have anything for a `.dSYM` to hold.
-/// No `cache_executables` check here — a non-user-facing invocation never
-/// stores an executable, and a user-facing one only reaches the store when
-/// `cache_executables` already let it past the passthrough gate.
 /// The executable artifact of this invocation, if any — the binary the
 /// store-time debug bundle is baked FROM. Classification is contextual
 /// (extensionless bins need the crate-type), so this rides classify_output
@@ -5444,8 +5438,13 @@ fn find_executable_output(
         .map(|a| (a.path.clone(), a.store_name.clone()))
 }
 
+/// Bundle debug info for cached user binaries unless the invocation opts out
+/// of dsymutil. `get_codegen_opt` follows rustc's last-value-wins rule.
+/// Executable-cache admission has already happened before this gate.
 fn wants_debug_bundle(args: &RustcArgs) -> bool {
-    args.is_user_facing_executable() && rustc_debuginfo_enabled(args)
+    args.is_user_facing_executable()
+        && rustc_debuginfo_enabled(args)
+        && args.get_codegen_opt("split-debuginfo") != Some("off")
 }
 
 /// Whether a store's outputs include a file large enough to prestage.
@@ -7916,6 +7915,10 @@ fn restore_from_cache_with_memo_store(
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
+        // Older entries may carry a bundle despite an explicit opt-out.
+        if kind == ArtifactKind::DebugBundle && !wants_debug_bundle(args) {
+            continue;
+        }
         let shared_rlib = restores_as_shared_rlib(args, &cached_file.name, &meta.files);
         let restored = materialize_cached_artifact(
             store,
@@ -8212,14 +8215,18 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     crate_name: &str,
     root: &str,
     start: std::time::Instant,
-    lease: Lease,
+    mut lease: Lease,
     reason: R,
     keyed: Option<(&str, u64, FileHashStats, u64)>,
     key_record: KeyEventRecord,
 ) -> Result<i32> {
     let reason = reason.into();
     let kind = lease.kind();
-    let compiler_args = lease.compiler_args(args);
+    let compiler_args = lease.worktree_compiler_args(
+        args,
+        config.incremental_seed_from.as_deref(),
+        config.unstable,
+    );
     let permit = adaptive_lane_takes_permit(kind).then(|| {
         scheduler::begin_keyless_compile(
             &config.cache_dir,
@@ -8230,7 +8237,9 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         )
     });
     let compile_start = std::time::Instant::now();
-    let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    let compiler = RustcCompiler::new()
+        .with_base_dirs(config.base_dirs.clone())
+        .with_incremental_bootstrap(lease.worktree_bootstrap());
     let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
     let compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
         compiler.execute_passthrough_preserving_incremental(args, &compiler_args)
@@ -8925,7 +8934,9 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 /// here may fail a build.
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
     let _trace = crate::phase_trace::phase("event_log");
-    let _ = events::log_event(&config.event_log_path(), event);
+    if events::log_event_for_build(&config.event_log_path(), event).is_err() {
+        return;
+    }
     let _ = events::rotate_events_if_needed(
         &config.event_log_path(),
         config.event_log_max_size,
@@ -9161,7 +9172,7 @@ fn explain_miss_diff(
     {
         return Vec::new();
     }
-    let events = match events::read_events(&config.event_log_path()) {
+    let events = match events::recent_events_for_build(&config.event_log_path()) {
         Ok(events) => events,
         Err(_) => return Vec::new(),
     };

@@ -2260,7 +2260,7 @@ fn missed_entry<'a>(
 }
 
 fn read_entry_meta(entry: &daemon::StatsEntry) -> Option<crate::store::EntryMeta> {
-    let content = std::fs::read_to_string(entry.meta_path()).ok()?;
+    let content = std::fs::read_to_string(crate::store_view::entry_meta_path(entry)?).ok()?;
     serde_json::from_str(&content).ok()
 }
 
@@ -2386,7 +2386,7 @@ fn stored_entry_row(
         format_relative_time(&entry.last_accessed),
         term::bytes(entry.size),
         term::count(entry.hit_count),
-        entry.store_locations(),
+        crate::store_view::entry_store_locations(entry),
         details.join(", "),
     ]
 }
@@ -3795,8 +3795,8 @@ pub fn list(
         for entry in &matching {
             lines.extend(entry_detail_lines(entry));
 
-            let meta_path = entry.meta_path();
-            if let Ok(content) = std::fs::read_to_string(&meta_path)
+            if let Some(meta_path) = crate::store_view::entry_meta_path(entry)
+                && let Ok(content) = std::fs::read_to_string(&meta_path)
                 && let Ok(meta) = serde_json::from_str::<crate::store::EntryMeta>(&content)
             {
                 push_nonempty_detail(&mut lines, "  Features: ", &meta.features.join(", "));
@@ -3839,7 +3839,7 @@ pub fn list(
                 term::count(entry.hit_count),
                 local_store_date(&entry.created_at),
                 local_store_date(&entry.last_accessed),
-                entry.store_locations(),
+                crate::store_view::entry_store_locations(entry),
             ]);
         }
         use term::Align::{Left, Right};
@@ -3881,7 +3881,10 @@ fn entry_detail_lines(entry: &daemon::StatsEntry) -> Vec<String> {
     let mut lines = vec![
         format!("Cache key: {}", term::short_key(&entry.cache_key)),
         format!("  Crate:    {}", entry.crate_name),
-        format!("  Stores:   {}", entry.store_locations()),
+        format!(
+            "  Stores:   {}",
+            crate::store_view::entry_store_locations(entry)
+        ),
     ];
     push_nonempty_detail(&mut lines, "  Type:     ", &entry.crate_type);
     push_nonempty_detail(&mut lines, "  Profile:  ", &entry.profile);
@@ -4126,16 +4129,9 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         print!("Backfilling compile times...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
-    let costs = store.backfill_compile_times().unwrap_or(0);
+    let costs = store.backfill_compile_times();
     if verbose {
-        if costs > 0 {
-            println!(
-                " {} updated.",
-                term::counted(costs as u64, "entry", "entries")
-            );
-        } else {
-            println!(" up to date.");
-        }
+        println!("{}", compile_time_backfill_message(costs));
     }
 
     // Entry→blob rows for pre-#608 entries; same sweep, same convergence.
@@ -4419,6 +4415,17 @@ fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats)
     // held bytes must not add up to twice as many.
     total.bytes_held = total.bytes_held.max(part.bytes_held);
     total.skipped |= part.skipped;
+}
+
+fn compile_time_backfill_message(result: Result<usize>) -> String {
+    match result {
+        Ok(0) => " no positive costs recovered this pass.".to_owned(),
+        Ok(count) => format!(
+            " {} updated.",
+            term::counted(count as u64, "entry", "entries")
+        ),
+        Err(error) => format!(" deferred: {error}"),
+    }
 }
 
 fn gc_stats_from_breakdown(report: &crate::daemon::GcBreakdown) -> crate::store::GcStats {
@@ -6244,8 +6251,12 @@ fn target_rows(config: &Config, now: i64) -> Result<Vec<TargetRow>> {
             cached_bytes: stats.cached_bytes,
         });
     }
-    rows.sort_by_key(|row| std::cmp::Reverse(row.reclaimable_bytes));
+    sort_target_rows(&mut rows);
     Ok(rows)
+}
+
+fn sort_target_rows(rows: &mut [TargetRow]) {
+    rows.sort_by_key(|row| std::cmp::Reverse(row.reclaimable_bytes));
 }
 
 /// `3d`, `5h`, `12m`, `40s`: the largest whole unit.
