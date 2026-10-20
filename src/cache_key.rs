@@ -5,7 +5,7 @@ pub(crate) use kache_format::{is_valid_cache_key, is_valid_crate_name};
 pub(crate) use kache_store::file_hash::*;
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -3293,7 +3293,7 @@ fn scoped_package_digest(
         fold_field(
             &mut hasher,
             b"package_top:",
-            scoped_ancestor_top_digest(package, file_hasher, &ignored, None)?.as_bytes(),
+            scoped_ancestor_top_digest(package, file_hasher, &ignored, None, None)?.as_bytes(),
         );
         if let Some(out_dir) = &workspace.out_dir {
             let roots = vec![TreeRoot::new(out_dir.clone(), b"out_dir", &[])];
@@ -3319,6 +3319,13 @@ fn scoped_package_digest(
         hasher.update(b"kache-scoped-guard-v1\n");
         fold_field(&mut hasher, b"package:", package_digest.as_bytes());
     }
+    // The inputs guard counts the workspace manifest less the registry
+    // dependencies the member does not inherit ([`inherited_dependencies`]).
+    let inherited = if inputs {
+        inherited_dependencies(package, file_hasher)
+    } else {
+        None
+    };
     let mut ancestor = package.parent();
     while let Some(directory) = ancestor.filter(|directory| directory.starts_with(&workspace.root))
     {
@@ -3326,7 +3333,14 @@ fn scoped_package_digest(
         fold_field(
             &mut hasher,
             b"ancestor:",
-            scoped_ancestor_top_digest(directory, file_hasher, &ignored, manifest)?.as_bytes(),
+            scoped_ancestor_top_digest(
+                directory,
+                file_hasher,
+                &ignored,
+                manifest,
+                inherited.as_ref(),
+            )?
+            .as_bytes(),
         );
         ancestor = directory.parent();
     }
@@ -3348,6 +3362,7 @@ fn scoped_ancestor_top_digest(
     file_hasher: &FileHasher<'_>,
     ignored: &[PathBuf],
     manifest: Option<&str>,
+    inherited: Option<&BTreeSet<String>>,
 ) -> Option<String> {
     let mut excluded = vec![directory.join(".git")];
     excluded.extend(
@@ -3406,7 +3421,7 @@ fn scoped_ancestor_top_digest(
             },
             Ok(metadata) if metadata.is_file() => match file_hasher.hash_unkeyed(&path) {
                 Ok(hash) if manifest.is_some_and(|manifest| name == manifest) => {
-                    root_manifest_entry(&path, &hash)
+                    root_manifest_entry(&path, &hash, inherited)
                 }
                 Ok(hash) => format!("file:{hash}"),
                 Err(_) => unreadable(),
@@ -3451,10 +3466,17 @@ const ROOT_MANIFEST: &str = "Cargo.toml";
 /// `Cargo.lock`, which the guard leaves out already
 /// ([`DEFAULT_GUARD_IGNORE`]). A unit that names the manifest in its closure
 /// (Clippy's, an `include_str!`) keys its bytes, every byte, as before.
-fn root_manifest_entry(path: &Path, hash: &str) -> String {
+///
+/// With `inherited` (the inputs guard), the `[workspace.dependencies]`
+/// entries not named in it are left out too ([`inherited_dependencies`]).
+fn root_manifest_entry(path: &Path, hash: &str, inherited: Option<&BTreeSet<String>>) -> String {
+    let name = match inherited {
+        None => format!("v1-{hash}"),
+        Some(names) => format!("v1-{hash}-inherits-{}", inherited_names_digest(names)),
+    };
     let memo = crate::config::probe_memo_dir()
         .join("root-manifest")
-        .join(format!("v1-{hash}"));
+        .join(name);
     if let Ok(digest) = std::fs::read_to_string(&memo)
         && digest.len() == 64
         && digest.bytes().all(|b| b.is_ascii_hexdigit())
@@ -3464,7 +3486,7 @@ fn root_manifest_entry(path: &Path, hash: &str) -> String {
     let Some(digest) = std::fs::read_to_string(path)
         .ok()
         .filter(|text| blake3::hash(text.as_bytes()).to_hex().as_str() == hash)
-        .and_then(|text| root_manifest_digest(&text))
+        .and_then(|text| root_manifest_digest(&text, inherited))
     else {
         return format!("file:{hash}");
     };
@@ -3477,16 +3499,18 @@ fn root_manifest_entry(path: &Path, hash: &str) -> String {
 }
 
 /// The digest [`root_manifest_entry`] folds for a manifest's `text`, or
-/// `None` when it does not parse.
-fn root_manifest_digest(text: &str) -> Option<String> {
+/// `None` when it does not parse. With `inherited`, only the
+/// `[workspace.dependencies]` entries it names are kept.
+fn root_manifest_digest(text: &str, inherited: Option<&BTreeSet<String>>) -> Option<String> {
     let mut manifest: toml::Table = toml::from_str(text).ok()?;
     if let Some(toml::Value::Table(workspace)) = manifest.get_mut("workspace") {
         for list in ["members", "exclude", "default-members"] {
             workspace.remove(list);
         }
         if let Some(toml::Value::Table(dependencies)) = workspace.get_mut("dependencies") {
-            dependencies.retain(|_, dependency| {
+            dependencies.retain(|name, dependency| {
                 !matches!(dependency, toml::Value::Table(spec) if spec.contains_key("path"))
+                    && inherited.is_none_or(|names| names.contains(name))
             });
             // A table left empty reads as no table: the first path entry
             // adds one.
@@ -3496,9 +3520,82 @@ fn root_manifest_digest(text: &str) -> Option<String> {
         }
     }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"kache-root-manifest-v1\n");
+    hasher.update(match inherited {
+        None => b"kache-root-manifest-v1\n".as_slice(),
+        Some(_) => b"kache-root-manifest-inherited-v1\n".as_slice(),
+    });
     fold_toml(&mut hasher, &toml::Value::Table(manifest));
     Some(hasher.finalize().to_hex().to_string())
+}
+
+/// The `[workspace.dependencies]` entries the member at `package` inherits:
+/// the names its manifest gives `workspace = true` in `[dependencies]`,
+/// `[dev-dependencies]`, `[build-dependencies]` (and their `_` spellings),
+/// plain or under a `[target.'cfg(..)']` table. `None`, so every entry
+/// counts, when the manifest cannot be read or does not parse, or when what
+/// was read is not what the guard hashed for it (an edit in between).
+///
+/// What the workspace says about another member's dependency reaches this
+/// member's units only through Cargo, as their `--extern` files, `--cfg`
+/// features and metadata, which the key holds; a macro that resolves the
+/// member's inherited dependencies (proc-macro-crate's renames) reads only
+/// the entries it names. `[workspace.package]`, lints, profiles, patches
+/// and metadata count whole, as before.
+fn inherited_dependencies(
+    package: &Path,
+    file_hasher: &FileHasher<'_>,
+) -> Option<BTreeSet<String>> {
+    let path = package.join("Cargo.toml");
+    let hash = file_hasher.hash_unkeyed(&path).ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    if blake3::hash(text.as_bytes()).to_hex().as_str() != hash {
+        return None;
+    }
+    inherited_dependency_names(&text)
+}
+
+/// [`inherited_dependencies`] for a member manifest's `text`.
+fn inherited_dependency_names(text: &str) -> Option<BTreeSet<String>> {
+    const TABLES: [&str; 5] = [
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+        "dev_dependencies",
+        "build_dependencies",
+    ];
+    let manifest: toml::Table = toml::from_str(text).ok()?;
+    let mut names = BTreeSet::new();
+    let mut collect = |table: &toml::Table| {
+        for kind in TABLES {
+            if let Some(toml::Value::Table(dependencies)) = table.get(kind) {
+                for (name, spec) in dependencies {
+                    if matches!(spec, toml::Value::Table(spec)
+                        if spec.get("workspace") == Some(&toml::Value::Boolean(true)))
+                    {
+                        names.insert(name.clone());
+                    }
+                }
+            }
+        }
+    };
+    collect(&manifest);
+    if let Some(toml::Value::Table(targets)) = manifest.get("target") {
+        for target in targets.values() {
+            if let toml::Value::Table(target) = target {
+                collect(target);
+            }
+        }
+    }
+    Some(names)
+}
+
+/// A short digest of `names`, for [`root_manifest_entry`]'s memo.
+fn inherited_names_digest(names: &BTreeSet<String>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for name in names {
+        fold_field(&mut hasher, b"name:", name.as_bytes());
+    }
+    hasher.finalize().to_hex()[..32].to_string()
 }
 
 /// Fold a TOML value, tables by sorted key, so the digest depends on what

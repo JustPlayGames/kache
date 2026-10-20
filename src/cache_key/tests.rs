@@ -18023,3 +18023,38 @@ fn the_inputs_guard_names_the_closures_directories_in_the_package() {
     write_file(&root.join("crates/kt/macro.cfg"), "edited");
     assert_ne!(guard(true), before, "a top file counts by content");
 }
+
+#[test]
+fn inherited_dependency_names_read_every_dependency_table() {
+    let names = inherited_dependency_names(
+        "[package]\nname = \"m\"\n\n\
+         [dependencies]\na.workspace = true\nb = { workspace = true, features = [\"x\"] }\n\
+         c = \"1\"\nd = { workspace = false }\ne = { path = \"../e\" }\n\n\
+         [dev-dependencies]\nf = { workspace = true }\n\n\
+         [build_dependencies]\ng.workspace = true\n\n\
+         [target.'cfg(windows)'.dependencies]\nh = { workspace = true }\n\n\
+         [target.'cfg(unix)'.build-dependencies]\ni.workspace = true\n",
+    )
+    .unwrap();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert_eq!(names, ["a", "b", "f", "g", "h", "i"]);
+    assert_eq!(inherited_dependency_names("[package\n"), None);
+    assert_eq!(
+        inherited_dependency_names("[package]\nname = \"m\"\n").map(|names| names.len()),
+        Some(0)
+    );
+}
+
+#[test]
+fn root_manifest_digest_keeps_only_the_inherited_registry_entries() {
+    let names: BTreeSet<String> = ["serde".to_string()].into_iter().collect();
+    let base = "[workspace]\nmembers = [\"m\"]\n\n[workspace.dependencies]\nserde = \"1\"\n";
+    let other = format!("{base}tokio = \"1\"\n");
+    let bumped = "[workspace]\nmembers = [\"m\"]\n\n[workspace.dependencies]\nserde = \"2\"\n";
+    let digest = |text: &str, names| root_manifest_digest(text, names).unwrap();
+    assert_eq!(digest(base, Some(&names)), digest(&other, Some(&names)));
+    assert_ne!(digest(base, Some(&names)), digest(bumped, Some(&names)));
+    assert_ne!(digest(base, None), digest(&other, None));
+    // Filtered and whole digests never meet, even with nothing left out.
+    assert_ne!(digest(base, Some(&names)), digest(base, None));
+}

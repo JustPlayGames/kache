@@ -2592,3 +2592,113 @@ fn inputs_a_checkout_moving_between_names_beside_the_closure_keeps_a_row_each() 
         }
     }
 }
+
+/// Under the inputs guard the workspace manifest counts for a member less
+/// the `[workspace.dependencies]` entries the member does not inherit
+/// (`name.workspace = true` in any of its dependency tables, a target's
+/// too): a registry dependency that another member adds or bumps keeps the
+/// record; one the member inherits, a profile and anything else in the
+/// manifest still refuse it. A member manifest that does not parse keeps
+/// every entry.
+#[test]
+fn inputs_a_root_dependency_the_member_does_not_inherit_keeps_the_record() {
+    build_kache();
+    let member = "[package]\nname = \"kt\"\n\n[dependencies]\nserde.workspace = true\n\n\
+                  [target.'cfg(unix)'.dev-dependencies]\nrenamed = { workspace = true }\n";
+    let unit = WorkspaceUnit::new(false)
+        .with_file("kt/Cargo.toml", member)
+        .inputs();
+    let a = unit.checkout("a");
+    let manifest = a.join("Cargo.toml");
+    let head = "[workspace]\nmembers = [\"kt\"]\n\n[workspace.dependencies]\n";
+    std::fs::write(&manifest, format!("{head}serde = \"1\"\nrenamed = \"1\"\n")).unwrap();
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let changes: [(String, bool, &str); 6] = [
+        (
+            format!("{head}serde = \"1\"\nrenamed = \"1\"\ntokio = \"1\"\n"),
+            false,
+            "a dependency another member inherits",
+        ),
+        (
+            format!(
+                "{head}serde = \"1\"\nrenamed = \"1\"\ntokio = {{ version = \"1.2\", features = [\"rt\"] }}\n"
+            ),
+            false,
+            "that dependency's version and features",
+        ),
+        (
+            format!("{head}serde = \"1.0.200\"\nrenamed = \"1\"\ntokio = \"1\"\n"),
+            true,
+            "a dependency the member inherits",
+        ),
+        (
+            format!("{head}serde = \"1.0.200\"\nrenamed = \"2\"\ntokio = \"1\"\n"),
+            true,
+            "a dependency the member inherits for one target's tests",
+        ),
+        (
+            format!("{head}serde = \"1.0.200\"\nrenamed = \"2\"\n\n[profile.dev]\nopt-level = 1\n"),
+            true,
+            "a profile",
+        ),
+        (
+            format!(
+                "{head}serde = \"1.0.200\"\nrenamed = \"2\"\nother = \"3\"\n\n[profile.dev]\nopt-level = 1\n"
+            ),
+            false,
+            "another dependency again",
+        ),
+    ];
+    for (text, refuses, what) in changes {
+        std::fs::write(&manifest, text).unwrap();
+        let event = unit.build(&a, true, None);
+        assert_eq!(event.result, "local_hit", "{what}");
+        assert_eq!(
+            event.dep_info_runs,
+            u64::from(refuses),
+            "a change to {what}"
+        );
+    }
+    // A member manifest that does not parse inherits nothing it can name:
+    // every entry counts again.
+    std::fs::write(a.join("kt/Cargo.toml"), "[package\n").unwrap();
+    assert_eq!(
+        unit.build(&a, true, None).dep_info_runs,
+        1,
+        "the member manifest changed"
+    );
+    std::fs::write(
+        &manifest,
+        format!("{head}serde = \"1.0.200\"\nrenamed = \"2\"\nother = \"4\"\n\n[profile.dev]\nopt-level = 1\n"),
+    )
+    .unwrap();
+    let event = unit.build(&a, true, None);
+    assert_eq!(event.result, "local_hit");
+    assert_eq!(
+        event.dep_info_runs, 1,
+        "any entry, with a member manifest that does not parse"
+    );
+}
+
+/// The scoped guard (the default) keeps counting every registry entry of
+/// `[workspace.dependencies]`, inherited or not.
+#[test]
+fn scoped_a_root_dependency_the_member_does_not_inherit_still_refuses_the_record() {
+    build_kache();
+    let member = "[package]\nname = \"kt\"\n\n[dependencies]\nserde.workspace = true\n";
+    let unit = WorkspaceUnit::new(false)
+        .with_file("kt/Cargo.toml", member)
+        .scoped();
+    let a = unit.checkout("a");
+    let manifest = a.join("Cargo.toml");
+    let head = "[workspace]\nmembers = [\"kt\"]\n\n[workspace.dependencies]\nserde = \"1\"\n";
+    std::fs::write(&manifest, head).unwrap();
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::write(&manifest, format!("{head}tokio = \"1\"\n")).unwrap();
+    let event = unit.build(&a, true, None);
+    assert_eq!(event.result, "local_hit");
+    assert_eq!(
+        event.dep_info_runs, 1,
+        "the scoped guard counts every registry entry"
+    );
+}
