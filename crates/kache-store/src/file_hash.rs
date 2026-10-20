@@ -460,6 +460,52 @@ impl<'db> FileHashCache<'db> {
         Ok(())
     }
 
+    /// [`Self::put_input_prediction`] for one of several rows of a unit, all
+    /// named `prefix` and something after it: the row is written, and of the
+    /// rows under `prefix` only the `keep` most recently used or written stay.
+    /// The unit's other rows, for trees no build has used since, go at once
+    /// instead of at the retention prune.
+    pub fn put_input_prediction_keeping(
+        &self,
+        prefix: &str,
+        identity: &str,
+        schema: u32,
+        crate_name: Option<&str>,
+        prediction_json: &str,
+        keep: usize,
+    ) -> rusqlite::Result<()> {
+        debug_assert!(identity.starts_with(prefix) && identity.len() > prefix.len());
+        self.put_input_prediction(identity, schema, crate_name, prediction_json)?;
+        // Every name longer than `prefix` that starts with it sorts after it
+        // and before `prefix` + U+10FFFF, so the primary key serves the range.
+        let upper = format!("{prefix}\u{10FFFF}");
+        self.db().execute(
+            "DELETE FROM input_predictions
+             WHERE identity > ?1 AND identity < ?2 AND identity NOT IN (
+                 SELECT identity FROM input_predictions
+                 WHERE identity > ?1 AND identity < ?2
+                 ORDER BY last_used DESC, updated_at DESC, identity = ?3 DESC
+                 LIMIT ?4)",
+            params![
+                prefix,
+                upper,
+                identity,
+                i64::try_from(keep).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Is any row named `prefix` and something after it recorded?
+    pub fn has_input_predictions_under(&self, prefix: &str) -> rusqlite::Result<bool> {
+        let upper = format!("{prefix}\u{10FFFF}");
+        self.db().query_row(
+            "SELECT EXISTS(SELECT 1 FROM input_predictions WHERE identity > ?1 AND identity < ?2)",
+            params![prefix, upper],
+            |row| row.get(0),
+        )
+    }
+
     /// Delete predictions no build has read or recorded for
     /// [`INPUT_PREDICTION_RETENTION_SECS`]. Run from the GC sweep and
     /// `doctor --repair`. Freed pages go to the freelist; index compaction

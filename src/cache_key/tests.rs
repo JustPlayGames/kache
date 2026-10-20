@@ -5189,7 +5189,7 @@ fn a_portable_prediction_round_trips_and_no_other_decoder_reads_it() {
     assert_eq!(hasher.portable_prediction("unit"), None);
     hasher.record_portable_prediction("unit", Some("kt"), &record);
     assert_eq!(
-        FileHasher::persistent(&db).portable_prediction("unit"),
+        FileHasher::persistent(&db).portable_prediction_under("unit", &record.tree),
         Some(record)
     );
     assert_eq!(hasher.input_prediction("unit"), None);
@@ -5613,6 +5613,111 @@ fn input_prediction_round_trips_through_the_database() {
     assert_eq!(record.sources, narrower.source_files);
     assert!(record.env_deps.is_empty());
     assert_eq!(record.tree.as_deref(), Some("tree-digest"));
+}
+
+/// Checkouts at different commits each keep their own portable row of a
+/// unit: a record made under another tree no longer replaces the row the
+/// next build under the first tree needs (GC19: 82 % of the real store's
+/// `tree-changed` hits restored a key only other checkouts had built, most
+/// of them at a commit with the same package). A row an older kache filed
+/// under the identity alone still answers when this tree has none, and a
+/// unit keeps at most [`TREE_ROWS_KEPT`] trees.
+#[test]
+fn a_portable_row_of_another_tree_leaves_this_trees_row_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let row = |tree: &str, file: &str| PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources: vec![Portable::Workspace(file.to_string())],
+        env_deps: Vec::new(),
+        tree: tree.to_string(),
+    };
+    let tree_of = |hasher: &FileHasher<'_>, guard: &str| {
+        hasher
+            .portable_prediction_under("unit", guard)
+            .map(|record| record.tree)
+    };
+    let hasher = FileHasher::persistent(&db);
+    hasher.record_portable_prediction(
+        "unit",
+        Some("demo"),
+        &row("scoped-v1:aaa+dirs:d1", "a/src/lib.rs"),
+    );
+    hasher.record_portable_prediction(
+        "unit",
+        Some("demo"),
+        &row("scoped-v1:bbb+dirs:d2", "a/src/lib.rs"),
+    );
+    let reader = FileHasher::persistent(&db);
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:aaa").as_deref(),
+        Some("scoped-v1:aaa+dirs:d1"),
+        "the first tree's row must survive a record made under another tree"
+    );
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:bbb").as_deref(),
+        Some("scoped-v1:bbb+dirs:d2")
+    );
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:ccc"),
+        None,
+        "a tree nobody recorded has no row"
+    );
+
+    // An older kache's row, under the identity alone, answers for any tree:
+    // the caller validates it, its tree included, as before.
+    let old = serde_json::to_string(&row("scoped-v1:old", "a/src/lib.rs")).unwrap();
+    reader
+        .cache
+        .as_ref()
+        .unwrap()
+        .put_input_prediction("unit", PORTABLE_PREDICTION_SCHEMA, None, &old)
+        .unwrap();
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:ccc").as_deref(),
+        Some("scoped-v1:old")
+    );
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:aaa").as_deref(),
+        Some("scoped-v1:aaa+dirs:d1")
+    );
+
+    // A registry unit's relocated row keys by its whole guard.
+    hasher.record_portable_prediction("other", None, &row("0123abcd", "x.rs"));
+    assert_eq!(
+        reader
+            .portable_prediction_under("other", "0123abcd")
+            .map(|record| record.tree)
+            .as_deref(),
+        Some("0123abcd")
+    );
+
+    // Bounded: the unit's rows for the trees used least recently go.
+    for n in 0..TREE_ROWS_KEPT + 4 {
+        hasher.record_portable_prediction(
+            "many",
+            None,
+            &row(&format!("scoped-v1:t{n:02}+dirs:x"), "a/src/lib.rs"),
+        );
+    }
+    let kept: Vec<_> = (0..TREE_ROWS_KEPT + 4)
+        .filter(|n| {
+            reader
+                .portable_prediction_under("many", &format!("scoped-v1:t{n:02}"))
+                .is_some()
+        })
+        .collect();
+    assert_eq!(kept.len(), TREE_ROWS_KEPT, "{kept:?}");
+    assert!(
+        kept.contains(&(TREE_ROWS_KEPT + 3)),
+        "the row just written stays: {kept:?}"
+    );
+    // Other units' rows are not touched by the bound.
+    assert!(
+        reader
+            .portable_prediction_under("unit", "scoped-v1:bbb")
+            .is_some()
+    );
 }
 
 /// The tree guard: a record for a proc-macro-dependent unit is only usable
