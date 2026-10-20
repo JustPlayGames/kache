@@ -1,12 +1,33 @@
 //! Stopping a compile only when nothing it started can outlive it: see
 //! [`super::stop_compile`].
 
-use std::process::Child;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// How long a compiler may take to stop (a thread in uninterruptible
 /// IO stops when that IO ends) before it is let go on instead.
 const STOP_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Have the kernel resume the compile `cmd` starts (SIGCONT) when the thread
+/// that starts it ends, as every thread of a wrapper killed while it decides
+/// does (Ctrl+C, a timeout's or a tool's SIGTERM to the whole job). A stopped
+/// process takes no signal but SIGKILL and SIGCONT, and the kernel's own
+/// rescue of a stopped job whose parents are gone (SIGHUP, SIGCONT) runs only
+/// if every thread had stopped by then: one still in uninterruptible IO, as
+/// in the build machine's IO stalls, stops later and would stay stopped for
+/// good, holding its memory. Resumed, it takes the signal that ended the job.
+pub(super) fn resume_if_orphaned(cmd: &mut Command) {
+    // SAFETY: the closure runs in the child between fork and exec and calls
+    // only prctl, which is async-signal-safe and allocates nothing.
+    unsafe {
+        cmd.pre_exec(|| {
+            // Best effort: without it the compile is no worse off than before.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGCONT as libc::c_ulong);
+            Ok(())
+        });
+    }
+}
 
 pub(super) fn stop_if_alone(child: &mut Child) -> Result<(), &'static str> {
     if !matches!(child.try_wait(), Ok(None)) {
@@ -113,10 +134,11 @@ pub(super) fn parse_state(stat: &[u8]) -> Option<char> {
 }
 
 /// rustc's codegen threads: the coordinator, and the LLVM workers it
-/// names after their work ("opt cgu.00", "lto ...", "copy ...").
+/// names after their work ("opt cgu.00", "lto ...", "cpy ..."; "copy ..."
+/// in older rustc).
 pub(super) fn is_codegen_thread(comm: &str) -> bool {
     comm == "coordinator"
-        || ["opt ", "lto ", "copy "]
+        || ["opt ", "lto ", "cpy ", "copy "]
             .iter()
             .any(|prefix| comm.starts_with(prefix))
 }

@@ -126,6 +126,11 @@ pub fn run_rustc(
     }
     let spawned = std::time::Instant::now();
     let mut cmd = Command::new(rustc);
+    #[cfg(target_os = "linux")]
+    if may_stop && stop_rule == StopRule::WhenAlone {
+        // It may be frozen while Kache decides: never leave it frozen.
+        freeze::resume_if_orphaned(&mut cmd);
+    }
     crate::toolchain_dylib::apply(&mut cmd, rustc);
 
     // Double-wrapper (RUSTC_WRAPPER + RUSTC_WORKSPACE_WRAPPER): the workspace
@@ -1005,6 +1010,8 @@ mod tests {
             "opt cgu.00",
             "opt regex.1f2e3",
             "lto fat",
+            "lto cgu.0.rcgu.",
+            "cpy cgu.3",
             "copy x",
         ] {
             assert!(freeze::is_codegen_thread(codegen), "{codegen}");
@@ -1049,6 +1056,157 @@ mod tests {
             !Path::new(&format!("/proc/{pid}")).exists(),
             "the stopped compile was not reaped"
         );
+    }
+
+    /// A linking compile frozen while Kache decides is resumed by the kernel
+    /// when the wrapper dies before it decided (Ctrl+C, a timeout's SIGTERM):
+    /// the thread that spawned it ends, as every thread of a dead wrapper
+    /// does. Left stopped, it would never take the signal that ended the job.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_frozen_compile_resumes_when_its_wrapper_dies() {
+        fn state(pid: i32) -> char {
+            let stat = fs::read(format!("/proc/{pid}/stat")).unwrap();
+            freeze::parse_state(&stat).unwrap()
+        }
+        let mut child = std::thread::spawn(|| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30");
+            // As run_rustc starts a linking compile that may stop.
+            freeze::resume_if_orphaned(&mut cmd);
+            let child = cmd.spawn().unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+            // SAFETY: our own unreaped child.
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state(pid) != 'T' {
+                assert!(std::time::Instant::now() < deadline, "it never stopped");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            child
+        })
+        .join()
+        .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let resumed = loop {
+            if state(pid) != 'T' {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            resumed,
+            "the compile stayed stopped after its wrapper's thread ended"
+        );
+    }
+
+    /// Stress against a real rustc, by hand: `KACHE_STRESS_RUSTC=<rustc>
+    /// KACHE_STRESS_SRC=<main.rs> [KACHE_STRESS_ROUNDS=n] [KACHE_STRESS_FLAGS=..]
+    /// cargo nextest run --bin kache --run-ignored only real_linking_compiles`.
+    /// A linking compile asked to stop at any moment from its dep-info to its
+    /// end is either stopped, and then nothing of it writes in its output
+    /// folder afterwards, or let go on to a successful end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn real_linking_compiles_stopped_at_any_moment() {
+        fn listing(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+            let mut all = fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let meta = entry.metadata().ok()?;
+                    Some((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        meta.len(),
+                        meta.modified().ok()?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            all.sort();
+            all
+        }
+        let rustc = std::env::var("KACHE_STRESS_RUSTC").expect("KACHE_STRESS_RUSTC");
+        let src = std::env::var("KACHE_STRESS_SRC").expect("KACHE_STRESS_SRC");
+        let rounds: u64 = std::env::var("KACHE_STRESS_ROUNDS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(60);
+        let span: u64 = std::env::var("KACHE_STRESS_SPAN_MS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1200);
+        let extra = std::env::var("KACHE_STRESS_FLAGS").unwrap_or_default();
+        let (mut stopped, mut refused, mut leftovers) = (0, 0, 0);
+        for round in 0..rounds {
+            let delay = std::time::Duration::from_millis(round * span / rounds);
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = Command::new(&rustc)
+                .args([
+                    "--edition=2021",
+                    "--crate-name=m",
+                    "--crate-type=bin",
+                    "--emit=dep-info,link",
+                    "--error-format=json",
+                    "--json=artifacts",
+                    "--out-dir",
+                ])
+                .arg(dir.path())
+                .args(extra.split_whitespace())
+                .arg(&src)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let mut stop = || {
+                std::thread::sleep(delay);
+                false
+            };
+            let (status, _, captured) = capture_rustc_output_with(
+                &mut child,
+                stdout,
+                stderr,
+                None,
+                Some(&mut stop),
+                StopRule::WhenAlone,
+            )
+            .unwrap();
+            if captured.stopped {
+                stopped += 1;
+                let at_return = listing(dir.path());
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                assert_eq!(
+                    listing(dir.path()),
+                    at_return,
+                    "round {round} ({delay:?}): the output folder changed after a stopped compile returned"
+                );
+                let left = at_return
+                    .iter()
+                    .filter(|(name, ..)| name.ends_with(".o") || name.starts_with("rustc"))
+                    .count();
+                if left > 0 {
+                    eprintln!("round {round} ({delay:?}): stopped, {left} objects/temp dirs left");
+                }
+                leftovers += left;
+            } else {
+                refused += 1;
+                assert!(
+                    status.success(),
+                    "round {round}: a compile let go on failed"
+                );
+                assert!(dir.path().join("m").exists(), "round {round}: no output");
+            }
+        }
+        eprintln!("stopped {stopped}, let go on {refused}, leftover objects/temp dirs {leftovers}");
     }
 
     #[cfg(unix)]
