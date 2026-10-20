@@ -242,6 +242,34 @@ pub(crate) fn remember(cache_dir: &Path, target_dir: &Path, dest: &Path, blob: &
     }
 }
 
+/// Drop what was recorded or staged for the artifact at `dest`, when its
+/// restore no longer copies it (a test binary, restored by link since
+/// tasty.18): a record left from an earlier version would be staged for
+/// nothing. A record of another file under the same artifact name (a
+/// binary and its unit tests are both `deps/<name>-<hash>`) is kept. Usually
+/// a failed open and a failed unlink.
+pub(crate) fn forget(cache_dir: &Path, target_dir: &Path, dest: &Path, blob: &str) {
+    let Ok(rel) = dest.strip_prefix(target_dir) else {
+        return;
+    };
+    let path = records_dir(cache_dir, target_dir).join(short_hash(artifact_key(rel).as_bytes()));
+    let ours = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Record>(&bytes).ok())
+        .is_some_and(|record| record.dest == dest || record.blob == blob);
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(staged) = staged_path(dest, blob) {
+        remove_staged(&staged);
+    }
+}
+
+fn remove_staged(staged: &Path) {
+    let _ = std::fs::remove_file(staged);
+    let _ = std::fs::remove_file(fingerprint_path(staged));
+}
+
 /// The target directory of `target_dir`'s project that recorded last, when
 /// it is not `target_dir`.
 fn lender(cache_dir: &Path, target_dir: &Path) -> Option<PathBuf> {

@@ -5522,18 +5522,21 @@ fn remember_prestaged_executables(
         return;
     };
     for file in &meta.files {
+        if file.size < crate::prestage::MIN_BYTES {
+            continue;
+        }
         let kind = compiler.classify_output(args, &file.name);
-        if file.size >= crate::prestage::MIN_BYTES
-            && restore_link_strategy(kind, file.executable, shared_loadable)
-                == link::LinkStrategy::Copy
+        let test_binary =
+            restores_as_shared_test_binary(&file.name, file.executable, &meta.crate_types);
+        let dest = artifact_target_path(args, output_dir, &file.name);
+        if restore_link_strategy(kind, file.executable, test_binary, shared_loadable)
+            == link::LinkStrategy::Copy
         {
-            crate::prestage::remember(
-                &config.cache_dir,
-                &target_dir,
-                &artifact_target_path(args, output_dir, &file.name),
-                &file.hash,
-                file.size,
-            );
+            crate::prestage::remember(&config.cache_dir, &target_dir, &dest, &file.hash, file.size);
+        } else if test_binary {
+            // Restored by link now: a record or copy left from when it was
+            // copied would only be staged for nothing.
+            crate::prestage::forget(&config.cache_dir, &target_dir, &dest, &file.hash);
         }
     }
 }
@@ -5556,18 +5559,44 @@ fn remember_prestaged_executables(
 /// The exception is `shared_loadable`, the executable kind of this compile
 /// that nothing rewrites in place (see [`shared_inode_loadable`]). It may
 /// share the blob's inode like an rlib.
+///
+/// A test binary (`test_binary`, see [`restores_as_shared_test_binary`]) may
+/// share the blob's inode with every target that restores it.
 fn restore_link_strategy(
     kind: ArtifactKind,
     executable: bool,
+    test_binary: bool,
     shared_loadable: Option<ArtifactKind>,
 ) -> link::LinkStrategy {
     if shared_loadable == Some(kind) {
         link::LinkStrategy::ExecutableHardlink
+    } else if executable && test_binary {
+        link::LinkStrategy::SharedExecutableHardlink
     } else if executable {
         link::LinkStrategy::Copy
     } else {
         kind.link_strategy()
     }
+}
+
+/// Whether `name`, an executable of an entry compiled as `crate_types`, is a
+/// test binary that every target may restore by sharing its blob's inode
+/// ([`link::LinkStrategy::SharedExecutableHardlink`]). The rule is the
+/// store's own for storing it by hardlink
+/// ([`CompilerArtifactPolicy::allow_executable_hardlink`]), so a hit on such
+/// an entry already checks the blob unless the file-hash memo vouches for it:
+/// nothing rewrites a test binary in place, and a writer that ignores the
+/// read-only bit is caught there. A test binary is a leaf of the build graph,
+/// so the restore's mtime stamp on the shared inode, which re-dates it in
+/// every target sharing it, makes nothing stale (#794 is about what depends
+/// on a re-dated file).
+fn restores_as_shared_test_binary(name: &str, executable: bool, crate_types: &[String]) -> bool {
+    use kache_store::ArtifactPolicy as _;
+    executable
+        && crate::compiler_store::CompilerArtifactPolicy::allow_executable_hardlink(
+            name,
+            crate_types,
+        )
 }
 
 /// The executable output of this compile that nothing rewrites in place after
@@ -5637,6 +5666,7 @@ fn materialize_cached_artifact(
     target_path: &Path,
     kind: ArtifactKind,
     shared_loadable: Option<ArtifactKind>,
+    test_binary: bool,
     depinfo_anchor: &Path,
     depinfo_working_dir: &Path,
     depinfo_workspace_dir: Option<&Path>,
@@ -5705,15 +5735,19 @@ fn materialize_cached_artifact(
         }
     };
 
-    let strategy = restore_link_strategy(kind, cached_file.executable, shared_loadable);
+    let strategy =
+        restore_link_strategy(kind, cached_file.executable, test_binary, shared_loadable);
     // A fresh transformed file can keep its original mode. Only the blob path
     // needs a private inode when it belongs to another process's store.
-    let blob_strategy =
-        if store.is_read_only() && strategy == link::LinkStrategy::ExecutableHardlink {
-            link::LinkStrategy::Copy
-        } else {
-            strategy
-        };
+    let blob_strategy = if store.is_read_only()
+        && matches!(
+            strategy,
+            link::LinkStrategy::ExecutableHardlink | link::LinkStrategy::SharedExecutableHardlink
+        ) {
+        link::LinkStrategy::Copy
+    } else {
+        strategy
+    };
     let rewrote_content = transformed.is_some();
     match transformed {
         Some(content) => {
@@ -5863,18 +5897,18 @@ fn output_already_holds(
         if !metadata.file_type().is_file() || metadata.len() != cached_file.size {
             return false;
         }
-        let runs = matches!(
-            strategy,
-            link::LinkStrategy::Copy | link::LinkStrategy::ExecutableHardlink
-        );
-        if (runs || cached_file.executable) && metadata.mode() & 0o111 != 0o111 {
+        if (strategy.is_executable() || cached_file.executable)
+            && metadata.mode() & 0o111 != 0o111
+        {
             return false;
         }
         if let Ok(blob) = std::fs::metadata(store_path)
             && blob.dev() == metadata.dev()
             && blob.ino() == metadata.ino()
         {
-            return metadata.nlink() == 2;
+            // A test binary's inode may be shared by any number of targets.
+            return metadata.nlink() == 2
+                || strategy == link::LinkStrategy::SharedExecutableHardlink;
         }
         if metadata.nlink() != 1 && !(metadata.nlink() == 2 && cargo_uplift_shares(target_path, &metadata)) {
             return false;
@@ -7809,12 +7843,18 @@ fn restore_from_cache_with_memo_store(
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
         // matching at the call site.
         let kind = compiler.classify_output(args, &cached_file.name);
+        let test_binary = restores_as_shared_test_binary(
+            &cached_file.name,
+            cached_file.executable,
+            &meta.crate_types,
+        );
         let restored = materialize_cached_artifact(
             store,
             cached_file,
             &target_path,
             kind,
             shared_loadable,
+            test_binary,
             &depinfo_anchor,
             &depinfo_working_dir,
             depinfo_workspace_dir,

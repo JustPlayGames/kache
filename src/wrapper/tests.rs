@@ -4236,6 +4236,7 @@ fn materialize_cached_artifact_reports_missing_blob_as_cache_miss() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4279,6 +4280,7 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
         &target,
         ArtifactKind::DepInfo,
         None,
+        false,
         &anchor,
         dir.path(),
         None,
@@ -4348,6 +4350,7 @@ fn materialize_cached_artifact_restores_executable_bit_recorded_at_insert() {
         &target,
         ArtifactKind::Other("rustc:unknown"),
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4389,6 +4392,7 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4415,33 +4419,33 @@ fn restore_link_strategy_shares_only_the_named_loadable_kind() {
     let proc_macro = Some(ArtifactKind::DynamicLibrary);
     let build_script = Some(ArtifactKind::Executable);
     assert_eq!(
-        restore_link_strategy(ArtifactKind::DynamicLibrary, true, proc_macro),
+        restore_link_strategy(ArtifactKind::DynamicLibrary, true, false, proc_macro),
         ExecutableHardlink
     );
     assert_eq!(
-        restore_link_strategy(ArtifactKind::Executable, true, build_script),
+        restore_link_strategy(ArtifactKind::Executable, true, false, build_script),
         ExecutableHardlink
     );
     // The rest of the same compile keeps its ordinary strategy.
     assert_eq!(
-        restore_link_strategy(ArtifactKind::DepInfo, false, proc_macro),
+        restore_link_strategy(ArtifactKind::DepInfo, false, false, proc_macro),
         Hardlink
     );
     assert_eq!(
-        restore_link_strategy(ArtifactKind::Executable, true, proc_macro),
+        restore_link_strategy(ArtifactKind::Executable, true, false, proc_macro),
         Copy
     );
     // Without the gate every executable is a private copy.
     assert_eq!(
-        restore_link_strategy(ArtifactKind::DynamicLibrary, true, None),
+        restore_link_strategy(ArtifactKind::DynamicLibrary, true, false, None),
         Copy
     );
     assert_eq!(
-        restore_link_strategy(ArtifactKind::Other("rustc:unknown"), true, None),
+        restore_link_strategy(ArtifactKind::Other("rustc:unknown"), true, false, None),
         Copy
     );
     assert_eq!(
-        restore_link_strategy(ArtifactKind::Library, false, None),
+        restore_link_strategy(ArtifactKind::Library, false, false, None),
         Hardlink
     );
 }
@@ -4520,6 +4524,7 @@ fn materialize_shared_loadable_restores_a_loadable_file_and_leaves_the_blob() {
         &target,
         ArtifactKind::DynamicLibrary,
         Some(ArtifactKind::DynamicLibrary),
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4602,6 +4607,127 @@ fn restore_from_cache_shares_a_proc_macro_inode_but_copies_a_user_binary() {
     assert_eq!(mode & 0o777, 0o755);
 }
 
+// ── test binaries restored by a shared inode (tasty.18) ────────────
+
+#[test]
+fn restore_link_strategy_shares_a_test_binary_with_every_target() {
+    use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink, SharedExecutableHardlink};
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::Executable, true, true, None),
+        SharedExecutableHardlink
+    );
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::Other("rustc:unknown"), true, true, None),
+        SharedExecutableHardlink
+    );
+    // The dep-info beside it is no executable.
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::DepInfo, false, true, None),
+        Hardlink
+    );
+    // The one-consumer gate of proc-macros and build scripts still wins.
+    assert_eq!(
+        restore_link_strategy(
+            ArtifactKind::Executable,
+            true,
+            true,
+            Some(ArtifactKind::Executable)
+        ),
+        ExecutableHardlink
+    );
+    assert_eq!(
+        restore_link_strategy(ArtifactKind::Executable, true, false, None),
+        Copy
+    );
+}
+
+#[test]
+fn only_a_test_binary_restores_as_a_shared_inode() {
+    let test: &[String] = &[];
+    let linux = cfg!(target_os = "linux");
+    assert_eq!(restores_as_shared_test_binary("hk-0123456789abcdef", true, test), linux);
+    assert!(!restores_as_shared_test_binary("hk-0123456789abcdef", false, test));
+    assert!(!restores_as_shared_test_binary("hk-0123456789abcdef.d", true, test));
+    for crate_type in ["bin", "cdylib", "dylib", "proc-macro", "lib"] {
+        assert!(
+            !restores_as_shared_test_binary("hk-0123456789abcdef", true, &[crate_type.to_string()]),
+            "{crate_type}"
+        );
+    }
+}
+
+/// End to end on Linux without reflink: two targets restore one test binary
+/// and both share its read-only blob's inode, which runs, and nothing is
+/// left for the daemon to stage for it (a record from when it was copied
+/// is dropped). A user binary of the same size stays a private copy.
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_from_cache_shares_a_test_binary_inode_across_targets() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let hash = "8888888888888888888888888888888888888888888888888888888888888888";
+    create_blob(&store, hash, b"test binary");
+    let blob = store.blob_path(hash);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if crate::link::try_reflink(&blob, &dir.path().join("probe")).is_ok() {
+        eprintln!("reflink available; the no-CoW restore path is not reachable here");
+        return;
+    }
+    let size = crate::prestage::MIN_BYTES * 2;
+    let restore = |tree: &str, crate_types: &[&str]| {
+        let root = dir.path().join(tree);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"hk\"\n").unwrap();
+        let out_dir = root.join("target/debug/deps");
+        let mut argv = vec!["rustc", "--crate-name", "hk", "src/lib.rs"];
+        if crate_types.is_empty() {
+            argv.push("--test");
+        }
+        for crate_type in crate_types {
+            argv.extend(["--crate-type", crate_type]);
+        }
+        let out_dir_str = out_dir.to_str().unwrap().to_string();
+        argv.extend(["--emit", "link", "--out-dir", &out_dir_str, "-C", "extra-filename=-1"]);
+        let args = rustc_args(&argv);
+        let mut cached = cached_file("hk-1", hash);
+        cached.executable = true;
+        cached.size = size;
+        let mut meta = entry_meta("hk", vec![cached], &["link"]);
+        meta.crate_types = crate_types.iter().map(|t| (*t).to_string()).collect();
+        // What an earlier version, which copied test binaries, recorded.
+        crate::prestage::remember(
+            &config.cache_dir,
+            &root.join("target"),
+            &out_dir.join("hk-1"),
+            hash,
+            size,
+        );
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        out_dir.join("hk-1")
+    };
+    let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+
+    let a = restore("a", &[]);
+    let b = restore("b", &[]);
+    assert_eq!(ino(&a), ino(&blob), "the first target shares the blob");
+    assert_eq!(ino(&b), ino(&blob), "and so does every later one");
+    assert_eq!(std::fs::metadata(&b).unwrap().permissions().mode() & 0o777, 0o555);
+    assert!(
+        crate::prestage::recorded_dests(&config.cache_dir).is_empty(),
+        "nothing to stage for a linked test binary"
+    );
+    // Restoring it again where it already is keeps the shared file.
+    let again = restore("a", &[]);
+    assert_eq!(ino(&again), ino(&blob));
+
+    let bin = restore("c", &["bin"]);
+    assert_ne!(ino(&bin), ino(&blob), "a user binary stays a private copy");
+    assert_eq!(crate::prestage::recorded_dests(&config.cache_dir), vec![bin]);
+}
+
 // ── restored-blob digest reuse (kunobi-ninja/kache#540) ──────────
 
 /// A plain library restore is a verbatim blob copy, so the entry's recorded
@@ -4623,6 +4749,7 @@ fn materialize_reports_a_plain_library_restore_as_an_exact_blob_copy() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4660,6 +4787,7 @@ fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
         &target,
         ArtifactKind::DepInfo,
         None,
+        false,
         &dir.path().join("target"),
         dir.path(),
         None,
@@ -4695,6 +4823,7 @@ fn materialize_reports_an_untouched_external_action_as_an_exact_blob_copy() {
         &target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4736,6 +4865,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4813,6 +4943,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
         &target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4849,6 +4980,7 @@ fn restore_loadable(
         target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         anchor,
         anchor,
         None,
@@ -5085,6 +5217,7 @@ fn materialize_cached_artifact_unpacks_debug_bundle_beside_binary() {
         &target,
         ArtifactKind::DebugBundle,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5179,6 +5312,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         &target,
         ArtifactKind::DebugBundle,
         None,
+        false,
         restore_dir.path(),
         restore_dir.path(),
         None,
@@ -11264,6 +11398,7 @@ fn a_read_only_store_restores_by_copy() {
             target,
             ArtifactKind::Library,
             None,
+            false,
             dir.path(),
             dir.path(),
             None,
@@ -11345,6 +11480,7 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
             &target,
             kind,
             shared_loadable,
+            false,
             dir.path(),
             dir.path(),
             None,
