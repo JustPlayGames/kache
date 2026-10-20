@@ -314,12 +314,23 @@ pub(crate) fn warn_hardlink_fallback_once(
 ///   stale because nothing depends on a test binary. The blob must also be
 ///   this user's, since only the owner may stamp a read-only file. Any other
 ///   blob, and every Windows restore, is copied as `Copy` would.
+/// - `SharedLibHardlink`: an `.rlib` whose unit also emits an `.rmeta` that
+///   the same restore writes and stamps beside it. Cargo judges a library
+///   unit by the newest of its outputs, or by its `.rmeta` alone where a
+///   dependent needs only the metadata, so the `.rmeta`'s stamp carries the
+///   restore's "written now" and the `.rlib` needs none. On Unix it shares
+///   the blob's inode with every target restoring it, when the blob is a
+///   read-only regular file whose mtime is not in the future, and the caller
+///   leaves the shared inode's mtime alone: nothing re-dates it, so no target
+///   sees another's restore (#794). Any other blob is copied, and a Windows
+///   restore follows `Hardlink`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LinkStrategy {
     Hardlink,
     Copy,
     ExecutableHardlink,
     SharedExecutableHardlink,
+    SharedLibHardlink,
 }
 
 impl LinkStrategy {
@@ -364,7 +375,9 @@ fn link_to_target_via(
         let reflink_err = match reflink(store_path, target_path) {
             Ok(()) => {
                 match strategy {
-                    LinkStrategy::Hardlink => set_owner_write_permission(target_path)?,
+                    LinkStrategy::Hardlink | LinkStrategy::SharedLibHardlink => {
+                        set_owner_write_permission(target_path)?
+                    }
                     // Executables and loadable libraries also need execute bits.
                     LinkStrategy::Copy
                     | LinkStrategy::ExecutableHardlink
@@ -402,7 +415,7 @@ fn link_to_target_via(
             // mtime-based, so eviction is unaffected). gnu/clang restores keep
             // hardlinking — reflink/hardlink there are writable or CoW-isolated.
             #[cfg(windows)]
-            LinkStrategy::Hardlink => {
+            LinkStrategy::Hardlink | LinkStrategy::SharedLibHardlink => {
                 if WINDOWS_HARDLINK_RESTORE.load(Ordering::Relaxed) {
                     // Opt-in (#429 / `[cache] windows_hardlink`): the caller accepts
                     // that this build never deletes/rewrites a restored object, so
@@ -417,6 +430,24 @@ fn link_to_target_via(
             }
             #[cfg(not(windows))]
             LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
+            // An rlib whose `.rmeta` carries the stamp: every consumer may
+            // share the inode, which nobody re-dates.
+            #[cfg(unix)]
+            LinkStrategy::SharedLibHardlink
+                if lib_blob_is_shareable(
+                    fs::metadata(store_path).ok().as_ref(),
+                    std::time::SystemTime::now(),
+                ) =>
+            {
+                shared_lib_hardlink_or_copy(store_path, target_path, bytes)
+            }
+            #[cfg(unix)]
+            LinkStrategy::SharedLibHardlink => {
+                crate::opcounts::record_restore_copy_other(bytes);
+                copy_hardlink_fallback(store_path, target_path, bytes, false)
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            LinkStrategy::SharedLibHardlink => hardlink_or_copy(store_path, target_path, bytes),
             // Share the inode only when the blob can already run as it is: a
             // chmod on the link would change the blob too.
             #[cfg(unix)]
@@ -517,6 +548,47 @@ fn test_binary_blob_is_shareable(blob: Option<&fs::Metadata>, euid: u32) -> bool
             && meta.uid() == euid
             && executable_blob_is_shareable(Some(meta.permissions().mode()))
     })
+}
+
+/// Whether a `SharedLibHardlink` restore may share the blob's inode: a
+/// regular file nobody can write through a link, whose mtime is not later
+/// than `now`. The restore leaves that mtime alone, so it must not be newer
+/// than the stamp the `.rmeta` beside it gets, or the rlib would decide the
+/// unit's newest output instead of the `.rmeta` (a blob made on this machine
+/// is always older; a clock step or an imported file's date could say
+/// otherwise).
+#[cfg(unix)]
+fn lib_blob_is_shareable(blob: Option<&fs::Metadata>, now: std::time::SystemTime) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    blob.is_some_and(|meta| {
+        meta.is_file()
+            && meta.permissions().mode() & 0o222 == 0
+            && meta.modified().is_ok_and(|modified| modified <= now)
+    })
+}
+
+/// Hardlink fallback for `SharedLibHardlink`: link the blob whatever else
+/// links it (see [`LinkStrategy::SharedLibHardlink`]), or copy it when the
+/// link fails (another filesystem, say).
+#[cfg(unix)]
+fn shared_lib_hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
+    if let Err(e) = try_hard_link(store_path, target_path) {
+        let reason = classify_hardlink_io_error(e.kind());
+        match reason {
+            HardlinkIoReason::CrossDevice => crate::opcounts::record_restore_copy_cross_device(bytes),
+            HardlinkIoReason::Permission => crate::opcounts::record_restore_copy_permission(bytes),
+            HardlinkIoReason::Other => crate::opcounts::record_restore_copy_other(bytes),
+        }
+        warn_hardlink_fallback_once(store_path, target_path, reason, &e);
+        return copy_hardlink_fallback(store_path, target_path, bytes, false);
+    }
+    tracing::debug!(
+        "hardlinked rlib {} -> {}",
+        store_path.display(),
+        target_path.display()
+    );
+    crate::opcounts::record_hardlinked(bytes);
+    Ok(())
 }
 
 /// Hardlink fallback for `SharedExecutableHardlink`: link the blob whatever
@@ -4873,6 +4945,70 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         assert!(!executable_blob_is_shareable(Some(0o755)));
         assert!(!executable_blob_is_shareable(Some(0o557)));
         assert!(!executable_blob_is_shareable(None));
+    }
+
+    // ── SharedLibHardlink: pipelined rlibs ────────────────────────────────
+
+    /// Without CoW, a read-only rlib blob is linked by every target that
+    /// restores it, not only the first, and linking leaves its mtime alone:
+    /// the `.rmeta` beside it carries the restore's stamp.
+    #[cfg(unix)]
+    #[test]
+    fn a_lib_blob_is_shared_by_every_consumer_and_keeps_its_mtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        fs::write(&blob, b"rlib").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&blob, old).unwrap();
+        let trees = [
+            dir.path().join("a/libx.rlib"),
+            dir.path().join("b/libx.rlib"),
+        ];
+        for tree in &trees {
+            fs::create_dir_all(tree.parent().unwrap()).unwrap();
+            link_to_target_via(&blob, tree, LinkStrategy::SharedLibHardlink, no_reflink).unwrap();
+        }
+        for tree in &trees {
+            assert_eq!(ino_of(tree), ino_of(&blob));
+            assert_eq!(mode_of(tree) & 0o777, 0o444, "no writer reaches the blob");
+            let mtime =
+                filetime::FileTime::from_last_modification_time(&fs::metadata(tree).unwrap());
+            assert_eq!(mtime, old, "linking re-dates nothing");
+        }
+    }
+
+    /// A blob a link could be written through, or one dated after the
+    /// restore, is copied: the copy is private, and the blob keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_lib_blob_that_cannot_be_shared_is_copied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let future = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        );
+        for (name, mode, mtime) in [("writable", 0o644, None), ("future", 0o444, Some(future))] {
+            let blob = dir.path().join(name);
+            fs::write(&blob, b"rlib").unwrap();
+            fs::set_permissions(&blob, fs::Permissions::from_mode(mode)).unwrap();
+            if let Some(mtime) = mtime {
+                filetime::set_file_mtime(&blob, mtime).unwrap();
+            }
+            let target = dir.path().join(format!("lib{name}.rlib"));
+            link_to_target_via(&blob, &target, LinkStrategy::SharedLibHardlink, no_reflink)
+                .unwrap();
+            assert_ne!(ino_of(&target), ino_of(&blob), "{name}");
+            assert_eq!(mode_of(&blob), mode, "{name}");
+            assert_eq!(fs::read(&target).unwrap(), b"rlib", "{name}");
+        }
+        let meta = fs::metadata(dir.path()).unwrap();
+        assert!(!lib_blob_is_shareable(
+            Some(&meta),
+            std::time::SystemTime::now()
+        ));
+        assert!(!lib_blob_is_shareable(None, std::time::SystemTime::now()));
     }
 
     // ── SharedExecutableHardlink: test binaries ───────────────────────────

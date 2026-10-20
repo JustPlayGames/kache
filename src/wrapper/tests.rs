@@ -4237,6 +4237,7 @@ fn materialize_cached_artifact_reports_missing_blob_as_cache_miss() {
         ArtifactKind::Library,
         None,
         false,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4280,6 +4281,7 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
         &target,
         ArtifactKind::DepInfo,
         None,
+        false,
         false,
         &anchor,
         dir.path(),
@@ -4351,6 +4353,7 @@ fn materialize_cached_artifact_restores_executable_bit_recorded_at_insert() {
         ArtifactKind::Other("rustc:unknown"),
         None,
         false,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4392,6 +4395,7 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         false,
         dir.path(),
         dir.path(),
@@ -4524,6 +4528,7 @@ fn materialize_shared_loadable_restores_a_loadable_file_and_leaves_the_blob() {
         &target,
         ArtifactKind::DynamicLibrary,
         Some(ArtifactKind::DynamicLibrary),
+        false,
         false,
         dir.path(),
         dir.path(),
@@ -4728,6 +4733,199 @@ fn restore_from_cache_shares_a_test_binary_inode_across_targets() {
     assert_eq!(crate::prestage::recorded_dests(&config.cache_dir), vec![bin]);
 }
 
+/// End to end on Linux without reflink: a pipelined library restored into
+/// two targets shares its rlib blob's inode in both, at the blob's own mtime,
+/// while each target gets an `.rmeta` stamped by its restore, the output
+/// Cargo reads. The second restore re-dates nothing in the first (#794).
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_from_cache_shares_an_rlib_inode_and_stamps_only_the_rmeta() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let rlib_hash = "9191919191919191919191919191919191919191919191919191919191919191";
+    let rmeta_hash = "9292929292929292929292929292929292929292929292929292929292929292";
+    create_blob(&store, rlib_hash, b"rlib bytes");
+    create_blob(&store, rmeta_hash, b"rmeta bytes");
+    let (rlib_blob, rmeta_blob) = (store.blob_path(rlib_hash), store.blob_path(rmeta_hash));
+    if crate::link::try_reflink(&rlib_blob, &dir.path().join("probe")).is_ok() {
+        eprintln!("reflink available; the no-CoW restore path is not reachable here");
+        return;
+    }
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for blob in [&rlib_blob, &rmeta_blob] {
+        std::fs::set_permissions(blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        filetime::set_file_mtime(blob, old).unwrap();
+    }
+    let restore = |tree: &str| {
+        let root = dir.path().join(tree);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"hk\"\n").unwrap();
+        let out_dir = root.join("target/debug/deps");
+        let out_dir_str = out_dir.to_str().unwrap().to_string();
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "hk",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=metadata,link",
+            "--out-dir",
+            &out_dir_str,
+            "-C",
+            "extra-filename=-1",
+        ]);
+        let files = vec![
+            cached_file("libhk-1.rlib", rlib_hash),
+            cached_file("libhk-1.rmeta", rmeta_hash),
+        ];
+        let meta = entry_meta("hk", files, &["metadata", "link"]);
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        (out_dir.join("libhk-1.rlib"), out_dir.join("libhk-1.rmeta"))
+    };
+    let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+    let mtime = |path: &Path| {
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(path).unwrap())
+    };
+
+    let (a_rlib, a_rmeta) = restore("a");
+    let a_rmeta_mtime = mtime(&a_rmeta);
+    assert_eq!(ino(&a_rlib), ino(&rlib_blob));
+    assert_eq!(
+        mtime(&a_rlib),
+        old,
+        "the shared rlib keeps the blob's mtime"
+    );
+    assert!(a_rmeta_mtime > old, "the rmeta is stamped");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let (b_rlib, b_rmeta) = restore("b");
+    assert_eq!(
+        ino(&b_rlib),
+        ino(&rlib_blob),
+        "every later target shares the rlib too"
+    );
+    assert_ne!(
+        ino(&b_rmeta),
+        ino(&rmeta_blob),
+        "an rmeta another target links is copied"
+    );
+    assert!(mtime(&b_rmeta) > a_rmeta_mtime, "and stamped");
+    assert_eq!(mtime(&a_rlib), old, "restoring b re-dates nothing a reads");
+    assert_eq!(mtime(&a_rmeta), a_rmeta_mtime);
+    assert_eq!(std::fs::read(&b_rlib).unwrap(), b"rlib bytes");
+
+    // Restoring it again where it already is keeps the shared file, unstamped.
+    let (again, _) = restore("a");
+    assert_eq!(ino(&again), ino(&rlib_blob));
+    assert_eq!(mtime(&rlib_blob), old);
+}
+
+/// Only the rlib of a unit whose `.rmeta` Cargo counts as an output, and the
+/// restore writes beside it, is shared that way.
+#[test]
+fn only_a_pipelined_rlib_restores_as_a_shared_inode() {
+    let out = "/t/debug/deps";
+    let args = |crate_type: &str, emit: &str| {
+        rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "hk",
+            "src/lib.rs",
+            "--crate-type",
+            crate_type,
+            emit,
+            "--out-dir",
+            out,
+        ])
+    };
+    let both = [
+        cached_file("libhk-1.rlib", "a"),
+        cached_file("libhk-1.rmeta", "b"),
+    ];
+    let rlib_only = [cached_file("libhk-1.rlib", "a")];
+    let other_rmeta = [
+        cached_file("libhk-1.rlib", "a"),
+        cached_file("libother-2.rmeta", "b"),
+    ];
+    let unix = cfg!(unix);
+    let pipelined = args("lib", "--emit=dep-info,metadata,link");
+    assert_eq!(
+        restores_as_shared_rlib(&pipelined, "libhk-1.rlib", &both),
+        unix
+    );
+    assert_eq!(
+        restores_as_shared_rlib(
+            &args("rlib", "--emit=dep-info,metadata,link"),
+            "libhk-1.rlib",
+            &both
+        ),
+        unix
+    );
+    assert!(
+        !restores_as_shared_rlib(&pipelined, "libhk-1.rmeta", &both),
+        "the rmeta takes the stamp"
+    );
+    assert!(!restores_as_shared_rlib(
+        &pipelined,
+        "libhk-1.rlib",
+        &rlib_only
+    ));
+    assert!(!restores_as_shared_rlib(
+        &pipelined,
+        "libhk-1.rlib",
+        &other_rmeta
+    ));
+    assert!(!restores_as_shared_rlib(
+        &args("lib", "--emit=dep-info,link"),
+        "libhk-1.rlib",
+        &both
+    ));
+    assert!(!restores_as_shared_rlib(
+        &args("lib", "--emit=dep-info,metadata"),
+        "libhk-1.rlib",
+        &both
+    ));
+    for crate_type in ["proc-macro", "dylib", "cdylib", "bin", "staticlib"] {
+        assert!(
+            !restores_as_shared_rlib(
+                &args(crate_type, "--emit=dep-info,metadata,link"),
+                "libhk-1.rlib",
+                &both
+            ),
+            "{crate_type}"
+        );
+    }
+    let to_output = rustc_args(&[
+        "rustc",
+        "--crate-name",
+        "hk",
+        "src/lib.rs",
+        "--crate-type",
+        "lib",
+        "--emit=dep-info,metadata,link",
+        "-o",
+        "/t/libhk-1.rlib",
+    ]);
+    assert!(!restores_as_shared_rlib(&to_output, "libhk-1.rlib", &both));
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Library, false, false, unix, None),
+        if unix {
+            link::LinkStrategy::SharedLibHardlink
+        } else {
+            link::LinkStrategy::Hardlink
+        }
+    );
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Library, true, false, true, None),
+        link::LinkStrategy::Copy,
+        "an executable never shares that way"
+    );
+}
+
 // ── restored-blob digest reuse (kunobi-ninja/kache#540) ──────────
 
 /// A plain library restore is a verbatim blob copy, so the entry's recorded
@@ -4749,6 +4947,7 @@ fn materialize_reports_a_plain_library_restore_as_an_exact_blob_copy() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         false,
         dir.path(),
         dir.path(),
@@ -4788,6 +4987,7 @@ fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
         ArtifactKind::DepInfo,
         None,
         false,
+        false,
         &dir.path().join("target"),
         dir.path(),
         None,
@@ -4823,6 +5023,7 @@ fn materialize_reports_an_untouched_external_action_as_an_exact_blob_copy() {
         &target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         false,
         dir.path(),
         dir.path(),
@@ -4865,6 +5066,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
         &target,
         ArtifactKind::Library,
         None,
+        false,
         false,
         dir.path(),
         dir.path(),
@@ -4944,6 +5146,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
         ArtifactKind::DynamicLibrary,
         None,
         false,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4980,6 +5183,7 @@ fn restore_loadable(
         target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         false,
         anchor,
         anchor,
@@ -5218,6 +5422,7 @@ fn materialize_cached_artifact_unpacks_debug_bundle_beside_binary() {
         ArtifactKind::DebugBundle,
         None,
         false,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5312,6 +5517,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         &target,
         ArtifactKind::DebugBundle,
         None,
+        false,
         false,
         restore_dir.path(),
         restore_dir.path(),
@@ -11399,6 +11605,7 @@ fn a_read_only_store_restores_by_copy() {
             ArtifactKind::Library,
             None,
             false,
+            false,
             dir.path(),
             dir.path(),
             None,
@@ -11480,6 +11687,7 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
             &target,
             kind,
             shared_loadable,
+            false,
             false,
             dir.path(),
             dir.path(),
