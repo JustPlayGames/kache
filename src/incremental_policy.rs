@@ -589,6 +589,10 @@ impl AdaptiveUnit {
         if !valid_state(state, &self.unit_key) || unsafe_file(&self.state_path) {
             return false;
         }
+        #[cfg(test)]
+        if durable {
+            DURABLE_STATE_WRITES.with(|count| count.set(count.get() + 1));
+        }
         let Ok(bytes) = serde_json::to_vec(state) else {
             return false;
         };
@@ -654,7 +658,10 @@ impl Lease {
             last_used_secs: now,
             in_flight: true,
         };
-        if !self.unit.store_state(&busy, true) {
+        // The deferred seed's own start already put an in-flight marker on
+        // disk; losing this write in a crash leaves that marker, which every
+        // lease resets. No flush.
+        if !self.unit.store_state(&busy, false) {
             return false;
         }
         self.completion = Completion::Seed {
@@ -705,7 +712,7 @@ impl Lease {
                 // A cancelled hit or failed compile retains the observation.
                 if reset_locked(&self.unit)
                     && outcome != CompileOutcome::Success
-                    && !self.unit.store_state(&previous, true)
+                    && !self.unit.store_state(&previous, false)
                 {
                     reset_locked(&self.unit);
                 }
@@ -734,8 +741,13 @@ impl Lease {
             (Completion::Immediate { restore }, _) => restore,
         };
 
+        // Not flushed: the state on disk is this lease's in-flight marker,
+        // flushed when the lease began, so a crash that loses this write
+        // leaves a marker every lease resets (a torn file reads as corrupt
+        // and resets too). Flushing it cost two journal commits per compile,
+        // seconds each when the disk is busy, on an edit loop's critical path.
         match next {
-            Some(state) if self.unit.store_state(&state, true) => true,
+            Some(state) if self.unit.store_state(&state, false) => true,
             None => remove_path_safely(&self.unit.state_path),
             Some(_) => {
                 reset_locked(&self.unit);
@@ -1031,9 +1043,76 @@ fn now_secs() -> u64 {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// State writes this test thread asked to flush ([`AdaptiveUnit::store_state`]).
+    static DURABLE_STATE_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn durable_writes() -> usize {
+        DURABLE_STATE_WRITES.with(std::cell::Cell::get)
+    }
+
+    /// Each lease flushes the one write that marks its unit in flight, before
+    /// rustc touches the private directory. The writes after it (a deferred
+    /// seed's qualification, every finish) replace an in-flight state already
+    /// on disk, so a crash that loses one leaves that marker, which every
+    /// lease resets (`stale_*_in_flight_state_cannot_*`): they need no flush.
+    #[test]
+    fn a_lease_flushes_only_the_write_that_puts_its_unit_in_flight() {
+        let (_temp, _args, unit) = fixture();
+        activate(&unit, 100);
+        let before = durable_writes();
+        let lease = unit.try_active_at(110).unwrap();
+        assert_eq!(durable_writes() - before, 1, "an active lease's start");
+        fs::write(unit.rustc_dir.join("dep-graph.bin"), b"active").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 111));
+        assert_eq!(durable_writes() - before, 1, "an active lease's finish");
+        assert!(!read_state(&unit).in_flight);
+
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let before = durable_writes();
+        let lease = unit
+            .try_seed_at(
+                &cache_key("second"),
+                &fields("stable", "source-b", "extern-a"),
+                101,
+            )
+            .unwrap();
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        assert_eq!(durable_writes() - before, 1, "a seed: its start alone");
+        assert_eq!(read_state(&unit).phase, Phase::Active);
+
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let before = durable_writes();
+        let mut lease = unit.try_deferred_seed().unwrap();
+        assert!(lease.qualify_deferred_seed_at(
+            &cache_key("second"),
+            &fields("stable", "source-b", "extern-a"),
+            101,
+        ));
+        assert!(read_state(&unit).in_flight);
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"seed").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        assert_eq!(durable_writes() - before, 1, "a deferred seed: its start alone");
+        assert_eq!(read_state(&unit).phase, Phase::Active);
+
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 100);
+        let before = durable_writes();
+        let lease = unit.try_immediate_at(101).unwrap();
+        fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), b"immediate").unwrap();
+        assert!(lease.finish_at(CompileOutcome::Success, 102));
+        assert_eq!(durable_writes() - before, 1, "an immediate lease: its start alone");
+        assert!(!read_state(&unit).in_flight);
+    }
 
     fn cache_key(label: &str) -> String {
         blake3::hash(label.as_bytes()).to_hex().to_string()
