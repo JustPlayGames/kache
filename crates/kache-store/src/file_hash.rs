@@ -475,6 +475,12 @@ impl<'db> FileHashCache<'db> {
         keep: usize,
     ) -> rusqlite::Result<()> {
         debug_assert!(identity.starts_with(prefix) && identity.len() > prefix.len());
+        // One write transaction for the row and the trim, not two: each
+        // takes the index's write lock, which a burst of stores queues on.
+        let tx = rusqlite::Transaction::new_unchecked(
+            self.db(),
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         self.put_input_prediction(identity, schema, crate_name, prediction_json)?;
         // Every name longer than `prefix` that starts with it sorts after it
         // and before `prefix` + U+10FFFF, so the primary key serves the range.
@@ -493,7 +499,7 @@ impl<'db> FileHashCache<'db> {
                 i64::try_from(keep).unwrap_or(i64::MAX)
             ],
         )?;
-        Ok(())
+        tx.commit()
     }
 
     /// The names of the rows named `prefix` and something after it, most
