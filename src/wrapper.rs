@@ -5568,7 +5568,21 @@ fn restore_link_strategy(
     test_binary: bool,
     shared_loadable: Option<ArtifactKind>,
 ) -> link::LinkStrategy {
-    if shared_loadable == Some(kind) {
+    restore_link_strategy_for(kind, executable, test_binary, false, shared_loadable)
+}
+
+/// [`restore_link_strategy`] for a file that may be a shared rlib
+/// (`shared_rlib`, see [`restores_as_shared_rlib`]).
+fn restore_link_strategy_for(
+    kind: ArtifactKind,
+    executable: bool,
+    test_binary: bool,
+    shared_rlib: bool,
+    shared_loadable: Option<ArtifactKind>,
+) -> link::LinkStrategy {
+    if shared_rlib && !executable && kind.link_strategy() == link::LinkStrategy::Hardlink {
+        link::LinkStrategy::SharedLibHardlink
+    } else if shared_loadable == Some(kind) {
         link::LinkStrategy::ExecutableHardlink
     } else if executable && test_binary {
         link::LinkStrategy::SharedExecutableHardlink
@@ -5597,6 +5611,42 @@ fn restores_as_shared_test_binary(name: &str, executable: bool, crate_types: &[S
             name,
             crate_types,
         )
+}
+
+/// Whether `name`, a file of an entry holding `files`, is the `.rlib` of a
+/// library unit Cargo builds with pipelining: `--emit` asks for both the
+/// metadata and the link, so Cargo counts the `.rmeta` beside the `.rlib` as
+/// an output of the unit, and the restore writes and stamps that `.rmeta`.
+/// Cargo judges the unit by the newest of its outputs, and a dependent by that
+/// or by the `.rmeta` alone, never by the `.rlib` alone, so such an `.rlib`
+/// may share the blob's inode with every target and keep the blob's mtime
+/// ([`link::LinkStrategy::SharedLibHardlink`]). In build mode Cargo never
+/// re-dates an output (check mode re-dates its `.rmeta`, and has no `.rlib`),
+/// and rustc writes a new output by renaming over the old name, so nothing
+/// changes the shared inode. Unix only: elsewhere the restore keeps
+/// [`link::LinkStrategy::Hardlink`].
+fn restores_as_shared_rlib(
+    args: &RustcArgs,
+    name: &str,
+    files: &[crate::store::CachedFile],
+) -> bool {
+    if !cfg!(unix) || args.out_dir.is_none() || args.output.is_some() {
+        return false;
+    }
+    let Some(stem) = name.strip_suffix(".rlib") else {
+        return false;
+    };
+    let emits = |kind: &str| args.emit.iter().any(|emit| emit == kind);
+    emits("metadata")
+        && emits("link")
+        && !args.crate_types.is_empty()
+        && args
+            .crate_types
+            .iter()
+            .all(|crate_type| crate_type == "lib" || crate_type == "rlib")
+        && files
+            .iter()
+            .any(|file| file.name.strip_suffix(".rmeta") == Some(stem))
 }
 
 /// The executable output of this compile that nothing rewrites in place after
@@ -5667,6 +5717,7 @@ fn materialize_cached_artifact(
     kind: ArtifactKind,
     shared_loadable: Option<ArtifactKind>,
     test_binary: bool,
+    shared_rlib: bool,
     depinfo_anchor: &Path,
     depinfo_working_dir: &Path,
     depinfo_workspace_dir: Option<&Path>,
@@ -5735,8 +5786,13 @@ fn materialize_cached_artifact(
         }
     };
 
-    let strategy =
-        restore_link_strategy(kind, cached_file.executable, test_binary, shared_loadable);
+    let strategy = restore_link_strategy_for(
+        kind,
+        cached_file.executable,
+        test_binary,
+        shared_rlib,
+        shared_loadable,
+    );
     // A fresh transformed file can keep its original mode. Only the blob path
     // needs a private inode when it belongs to another process's store.
     let blob_strategy = if store.is_read_only()
@@ -5745,6 +5801,8 @@ fn materialize_cached_artifact(
             link::LinkStrategy::ExecutableHardlink | link::LinkStrategy::SharedExecutableHardlink
         ) {
         link::LinkStrategy::Copy
+    } else if store.is_read_only() && strategy == link::LinkStrategy::SharedLibHardlink {
+        link::LinkStrategy::Hardlink
     } else {
         strategy
     };
@@ -5801,8 +5859,17 @@ fn materialize_cached_artifact(
             // not affect SQLite `last_accessed` eviction ranking, though it can
             // conservatively delay the later orphan-blob age sweep. The Windows
             // hardlink opt-in deliberately retains its documented legacy risk.
-            link::touch_mtime_write_clock(target_path)
-                .with_context(|| format!("{context}: touching {}", target_path.display()))?;
+            //
+            // A shared rlib that holds the blob's inode is the exception: its
+            // `.rmeta`, restored beside it, takes the stamp, and the inode
+            // other targets share keeps its mtime
+            // ([`link::LinkStrategy::SharedLibHardlink`]).
+            if !(blob_strategy == link::LinkStrategy::SharedLibHardlink
+                && same_inode(target_path, &store_path))
+            {
+                link::touch_mtime_write_clock(target_path)
+                    .with_context(|| format!("{context}: touching {}", target_path.display()))?;
+            }
         }
     }
 
@@ -5870,6 +5937,24 @@ fn materialize_cached_artifact(
     })
 }
 
+/// Whether `a` and `b` name the same inode. False when either cannot be read,
+/// and always off Unix.
+fn same_inode(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
 /// Whether the file at `target_path` already holds `cached_file`'s bytes, as
 /// when Cargo runs a unit again whose output an earlier restore of the same
 /// entry left in place (a third of all restores, measured over 6 h of this
@@ -5906,9 +5991,11 @@ fn output_already_holds(
             && blob.dev() == metadata.dev()
             && blob.ino() == metadata.ino()
         {
-            // A test binary's inode may be shared by any number of targets.
+            // A test binary's or a shared rlib's inode may be shared by any
+            // number of targets.
             return metadata.nlink() == 2
-                || strategy == link::LinkStrategy::SharedExecutableHardlink;
+                || strategy == link::LinkStrategy::SharedExecutableHardlink
+                || strategy == link::LinkStrategy::SharedLibHardlink;
         }
         if metadata.nlink() != 1 && !(metadata.nlink() == 2 && cargo_uplift_shares(target_path, &metadata)) {
             return false;
@@ -7848,6 +7935,7 @@ fn restore_from_cache_with_memo_store(
             cached_file.executable,
             &meta.crate_types,
         );
+        let shared_rlib = restores_as_shared_rlib(args, &cached_file.name, &meta.files);
         let restored = materialize_cached_artifact(
             store,
             cached_file,
@@ -7855,6 +7943,7 @@ fn restore_from_cache_with_memo_store(
             kind,
             shared_loadable,
             test_binary,
+            shared_rlib,
             &depinfo_anchor,
             &depinfo_working_dir,
             depinfo_workspace_dir,
