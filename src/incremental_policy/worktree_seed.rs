@@ -1,5 +1,4 @@
-//! Explicit, local donor import for experiments with rustc's cwd remapping.
-//! The normal cache and adaptive learning policy do not select donors.
+//! Import compatible local rustc state without sharing a writable session.
 
 use super::*;
 use std::io;
@@ -17,12 +16,22 @@ impl Lease {
         &mut self,
         args: &RustcArgs,
         donor_profile: Option<&Path>,
-        unstable: bool,
+        enabled: bool,
+    ) -> Vec<String> {
+        let donors: Vec<_> = donor_profile.into_iter().map(Path::to_path_buf).collect();
+        self.worktree_compiler_args_from(args, &donors, enabled)
+    }
+
+    pub(crate) fn worktree_compiler_args_from(
+        &mut self,
+        args: &RustcArgs,
+        donor_profiles: &[PathBuf],
+        enabled: bool,
     ) -> Vec<String> {
         self.worktree_seed_key = None;
         self.worktree_bootstrap = false;
         let isolated = self.compiler_args(args);
-        if !unstable || self.kind != LeaseKind::Immediate || args.inner_rustc.is_some() {
+        if !enabled || args.inner_rustc.is_some() || path_exists(&self.bootstrap_env_marker()) {
             return isolated;
         }
         let Ok(cwd) = std::env::current_dir() else {
@@ -76,7 +85,7 @@ impl Lease {
             current_bootstrap.as_deref()
         };
         if inject_bootstrap {
-            // The opt-in permits cwd remapping, not unstable source features.
+            // Bootstrap permits cwd remapping, not unstable source features.
             normalized.push("-Zallow-features=".into());
         }
         let Some(identity) =
@@ -91,11 +100,13 @@ impl Lease {
             bootstrap,
             &identity,
         );
-        if let Some(donor_profile) = donor_profile
-            && empty_directory(&self.unit.rustc_dir)
-        {
-            let imported = import(&self.unit, donor_profile, &key);
-            tracing::debug!(imported, "experimental worktree incremental seed");
+        if empty_directory(&self.unit.rustc_dir) {
+            for donor_profile in donor_profiles {
+                if import(&self.unit, donor_profile, &key) {
+                    tracing::debug!(donor = %donor_profile.display(), "imported worktree incremental seed");
+                    break;
+                }
+            }
         }
         self.worktree_seed_key = Some(key);
         self.worktree_bootstrap = inject_bootstrap;
@@ -105,10 +116,55 @@ impl Lease {
     pub(crate) fn worktree_bootstrap(&self) -> bool {
         self.worktree_bootstrap
     }
+
+    pub(crate) fn worktree_portable(&self) -> bool {
+        self.worktree_seed_key.is_some()
+    }
+
+    pub(crate) fn needs_worktree_donor(&self) -> bool {
+        !path_exists(&self.bootstrap_env_marker()) && empty_directory(&self.unit.rustc_dir)
+    }
+
+    fn bootstrap_env_marker(&self) -> PathBuf {
+        self.unit.unit_dir.join("bootstrap-env-dep")
+    }
+
+    /// A source that reads bootstrap must see the caller's original value.
+    /// Remember the refusal so later edits need no speculative attempt.
+    pub(crate) fn decline_worktree_bootstrap(&mut self) -> bool {
+        self.worktree_seed_key = None;
+        self.worktree_bootstrap = false;
+        let Ok(mut marker) = tempfile::NamedTempFile::new_in(&self.unit.unit_dir) else {
+            return false;
+        };
+        use std::io::Write;
+        marker.write_all(b"source reads RUSTC_BOOTSTRAP\n").is_ok()
+            && marker.persist(self.bootstrap_env_marker()).is_ok()
+            && remove_path_safely(&self.unit.rustc_dir)
+            && ensure_real_directory(&self.unit.rustc_dir)
+    }
+}
+
+pub(crate) fn compiler_supports_automatic_seed(version: &str) -> bool {
+    let mut words = version.split_whitespace();
+    if words.next() != Some("rustc") {
+        return false;
+    }
+    let Some(release) = words.next() else {
+        return false;
+    };
+    let mut parts = release.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    match (major.parse::<u64>(), minor.parse::<u64>()) {
+        (Ok(major), Ok(minor)) => (major, minor) >= (1, 98),
+        _ => false,
+    }
 }
 
 fn bootstrap_override_allowed(current: Option<&std::ffi::OsStr>, flags: &[String]) -> bool {
-    current.is_none_or(|value| value.is_empty())
+    current.is_none()
         && flags
             .iter()
             .all(|flag| flag.starts_with("remap-cwd-prefix=") || flag == "incremental-info")
@@ -173,7 +229,7 @@ fn path_operand(flag: &str, value: &str, cwd: &Path) -> Option<String> {
 }
 
 /// An allowlist prevents treating a cfg string or an unknown flag's operand
-/// as a filesystem path. Unmodeled flags decline the experiment.
+/// as a filesystem path. Unmodeled flags decline portable seeding.
 fn portable_args(args: &[String], source: Option<&Path>, cwd: &Path) -> Option<Vec<String>> {
     let source = source?;
     // Absolute and relative source operands produce different file!() values
@@ -261,7 +317,7 @@ fn portable_args(args: &[String], source: Option<&Path>, cwd: &Path) -> Option<V
     (remap_count == 1 && saw_source).then_some(result)
 }
 
-fn empty_directory(path: &Path) -> bool {
+pub(super) fn empty_directory(path: &Path) -> bool {
     real_directory(path) && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
@@ -289,6 +345,7 @@ fn import(receiver: &AdaptiveUnit, profile: &Path, key: &str) -> bool {
             continue;
         }
         let donor = AdaptiveUnit {
+            source_file: None,
             original_incremental: profile.join("incremental"),
             unit_key: name,
             unit_dir: entry.path(),
@@ -357,12 +414,54 @@ struct CopyBudget {
     bytes: u64,
 }
 
+fn finalized_session(path: &Path, depth: usize) -> bool {
+    if depth != 2 {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let parts: Vec<_> = name.split('-').collect();
+    matches!(parts.as_slice(), ["s", time, random, hash]
+    if *hash != "working"
+        && [time, random, hash].into_iter().all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        }))
+}
+
+fn session_timestamp(path: &Path, depth: usize) -> Option<u64> {
+    if !finalized_session(path, depth) {
+        return None;
+    }
+    u64::from_str_radix(path.file_name()?.to_str()?.split('-').nth(1)?, 36).ok()
+}
+
+/// rustc selects the greatest base-36 timestamp in the session name. Keep
+/// unfamiliar layouts intact, and retain ties rather than choosing between them.
+fn newest_session(entries: &[fs::DirEntry], depth: usize) -> Option<u64> {
+    if depth != 1 {
+        return None;
+    }
+    let mut newest = None;
+    for entry in entries {
+        if entry.file_type().ok()?.is_dir() {
+            let timestamp = session_timestamp(&entry.path(), depth + 1)?;
+            newest = Some(newest.map_or(timestamp, |current: u64| current.max(timestamp)));
+        }
+    }
+    newest
+}
+
 fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) -> io::Result<()> {
     if depth > 8 {
         return Err(io::Error::other("incremental tree too deep"));
     }
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
+    let finalized = finalized_session(source, depth);
+    let entries = fs::read_dir(source)?
+        .take(budget.files.saturating_add(1))
+        .collect::<io::Result<Vec<_>>>()?;
+    let newest = newest_session(&entries, depth);
+    for entry in entries {
         let meta = fs::symlink_metadata(entry.path())?;
         let name = entry.file_name();
         if name.to_string_lossy().ends_with("-working") {
@@ -374,6 +473,12 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
             .ok_or_else(|| io::Error::other("too many incremental files"))?;
         let target = dest.join(name);
         if meta.is_dir() {
+            if let Some(newest) = newest
+                && session_timestamp(&entry.path(), depth + 1)
+                    .is_some_and(|timestamp| timestamp < newest)
+            {
+                continue;
+            }
             fs::create_dir(&target)?;
             copy_tree(&entry.path(), &target, budget, depth + 1)?;
         } else if meta.is_file() {
@@ -381,9 +486,24 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
                 .bytes
                 .checked_sub(meta.len())
                 .ok_or_else(|| io::Error::other("incremental state too large"))?;
-            // Copy, including lock files: no mutable inode is shared with
-            // another checkout. This also works across filesystems.
-            fs::copy(entry.path(), target)?;
+            let path = entry.path();
+            // rustc never changes finalized sessions. Share only their graph
+            // and codegen data; locks and unfamiliar files keep private inodes.
+            let immutable = finalized
+                && matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("bin" | "o" | "obj" | "bc")
+                );
+            if !immutable || fs::hard_link(&path, &target).is_err() {
+                // Never overwrite a stage file that might already link to a donor.
+                let mut input = File::open(path)?;
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(target)?;
+                io::copy(&mut input, &mut output)?;
+                output.set_permissions(meta.permissions())?;
+            }
         } else {
             return Err(io::Error::other("non-regular incremental entry"));
         }
@@ -396,6 +516,95 @@ mod tests {
     use super::*;
 
     const VIRTUAL_PREFIX: &str = if cfg!(windows) { r"C:\src" } else { "/src" };
+
+    #[test]
+    fn imports_newest_session_by_numeric_name_and_retains_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let krate = source.join("crate");
+        for name in ["s-z-abc-old", "s-10-abc-new", "s-10-other-tied"] {
+            let session = krate.join(name);
+            fs::create_dir_all(&session).unwrap();
+            fs::write(session.join("dep-graph.bin"), name).unwrap();
+        }
+        fs::write(krate.join("s-z-abc.lock"), b"private lock").unwrap();
+        let entries = fs::read_dir(&krate)
+            .unwrap()
+            .collect::<io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(newest_session(&entries, 1), Some(36));
+        assert_eq!(newest_session(&entries, 0), None);
+        assert_eq!(newest_session(&entries, 2), None);
+        let mut budget = CopyBudget {
+            files: 16,
+            bytes: 1024,
+        };
+        copy_tree(&source, &dest, &mut budget, 0).unwrap();
+        assert!(!dest.join("crate/s-z-abc-old").exists());
+        for name in ["s-10-abc-new", "s-10-other-tied"] {
+            assert_eq!(
+                fs::read(dest.join("crate").join(name).join("dep-graph.bin")).unwrap(),
+                name.as_bytes()
+            );
+        }
+        assert_eq!(
+            fs::read(dest.join("crate/s-z-abc.lock")).unwrap(),
+            b"private lock"
+        );
+        assert!(krate.join("s-z-abc-old/dep-graph.bin").exists());
+    }
+
+    #[test]
+    fn unknown_session_layouts_keep_all_state_and_working_sessions_still_decline() {
+        for unknown in [
+            "unfamiliar",
+            "s-zzzzzzzzzzzzzzzzzzzz-abc-hash",
+            "s-20-abc-working",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let dest = temp.path().join("dest");
+            fs::create_dir(&dest).unwrap();
+            for name in ["s-z-abc-old", "s-10-abc-new", unknown] {
+                let session = source.join("crate").join(name);
+                fs::create_dir_all(&session).unwrap();
+                fs::write(session.join("dep-graph.bin"), name).unwrap();
+            }
+            let mut budget = CopyBudget {
+                files: 16,
+                bytes: 1024,
+            };
+            let result = copy_tree(&source, &dest, &mut budget, 0);
+            if unknown.ends_with("-working") {
+                assert!(result.is_err());
+            } else {
+                result.unwrap();
+                for name in ["s-z-abc-old", "s-10-abc-new", unknown] {
+                    assert_eq!(
+                        fs::read(dest.join("crate").join(name).join("dep-graph.bin")).unwrap(),
+                        name.as_bytes()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn entry_budget_cannot_silently_truncate_a_wide_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("one"), b"1").unwrap();
+        fs::write(source.join("two"), b"2").unwrap();
+        for files in [0, 1] {
+            let dest = temp.path().join(format!("dest-{files}"));
+            fs::create_dir(&dest).unwrap();
+            let mut budget = CopyBudget { files, bytes: 8 };
+            assert!(copy_tree(&source, &dest, &mut budget, 0).is_err());
+        }
+    }
 
     fn fixture(root: &Path) -> (RustcArgs, AdaptiveUnit) {
         let profile = root.join("target/debug");
@@ -667,7 +876,8 @@ mod tests {
         publish(&donor, Some(&key));
         drop(abandoned);
         assert!(!import(&receiver, &profile, &key));
-        fs::write(&donor.state_path, b"invalid state").unwrap();
+        crate::atomic::atomic_replace_deferrable(&donor.state_path, b"invalid state", false)
+            .unwrap();
         assert!(!import(&receiver, &profile, &key));
         fs::remove_file(&donor.state_path).unwrap();
 
@@ -703,8 +913,7 @@ mod tests {
     fn bootstrap_opt_in_never_overrides_an_existing_selection() {
         use std::ffi::OsStr;
         assert!(bootstrap_override_allowed(None, &[]));
-        assert!(bootstrap_override_allowed(Some(OsStr::new("")), &[]));
-        for value in ["-1", "0", "other_crate", "1"] {
+        for value in ["", "-1", "0", "other_crate", "1"] {
             assert!(!bootstrap_override_allowed(Some(OsStr::new(value)), &[]));
         }
         for flag in ["remap-cwd-prefix=/src", "incremental-info"] {
@@ -749,7 +958,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn inner_wrappers_and_adaptive_leases_cannot_prepare_worktree_seeds() {
+    fn inner_wrappers_decline_but_adaptive_leases_prepare_portable_state() {
         let _lock = crate::test_support::process_state_test_lock();
         let temp = tempfile::tempdir().unwrap();
         let _cache = crate::config::tests::set_env_for_test(
@@ -774,10 +983,56 @@ mod tests {
             let mut lease = unit.try_immediate().unwrap();
             lease.kind = kind;
             let isolated = lease.compiler_args(&args);
-            assert_eq!(lease.worktree_compiler_args(&args, None, true), isolated);
-            assert!(lease.worktree_seed_key.is_none());
+            let portable = lease.worktree_compiler_args(&args, None, true);
+            if kind == LeaseKind::Immediate {
+                assert_eq!(portable, isolated);
+                assert!(!lease.worktree_portable());
+            } else {
+                assert_eq!(portable, isolated);
+                assert!(lease.worktree_portable());
+            }
             assert!(!lease.worktree_bootstrap());
         }
+    }
+
+    #[test]
+    fn automatic_seed_requires_rustc_198_or_later() {
+        for version in [
+            "rustc 1.98.0",
+            "rustc 1.98.0-beta.2",
+            "rustc 1.99.0-nightly",
+            "rustc 2.0.0",
+        ] {
+            assert!(compiler_supports_automatic_seed(version), "{version}");
+        }
+        for version in [
+            "rustc 1.97.1",
+            "rustc 1.97.0-nightly",
+            "rustc unknown",
+            "rustc",
+            "clang 19.0.0",
+            "rustc 1.unknown.0",
+        ] {
+            assert!(!compiler_supports_automatic_seed(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_observation_disables_portable_state_for_later_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (args, unit) = fixture(temp.path());
+        let mut lease = unit.try_immediate().unwrap();
+        fs::write(unit.rustc_dir.join("graph.bin"), b"override").unwrap();
+        lease.worktree_bootstrap = true;
+        lease.worktree_seed_key = Some("a".repeat(64));
+        assert!(lease.decline_worktree_bootstrap());
+        assert!(empty_directory(&unit.rustc_dir));
+        assert!(!lease.worktree_bootstrap());
+        assert!(!lease.worktree_portable());
+        assert!(!lease.needs_worktree_donor());
+        let isolated = lease.compiler_args(&args);
+        assert_eq!(lease.worktree_compiler_args(&args, None, true), isolated);
+        assert!(lease.bootstrap_env_marker().is_file());
     }
 
     #[test]
@@ -808,6 +1063,120 @@ mod tests {
             bytes: 32,
         };
         assert!(copy_tree(&source, &refused, &mut budget, 0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_files_share_only_finalized_graphs_and_codegen() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        let cases = [
+            ("crate/s-123-456-abcdef/dep-graph.bin", true),
+            ("crate/s-123-456-abcdef/unit.o", true),
+            ("crate/s-123-456-abcdef/unit.obj", true),
+            ("crate/s-123-456-abcdef/unit.bc", true),
+            ("crate/s-123-456-abcdef/session.lock", false),
+            ("crate/s-123-456-abcdef/unknown.txt", false),
+            ("s-123-456-abcdef/dep-graph.bin", false),
+            ("crate/s-123-finished/dep-graph.bin", false),
+            ("crate/unknown/dep-graph.bin", false),
+            ("crate/s-123-456-bad_name/dep-graph.bin", false),
+            ("crate/s--456-abcdef/dep-graph.bin", false),
+        ];
+        for (name, _) in cases {
+            let input = source.join(name);
+            fs::create_dir_all(input.parent().unwrap()).unwrap();
+            fs::write(&input, b"original").unwrap();
+        }
+        let mut budget = CopyBudget {
+            files: 128,
+            bytes: 4096,
+        };
+        copy_tree(&source, &dest, &mut budget, 0).unwrap();
+        for (name, shared) in cases {
+            let input = source.join(name);
+            let output = dest.join(name);
+            assert_eq!(fs::read(&output).unwrap(), b"original");
+            assert_eq!(
+                fs::metadata(&input).unwrap().ino() == fs::metadata(&output).unwrap().ino(),
+                shared,
+                "{name}"
+            );
+            if !shared {
+                fs::write(&output, b"receiver").unwrap();
+                assert_eq!(fs::read(&input).unwrap(), b"original", "{name}");
+            }
+        }
+        assert!(!finalized_session(Path::new("s-123-456-working"), 2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalized_seed_copies_when_donor_is_on_another_filesystem() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let Ok(other) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        if fs::metadata(temp.path()).unwrap().dev() == fs::metadata(other.path()).unwrap().dev() {
+            return;
+        }
+        let source = temp.path().join("s-123-456-abcdef");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("dep-graph.bin"), b"original").unwrap();
+        let mut budget = CopyBudget { files: 1, bytes: 8 };
+        copy_tree(&source, other.path(), &mut budget, 2).unwrap();
+        fs::write(other.path().join("dep-graph.bin"), b"receiver").unwrap();
+        assert_eq!(fs::read(source.join("dep-graph.bin")).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_seed_copies_preserve_read_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("receiver");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        let input = source.join("session.lock");
+        fs::write(&input, b"private").unwrap();
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o400)).unwrap();
+        let mut budget = CopyBudget { files: 1, bytes: 7 };
+        copy_tree(&source, &dest, &mut budget, 0).unwrap();
+        let output = dest.join("session.lock");
+        assert_eq!(fs::read(&output).unwrap(), b"private");
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
+    #[test]
+    fn an_existing_stage_file_cannot_overwrite_a_linked_donor() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("s-123-456-abcdef");
+        let dest = temp.path().join("receiver");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("dep-graph.bin"), b"receiver").unwrap();
+        let donor = temp.path().join("donor.bin");
+        fs::write(&donor, b"original").unwrap();
+        fs::hard_link(&donor, dest.join("dep-graph.bin")).unwrap();
+        let mut budget = CopyBudget { files: 1, bytes: 8 };
+        assert_eq!(
+            copy_tree(&source, &dest, &mut budget, 2)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(donor).unwrap(), b"original");
     }
 
     #[cfg(unix)]

@@ -2698,6 +2698,10 @@ fn adaptive_policy_guard_tracks_kache_semantic_inputs() {
     let mut config = test_config(dir.path().join("cache"));
     let baseline = adaptive_policy_guard(&config);
 
+    config.seed_incremental = false;
+    assert_ne!(adaptive_policy_guard(&config), baseline);
+    config.seed_incremental = true;
+
     config.key_salt = Some("salt-a".to_string());
     assert_ne!(adaptive_policy_guard(&config), baseline);
     config.key_salt = None;
@@ -2711,6 +2715,83 @@ fn adaptive_policy_guard_tracks_kache_semantic_inputs() {
 
     config.base_dirs = vec![dir.path().display().to_string()];
     assert_ne!(adaptive_policy_guard(&config), baseline);
+}
+
+#[test]
+fn automatic_donors_require_built_live_targets_and_keep_the_recent_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let current = temp.path().join("current");
+    std::fs::create_dir(&current).unwrap();
+    let entry = |path: PathBuf, discovered| crate::store::TrackedTargetRoot {
+        identity: kache_store::filesystem::directory_identity(&path).unwrap(),
+        workspace_root: temp.path().to_path_buf(),
+        path,
+        first_seen: 0,
+        last_seen: 0,
+        rustc: None,
+        discovered,
+    };
+    let mut targets = Vec::new();
+    for index in 0..10 {
+        let path = temp.path().join(format!("target-{index}"));
+        std::fs::create_dir(&path).unwrap();
+        targets.push(entry(path, false));
+    }
+    let discovered = temp.path().join("discovered");
+    std::fs::create_dir(&discovered).unwrap();
+    targets.push(entry(discovered, true));
+    let stale = temp.path().join("replaced");
+    std::fs::create_dir(&stale).unwrap();
+    let mut stale = entry(stale, false);
+    stale.identity.inode = stale.identity.inode.wrapping_add(1);
+    targets.push(stale);
+    targets.push(entry(current.clone(), false));
+    targets.push(entry(current.join("."), false));
+    let chosen = worktree_donor_profiles(&current, Path::new("debug"), targets.clone());
+    assert_eq!(chosen.len(), 8);
+    assert_eq!(chosen[0], temp.path().join("target-9/debug"));
+    assert_eq!(chosen[7], temp.path().join("target-2/debug"));
+    assert!(
+        worktree_donor_profiles(&temp.path().join("missing"), Path::new("debug"), targets)
+            .is_empty()
+    );
+}
+
+#[test]
+fn bootstrap_retry_requires_fresh_dep_info_and_retires_discarded_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-name".into(),
+        "probe".into(),
+        "src/lib.rs".into(),
+        "--out-dir".into(),
+        temp.path().display().to_string(),
+        "-Cextra-filename=-1234abcd".into(),
+        "--emit=dep-info,metadata".into(),
+    ])
+    .unwrap();
+    let dep_info = args.dep_info_path().unwrap();
+    std::fs::write(&dep_info, b"old bootstrap observation").unwrap();
+    assert!(clear_incremental_bootstrap_dep_info(&args));
+    assert!(!dep_info.exists());
+    assert!(clear_incremental_bootstrap_dep_info(&args));
+    std::fs::create_dir(&dep_info).unwrap();
+    assert!(!clear_incremental_bootstrap_dep_info(&args));
+    let no_dep_info = RustcArgs::parse(&["rustc".into(), "src/main.rs".into()]).unwrap();
+    assert!(!clear_incremental_bootstrap_dep_info(&no_dep_info));
+
+    let output = temp.path().join("discarded-program");
+    std::fs::write(&output, b"bootstrap-dependent output").unwrap();
+    let artifacts =
+        ArtifactSet::from_output_files(vec![(output.clone(), "program".into())], |_| {
+            ArtifactKind::Executable
+        });
+    assert!(discard_bootstrap_outputs(&artifacts));
+    assert!(!output.exists());
+    assert!(discard_bootstrap_outputs(&artifacts));
+    std::fs::create_dir(output).unwrap();
+    assert!(!discard_bootstrap_outputs(&artifacts));
 }
 
 fn meta_with_diagnostics(stdout: &str, stderr: &str) -> crate::store::EntryMeta {
