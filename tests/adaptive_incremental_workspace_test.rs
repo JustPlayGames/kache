@@ -654,7 +654,12 @@ fn a_seed_releases_the_discovery_flight_before_it_compiles() {
         .as_secs() as i64
         + 3_600;
     // This build's event for the library, and how many flights another
-    // process held when the library's compile started.
+    // process held when the library's compile started. The scoped guard
+    // (the default) is pinned: it walks the library's package, so each edit
+    // voids the record and the unit discovers again. The inputs guard keeps
+    // a record through an edit to a file of its closure, so the keyed miss
+    // of step 3 is a predicted key that holds no flight (none is needed: a
+    // peer validates the same record and does not wait).
     let build = |mtime: Option<i64>, answer: u64, env: &[(&str, &str)]| {
         let source = project.join("lib/src/lib.rs");
         fs::write(&source, format!("pub fn answer() -> u64 {{ {answer} }}\n")).unwrap();
@@ -671,6 +676,7 @@ fn a_seed_releases_the_discovery_flight_before_it_compiles() {
             .env("FLIGHT_PROBE", &probe)
             .env("FLIGHT_DIR", cache.path().join("scheduler/discovery"))
             .env("FLIGHT_LOG", &log)
+            .env("KACHE_WORKSPACE_GUARD", "scoped")
             .envs(env.iter().copied())
             .output()
             .expect("failed to build the workspace fixture");
