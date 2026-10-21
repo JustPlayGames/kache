@@ -18264,6 +18264,61 @@ fn the_inputs_guard_names_the_closures_directories_in_the_package() {
     assert_ne!(guard(true), before, "a top file counts by content");
 }
 
+/// The inputs guard tells which directories beside the closure's hold no
+/// file, at any depth: the first file in one moves the guard, as a new
+/// directory's name does, while a file added where files are already
+/// (`tests/`, a directory that held one) keeps it. A record whose compile
+/// may have seen such a directory before its first file arrived is not made.
+#[test]
+fn the_inputs_guard_tells_the_directories_beside_the_closure_that_hold_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = member_workspace(&root);
+    std::fs::create_dir_all(root.join("crates/kt/assets/nested")).unwrap();
+    std::fs::create_dir_all(root.join("crates/kt/src/a/empty")).unwrap();
+    let sources = [
+        PathBuf::from("crates/kt/src/lib.rs"),
+        PathBuf::from("crates/kt/src/a.rs"),
+        PathBuf::from("crates/kt/src/a/b.rs"),
+    ];
+    let hasher = FileHasher::new();
+    let _mode = WorkspaceGuardForTest::inputs();
+    let guard = || {
+        let tree = workspace_tree_digest(&roots, &hasher).unwrap();
+        expected_tree(&tree, &sources, Some(&roots)).unwrap()
+    };
+    let package = root.join("crates/kt");
+    let since = |not_after| closure_dirs_digest(&sources, &roots, &package, not_after, true);
+
+    for (what, path, moves) in [
+        ("a file in tests/", "crates/kt/tests/new.rs", false),
+        (
+            "the first file below assets/",
+            "crates/kt/assets/nested/a.txt",
+            true,
+        ),
+        ("a second file in assets/", "crates/kt/assets/b.txt", false),
+        (
+            "the first file of a/empty/",
+            "crates/kt/src/a/empty/c.txt",
+            true,
+        ),
+    ] {
+        let before = guard();
+        let taken = stamp_clock_ns();
+        write_file(&root.join(path), "");
+        assert_eq!(guard() != before, moves, "{what}");
+        if moves {
+            assert_eq!(
+                since(Some(taken)),
+                None,
+                "{what}: arrived after the compile"
+            );
+        }
+    }
+    assert!(since(None).is_some());
+}
+
 #[test]
 fn inherited_dependency_names_read_every_dependency_table() {
     let names = inherited_dependency_names(
