@@ -5837,6 +5837,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
+    /// Run `write` inside one write transaction on this store's connection,
+    /// committed when it succeeds and rolled back when it fails. Writes that
+    /// open their own transaction only when none is open
+    /// ([`Self::remember_target_root_built_by`]) join it, so the daemon
+    /// writes the rows wrappers handed it under one take of the write lock.
+    pub fn with_write_transaction<T>(&self, write: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.refuse_write("write handed rows")?;
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let written = write(self);
+        finish_transaction(&self.db, written.is_ok())?;
+        written
+    }
+
     /// Remember a Cargo target root without putting absolute paths in cache
     /// entries or remote data. Updates are debounced to keep compiler-wrapper
     /// writes off the hot path.
@@ -5851,6 +5864,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         target: &Path,
         workspace_root: &Path,
         rustc: Option<&str>,
+    ) -> Result<()> {
+        self.remember_target_root_within(target, workspace_root, rustc, None)
+    }
+
+    /// [`Self::remember_target_root_built_by`], waiting at most `wait` for
+    /// the index's write lock. A build's wrapper records its target root
+    /// this way: on a new target directory every unit of the build finds no
+    /// row, and each one waiting out the full busy timeout behind a store
+    /// held a burst of misses for seconds. A refusal is SQLite contention
+    /// ([`is_sqlite_contention`]); the caller hands the row on or leaves it
+    /// to the build's next unit.
+    pub fn remember_target_root_waiting(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+        rustc: Option<&str>,
+        wait: Duration,
+    ) -> Result<()> {
+        self.remember_target_root_within(target, workspace_root, rustc, Some(wait))
+    }
+
+    fn remember_target_root_within(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+        rustc: Option<&str>,
+        wait: Option<Duration>,
     ) -> Result<()> {
         self.refuse_write("record a target root")?;
         if !crate::filesystem::target_root_is_safe(target, workspace_root) {
@@ -5889,7 +5929,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // registration cannot slip between them and lose its row to ours.
         let in_transaction = !self.db.is_autocommit();
         if !in_transaction {
-            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            if let Some(wait) = wait {
+                let _ = self.db.busy_timeout(wait);
+            }
+            let begun = self.db.execute_batch("BEGIN IMMEDIATE");
+            if wait.is_some() {
+                let _ = self.db.busy_timeout(Duration::from_millis(5000));
+            }
+            begun?;
         }
         let written = self.record_target_root(&target, &workspace_root, identity, rustc);
         if !in_transaction {
