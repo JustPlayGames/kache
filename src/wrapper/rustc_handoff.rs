@@ -19,10 +19,12 @@
 //!   the key up meanwhile finds no entry, then the key contended, and waits
 //!   for the commit as it would for a wrapper still storing. The blobs are
 //!   unreferenced until then, so no peer can find a partial entry.
-//! - The daemon registers the entry with `Store::put_staged_handed_off`,
-//!   which hashes each link first and commits nothing if one differs: a blob
-//!   sharing its inode with an output rewritten in place after the wrapper
-//!   returned costs the entry, never its correctness.
+//! - The daemon hashes each link first (`Store::check_staged_handed_off`)
+//!   and commits nothing for the entry if one differs: a blob sharing its
+//!   inode with an output rewritten in place after the wrapper returned
+//!   costs the entry, never its correctness. It registers the entries that
+//!   queued while the index was busy together, in one transaction, when the
+//!   index's write lock frees (`Store::register_handed_off_batch`).
 //! - Anything that keeps the daemon from accepting (no daemon, an older
 //!   daemon, a full queue, a busy daemon past the hand-off budget) leaves
 //!   the registration to the wrapper, which then waits for the lock as a put
@@ -77,10 +79,13 @@ pub(super) struct RustcHandoff<'a> {
 pub(super) const INDEX_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// How long a wrapper whose index is busy waits for the daemon to take the
-/// staged entry. Longer than a C/C++ hand-off's budget: the wrapper would
-/// otherwise wait for a lock another writer holds, for seconds under a burst
-/// of stores, and a burst is when hundreds of wrappers hand off at once and
-/// the daemon answers them in turn.
+/// staged entry. The daemon answers in a few milliseconds whatever its
+/// worker and the index are doing (its claims, each a lock file and a
+/// rename, run side by side), so the budget only bounds a stalled daemon,
+/// such as a claim whose lock-file write the filesystem held for 0.9 s
+/// under a burst. Running out costs the wrapper a wait for a lock another
+/// writer holds, seconds under a burst of stores, so the budget stays far
+/// above a C/C++ hand-off's.
 pub(super) const BUSY_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Whether a busy index may hand this compile's registration to the daemon:

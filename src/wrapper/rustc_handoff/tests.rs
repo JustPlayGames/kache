@@ -22,11 +22,30 @@ struct Compiled {
 fn compiled(label: &str) -> Compiled {
     let dir = tempfile::tempdir().unwrap();
     let config = crate::test_support::test_config(dir.path().join("cache"));
+    compiled_in(dir, config, label, b'r')
+}
+
+/// Compiles of their own, `fill` the byte of each output, all storing into
+/// one store.
+fn compiled_many(count: usize) -> (tempfile::TempDir, Vec<Compiled>) {
+    let root = tempfile::tempdir().unwrap();
+    let config = crate::test_support::test_config(root.path().join("cache"));
+    let compiled = (0..count)
+        .map(|index| {
+            let dir = tempfile::tempdir_in(root.path()).unwrap();
+            let fill = b'a' + u8::try_from(index % 26).unwrap();
+            compiled_in(dir, config.clone(), &format!("many-{index}"), fill)
+        })
+        .collect();
+    (root, compiled)
+}
+
+fn compiled_in(dir: tempfile::TempDir, config: Config, label: &str, fill: u8) -> Compiled {
     let deps = dir.path().join("target/debug/deps");
     std::fs::create_dir_all(&deps).unwrap();
     let rlib = deps.join("libfoo-0123456789abcdef.rlib");
     // Large enough for the file-hash memo to keep a row for it.
-    std::fs::write(&rlib, vec![b'r'; 96 << 10]).unwrap();
+    std::fs::write(&rlib, vec![fill; 96 << 10]).unwrap();
     let args = crate::compiler::rustc::RustcCompiler::new()
         .parse(
             &[
@@ -101,9 +120,14 @@ struct PendingDaemon {
 
 impl PendingDaemon {
     fn listen(config: &Config) -> Self {
+        Self::listen_queueing(config, 8)
+    }
+
+    /// [`Self::listen`] with room for `capacity` accepted hand-offs.
+    fn listen_queueing(config: &Config, capacity: usize) -> Self {
         use interprocess::local_socket::traits::tokio::Listener as _;
         let daemon = Arc::new(Daemon::new(config.clone()));
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         daemon.publish_queue().set_sender(tx);
         let socket = config.socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -133,11 +157,22 @@ impl PendingDaemon {
     /// Start the publish worker and wait until it has stored everything
     /// accepted so far.
     async fn publish_all(&mut self) {
-        let worker = crate::daemon_publish::spawn_publish_worker(
+        let worker = self.start_worker();
+        self.drain(worker).await;
+    }
+
+    /// Start the publish worker; it stores what is queued and keeps taking
+    /// hand-offs until [`Self::drain`].
+    fn start_worker(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        crate::daemon_publish::spawn_publish_worker(
             Arc::clone(&self.daemon),
             self.rx.take().unwrap(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Close the queue and wait until the worker has stored all of it.
+    async fn drain(&self, worker: tokio::sync::oneshot::Receiver<()>) {
         self.daemon.publish_queue().close();
         tokio::time::timeout(Duration::from_secs(30), worker)
             .await
@@ -536,4 +571,190 @@ async fn on_a_busy_index_the_wrapper_returns_and_the_daemon_commits_after() {
         events[0].store_error
     );
     assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
+}
+
+/// Store a compile as the wrapper does after a miss, with whatever the
+/// caller holds of the index; how long the store took the wrapper.
+fn hand_off_now(compiled: &Compiled) -> (RustcStore, Option<KeyLock>, Duration) {
+    tokio::task::block_in_place(|| {
+        let store = Store::open(&compiled.config).unwrap();
+        let compiler = RustcCompiler::new();
+        let mut lock = match store.claim_build(&compiled.key).unwrap() {
+            BuildClaim::Acquired(lock) => Some(lock),
+            _ => panic!("a fresh key"),
+        };
+        let started = std::time::Instant::now();
+        let outcome = store_within(
+            &compiled.config,
+            &store,
+            &mut lock,
+            handoff(compiled, &compiler, started),
+            Duration::from_secs(10),
+            true,
+        );
+        (outcome, lock, started.elapsed())
+    })
+}
+
+/// The events the daemon logged, as written: field by field, whatever this
+/// release's `BuildEvent` knows.
+fn raw_events(config: &Config) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(config.event_log_path())
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Hand-offs that queue while another connection holds the index's write
+/// lock are registered together once it lets go: one transaction for all of
+/// them, so a lock that is free only now and then is taken once, not once
+/// per entry. Each entry is the compiler's bytes, and each event says how
+/// many entries its transaction committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
+    const COUNT: usize = 12;
+    let (_root, compiled) = compiled_many(COUNT);
+    let config = &compiled[0].config;
+    let mut daemon = PendingDaemon::listen_queueing(config, 64);
+
+    let (released, holder) = hold_index_lock(config, BUSY);
+    for one in &compiled {
+        let (outcome, lock, _) = hand_off_now(one);
+        assert!(matches!(outcome, RustcStore::HandedOff));
+        assert!(lock.is_none());
+    }
+    let worker = daemon.start_worker();
+    assert!(
+        !released.load(std::sync::atomic::Ordering::SeqCst),
+        "every hand-off queued while the index was held"
+    );
+    tokio::task::block_in_place(|| holder.join().unwrap());
+    daemon.drain(worker).await;
+
+    let store = Store::open(config).unwrap();
+    for one in &compiled {
+        let meta = store.get(&one.key).unwrap().expect("committed");
+        assert_eq!(
+            std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+            std::fs::read(&one.rlib).unwrap()
+        );
+    }
+    let events = raw_events(config);
+    assert_eq!(events.len(), COUNT);
+    for event in &events {
+        assert_eq!(event["store_error"], serde_json::Value::Null, "{event}");
+        assert_eq!(event["daemon_store_batch"], COUNT, "{event}");
+    }
+    assert_eq!(handoff_requests(config), 0, "no snapshot is left");
+}
+
+/// An output rewritten in place after its wrapper returned costs its own
+/// entry only: the rest of the batch commits, and the changed blob is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewritten_output_costs_only_its_own_entry_in_a_batch() {
+    use std::os::unix::fs::PermissionsExt;
+    const COUNT: usize = 6;
+    let (_root, compiled) = compiled_many(COUNT);
+    let config = &compiled[0].config;
+    let mut daemon = PendingDaemon::listen_queueing(config, 64);
+    let bad = &compiled[2];
+    let bad_hash = crate::cache_key::hash_file(&bad.rlib).unwrap();
+
+    let (_, holder) = hold_index_lock(config, BUSY);
+    for one in &compiled {
+        assert!(matches!(hand_off_now(one).0, RustcStore::HandedOff));
+    }
+    std::fs::set_permissions(&bad.rlib, std::fs::Permissions::from_mode(0o644)).unwrap();
+    {
+        use std::io::{Seek, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bad.rlib)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(1000)).unwrap();
+        file.write_all(b"post-processed").unwrap();
+    }
+    let worker = daemon.start_worker();
+    tokio::task::block_in_place(|| holder.join().unwrap());
+    daemon.drain(worker).await;
+
+    let store = Store::open(config).unwrap();
+    assert!(store.get(&bad.key).unwrap().is_none(), "no entry");
+    assert!(!store.blob_path(&bad_hash).exists(), "no changed blob");
+    assert!(matches!(
+        store.claim_build(&bad.key).unwrap(),
+        BuildClaim::Acquired(_)
+    ));
+    for one in compiled.iter().filter(|one| one.key != bad.key) {
+        assert!(store.get(&one.key).unwrap().is_some(), "committed");
+    }
+    let events = raw_events(config);
+    assert_eq!(events.len(), COUNT);
+    let (failed, stored): (Vec<_>, Vec<_>) = events
+        .iter()
+        .partition(|event| event["store_error"].is_string());
+    assert_eq!(failed.len(), 1);
+    assert!(
+        failed[0]["store_error"]
+            .as_str()
+            .unwrap()
+            .contains("changed after the compile"),
+        "{}",
+        failed[0]
+    );
+    for event in stored {
+        assert_eq!(event["daemon_store_batch"], COUNT - 1, "{event}");
+    }
+    assert_eq!(handoff_requests(config), 0, "no snapshot is left");
+}
+
+/// The daemon answers a hand-off at once whatever else it is doing: its
+/// worker waiting for the index's write lock with an entry, and its own
+/// store connection taken by other work, cost the wrapper nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_answers_a_hand_off_while_its_worker_and_store_are_busy() {
+    let (_root, compiled) = compiled_many(2);
+    let config = &compiled[0].config;
+    let mut daemon = PendingDaemon::listen_queueing(config, 64);
+    let (released, holder) = hold_index_lock(config, BUSY);
+    assert!(matches!(
+        hand_off_now(&compiled[0]).0,
+        RustcStore::HandedOff
+    ));
+    let worker = daemon.start_worker();
+    // Other work holds the daemon's store connection for longer than any
+    // wrapper should wait.
+    let (take, taken) = std::sync::mpsc::channel();
+    let busy_store = {
+        let daemon = Arc::clone(&daemon.daemon);
+        std::thread::spawn(move || {
+            daemon
+                .with_store(|_| {
+                    take.send(()).unwrap();
+                    std::thread::sleep(BUSY);
+                    Ok(())
+                })
+                .unwrap();
+        })
+    };
+    taken.recv().unwrap();
+
+    let (outcome, _, took) = hand_off_now(&compiled[1]);
+    assert!(matches!(outcome, RustcStore::HandedOff));
+    assert!(took < Duration::from_secs(1), "the wrapper waited {took:?}");
+    assert!(
+        !released.load(std::sync::atomic::Ordering::SeqCst),
+        "answered while the worker still waited for the index"
+    );
+
+    tokio::task::block_in_place(|| {
+        holder.join().unwrap();
+        busy_store.join().unwrap();
+    });
+    daemon.drain(worker).await;
+    let store = Store::open(config).unwrap();
+    for one in &compiled {
+        assert!(store.get(&one.key).unwrap().is_some(), "committed");
+    }
 }

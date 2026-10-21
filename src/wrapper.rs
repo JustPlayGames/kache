@@ -9463,6 +9463,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         store_error,
         store_handed_off: false,
         daemon_store_ms: 0,
+        daemon_store_batch: 0,
         lookup_rejection,
         verify_compare: crate::verify_compare::take_last_report(),
         fallback,
