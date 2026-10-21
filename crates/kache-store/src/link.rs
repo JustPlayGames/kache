@@ -580,6 +580,19 @@ fn hardlink_or_copy_with_prelink_hook(
     match fs::metadata(store_path) {
         Ok(meta) => {
             use std::os::unix::fs::MetadataExt;
+            // Store blobs are read-only. A shared link hands the blob's inode
+            // to every tree, so a blob that has gained a write bit (a tool in
+            // some tree made its file writable to edit it in place) may no
+            // longer hold the bytes its name promises: never link it again.
+            if shared && meta.mode() & 0o222 != 0 {
+                tracing::warn!(
+                    mode = format_args!("{:o}", meta.mode() & 0o7777),
+                    "store blob is writable, restoring by copy (run `kache doctor --verify`): {}",
+                    store_path.display()
+                );
+                crate::opcounts::record_restore_copy_other(bytes);
+                return copy_instead();
+            }
             if !shared && meta.nlink() != 1 {
                 tracing::debug!(
                     links = meta.nlink(),
@@ -4766,6 +4779,7 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("blob.rlib");
         fs::write(&blob, b"cached rlib").unwrap();
+        read_only(&blob);
         let bytes = fs::metadata(&blob).unwrap().len();
         set_shared_hardlink_restores(true);
         let result = (|| {
@@ -4786,6 +4800,44 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             fs::metadata(&first).unwrap().ino(),
             fs::metadata(&second).unwrap().ino()
         );
+    }
+
+    /// Store blobs are written read-only, as the store does.
+    #[cfg(unix)]
+    fn read_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    /// A blob that gained a write bit may have been edited in place through
+    /// another tree's link: shared restores copy it instead of linking it.
+    #[test]
+    #[cfg(unix)]
+    fn shared_restores_never_link_a_writable_blob() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let before = crate::opcounts::restore_copy_other_bytes();
+        set_shared_hardlink_restores(true);
+        let target = dir.path().join("tree.rlib");
+        let result = hardlink_or_copy(&blob, &target, bytes);
+        set_shared_hardlink_restores(false);
+        result.unwrap();
+        assert_eq!(
+            fs::metadata(&blob).unwrap().nlink(),
+            1,
+            "the writable blob is not linked"
+        );
+        assert_ne!(
+            fs::metadata(&blob).unwrap().ino(),
+            fs::metadata(&target).unwrap().ino()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
+        assert!(crate::opcounts::restore_copy_other_bytes() >= before + bytes);
     }
 
     #[test]
