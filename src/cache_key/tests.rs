@@ -9702,7 +9702,6 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
         ("--error-format", "json", "human"),
         ("--json", "artifacts", "diagnostic-rendered-ansi"),
         ("--color", "always", "never"),
-        ("--diagnostic-width", "80", "120"),
     ] {
         let attached = format!("{flag}={value}");
         let first = key_of_flags(&flag_base(&source, &[&attached]));
@@ -9718,6 +9717,39 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
         );
     }
     assert_eq!(base, key_of_flags(&flag_base(&source, &["--verbose"])));
+}
+
+/// `--diagnostic-width` only wraps printed text: a build from a terminal (Cargo
+/// passes the terminal's width) and one from a pipe (no width) share a key,
+/// in both spellings, while the format flags beside it stay keyed.
+#[test]
+fn diagnostic_width_leaves_the_key_alone() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+    let json = [
+        "--error-format=json",
+        "--json=diagnostic-rendered-ansi,artifacts",
+    ];
+    let piped = key_of_flags(&flag_base(&source, &json));
+    for width in [
+        vec!["--diagnostic-width=80"],
+        vec!["--diagnostic-width", "211"],
+    ] {
+        let mut flags = json.to_vec();
+        flags.extend(width.iter().copied());
+        assert_eq!(
+            piped,
+            key_of_flags(&flag_base(&source, &flags)),
+            "{width:?}"
+        );
+    }
+    assert_ne!(
+        piped,
+        key_of_flags(&flag_base(&source, &["--diagnostic-width=80"])),
+        "the format stays keyed"
+    );
 }
 
 /// kunobi-ninja/kache#399: lexical `.`/`..` collapse + separator unification.

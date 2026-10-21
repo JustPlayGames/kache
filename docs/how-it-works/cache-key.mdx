@@ -15,7 +15,7 @@ The exact set depends on the invocation. It can include:
 - source and included file contents discovered through dep-info
 - code-generation flags, rustflags, and requested emit kinds
 - lint levels and `--check-cfg` values (`-A`, `-W`, `-D`, `-F`, `--force-warn`, `--cap-lints`), in order, because they decide whether a compile succeeds
-- diagnostic presentation flags (`--error-format`, `--json`, `--color`, `--diagnostic-width`), in order, because a hit replays the stored diagnostics
+- diagnostic presentation flags (`--error-format`, `--json`, `--color`), in order, because a hit replays the stored diagnostics; `--diagnostic-width` is left out, so a hit may print a stored diagnostic wrapped at another width
 - `-Z` flags, `RUSTC_BOOTSTRAP` when set, `--sysroot`, and the `CARGO_CFG_*` variables
 - the library of a codegen backend selected by name, or a backend dylib passed as a path when `cache.trust_codegen_backends` allows it, by content
 - other rustc flags Kache does not model, with paths normalized (`KACHE_LOG=warn` names them)
