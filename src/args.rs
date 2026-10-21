@@ -280,6 +280,8 @@ pub struct RustcArgs {
     pub outcome_lint_flags: Vec<String>,
     /// Diagnostic flags in argv order, with separated values joined by `=`.
     pub diagnostic_flags: Vec<String>,
+    /// Positions consumed as diagnostic flags or values in `all_args`.
+    diagnostic_arg_indices: Vec<usize>,
     /// Whether this is a `--test` compilation (test harness binary)
     pub is_test: bool,
     /// Whether this looks like a primary compilation (has source file + crate name)
@@ -431,6 +433,7 @@ impl RustcArgs {
             residual_args: Vec::new(),
             outcome_lint_flags: Vec::new(),
             diagnostic_flags: Vec::new(),
+            diagnostic_arg_indices: Vec::new(),
             is_test: false,
             is_primary: false,
             path_normalize_disabled: !crate::path_normalizer::rustc_path_normalize_enabled(),
@@ -642,7 +645,9 @@ impl RustcArgs {
                     parsed.outcome_lint_flags.push(arg.clone());
                 }
                 _ if DIAGNOSTIC_VALUE_FLAGS.contains(&arg.as_str()) => {
+                    parsed.diagnostic_arg_indices.push(i);
                     if let Some(value) = rustc_args.get(i + 1) {
+                        parsed.diagnostic_arg_indices.push(i + 1);
                         parsed.diagnostic_flags.push(format!("{arg}={value}"));
                         i += 1;
                     } else {
@@ -653,6 +658,7 @@ impl RustcArgs {
                     .split_once('=')
                     .is_some_and(|(flag, _)| DIAGNOSTIC_VALUE_FLAGS.contains(&flag)) =>
                 {
+                    parsed.diagnostic_arg_indices.push(i);
                     parsed.diagnostic_flags.push(arg.clone());
                 }
                 _ if IGNORED_VALUE_FLAGS.contains(&arg.as_str()) => {
@@ -696,6 +702,14 @@ impl RustcArgs {
             .map(|cwd| parsed.select_path_normalization_root(&cwd));
 
         Ok(parsed)
+    }
+
+    /// Borrow the parsed invocation without presentation options. Record the
+    /// parser's positions so a same-spelled operand of another flag is kept.
+    pub(crate) fn args_without_diagnostic_presentation(&self) -> impl Iterator<Item = &String> {
+        self.all_args.iter().enumerate().filter_map(|(index, arg)| {
+            (!self.diagnostic_arg_indices.contains(&index)).then_some(arg)
+        })
     }
 
     /// Original compact argv. This differs from [`Self::all_args`] only after

@@ -635,7 +635,7 @@ fn remove(parts: &[PathBuf]) -> std::io::Result<()> {
 }
 
 /// Bytes under `path`, symbolic links not followed.
-fn size(path: &Path) -> u64 {
+pub(crate) fn size(path: &Path) -> u64 {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => entries(path).iter().map(|entry| size(entry)).sum(),
         Ok(metadata) => metadata.len(),
@@ -651,7 +651,7 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn subdirectories(dir: &Path) -> Vec<PathBuf> {
+pub(crate) fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     entries(dir)
         .into_iter()
         .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
