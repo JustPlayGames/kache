@@ -3221,8 +3221,9 @@ impl Drop for WorkspaceGuardForTest {
 }
 
 /// The root-level paths the scoped guard leaves out when
-/// `KACHE_GUARD_IGNORE` is unset: agent and CI configuration and the
-/// top-level docs, which no build reads, and `Cargo.lock` and `.env`.
+/// `KACHE_GUARD_IGNORE` is unset: agent and CI configuration, `.config`
+/// (where cargo-nextest, cargo-mutants and other tools keep their settings)
+/// and the top-level docs, which no build reads, and `Cargo.lock` and `.env`.
 ///
 /// `Cargo.lock` reaches a unit's output only through what Cargo passes it:
 /// a changed version changes the unit's `--extern` files and metadata hash,
@@ -3235,6 +3236,7 @@ pub(crate) const DEFAULT_GUARD_IGNORE: &[&str] = &[
     ".agents",
     ".github",
     ".claude",
+    ".config",
     "AGENTS.md",
     "README.md",
     "Cargo.lock",
