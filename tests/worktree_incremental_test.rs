@@ -31,6 +31,7 @@ fn build(root: &Path, donor: Option<&Path>, extra_flags: &str) -> Output {
         .env("KACHE_INCREMENTAL_CRATES", "worktree_probe")
         .env("KACHE_UNSTABLE", "true")
         .env("KACHE_ADAPTIVE_INCREMENTAL", "0")
+        .env("KACHE_SEED_INCREMENTAL", "1")
         // Only this test's compiler children opt into unstable flags.
         .env("RUSTC_BOOTSTRAP", "1")
         .env(
@@ -171,7 +172,7 @@ fn managed_command(
         command.env("KACHE_LOG", "kache=trace");
     }
     if enabled {
-        command.env_remove("KACHE_SEED_INCREMENTAL");
+        command.env("KACHE_SEED_INCREMENTAL", "1");
     } else {
         command.env("KACHE_SEED_INCREMENTAL", "0");
     }
@@ -788,6 +789,7 @@ fn absolute_source_keeps_file_macro_semantics_without_publishing_a_seed() {
     .env("KACHE_UNSTABLE", "true")
     .env("KACHE_PRESERVE_INCREMENTAL", "0")
     .env("KACHE_ADAPTIVE_INCREMENTAL", "0")
+    .env("KACHE_SEED_INCREMENTAL", "1")
     .env("KACHE_INCREMENTAL_SEED_FROM", &profile)
     .env("RUSTC_BOOTSTRAP", "1")
     .output()
