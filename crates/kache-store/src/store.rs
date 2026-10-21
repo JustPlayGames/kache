@@ -1511,6 +1511,20 @@ pub struct StoreLock {
 /// Lock guard for a cache key. Dropping it releases the OS lock.
 pub type KeyLock = StoreLock;
 
+/// [`ArtifactStore::try_lock`] in the store directory `store_dir`, without
+/// opening its index: the key's lock is a file of its own.
+pub fn try_lock_key_in(store_dir: &Path, cache_key: &str) -> Result<Option<KeyLock>> {
+    StoreLock::try_acquire(&store_dir.join(cache_key).with_extension("lock"))
+}
+
+/// Whether the store directory `store_dir` holds a `meta.json` for
+/// `cache_key`. Without one nothing is committed under the key, whatever
+/// the index says ([`ArtifactStore::contains`]); with one, only the index
+/// can tell.
+pub fn entry_meta_exists_in(store_dir: &Path, cache_key: &str) -> bool {
+    store_dir.join(cache_key).join("meta.json").exists()
+}
+
 /// Lock guard for store-wide GC. Dropping it releases the OS lock.
 pub type GcLock = StoreLock;
 
@@ -3075,7 +3089,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Acquire a build lock for a cache key. Returns None if another process holds it.
     pub fn try_lock(&self, cache_key: &str) -> Result<Option<KeyLock>> {
         self.refuse_write("acquire a build lock")?;
-        StoreLock::try_acquire(&self.entry_dir(cache_key).with_extension("lock"))
+        try_lock_key_in(&self.config.store_dir(), cache_key)
     }
 
     /// Claim a cache miss, re-checking the store after acquiring the key lock.
@@ -3086,6 +3100,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let Some(lock) = self.try_lock(cache_key)? else {
             return Ok(BuildClaim::Contended);
         };
+        self.claim_build_locked(cache_key, lock)
+    }
+
+    /// The re-check of [`Self::claim_build`] for a key whose lock the caller
+    /// took without this store ([`try_lock_key_in`]).
+    pub fn claim_build_locked(&self, cache_key: &str, lock: KeyLock) -> Result<BuildClaim> {
+        self.refuse_write("acquire a build lock")?;
         match self.get(cache_key)? {
             Some(meta) if meta.files.is_empty() => {
                 tracing::warn!("cache entry {cache_key} has no files, evicting before build");

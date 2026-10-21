@@ -373,9 +373,24 @@ impl Daemon {
         };
         let key = request.cache_key.clone();
         let daemon = Arc::clone(self);
-        let claim =
-            tokio::task::spawn_blocking(move || daemon.with_store(|store| store.claim_build(&key)))
-                .await;
+        let store_dir = config.store_dir();
+        // The key's lock is a file of its own, and a key without a meta.json
+        // has nothing committed, so a claim asks the daemon's store connection
+        // only when a peer may have stored the key meanwhile. Claimed on that
+        // shared connection, a burst of hand-offs (hundreds at once) waited
+        // for one another and for any other work on it, and one claim slowed
+        // by the filesystem kept them all waiting past their wrappers'
+        // budgets: those wrappers then waited for the busy index themselves.
+        let claim = tokio::task::spawn_blocking(move || {
+            let Some(lock) = crate::store::try_lock_key_in(&store_dir, &key)? else {
+                return Ok(BuildClaim::Contended);
+            };
+            if !crate::store::entry_meta_exists_in(&store_dir, &key) {
+                return Ok(BuildClaim::Acquired(lock));
+            }
+            daemon.with_store(|store| store.claim_build_locked(&key, lock))
+        })
+        .await;
         let lock = match claim {
             Ok(Ok(BuildClaim::Acquired(lock))) => lock,
             Ok(Ok(BuildClaim::Committed(_))) => return refused("already committed"),
