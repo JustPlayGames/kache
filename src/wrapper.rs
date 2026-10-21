@@ -7006,6 +7006,31 @@ fn record_input_prediction(
             crate::prediction_share::for_remote_portable(&record, registry.as_deref()),
         );
     }
+    hand_busy_predictions(config, store, &file_hasher);
+}
+
+/// Hand the prediction rows a busy index refused to the daemon, which writes
+/// them once the index lets it: the unit does not wait for the write lock
+/// after its compile, and the next build still finds its rows. The daemon
+/// takes rows of its own store only; without one they are dropped, which
+/// costs that next build a pre-pass and nothing else.
+fn hand_busy_predictions(
+    config: &Config,
+    store: &Store,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) {
+    let rows = file_hasher.take_busy_predictions();
+    if rows.is_empty() {
+        return;
+    }
+    let count = rows.len();
+    let handed = store.cache_dir() == config.cache_dir
+        && crate::daemon::send_prediction_rows(&config.socket_path(), &config.cache_dir, rows);
+    tracing::debug!(
+        rows = count,
+        handed,
+        "input prediction rows not written (index busy)"
+    );
 }
 
 /// Hand a row to the daemon for the remote, when it can travel at all.

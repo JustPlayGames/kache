@@ -15602,11 +15602,70 @@ fn a_handed_target_root_gone_before_the_flush_is_not_recorded() {
     assert!(store.tracked_target_roots(0).unwrap().is_empty());
 }
 
-/// Target roots go to the daemon without waiting for its answer, however
-/// slowly it answers.
+/// Handed prediction rows: the latest row of an identity wins, a row of a
+/// unit's tree trims the unit's other trees as the wrapper's own write does,
+/// and a full queue refuses more.
+#[test]
+fn handed_prediction_rows_keep_the_latest_and_trim_like_the_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let row = |identity: &str, json: &str, keep: Option<u32>| kache_protocol::PredictionRow {
+        identity: identity.into(),
+        schema: 7,
+        crate_name: Some("c".into()),
+        json: json.into(),
+        keep_under: keep.map(|keep| ("unit/".to_string(), keep)),
+    };
+    let request = |rows| RecordPredictionsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows,
+    };
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![
+                row("plain", "old", None),
+                row("unit/a", "a", Some(1)),
+            ]))
+            .ok
+    );
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![row("plain", "new", None)]))
+            .ok
+    );
+    daemon.flush_handed_rows();
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![row("unit/b", "b", Some(1))]))
+            .ok
+    );
+    daemon.flush_handed_rows();
+    let store = Store::open(&config).unwrap();
+    let cache = store.file_hash_cache();
+    assert_eq!(
+        cache.get_input_prediction("plain").unwrap(),
+        Some((7, "new".to_string()))
+    );
+    assert_eq!(
+        cache.get_input_prediction("unit/b").unwrap(),
+        Some((7, "b".to_string()))
+    );
+    assert_eq!(
+        cache.get_input_prediction("unit/a").unwrap(),
+        None,
+        "kept one row of the unit"
+    );
+
+    let full = vec![row("plain", "x", None); MAX_PENDING_HANDED_ROWS + 1];
+    assert!(!daemon.handle_record_predictions(&request(full)).ok);
+}
+
+/// Target roots and prediction rows go to the daemon without waiting for
+/// its answer, however slowly it answers.
 #[cfg(unix)]
 #[test]
-fn handed_target_roots_are_sent_without_waiting_for_the_answer() {
+fn handed_rows_are_sent_without_waiting_for_the_answer() {
     use interprocess::local_socket::traits::ListenerExt as _;
     use std::io::{BufRead, Write};
     let dir = tempfile::tempdir().unwrap();
@@ -15650,6 +15709,21 @@ fn handed_target_roots_are_sent_without_waiting_for_the_answer() {
             workspace_root: "/".into(),
             rustc: None,
         }
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    check();
+    let (socket, check) = serve("record_predictions");
+    let started = std::time::Instant::now();
+    assert!(send_prediction_rows(
+        &socket,
+        &cache_dir,
+        vec![kache_protocol::PredictionRow {
+            identity: "i".into(),
+            schema: 1,
+            crate_name: None,
+            json: "{}".into(),
+            keep_under: None,
+        }]
     ));
     assert!(started.elapsed() < std::time::Duration::from_millis(250));
     check();

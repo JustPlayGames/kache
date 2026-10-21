@@ -12428,3 +12428,52 @@ fn a_busy_index_does_not_hold_a_unit_for_its_target_root() {
     assert!(!roots[0].discovered);
 }
 
+/// A unit does not wait out the index's busy timeout to record its input
+/// prediction: the rows a busy index refuses are kept for the daemon, and
+/// written later they read back as the record the unit made.
+#[test]
+fn a_busy_index_keeps_prediction_rows_for_the_daemon_instead_of_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let closure = crate::cache_key::DepInfo {
+        source_files: vec![source],
+        env_deps: Vec::new(),
+    };
+    let hasher = store.file_hasher().with_input_predictions(true);
+
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    hasher.record_input_prediction("unit-a", Some("a"), &closure, None);
+    hasher.record_input_prediction("unit-b", Some("b"), &closure, None);
+    let waited = started.elapsed();
+    assert!(
+        waited < std::time::Duration::from_millis(100),
+        "the unit waited {waited:?} for its prediction rows"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+    assert!(hasher.input_prediction("unit-a").is_none());
+    let rows = hasher.take_busy_predictions();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.identity.as_str())
+            .collect::<Vec<_>>(),
+        ["unit-a", "unit-b"]
+    );
+
+    let daemon = crate::daemon::Daemon::new(config.clone());
+    let req = kache_protocol::RecordPredictionsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows,
+    };
+    assert!(daemon.handle_record_predictions(&req).ok);
+    daemon.flush_handed_rows();
+    assert_eq!(
+        hasher.input_prediction("unit-a").map(|row| row.sources),
+        Some(closure.source_files.clone())
+    );
+    assert!(hasher.input_prediction("unit-b").is_some());
+}

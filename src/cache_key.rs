@@ -8359,6 +8359,11 @@ pub struct FileHasher<'db> {
     /// 380 ms. Each row keeps the time its file was observed, which alone
     /// decides whether it may be written.
     pending_memo: RefCell<Vec<(ObservedFingerprint, String)>>,
+    /// Prediction rows the index was too busy to take within
+    /// [`PREDICTION_RECORD_WAIT`], for the caller to hand to the daemon
+    /// ([`FileHasher::take_busy_predictions`]). Once one write found the
+    /// index busy, the process's further rows join it without waiting again.
+    busy_predictions: RefCell<Vec<kache_protocol::PredictionRow>>,
     /// The stat walks behind the tree digests computed since the last
     /// [`FileHasher::take_tree_walks`] (see [`tree_guard_of`]).
     tree_walks: RefCell<Vec<GuardWalk>>,
@@ -8475,6 +8480,7 @@ impl FileHasher<'static> {
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
+            busy_predictions: RefCell::new(Vec::new()),
             tree_walks: RefCell::new(Vec::new()),
             own_dirs: Vec::new(),
         }
@@ -8496,6 +8502,7 @@ impl FileHasher<'static> {
                 too_new: TooNewGuard::default(),
                 guard_inputs: RefCell::new(Vec::new()),
                 pending_memo: RefCell::new(Vec::new()),
+                busy_predictions: RefCell::new(Vec::new()),
                 tree_walks: RefCell::new(Vec::new()),
                 own_dirs: Vec::new(),
             },
@@ -8508,6 +8515,24 @@ impl FileHasher<'static> {
             }
         }
     }
+}
+
+/// How long a prediction record waits for the index's write lock
+/// ([`FileHasher::take_busy_predictions`] holds the rows it could not write).
+/// A record saves a later pre-pass; in a burst of misses the full busy
+/// timeout made a unit wait over a second for it after its compile.
+const PREDICTION_RECORD_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// SQLite's busy or locked answer.
+fn sqlite_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 impl<'db> FileHasher<'db> {
@@ -8578,6 +8603,7 @@ impl<'db> FileHasher<'db> {
             too_new: TooNewGuard::default(),
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
+            busy_predictions: RefCell::new(Vec::new()),
             tree_walks: RefCell::new(Vec::new()),
             own_dirs: Vec::new(),
         }
@@ -8828,9 +8854,57 @@ impl<'db> FileHasher<'db> {
                 return;
             }
         };
-        if let Err(error) = cache.put_input_prediction(identity, record.schema, crate_name, &json) {
-            tracing::debug!("input prediction record failed: {error}");
+        self.put_prediction_row(
+            cache,
+            kache_protocol::PredictionRow {
+                identity: identity.to_owned(),
+                schema: record.schema,
+                crate_name: crate_name.map(str::to_owned),
+                json,
+                keep_under: None,
+            },
+        );
+    }
+
+    /// Write `row` with at most [`PREDICTION_RECORD_WAIT`] for the index's
+    /// write lock; a busy index keeps it in [`Self::take_busy_predictions`].
+    fn put_prediction_row(&self, cache: &FileHashCache<'_>, row: kache_protocol::PredictionRow) {
+        let _trace = crate::phase_trace::phase("prediction_write");
+        if !self.busy_predictions.borrow().is_empty() {
+            self.busy_predictions.borrow_mut().push(row);
+            return;
         }
+        let db = cache.db();
+        let _ = db.busy_timeout(PREDICTION_RECORD_WAIT);
+        let written = match &row.keep_under {
+            Some((prefix, keep)) => cache.put_input_prediction_keeping(
+                prefix,
+                &row.identity,
+                row.schema,
+                row.crate_name.as_deref(),
+                &row.json,
+                *keep as usize,
+            ),
+            None => cache.put_input_prediction(
+                &row.identity,
+                row.schema,
+                row.crate_name.as_deref(),
+                &row.json,
+            ),
+        };
+        let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
+        match written {
+            Ok(()) => {}
+            Err(error) if sqlite_busy(&error) => self.busy_predictions.borrow_mut().push(row),
+            Err(error) => tracing::debug!("input prediction record failed: {error}"),
+        }
+    }
+
+    /// The prediction rows a busy index refused, for the caller to hand to
+    /// the daemon. Rows nobody takes are dropped with the hasher: each costs
+    /// a later pre-pass, never a key (every row is validated before use).
+    pub(crate) fn take_busy_predictions(&self) -> Vec<kache_protocol::PredictionRow> {
+        std::mem::take(&mut *self.busy_predictions.borrow_mut())
     }
 
     /// The closure recorded for `identity`, if this build can still read it.
@@ -8885,16 +8959,16 @@ impl<'db> FileHasher<'db> {
         // checkout at this one needs (see [`tree_keyed_identity`]).
         let prefix = tree_keyed_prefix(identity);
         let keyed = tree_keyed_identity(identity, &record.tree);
-        if let Err(error) = cache.put_input_prediction_keeping(
-            &prefix,
-            &keyed,
-            record.schema,
-            crate_name,
-            &json,
-            TREE_ROWS_KEPT,
-        ) {
-            tracing::debug!("portable prediction record failed: {error}");
-        }
+        self.put_prediction_row(
+            cache,
+            kache_protocol::PredictionRow {
+                identity: keyed,
+                schema: record.schema,
+                crate_name: crate_name.map(str::to_owned),
+                json,
+                keep_under: Some((prefix, TREE_ROWS_KEPT as u32)),
+            },
+        );
     }
 
     /// The relocated closure recorded for `identity` under the tree whose
