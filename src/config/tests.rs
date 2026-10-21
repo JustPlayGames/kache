@@ -2340,6 +2340,39 @@ fn deferred_discovery_is_on_unless_switched_off() {
 }
 
 #[test]
+fn rustc_daemon_publish_is_on_unless_switched_off() {
+    let _lock = config_path_lock();
+    let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
+    let off: Result<FileConfig> =
+        Ok(toml::from_str("[cache]\ndaemon_publish_rustc = false\n").unwrap());
+    let on: Result<FileConfig> =
+        Ok(toml::from_str("[cache]\ndaemon_publish_rustc = true\n").unwrap());
+    // The C/C++ switch does not turn the rustc one off.
+    let cc_off: Result<FileConfig> =
+        Ok(toml::from_str("[cache]\ndaemon_publish = false\n").unwrap());
+    // SAFETY: the process-state lock serialises environment edits.
+    unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH_RUSTC") };
+    assert!(Config::daemon_publish_rustc_enabled(&none));
+    assert!(!Config::daemon_publish_rustc_enabled(&off));
+    assert!(Config::daemon_publish_rustc_enabled(&on));
+    assert!(Config::daemon_publish_rustc_enabled(&cc_off));
+    for (value, expected) in [("0", false), ("FALSE", false), ("1", true), ("", true)] {
+        unsafe { std::env::set_var("KACHE_DAEMON_PUBLISH_RUSTC", value) };
+        assert_eq!(
+            Config::daemon_publish_rustc_enabled(&on),
+            expected,
+            "{value:?}"
+        );
+        assert_eq!(
+            Config::daemon_publish_rustc_enabled(&off),
+            expected,
+            "{value:?} overrides the file"
+        );
+    }
+    unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH_RUSTC") };
+}
+
+#[test]
 fn daemon_publish_is_on_unless_switched_off() {
     let _lock = config_path_lock();
     let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
@@ -2444,6 +2477,7 @@ fn test_file_config_roundtrip() {
             out_dir_alias: None,
             deferred_durability: None,
             daemon_publish: None,
+            daemon_publish_rustc: None,
             auto_gc: None,
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,
@@ -3097,6 +3131,7 @@ fn test_config_store_dir() {
         out_dir_alias: true,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -3180,6 +3215,7 @@ fn test_config_index_db_path() {
         out_dir_alias: true,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -3259,6 +3295,7 @@ fn test_config_event_log_path() {
         out_dir_alias: true,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -3357,6 +3394,7 @@ fn test_config_socket_path() {
         out_dir_alias: true,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         project_rules: ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -4092,6 +4130,7 @@ fn test_save_and_load_file_config() {
             out_dir_alias: None,
             deferred_durability: None,
             daemon_publish: None,
+            daemon_publish_rustc: None,
             auto_gc: None,
             index_auto_compact: None,
             auto_clean_orphaned_targets: None,

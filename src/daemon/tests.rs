@@ -1325,6 +1325,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         out_dir_alias: true,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -1595,6 +1596,7 @@ fn requests_accept_legacy_epochs_and_report_optional_release_versions() {
         publishes_to_remote: false,
         event: crate::events::BuildEvent::new_for_test("a.c", crate::events::EventResult::Miss),
         memo: None,
+        rustc: None,
     }));
     assert_eq!(publish.client_version(), None);
     assert_eq!(Request::Health.client_version(), None);
