@@ -186,7 +186,8 @@ pub struct Config {
     /// explicit force mode.
     pub adaptive_incremental: bool,
     /// Seed private incremental state from compatible local Cargo targets.
-    /// Enabled by default; `KACHE_SEED_INCREMENTAL=0` opts out.
+    /// Off by default in this fork (its stable-rustc children run with
+    /// restricted bootstrap permission); `KACHE_SEED_INCREMENTAL=1` opts in.
     pub seed_incremental: bool,
     /// Optional explicit donor profile for worktree incremental seeds.
     pub incremental_seed_from: Option<PathBuf>,
@@ -1735,7 +1736,7 @@ impl Config {
                     .ok()
                     .and_then(|c| c.cache.as_ref())
                     .and_then(|c| c.seed_incremental)
-                    .unwrap_or(true)
+                    .unwrap_or(false)
             });
 
         let event_log_max_size = file_config

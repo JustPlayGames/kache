@@ -59,17 +59,17 @@ For recognized rustc layouts, the import keeps the newest finalized session
 per crate, using the timestamp in its name. Tied timestamps and unfamiliar
 layouts retain their existing copying behavior.
 
-To disable automatic seeding for one build:
+Automatic seeding is off by default in this fork. To enable it for one build:
 
 ```bash
-KACHE_SEED_INCREMENTAL=0 cargo build
+KACHE_SEED_INCREMENTAL=1 cargo build
 ```
 
 Or set it in the config file:
 
 ```toml
 [cache]
-seed_incremental = false
+seed_incremental = true
 ```
 
 This keeps target-local adaptive incremental compilation enabled. To choose a

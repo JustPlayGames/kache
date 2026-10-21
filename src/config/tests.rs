@@ -2725,14 +2725,14 @@ fn test_incremental_seed_from_is_explicit_and_respects_ignore_env() {
 }
 
 #[test]
-fn worktree_seeding_defaults_on_and_respects_file_env_and_ignore_env() {
+fn worktree_seeding_defaults_off_and_respects_file_env_and_ignore_env() {
     let _guard = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     let _config = set_kache_config_for_test(&path);
     let _env = NamedEnvGuard::remove("KACHE_SEED_INCREMENTAL");
     std::fs::write(&path, "[cache]\n").unwrap();
-    assert!(Config::load().unwrap().seed_incremental);
+    assert!(!Config::load().unwrap().seed_incremental);
     std::fs::write(&path, "[cache]\nseed_incremental = false\n").unwrap();
     assert!(!Config::load().unwrap().seed_incremental);
     for value in ["1", "true", "TRUE"] {
