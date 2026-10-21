@@ -9017,10 +9017,12 @@ pub fn send_hit_stamp(socket_path: &Path, cache_dir: &Path, key: &str) -> bool {
 }
 
 /// Hand memo rows the index was too busy for to the daemon
-/// ([`Request::RecordFileHashes`]). True when the daemon took them, or will
-/// (no answer within [`HIT_STAMP_HANDOFF_WAIT`]: the request is in its
-/// socket). False when no daemon took them: none runs, or one that refused
-/// (an older release, another store, a full queue).
+/// ([`Request::RecordFileHashes`]), without waiting for its answer: a
+/// restore must not wait on a daemon busy with other work for rows that only
+/// save a later hash. True once the request is in the daemon's socket; a
+/// daemon that refuses it (an older release, another store, a full queue)
+/// drops the rows, which then cost only that later hash. False when no
+/// daemon runs or none could be reached.
 #[cfg(unix)]
 pub fn send_memo_rows(
     socket_path: &Path,
@@ -9045,17 +9047,7 @@ pub fn send_memo_rows(
             })
             .collect(),
     });
-    match send_request_with_timeout(socket_path, &req, HIT_STAMP_HANDOFF_WAIT) {
-        Ok(line) => serde_json::from_str::<Response>(&line).is_ok_and(|resp| resp.ok),
-        Err(error) => error.chain().any(|cause| {
-            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                matches!(
-                    io.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                )
-            })
-        }),
-    }
+    send_request_fire_and_forget(socket_path, &req).is_ok()
 }
 
 pub fn send_hash_files_request(
