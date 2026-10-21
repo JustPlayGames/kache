@@ -1486,6 +1486,7 @@ fn sample_build_event(
         store_error: String::new(),
         store_handed_off: false,
         daemon_store_ms: 0,
+        daemon_store_batch: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
         fallback: false,
