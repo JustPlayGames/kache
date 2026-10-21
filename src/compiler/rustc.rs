@@ -225,6 +225,16 @@ impl RustcCompiler {
         parsed: &RustcArgs,
         isolated_args: &[String],
     ) -> Result<CompileResult> {
+        self.execute_portable_incremental(parsed, isolated_args, None)
+    }
+
+    pub(crate) fn execute_portable_incremental(
+        &self,
+        parsed: &RustcArgs,
+        isolated_args: &[String],
+        on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<CompileResult> {
+        let mut stderr = std::io::stderr();
         self.execute_with_args(
             parsed,
             isolated_args,
@@ -233,8 +243,14 @@ impl RustcCompiler {
             },
             Some(true),
             LinkLane::Passthrough,
-            Some(&mut std::io::stderr()),
-            None,
+            // An injected bootstrap attempt may be retried with the caller's
+            // environment. Do not expose diagnostics from a discarded attempt.
+            if self.incremental_bootstrap {
+                None
+            } else {
+                Some(&mut stderr)
+            },
+            on_dep_info,
         )
     }
 
