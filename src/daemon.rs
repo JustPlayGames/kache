@@ -7392,18 +7392,13 @@ async fn server_main(
     hit_stamps_handle.abort();
     daemon.flush_hit_stamps();
 
-    // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
-    // then give the entire enqueue + worker drain one shared 30s budget. The
-    // enqueue task itself can block on a full worker channel during an outage,
-    // so awaiting it outside this deadline would make restart unbounded even
-    // though every queued job is already durable on disk.
-    daemon.close_upload_queue();
     // Accepted hand-offs hold their key locks. Let the worker finish them
     // for as long as it keeps making progress: a job it never reaches is an
-    // entry the next build compiles again.
+    // entry the next build compiles again. This runs before the upload queue
+    // closes, so an entry stored now is still uploaded by this daemon, as one
+    // the wrapper stored before the shutdown is.
     daemon.publish_queue().close();
     let publish_progress = daemon.publish_queue().progress();
-    drop(daemon);
     let unpublished = crate::daemon_publish::drain_publications(
         publish_done,
         &publish_progress,
@@ -7413,6 +7408,13 @@ async fn server_main(
     if let Some(warning) = publish_drain_warning(unpublished) {
         tracing::warn!("{warning}");
     }
+    // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
+    // then give the entire enqueue + worker drain one shared 30s budget. The
+    // enqueue task itself can block on a full worker channel during an outage,
+    // so awaiting it outside this deadline would make restart unbounded even
+    // though every queued job is already durable on disk.
+    daemon.close_upload_queue();
+    drop(daemon);
     if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
         tracing::warn!("upload drain timeout, aborting remaining upload tasks");
     }
