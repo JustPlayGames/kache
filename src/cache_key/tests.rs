@@ -17611,6 +17611,7 @@ fn scoped_guard_ignore_list_defaults_and_overrides() {
             ".agents",
             ".github",
             ".claude",
+            ".config",
             "AGENTS.md",
             "README.md",
             "Cargo.lock",

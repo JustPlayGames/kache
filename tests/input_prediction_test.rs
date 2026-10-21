@@ -2214,25 +2214,27 @@ fn scoped_a_listed_directory_changed_while_the_unit_builds_leaves_no_record() {
 /// A dot-directory or file at the workspace root is on the way up from the
 /// package (`.sqlx`, `.env`), so a change there refuses the record, except
 /// for the paths no build reads: by default `.agents`, `.github`, `.claude`,
-/// `AGENTS.md` and `README.md`; `KACHE_GUARD_IGNORE` replaces the list, and
-/// an empty one ignores nothing.
+/// `.config` (cargo-nextest's and other tools' settings), `AGENTS.md` and
+/// `README.md`; `KACHE_GUARD_IGNORE` replaces the list, and an empty one
+/// ignores nothing.
 #[test]
 fn scoped_a_root_change_refuses_the_record_unless_ignored() {
     build_kache();
-    // (KACHE_GUARD_IGNORE, does a change to .agents/ refuse, to AGENTS.md, to notes.txt)
-    let cases: [(Option<&str>, bool, bool, bool); 3] = [
-        (None, false, false, true),
-        (Some(""), true, true, true),
-        (Some(" .agents/ ; notes.txt"), false, true, false),
+    // (KACHE_GUARD_IGNORE, does a change to .agents/ refuse, to AGENTS.md, to notes.txt,
+    // to .config/nextest.toml)
+    let cases: [(Option<&str>, bool, bool, bool, bool); 3] = [
+        (None, false, false, true, false),
+        (Some(""), true, true, true, true),
+        (Some(" .agents/ ; notes.txt"), false, true, false, true),
     ];
-    for (ignore, agents, agents_md, notes) in cases {
+    for (ignore, agents, agents_md, notes, tool_config) in cases {
         let mut unit = WorkspaceUnit::new(false).scoped();
         if let Some(ignore) = ignore {
             unit = unit.with_env("KACHE_GUARD_IGNORE", ignore);
         }
         let a = unit.checkout("a");
         assert_eq!(unit.build(&a, true, None).result, "miss");
-        let changes: [(&dyn Fn(), bool, &str); 4] = [
+        let changes: [(&dyn Fn(), bool, &str); 5] = [
             (
                 &|| {
                     std::fs::create_dir_all(a.join(".agents")).unwrap();
@@ -2250,6 +2252,14 @@ fn scoped_a_root_change_refuses_the_record_unless_ignored() {
                 &|| std::fs::write(a.join("notes.txt"), "notes\n").unwrap(),
                 notes,
                 "notes.txt",
+            ),
+            (
+                &|| {
+                    std::fs::create_dir_all(a.join(".config")).unwrap();
+                    std::fs::write(a.join(".config/nextest.toml"), "[profile.default]\n").unwrap();
+                },
+                tool_config,
+                ".config",
             ),
             (
                 &|| {
