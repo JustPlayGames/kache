@@ -14892,3 +14892,166 @@ fn a_staged_put_whose_blobs_were_swept_registers_from_its_links() {
         hash
     );
 }
+
+/// Check a busy put's links as the daemon does before it batches them.
+#[cfg(unix)]
+fn check_staged_links(store: &Store, staged: &StagedPut, links: &[PathBuf]) -> CheckedHandoff {
+    store.check_staged_handed_off(
+        staged.cache_key(),
+        "staged",
+        &["lib".to_string()],
+        &[],
+        "x86_64-unknown-linux-gnu",
+        "dev",
+        links,
+        staged.files(),
+        staged.result(),
+        "",
+        "warning: kept\n",
+        3,
+        "unit-of-staged",
+    )
+}
+
+/// A busy put of `fill` bytes in a directory of its own under `dir`, with
+/// links to its blobs: what a wrapper hands the daemon.
+#[cfg(unix)]
+fn busy_put_handed_over(
+    store: &Store,
+    config: &Config,
+    dir: &Path,
+    key: &str,
+    fill: u8,
+) -> (Box<StagedPut>, Vec<PathBuf>, PathBuf) {
+    let own = dir.join(key);
+    fs::create_dir_all(&own).unwrap();
+    let files = [staged_put_output(&own, fill)];
+    let staged = put_while_the_index_is_busy(store, config, key, &files);
+    let links = link_staged_blobs(store, &staged, &own.join("handoff"));
+    (staged, links, files[0].0.clone())
+}
+
+/// Hand-offs checked while the index is busy wait for it together: a busy
+/// lock gives the whole batch back with nothing registered, and once it is
+/// free every entry registers in one go, each with its unit.
+#[cfg(unix)]
+#[test]
+fn handed_off_entries_register_together_once_the_index_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let handed: Vec<_> = (0..4)
+        .map(|index| {
+            busy_put_handed_over(
+                &store,
+                &config,
+                dir.path(),
+                &format!("batch_{index}"),
+                index,
+            )
+        })
+        .collect();
+    let daemon = Store::open(config.clone()).unwrap();
+    let batch: Vec<CheckedHandoff> = handed
+        .iter()
+        .map(|(staged, links, _)| check_staged_links(&daemon, staged, links))
+        .collect();
+    assert!(batch.iter().all(CheckedHandoff::is_ready));
+
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let BatchAttempt::Busy(batch) =
+        daemon.register_handed_off_batch(batch, Duration::from_millis(5))
+    else {
+        panic!("a busy index registers nothing");
+    };
+    assert_eq!(batch.len(), 4, "the whole batch comes back");
+    assert!(
+        handed
+            .iter()
+            .all(|(staged, _, _)| !store.contains(staged.cache_key()))
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+
+    let BatchAttempt::Registered(results) =
+        daemon.register_handed_off_batch(batch, Duration::from_millis(5))
+    else {
+        panic!("a free index registers the batch");
+    };
+    assert_eq!(results.len(), 4);
+    for ((staged, _, _), result) in handed.iter().zip(results) {
+        assert_eq!(result.unwrap(), staged.result());
+        let meta = store.get(staged.cache_key()).unwrap().expect("registered");
+        assert_eq!(meta.files, staged.files());
+    }
+    assert!(
+        store
+            .file_hash_cache()
+            .has_entry_for_unit("staged", "unit-of-staged")
+            .unwrap(),
+        "the unit is registered with the entry"
+    );
+}
+
+/// A blob changed in place after its compile returned costs the entries
+/// that name it, and only those: one whose check read the blob before the
+/// change is refused too, the blob is unlinked, and the rest of the batch
+/// registers.
+#[cfg(unix)]
+#[test]
+fn a_changed_blob_refuses_only_the_entries_of_a_batch_that_name_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let (changed, changed_links, output) =
+        busy_put_handed_over(&store, &config, dir.path(), "changed", 9);
+    // The same bytes: the same blob, checked before the writer got to it.
+    let (twin, twin_links, _) = busy_put_handed_over(&store, &config, dir.path(), "twin", 9);
+    let (other, other_links, _) = busy_put_handed_over(&store, &config, dir.path(), "other", 10);
+    let hash = changed.files()[0].hash.clone();
+    assert_eq!(twin.files()[0].hash, hash);
+    assert!(paths_share_inode(&output, &store.blob_path(&hash)));
+
+    let daemon = Store::open(config).unwrap();
+    let twin_checked = check_staged_links(&daemon, &twin, &twin_links);
+    assert!(twin_checked.is_ready());
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&output, vec![8u8; 100 << 10]).unwrap();
+    let changed_checked = check_staged_links(&daemon, &changed, &changed_links);
+    assert!(!changed_checked.is_ready());
+    let other_checked = check_staged_links(&daemon, &other, &other_links);
+
+    let BatchAttempt::Registered(results) = daemon.register_handed_off_batch(
+        vec![changed_checked, twin_checked, other_checked],
+        Duration::from_millis(5),
+    ) else {
+        panic!("a free index registers the batch");
+    };
+    let errors: Vec<String> = results
+        .iter()
+        .map(|result| {
+            result
+                .as_ref()
+                .err()
+                .map_or(String::new(), |error| format!("{error:#}"))
+        })
+        .collect();
+    assert!(
+        errors[0].contains("changed after the compile"),
+        "{errors:?}"
+    );
+    assert!(
+        errors[1].contains("changed after its compile"),
+        "{errors:?}"
+    );
+    assert!(errors[2].is_empty(), "{errors:?}");
+    assert!(store.get("changed").unwrap().is_none());
+    assert!(store.get("twin").unwrap().is_none());
+    assert!(store.get("other").unwrap().is_some());
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "the blob no longer holding its digest is gone"
+    );
+}
