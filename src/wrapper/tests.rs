@@ -12383,3 +12383,97 @@ fn an_output_is_kept_only_when_it_already_holds_the_entrys_bytes() {
     std::fs::hard_link(&blob, &output).unwrap();
     assert!(holds(hardlink), "the blob itself, linked here only");
 }
+
+/// A Cargo target directory `target_root_is_safe` accepts, under `workspace`.
+fn cargo_target_in(workspace: &Path) -> PathBuf {
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    target
+}
+
+/// A unit does not wait out the index's busy timeout to record its target
+/// root: with another connection holding the write lock it returns within a
+/// short bound, and the build's next unit records the root once the index
+/// lets it. Without the bound, a tenth of a 400-unit burst lost five seconds
+/// here.
+#[test]
+fn a_busy_index_does_not_hold_a_unit_for_its_target_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("ws");
+    let target = cargo_target_in(&workspace);
+
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
+    let waited = started.elapsed();
+    assert!(
+        waited < std::time::Duration::from_millis(100),
+        "the unit waited {waited:?} for its target root"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+
+    register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
+    let roots = store.tracked_target_roots(0).unwrap();
+    assert_eq!(roots.len(), 1, "the next unit records it");
+    assert_eq!(roots[0].path, std::path::absolute(&target).unwrap());
+    assert!(!roots[0].discovered);
+}
+
+/// A unit does not wait out the index's busy timeout to record its input
+/// prediction: the rows a busy index refuses are kept for the daemon, and
+/// written later they read back as the record the unit made.
+#[test]
+fn a_busy_index_keeps_prediction_rows_for_the_daemon_instead_of_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let closure = crate::cache_key::DepInfo {
+        source_files: vec![source],
+        env_deps: Vec::new(),
+    };
+    let hasher = store.file_hasher().with_input_predictions(true);
+
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    hasher.record_input_prediction("unit-a", Some("a"), &closure, None);
+    hasher.record_input_prediction("unit-b", Some("b"), &closure, None);
+    let waited = started.elapsed();
+    assert!(
+        waited < std::time::Duration::from_millis(100),
+        "the unit waited {waited:?} for its prediction rows"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+    assert!(hasher.input_prediction("unit-a").is_none());
+    let rows = hasher.take_busy_predictions();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.identity.as_str())
+            .collect::<Vec<_>>(),
+        ["unit-a", "unit-b"]
+    );
+
+    let daemon = crate::daemon::Daemon::new(config.clone());
+    let req = kache_protocol::RecordPredictionsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows,
+    };
+    assert!(daemon.handle_record_predictions(&req).ok);
+    daemon.flush_handed_rows();
+    assert_eq!(
+        hasher.input_prediction("unit-a").map(|row| row.sources),
+        Some(closure.source_files.clone())
+    );
+    assert!(hasher.input_prediction("unit-b").is_some());
+}

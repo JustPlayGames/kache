@@ -15516,3 +15516,215 @@ fn memo_rows_are_handed_off_without_waiting_for_the_answer() {
         "the restore waited {waited:?}"
     );
 }
+
+/// Target roots a wrapper handed over stay queued while the index refuses
+/// them, and are recorded once it lets them, as a build's own unit would.
+#[test]
+fn handed_target_roots_stay_queued_while_the_index_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let workspace = dir.path().join("ws");
+    let target = workspace.join("target");
+    fs::create_dir_all(target.join("debug")).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let req = RecordTargetRootsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        roots: vec![kache_protocol::TargetRootRow {
+            target: target.to_string_lossy().into_owned(),
+            workspace_root: workspace.to_string_lossy().into_owned(),
+            rustc: Some("rustc 1".into()),
+        }],
+    };
+    assert!(daemon.handle_record_target_roots(&req).ok);
+    let mut other = req.clone();
+    other.cache_dir = dir.path().join("elsewhere").to_string_lossy().into_owned();
+    assert!(!daemon.handle_record_target_roots(&other).ok);
+
+    daemon
+        .with_stamp_store(|store| {
+            store.set_busy_timeout_for_test(Duration::from_millis(0));
+            Ok(())
+        })
+        .unwrap();
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    daemon.flush_handed_rows();
+    assert_eq!(
+        daemon.pending_target_roots.lock().unwrap().len(),
+        1,
+        "refused, still queued"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+
+    daemon.flush_handed_rows();
+    assert!(daemon.pending_target_roots.lock().unwrap().is_empty());
+    let store = Store::open(&config).unwrap();
+    let roots = store.tracked_target_roots(0).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].path, std::path::absolute(&target).unwrap());
+    assert!(!roots[0].discovered);
+}
+
+/// A handed target root whose directory is gone by the time the daemon
+/// writes it is not recorded: the registry never names a directory that
+/// is not there.
+#[test]
+fn a_handed_target_root_gone_before_the_flush_is_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let workspace = dir.path().join("ws");
+    let target = workspace.join("target");
+    fs::create_dir_all(target.join("debug")).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let req = RecordTargetRootsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        roots: vec![kache_protocol::TargetRootRow {
+            target: target.to_string_lossy().into_owned(),
+            workspace_root: workspace.to_string_lossy().into_owned(),
+            rustc: None,
+        }],
+    };
+    assert!(daemon.handle_record_target_roots(&req).ok);
+    fs::remove_dir_all(&target).unwrap();
+    daemon.flush_handed_rows();
+    assert!(daemon.pending_target_roots.lock().unwrap().is_empty());
+    let store = Store::open(&config).unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+}
+
+/// Handed prediction rows: the latest row of an identity wins, a row of a
+/// unit's tree trims the unit's other trees as the wrapper's own write does,
+/// and a full queue refuses more.
+#[test]
+fn handed_prediction_rows_keep_the_latest_and_trim_like_the_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let row = |identity: &str, json: &str, keep: Option<u32>| kache_protocol::PredictionRow {
+        identity: identity.into(),
+        schema: 7,
+        crate_name: Some("c".into()),
+        json: json.into(),
+        keep_under: keep.map(|keep| ("unit/".to_string(), keep)),
+    };
+    let request = |rows| RecordPredictionsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows,
+    };
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![
+                row("plain", "old", None),
+                row("unit/a", "a", Some(1)),
+            ]))
+            .ok
+    );
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![row("plain", "new", None)]))
+            .ok
+    );
+    daemon.flush_handed_rows();
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![row("unit/b", "b", Some(1))]))
+            .ok
+    );
+    daemon.flush_handed_rows();
+    let store = Store::open(&config).unwrap();
+    let cache = store.file_hash_cache();
+    assert_eq!(
+        cache.get_input_prediction("plain").unwrap(),
+        Some((7, "new".to_string()))
+    );
+    assert_eq!(
+        cache.get_input_prediction("unit/b").unwrap(),
+        Some((7, "b".to_string()))
+    );
+    assert_eq!(
+        cache.get_input_prediction("unit/a").unwrap(),
+        None,
+        "kept one row of the unit"
+    );
+
+    let full = vec![row("plain", "x", None); MAX_PENDING_HANDED_ROWS + 1];
+    assert!(!daemon.handle_record_predictions(&request(full)).ok);
+}
+
+/// Target roots and prediction rows go to the daemon without waiting for
+/// its answer, however slowly it answers.
+#[cfg(unix)]
+#[test]
+fn handed_rows_are_sent_without_waiting_for_the_answer() {
+    use interprocess::local_socket::traits::ListenerExt as _;
+    use std::io::{BufRead, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    assert!(!send_target_root(
+        &dir.path().join("none.sock"),
+        &cache_dir,
+        kache_protocol::TargetRootRow {
+            target: "/t".into(),
+            workspace_root: "/".into(),
+            rustc: None,
+        }
+    ));
+    let serve = |expect: &'static str| {
+        let socket = fresh_endpoint(&dir.path().join("daemon.sock"));
+        let listener = bind_sync_listener(&socket);
+        let (received, got) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.incoming().next().unwrap().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .unwrap();
+            received.send(line).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = stream.write_all(b"{\"ok\":false}\n");
+        });
+        (socket, move || {
+            let line = got.recv().unwrap();
+            assert!(line.contains(expect), "{line}");
+            server.join().unwrap();
+        })
+    };
+    let (socket, check) = serve("record_target_roots");
+    let started = std::time::Instant::now();
+    assert!(send_target_root(
+        &socket,
+        &cache_dir,
+        kache_protocol::TargetRootRow {
+            target: "/t".into(),
+            workspace_root: "/".into(),
+            rustc: None,
+        }
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    check();
+    let (socket, check) = serve("record_predictions");
+    let started = std::time::Instant::now();
+    assert!(send_prediction_rows(
+        &socket,
+        &cache_dir,
+        vec![kache_protocol::PredictionRow {
+            identity: "i".into(),
+            schema: 1,
+            crate_name: None,
+            json: "{}".into(),
+            keep_under: None,
+        }]
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    check();
+}

@@ -115,6 +115,53 @@ pub struct RecordFileHashesRequest {
     pub rows: Vec<FileHashRow>,
 }
 
+/// Target roots a wrapper's index was too busy to record. The daemon records
+/// each in its own store when the index lets it, under the same checks as the
+/// wrapper (`Store::remember_target_root_built_by`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordTargetRootsRequest {
+    /// The cache directory of the store the rows belong to. The daemon
+    /// writes only to its own store and refuses any other.
+    pub cache_dir: String,
+    pub roots: Vec<TargetRootRow>,
+}
+
+/// A Cargo target directory a build wrote into, the workspace that owns it,
+/// and the `rustc -vV` that built there (`None` keeps the recorded one).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TargetRootRow {
+    pub target: String,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub rustc: Option<String>,
+}
+
+/// Input prediction rows a wrapper's index was too busy to take. The daemon
+/// writes them to its own store when the index lets it. A row only saves a
+/// later pre-pass, and every row is validated in full before it is used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordPredictionsRequest {
+    /// The cache directory of the store the rows belong to. The daemon
+    /// writes only to its own store and refuses any other.
+    pub cache_dir: String,
+    pub rows: Vec<PredictionRow>,
+}
+
+/// One `input_predictions` row as the wrapper would have written it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredictionRow {
+    pub identity: String,
+    pub schema: u32,
+    #[serde(default)]
+    pub crate_name: Option<String>,
+    pub json: String,
+    /// For one of a unit's rows per tree: the name every row of the unit
+    /// starts with, and how many of them stay
+    /// (`FileHashCache::put_input_prediction_keeping`).
+    #[serde(default)]
+    pub keep_under: Option<(String, u32)>,
+}
+
 /// `hash` is the content of the file at exactly this stamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileHashRow {
