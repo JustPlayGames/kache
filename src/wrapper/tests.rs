@@ -12383,3 +12383,48 @@ fn an_output_is_kept_only_when_it_already_holds_the_entrys_bytes() {
     std::fs::hard_link(&blob, &output).unwrap();
     assert!(holds(hardlink), "the blob itself, linked here only");
 }
+
+/// A Cargo target directory `target_root_is_safe` accepts, under `workspace`.
+fn cargo_target_in(workspace: &Path) -> PathBuf {
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    target
+}
+
+/// A unit does not wait out the index's busy timeout to record its target
+/// root: with another connection holding the write lock it returns within a
+/// short bound, and the build's next unit records the root once the index
+/// lets it. Without the bound, a tenth of a 400-unit burst lost five seconds
+/// here.
+#[test]
+fn a_busy_index_does_not_hold_a_unit_for_its_target_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("ws");
+    let target = cargo_target_in(&workspace);
+
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
+    let waited = started.elapsed();
+    assert!(
+        waited < std::time::Duration::from_millis(100),
+        "the unit waited {waited:?} for its target root"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+
+    register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
+    let roots = store.tracked_target_roots(0).unwrap();
+    assert_eq!(roots.len(), 1, "the next unit records it");
+    assert_eq!(roots[0].path, std::path::absolute(&target).unwrap());
+    assert!(!roots[0].discovered);
+}
+

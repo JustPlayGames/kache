@@ -4275,16 +4275,13 @@ fn run_parsed_rustc(
             workspace_root,
             crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)).as_deref(),
         )
-        && let Err(e) = store.remember_target_root_built_by(
+    {
+        register_target_root(
+            config,
+            &store,
             &target_dir,
             workspace_root,
             crate::cache_key::rustc_version_text(args.probed_rustc()).as_deref(),
-        )
-    {
-        tracing::warn!(
-            "failed to register target root {}: {}",
-            target_dir.display(),
-            e
         );
     }
     drop(trace_remember);
@@ -8438,6 +8435,58 @@ fn prepare_worktree_compiler_args(
     lease.worktree_compiler_args_from(args, &donors, true)
 }
 
+/// How long a unit waits for the index's write lock to record its target
+/// root ([`register_target_root`]).
+const TARGET_ROOT_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Record that a build wrote into `target`, owned by `workspace_root`, with
+/// at most [`TARGET_ROOT_WAIT`] for the index's write lock.
+///
+/// The row is bookkeeping (which target directories exist, for cleanup,
+/// worktree donors and seeding), and every unit of the build records it
+/// again until one finds it fresh. On a new target directory every unit of a
+/// burst finds no row; each one waiting out the busy timeout behind the
+/// misses' stores cost a tenth of a 400-unit burst five seconds. A busy index
+/// hands the row to the daemon, which records it once the index lets it;
+/// without a daemon the build's next unit records it. A late row cannot
+/// make cleanup remove anything: a target the registry does not know is one
+/// no rule touches.
+fn register_target_root(
+    config: &Config,
+    store: &Store,
+    target: &Path,
+    workspace_root: &Path,
+    rustc: Option<&str>,
+) {
+    let Err(error) =
+        store.remember_target_root_waiting(target, workspace_root, rustc, TARGET_ROOT_WAIT)
+    else {
+        return;
+    };
+    if !crate::store::is_sqlite_contention(&error) {
+        tracing::warn!(
+            "failed to register target root {}: {error}",
+            target.display()
+        );
+        return;
+    }
+    let handed = store.cache_dir() == config.cache_dir
+        && crate::daemon::send_target_root(
+            &config.socket_path(),
+            &config.cache_dir,
+            kache_protocol::TargetRootRow {
+                target: target.to_string_lossy().into_owned(),
+                workspace_root: workspace_root.to_string_lossy().into_owned(),
+                rustc: rustc.map(str::to_owned),
+            },
+        );
+    tracing::debug!(
+        handed,
+        "target root {} not recorded yet (index busy)",
+        target.display()
+    );
+}
+
 fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
     config.seed_incremental
         && args.inner_rustc.is_none()
@@ -8466,7 +8515,9 @@ fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> 
             crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)).as_deref(),
         )
     {
-        let _ = store.remember_target_root_built_by(
+        register_target_root(
+            config,
+            &store,
             &target,
             workspace,
             crate::cache_key::rustc_version_text(&args.rustc).as_deref(),
