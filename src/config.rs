@@ -489,6 +489,14 @@ pub struct Config {
     /// false` keeps every put in the wrapper. Without a reachable daemon the
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
+    /// Hand a finished rustc compile's store to the daemon the same way: the
+    /// wrapper snapshots the outputs (hardlinks, read back for their
+    /// digests) and returns to Cargo, and the daemon stores them, refusing
+    /// any output rewritten since. On by default on Unix;
+    /// `KACHE_DAEMON_PUBLISH_RUSTC=0` or `[cache] daemon_publish_rustc =
+    /// false` keeps every rustc store in the wrapper. Without a reachable
+    /// daemon, and on Windows, the wrapper stores on its own either way.
+    pub daemon_publish_rustc: bool,
     /// The project's `[cache] exclude` and `bypass_*` rule lists, read once
     /// with the rest of the file. Every wrapper invocation consults them
     /// before any key work; re-reading the file for each list cost a C
@@ -915,6 +923,8 @@ pub(crate) struct CacheFileConfig {
     pub(crate) deferred_durability: Option<bool>,
     /// Daemon hand-off toggle. See [`Config::daemon_publish`].
     pub(crate) daemon_publish: Option<bool>,
+    /// Rustc daemon hand-off toggle. See [`Config::daemon_publish_rustc`].
+    pub(crate) daemon_publish_rustc: Option<bool>,
     /// Opportunistic size-pressure GC toggle. See [`Config::auto_gc`].
     pub(crate) auto_gc: Option<bool>,
     /// Daemon index compaction toggle. See [`Config::index_auto_compact`].
@@ -1354,6 +1364,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SHARED_HARDLINK_RESTORES",
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
+    "KACHE_DAEMON_PUBLISH_RUSTC",
     "KACHE_OUT_DIR_ALIAS",
     "KACHE_DEFERRED_DURABILITY",
     "KACHE_AUTO_GC",
@@ -1462,6 +1473,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_OUT_DIR_ALIAS", "cache.out_dir_alias"),
     ("KACHE_DEFERRED_DURABILITY", "cache.deferred_durability"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
+    ("KACHE_DAEMON_PUBLISH_RUSTC", "cache.daemon_publish_rustc"),
     ("KACHE_AUTO_GC", "cache.auto_gc"),
     ("KACHE_INDEX_AUTO_COMPACT", "cache.index_auto_compact"),
     (
@@ -2072,6 +2084,7 @@ impl Config {
         let out_dir_alias = Self::out_dir_alias_enabled(&file_config);
         let deferred_durability = Self::deferred_durability_enabled(&file_config);
         let daemon_publish = Self::daemon_publish_enabled(&file_config);
+        let daemon_publish_rustc = Self::daemon_publish_rustc_enabled(&file_config);
         let project_rules = ProjectRules::from_file_config(&file_config);
         let auto_gc = Self::auto_gc_enabled(&file_config);
         let index_auto_compact = Self::index_auto_compact_enabled(&file_config);
@@ -2192,6 +2205,7 @@ impl Config {
             out_dir_alias,
             deferred_durability,
             daemon_publish,
+            daemon_publish_rustc,
             project_rules,
             auto_gc,
             index_auto_compact,
@@ -2763,6 +2777,19 @@ impl Config {
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.deferred_discovery)
+            .unwrap_or(true)
+    }
+
+    fn daemon_publish_rustc_enabled(file_config: &Result<FileConfig>) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored("KACHE_DAEMON_PUBLISH_RUSTC", ignore_env) {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.daemon_publish_rustc)
             .unwrap_or(true)
     }
 

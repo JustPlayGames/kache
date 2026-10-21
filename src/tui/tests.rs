@@ -119,6 +119,7 @@ fn test_config() -> Config {
         out_dir_alias: true,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
