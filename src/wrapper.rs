@@ -1034,6 +1034,10 @@ fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Ve
 /// the index's write lock to stamp its access time (`Store::get`). The
 /// daemon stamps only its own store (a volume shard's hits stamp the shard
 /// themselves), and with no daemon the hit stamps the index itself.
+///
+/// The memo rows a restore learns go the same way when the index is busy
+/// (`Store::record_restored_file_hashes`): the hit does not wait for them,
+/// and the daemon writes them once the index lets it.
 pub(crate) fn send_hit_stamps_to_daemon(config: &Config, store: &mut Store) {
     #[cfg(unix)]
     {
@@ -1041,6 +1045,11 @@ pub(crate) fn send_hit_stamps_to_daemon(config: &Config, store: &mut Store) {
         let cache_dir = config.cache_dir.clone();
         store.send_hit_stamps_to(Box::new(move |key| {
             crate::daemon::send_hit_stamp(&socket, &cache_dir, key)
+        }));
+        let socket = config.socket_path();
+        let cache_dir = config.cache_dir.clone();
+        store.send_busy_memo_rows_to(Box::new(move |rows| {
+            crate::daemon::send_memo_rows(&socket, &cache_dir, rows)
         }));
     }
     #[cfg(not(unix))]
@@ -7421,13 +7430,16 @@ fn try_rustc_remote_hit(
 ///
 /// Best-effort by construction — `record_verified_file_hash` drops files
 /// below the memo's size floor, which the hasher would not consult anyway.
-fn record_known_file_hashes(store: &Store, restored: &[(crate::cache_key::FileFingerprint, &str)]) {
+///
+/// `redated` are the check unit's outputs [`redate_check_outputs`] re-dated,
+/// written in the same transaction as the others.
+fn record_known_file_hashes(
+    store: &Store,
+    restored: &[(crate::cache_key::FileFingerprint, &str)],
+    redated: &[(crate::cache_key::FileFingerprint, &str)],
+) {
     let _trace = crate::phase_trace::phase("memo_restored");
-    let restored: Vec<_> = restored
-        .iter()
-        .map(|(fingerprint, hash)| (fingerprint.clone(), *hash))
-        .collect();
-    store.record_verified_file_hashes(&restored);
+    store.record_restored_file_hashes(restored, redated);
 }
 
 /// The time Cargo will set this unit's outputs' mtime to once the unit ends,
@@ -7498,16 +7510,22 @@ fn is_rmeta(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "rmeta")
 }
 
-/// For a check unit, re-date its restored `.rmeta` files as Cargo will and
-/// record their hashes under the re-date rule; returns the restores left for
-/// the ordinary rows.
+/// The restores of one hit, split by the rows they earn: re-dated outputs
+/// and the rest.
+type RestoreRows<'a> = (
+    Vec<(crate::cache_key::FileFingerprint, &'a str)>,
+    Vec<(crate::cache_key::FileFingerprint, &'a str)>,
+);
+
+/// For a check unit, re-date its restored `.rmeta` files as Cargo will;
+/// returns the restores left for the ordinary rows, then the re-dated ones,
+/// for the re-date rule.
 fn redate_check_outputs<'a>(
-    store: &Store,
     args: &RustcArgs,
     restored: Vec<(crate::cache_key::FileFingerprint, &'a str)>,
-) -> Vec<(crate::cache_key::FileFingerprint, &'a str)> {
+) -> RestoreRows<'a> {
     let Some(invoked) = cargo_check_redate_ns(args) else {
-        return restored;
+        return (restored, Vec::new());
     };
     let mut redated = Vec::new();
     let mut rest = Vec::with_capacity(restored.len());
@@ -7521,8 +7539,7 @@ fn redate_check_outputs<'a>(
             None => rest.push((fingerprint, hash)),
         }
     }
-    store.record_redated_file_hashes(&redated);
-    rest
+    (rest, redated)
 }
 
 /// [`redate_check_outputs`] for a check unit's freshly stored `.rmeta`
@@ -8030,8 +8047,8 @@ fn restore_from_cache_with_memo_store(
         restored_paths.push((cached_file.name.clone(), target_path));
     }
 
-    let exact_restores = redate_check_outputs(memo_store, args, exact_restores);
-    record_known_file_hashes(memo_store, &exact_restores);
+    let (exact_restores, redated) = redate_check_outputs(args, exact_restores);
+    record_known_file_hashes(memo_store, &exact_restores, &redated);
 
     maybe_verify_restored_hit(compiler, args, &restored_paths);
 
