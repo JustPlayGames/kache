@@ -3608,8 +3608,9 @@ impl Daemon {
     /// one transaction on the stamp connection. A target root is recorded
     /// under the wrapper's own checks, read again now: a directory gone or
     /// replaced since is skipped or recorded as it is now, as a later unit
-    /// of its build would. A batch the index refused stays for the next call,
-    /// unless newer rows for the same target or identity arrived meanwhile.
+    /// of its build would. A batch the busy index refused stays for the next
+    /// call, unless newer rows for the same target or identity arrived
+    /// meanwhile; one a store refuses otherwise (read-only) is dropped.
     pub(crate) fn flush_handed_rows(&self) {
         let roots = self
             .pending_target_roots
@@ -3675,6 +3676,9 @@ impl Daemon {
                 predictions = predictions.len(),
                 "handed rows written"
             ),
+            Err(error) if !crate::store::is_sqlite_contention(&error) => {
+                tracing::debug!("handed rows dropped: {error:#}");
+            }
             Err(error) => {
                 tracing::debug!("handed rows not written yet: {error:#}");
                 if let Ok(mut pending) = self.pending_target_roots.lock() {
