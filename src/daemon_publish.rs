@@ -545,8 +545,31 @@ pub(crate) fn run_publish_worker(
             return;
         }
     };
-    while let Some(job) = rx.blocking_recv() {
-        publish_one(&daemon, &config, &store, job);
+    let mut next = None;
+    loop {
+        let job = match next.take() {
+            Some(job) => job,
+            None => match rx.blocking_recv() {
+                Some(job) => job,
+                None => break,
+            },
+        };
+        if job.is_staged() {
+            next = publish_staged_batch(&daemon, &config, &store, &mut rx, job);
+        } else {
+            publish_one(&daemon, &config, &store, job);
+        }
+    }
+}
+
+impl PublishJob {
+    /// A rustc entry the wrapper staged itself, registered in batches
+    /// ([`publish_staged_batch`]).
+    fn is_staged(&self) -> bool {
+        self.request
+            .rustc
+            .as_ref()
+            .is_some_and(|rustc| rustc.staged.is_some())
     }
 }
 
@@ -554,16 +577,196 @@ pub(crate) fn run_publish_worker(
 /// held. Every failure is recorded on the event; none of them can reach a
 /// build.
 fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: PublishJob) {
-    let PublishJob { request, _lock } = job;
     let store_started = std::time::Instant::now();
+    let bytes_before = StoreBytes::snapshot();
+    let put = put_job(store, &job.request);
+    // As after a wrapper's put: a size check after a stored entry, recovery
+    // after one refused for lack of space.
+    crate::wrapper::after_store(config, store, put.as_ref().err());
+    let published = record_put(
+        daemon,
+        config,
+        store,
+        job,
+        put,
+        &bytes_before,
+        store_started,
+        false,
+    );
+    // The put has its own copy (staged then published); the snapshots are
+    // done. Drop the lock only after the files are gone: a peer that takes
+    // the key next must find a committed entry, and nothing of ours left.
+    discard_handoff_files(&published.job.request);
+    // After the snapshots are gone: removing a link changes the inode's
+    // ctime, which a memo row recorded before would no longer match.
+    if published.stored
+        && let Some(rustc) = &published.job.request.rustc
+    {
+        seed_rustc_outputs(store, rustc);
+    }
+    release(daemon, config, published);
+}
+
+/// Most staged rustc entries the publish worker registers in one
+/// transaction: everything the queue can hold.
+pub(crate) const PUBLISH_BATCH_MAX: usize = PUBLISH_QUEUE_CAPACITY;
+
+/// How long one attempt at the index's write lock waits before the worker
+/// takes in the hand-offs that queued meanwhile and asks again.
+const BATCH_LOCK_POLL: Duration = Duration::from_millis(20);
+
+/// How long a batch waits for the index's write lock in all before its
+/// entries fail: a put's wait (four busy timeouts of 5 s).
+const BATCH_LOCK_PATIENCE: Duration = Duration::from_secs(20);
+
+/// Register `first` and every staged rustc entry queued behind it in one
+/// transaction, log their events and release what the jobs held. Returns a
+/// job of another kind it took from the queue, for the caller to publish
+/// next.
+///
+/// Each entry is checked against its links as it is taken in, outside any
+/// lock. Then the worker asks for the index's write lock in short waits,
+/// taking in what queued between them (up to [`PUBLISH_BATCH_MAX`]), so a
+/// burst of hand-offs on a busy index takes the lock once when it frees,
+/// not once per entry. An entry whose check or registration fails costs
+/// only itself ([`Store::register_handed_off_batch`]).
+fn publish_staged_batch(
+    daemon: &Arc<Daemon>,
+    config: &Config,
+    store: &Store,
+    rx: &mut tokio::sync::mpsc::Receiver<PublishJob>,
+    first: PublishJob,
+) -> Option<PublishJob> {
+    let started = std::time::Instant::now();
+    let mut jobs = Vec::new();
+    let mut batch = Vec::new();
+    let mut held_back = None;
+    take_staged(store, first, &mut jobs, &mut batch);
+    let results = loop {
+        while held_back.is_none() && jobs.len() < PUBLISH_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(job) if job.is_staged() => take_staged(store, job, &mut jobs, &mut batch),
+                Ok(job) => held_back = Some(job),
+                Err(_) => break,
+            }
+        }
+        match store.register_handed_off_batch(batch, BATCH_LOCK_POLL) {
+            crate::store::BatchAttempt::Registered(results) => break results,
+            crate::store::BatchAttempt::Busy(back) if started.elapsed() < BATCH_LOCK_PATIENCE => {
+                batch = back;
+            }
+            crate::store::BatchAttempt::Busy(back) => {
+                break back
+                    .iter()
+                    .map(|_| {
+                        Err(anyhow::anyhow!(
+                            "the index stayed busy for {BATCH_LOCK_PATIENCE:?}"
+                        ))
+                    })
+                    .collect();
+            }
+        }
+    };
+    let registered = results.iter().filter(|result| result.is_ok()).count();
+    if registered > 0 {
+        crate::wrapper::after_store(config, store, None);
+    }
+    if let Some(error) = results.iter().find_map(|result| result.as_ref().err()) {
+        crate::wrapper::after_store(config, store, Some(error));
+    }
+    // The wrapper moved the entries' bytes and its events count them.
+    let no_bytes = StoreBytes::snapshot();
+    let published: Vec<Published> = jobs
+        .into_iter()
+        .zip(results)
+        .map(|((job, taken), put)| {
+            let mut published = record_put(daemon, config, store, job, put, &no_bytes, taken, true);
+            if published.stored && registered > 1 {
+                published.event.daemon_store_batch = registered as u32;
+            }
+            published
+        })
+        .collect();
+    // As after a single put: the links go before the memo rows and the key
+    // locks.
+    for published in &published {
+        discard_handoff_files(&published.job.request);
+    }
+    let rows: Vec<crate::store::MemoRow> = published
+        .iter()
+        .filter(|published| published.stored)
+        .filter_map(|published| published.job.request.rustc.as_ref())
+        .flat_map(|rustc| &rustc.outputs)
+        .filter_map(|output| {
+            let path = output.output.as_ref()?;
+            store.shared_output_memo_row(Path::new(path), &output.hash, output.redated)
+        })
+        .collect();
+    // One short write for the whole batch; a busy index leaves the rows to
+    // the daemon's next flush rather than holding the keys for them.
+    if !rows.is_empty()
+        && let Err(error) = store.write_handed_memo_rows(&rows)
+    {
+        tracing::debug!(rows = rows.len(), "memo rows of a batch deferred: {error}");
+        daemon.defer_memo_rows(rows);
+    }
+    for published in published {
+        release(daemon, config, published);
+    }
+    held_back
+}
+
+/// Check a staged job's links and add it to the batch.
+fn take_staged(
+    store: &Store,
+    job: PublishJob,
+    jobs: &mut Vec<(PublishJob, std::time::Instant)>,
+    batch: &mut Vec<crate::store::CheckedHandoff>,
+) {
+    let taken = std::time::Instant::now();
+    let request = &job.request;
+    let checked = match &request.rustc {
+        Some(
+            rustc @ RustcPublish {
+                staged: Some(staged),
+                ..
+            },
+        ) => {
+            let links: Vec<PathBuf> = request
+                .files
+                .iter()
+                .map(|f| PathBuf::from(&f.path))
+                .collect();
+            store.check_staged_handed_off(
+                &request.cache_key,
+                &request.crate_name,
+                &rustc.crate_types,
+                &rustc.features,
+                &request.target,
+                &rustc.profile,
+                &links,
+                &staged.files,
+                staged.result(),
+                &request.stdout,
+                &request.stderr,
+                request.compile_time_ms,
+                rustc.unit.as_deref().unwrap_or_default(),
+            )
+        }
+        _ => unreachable!("only staged rustc jobs are batched"),
+    };
+    batch.push(checked);
+    jobs.push((job, taken));
+}
+
+/// The store a job asks for, as one put.
+fn put_job(store: &Store, request: &PublishCcRequest) -> Result<crate::store::StorePutResult> {
     let files: Vec<(PathBuf, String)> = request
         .files
         .iter()
         .map(|file| (PathBuf::from(&file.path), file.store_name.clone()))
         .collect();
-    let bytes_before = StoreBytes::snapshot();
-    let mut event = request.event.clone();
-    let put = match &request.rustc {
+    match &request.rustc {
         Some(
             rustc @ RustcPublish {
                 staged: Some(staged),
@@ -614,10 +817,34 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             &request.stderr,
             request.compile_time_ms,
         ),
-    };
-    // As after a wrapper's put: a size check after a stored entry, recovery
-    // after one refused for lack of space.
-    crate::wrapper::after_store(config, store, put.as_ref().err());
+    }
+}
+
+/// A job whose put is done, with its event filled in; its files and key
+/// lock still held.
+struct Published {
+    job: PublishJob,
+    event: BuildEvent,
+    stored: bool,
+}
+
+/// Fill in a job's event from its put and do what follows a stored entry
+/// (the cc memo, the unit and prestage records, the upload). `bytes_before`
+/// is the thread's byte counters before the put; `started`, when the worker
+/// took the job; `unit_registered`, whether the put registered the unit.
+#[allow(clippy::too_many_arguments)]
+fn record_put(
+    daemon: &Arc<Daemon>,
+    config: &Config,
+    store: &Store,
+    job: PublishJob,
+    put: Result<crate::store::StorePutResult>,
+    bytes_before: &StoreBytes,
+    started: std::time::Instant,
+    unit_registered: bool,
+) -> Published {
+    let request = &job.request;
+    let mut event = request.event.clone();
     let stored = put.is_ok();
     match put {
         Ok(put) => {
@@ -631,11 +858,7 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             event.store_new_blobs = put.new_blobs;
             // A staged entry's bytes were moved by the wrapper, whose event
             // already counts them.
-            if !request
-                .rustc
-                .as_ref()
-                .is_some_and(|rustc| rustc.staged.is_some())
-            {
+            if !job.is_staged() {
                 bytes_before.charge(&mut event);
             }
             if let Some(memo) = &request.memo
@@ -648,10 +871,10 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
                 tracing::debug!("daemon could not record the cc memo: {error}");
             }
             if let Some(rustc) = &request.rustc {
-                finish_rustc_store(config, store, &request.cache_key, rustc);
+                finish_rustc_store(config, store, &request.cache_key, rustc, unit_registered);
             }
             if request.publishes_to_remote && config.remote.is_some() {
-                enqueue_upload(daemon, config, &request);
+                enqueue_upload(daemon, config, request);
             }
         }
         Err(error) => {
@@ -670,27 +893,32 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
     }
     // This work overlaps later compiles. Keep it out of the wrapper's
     // synchronous store phase and report it separately.
-    event.daemon_store_ms = store_started.elapsed().as_millis() as u64;
+    event.daemon_store_ms = started.elapsed().as_millis() as u64;
     event.store_handed_off = true;
-    // The put has its own copy (staged then published); the snapshots are
-    // done. Drop the lock only after the files are gone: a peer that takes
-    // the key next must find a committed entry, and nothing of ours left.
-    discard_handoff_files(&request);
-    // After the snapshots are gone: removing a link changes the inode's
-    // ctime, which a memo row recorded before would no longer match.
-    if stored && let Some(rustc) = &request.rustc {
-        seed_rustc_outputs(store, rustc);
-    }
-    crate::wrapper::write_event(config, &event);
-    drop(_lock);
+    Published { job, event, stored }
+}
+
+/// Log a published job's event and let go of its key, once its files are
+/// gone.
+fn release(daemon: &Arc<Daemon>, config: &Config, published: Published) {
+    crate::wrapper::write_event(config, &published.event);
+    drop(published.job);
     daemon.publish_queue().progress.finished();
 }
 
 /// What a wrapper does after a synchronous rustc put, for a stored
-/// hand-off: the entry's unit and the prestage records. The outputs' memo
-/// rows follow once the snapshots are gone ([`seed_rustc_outputs`]).
-fn finish_rustc_store(config: &Config, store: &Store, cache_key: &str, rustc: &RustcPublish) {
-    if let Some(unit) = &rustc.unit
+/// hand-off: the entry's unit, unless its registration wrote it, and the
+/// prestage records. The outputs' memo rows follow once the snapshots are
+/// gone ([`seed_rustc_outputs`]).
+fn finish_rustc_store(
+    config: &Config,
+    store: &Store,
+    cache_key: &str,
+    rustc: &RustcPublish,
+    unit_registered: bool,
+) {
+    if !unit_registered
+        && let Some(unit) = &rustc.unit
         && let Err(error) = store.record_entry_unit(cache_key, unit)
     {
         tracing::debug!("recording the unit of {cache_key} failed: {error}");
