@@ -4852,6 +4852,66 @@ fn handle_hash_files_remembers_a_hash_only_if_its_stamp_had_settled() {
     ));
 }
 
+/// Cargo's re-date of a check output kache restored moves only its ctime,
+/// so the stamp the next units ask about has not settled. The bytes read
+/// for the first of them match the re-dated row, which lets the daemon
+/// remember the hash for that stamp: the others asking at once are served
+/// from memory instead of each reading the file before the row lands.
+/// Other bytes under the same stamp are not remembered.
+#[cfg(unix)]
+#[test]
+fn handle_hash_files_remembers_a_redated_output_it_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let redate = |file: &Path| {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(file).unwrap());
+        filetime::set_file_mtime(file, mtime).unwrap();
+    };
+    let ask_twice = |file: &Path| {
+        let (req, settles_at) = hash_files_request(file);
+        let results: Vec<_> = (0..2)
+            .map(|_| {
+                let resp = daemon.handle_hash_files_at(&req, || settles_at - 1);
+                resp.hash_results.unwrap().remove(0)
+            })
+            .collect();
+        (results[0].clone(), results[1].clone())
+    };
+
+    let file = dir.path().join("libdep.rmeta");
+    std::fs::write(&file, vec![3u8; 70 * 1024]).unwrap();
+    let recorded = crate::cache_key::FileFingerprint::from_path(&file).unwrap();
+    let hash = crate::cache_key::hash_file(&file).unwrap();
+    crate::store::Store::open(&config)
+        .unwrap()
+        .record_redated_file_hashes(&[(recorded, hash.as_str())]);
+    redate(&file);
+    let (first, second) = ask_twice(&file);
+    assert_eq!(first.hash.as_deref(), Some(hash.as_str()));
+    assert!(!first.cache_hit && first.bytes_hashed > 0);
+    assert!(second.cache_hit, "the re-dated stamp is remembered");
+    assert_eq!(second.bytes_hashed, 0);
+
+    // Same size and mtime, other bytes: the row does not vouch for them.
+    let other = dir.path().join("libother.rmeta");
+    std::fs::write(&other, vec![4u8; 70 * 1024]).unwrap();
+    let recorded = crate::cache_key::FileFingerprint::from_path(&other).unwrap();
+    crate::store::Store::open(&config)
+        .unwrap()
+        .record_redated_file_hashes(&[(recorded, hash.as_str())]);
+    redate(&other);
+    let (first, second) = ask_twice(&other);
+    assert_ne!(first.hash.as_deref(), Some(hash.as_str()));
+    assert!(
+        !second.cache_hit,
+        "bytes the row does not describe are not kept"
+    );
+    assert!(second.bytes_hashed > 0);
+}
+
 /// #281: the lock-narrowed HashFiles path (cache lookup on the hash store,
 /// blake3 outside its lock, the row written by the flush) must preserve the
 /// PERSISTENT cache. A second daemon with a fresh in-memory cache but the
