@@ -474,13 +474,35 @@ impl<'db> FileHashCache<'db> {
         prediction_json: &str,
         keep: usize,
     ) -> rusqlite::Result<()> {
-        debug_assert!(identity.starts_with(prefix) && identity.len() > prefix.len());
         // One write transaction for the row and the trim, not two: each
         // takes the index's write lock, which a burst of stores queues on.
         let tx = rusqlite::Transaction::new_unchecked(
             self.db(),
             rusqlite::TransactionBehavior::Immediate,
         )?;
+        self.put_input_prediction_trimming(
+            prefix,
+            identity,
+            schema,
+            crate_name,
+            prediction_json,
+            keep,
+        )?;
+        tx.commit()
+    }
+
+    /// [`Self::put_input_prediction_keeping`] inside a write transaction the
+    /// caller holds: the daemon writes a batch of handed rows in one.
+    pub fn put_input_prediction_trimming(
+        &self,
+        prefix: &str,
+        identity: &str,
+        schema: u32,
+        crate_name: Option<&str>,
+        prediction_json: &str,
+        keep: usize,
+    ) -> rusqlite::Result<()> {
+        debug_assert!(identity.starts_with(prefix) && identity.len() > prefix.len());
         self.put_input_prediction(identity, schema, crate_name, prediction_json)?;
         // Every name longer than `prefix` that starts with it sorts after it
         // and before `prefix` + U+10FFFF, so the primary key serves the range.
@@ -499,7 +521,7 @@ impl<'db> FileHashCache<'db> {
                 i64::try_from(keep).unwrap_or(i64::MAX)
             ],
         )?;
-        tx.commit()
+        Ok(())
     }
 
     /// The names of the rows named `prefix` and something after it, most
