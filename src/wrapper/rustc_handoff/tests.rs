@@ -152,9 +152,252 @@ impl Drop for PendingDaemon {
     }
 }
 
-async fn hand_off_now(compiled: &Compiled) -> (CcHandoffOutcome, Option<KeyLock>) {
-    // The wrapper is a blocking process; the daemon answers on this runtime's
-    // other workers meanwhile.
+fn handoff_requests(config: &Config) -> usize {
+    std::fs::read_dir(crate::daemon_publish::handoff_dir(config)).map_or(0, Iterator::count)
+}
+
+/// How long the tests below hold the index's write lock: long enough that a
+/// wrapper that waited for it could not be done before it is let go, and
+/// that a loaded test machine still reaches the registration while it is
+/// held.
+const BUSY: Duration = Duration::from_secs(3);
+
+/// An output rewritten in place after the wrapper returned, its read-only
+/// bit ignored (the staged blob shares its inode), is never stored under the
+/// compile's key: the daemon finds other bytes than the wrapper hashed and
+/// commits nothing, the blob that no longer holds its digest is gone, and
+/// the key is free again for the next build to compile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_output_rewritten_after_the_wrapper_returned_is_not_stored() {
+    use std::os::unix::fs::PermissionsExt;
+    let compiled = compiled("rewritten-after-return");
+    let mut daemon = PendingDaemon::listen(&compiled.config);
+    let compiled_hash = crate::cache_key::hash_file(&compiled.rlib).unwrap();
+
+    let (outcome, _, _) = store_now(&compiled, Some(BUSY)).await;
+    assert!(matches!(outcome, RustcStore::HandedOff));
+    std::fs::set_permissions(&compiled.rlib, std::fs::Permissions::from_mode(0o644)).unwrap();
+    {
+        use std::io::{Seek, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&compiled.rlib)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(1000)).unwrap();
+        file.write_all(b"post-processed").unwrap();
+    }
+    let rewritten = crate::cache_key::hash_file(&compiled.rlib).unwrap();
+
+    daemon.publish_all().await;
+
+    let store = Store::open(&compiled.config).unwrap();
+    assert!(store.get(&compiled.key).unwrap().is_none(), "no entry");
+    assert!(
+        !store.blob_path(&rewritten).exists(),
+        "no blob of the new bytes"
+    );
+    assert!(
+        !store.blob_path(&compiled_hash).exists(),
+        "no blob under the compiled digest holding other bytes"
+    );
+    assert!(matches!(
+        store.claim_build(&compiled.key).unwrap(),
+        BuildClaim::Acquired(_)
+    ));
+    let events = crate::events::read_events(&compiled.config.event_log_path()).unwrap();
+    assert!(
+        events[0].store_error.contains("changed after the compile"),
+        "{}",
+        events[0].store_error
+    );
+    assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
+}
+
+/// An output replaced by a new file after the wrapper returned does not
+/// touch the staged blob's inode: the entry is what the compiler wrote, and
+/// the new file gets no memo row under the stored digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_output_replaced_after_the_wrapper_returned_keeps_the_compiled_bytes() {
+    let compiled = compiled("replaced-after-return");
+    let mut daemon = PendingDaemon::listen(&compiled.config);
+    let written = std::fs::read(&compiled.rlib).unwrap();
+
+    let (outcome, _, _) = store_now(&compiled, Some(BUSY)).await;
+    assert!(matches!(outcome, RustcStore::HandedOff));
+    let replacement = compiled.rlib.with_extension("new");
+    std::fs::write(&replacement, vec![b'n'; 96 << 10]).unwrap();
+    std::fs::rename(&replacement, &compiled.rlib).unwrap();
+
+    daemon.publish_all().await;
+
+    let store = Store::open(&compiled.config).unwrap();
+    let meta = store.get(&compiled.key).unwrap().expect("committed");
+    assert_eq!(
+        std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+        written
+    );
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&compiled.rlib),
+        crate::cache_key::FileHashLookup::NeedsHash(_)
+    ));
+}
+
+/// Without a daemon the wrapper stores the compile itself: the hand-off is
+/// not wanted, and offering it anyway on a busy index gives the key back,
+/// leaves no link behind, and registers the entry here once the index lets
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_daemon_the_wrapper_stores_itself() {
+    let compiled = compiled("no-daemon");
+    let store = Store::open(&compiled.config).unwrap();
+    assert!(!wanted(&compiled.config, &store));
+
+    let (outcome, lock, _) = store_now(&compiled, Some(BUSY)).await;
+    assert!(matches!(outcome, RustcStore::Stored(Ok(_))));
+    assert!(lock.is_some(), "the wrapper stores under its own lock");
+    assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
+    assert!(store.get(&compiled.key).unwrap().is_some());
+}
+
+/// A daemon from before rustc hand-offs answers the unknown request with an
+/// error; the wrapper then registers the entry itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_daemon_leaves_the_store_to_the_wrapper() {
+    let compiled = compiled("older-daemon");
+    let older = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let server = {
+        use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
+        let socket = compiled.config.socket_path();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&socket).unwrap())
+            .create_tokio()
+            .unwrap();
+        let older = Arc::clone(&older);
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            while let Ok(stream) = listener.accept().await {
+                let (read, mut write) = stream.split();
+                let mut line = String::new();
+                let _ = tokio::io::BufReader::new(read).read_line(&mut line).await;
+                older.lock().unwrap().push(line.clone());
+                // What an older daemon says to a variant it does not know.
+                let _ = write
+                    .write_all(b"{\"ok\":false,\"error\":\"invalid request: unknown variant\"}\n")
+                    .await;
+            }
+        })
+    };
+
+    let (outcome, lock, _) = store_now(&compiled, Some(BUSY)).await;
+    server.abort();
+    assert!(matches!(outcome, RustcStore::Stored(Ok(_))));
+    assert!(lock.is_some());
+    let requests = older.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|line| line.contains("\"publish_rustc\"")),
+        "{requests:?}"
+    );
+    assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
+    let store = Store::open(&compiled.config).unwrap();
+    assert!(store.get(&compiled.key).unwrap().is_some());
+}
+
+/// A daemon that dies with a rustc store queued commits nothing: dropping
+/// the job releases the key, no entry appears, the request directory it left
+/// is reclaimed by the handoff sweep, as is one a wrapper left when it died
+/// between linking and handing off, and the staged blobs are orphans the
+/// orphan sweep reclaims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_dies_mid_store_leaves_no_entry_and_its_staging_is_swept() {
+    let compiled = compiled("daemon-dies");
+    let mut daemon = PendingDaemon::listen(&compiled.config);
+    let hash = crate::cache_key::hash_file(&compiled.rlib).unwrap();
+
+    let (outcome, _, _) = store_now(&compiled, Some(BUSY)).await;
+    assert!(matches!(outcome, RustcStore::HandedOff));
+    // The daemon goes away with the job queued: the job, its key lock and
+    // its queue are dropped without a put.
+    let rx = daemon.rx.take().unwrap();
+    drop(rx);
+    drop(daemon);
+    let store = Store::open(&compiled.config).unwrap();
+    // A wrapper that died after linking its blobs, before the hand-off.
+    let orphan = crate::daemon_publish::snapshot_staged_blobs(
+        &compiled.config,
+        &[(store.blob_path(&hash), compiled.files[0].1.clone())],
+    )
+    .unwrap();
+    assert!(handoff_requests(&compiled.config) >= 1);
+
+    assert!(
+        store.get(&compiled.key).unwrap().is_none(),
+        "nothing committed"
+    );
+    assert!(
+        matches!(
+            store.claim_build(&compiled.key).unwrap(),
+            BuildClaim::Acquired(_)
+        ),
+        "the key is free for the next build"
+    );
+    let swept = crate::daemon_publish::sweep_orphaned_handoffs(&compiled.config, Duration::ZERO);
+    assert!(swept.removed >= 1);
+    assert_eq!(
+        handoff_requests(&compiled.config),
+        0,
+        "every request directory is gone"
+    );
+    assert!(!Path::new(&orphan[0].path).exists());
+    assert_eq!(store.sweep_orphan_blobs(Duration::ZERO).unwrap().removed, 1);
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "the staged blob is reclaimed"
+    );
+    assert_eq!(
+        std::fs::read(&compiled.rlib).unwrap(),
+        vec![b'r'; 96 << 10],
+        "the sweeps never touch the output the blob linked"
+    );
+}
+
+/// Hold the index's write lock from another connection for `hold`, as a
+/// burst of stores or a sweep does. The flag is set just before it lets go.
+fn hold_index_lock(
+    config: &Config,
+    hold: Duration,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    drop(Store::open(config).unwrap());
+    let index = config.cache_dir.join("index.db");
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (ready, held) = std::sync::mpsc::channel();
+    let thread = {
+        let released = Arc::clone(&released);
+        std::thread::spawn(move || {
+            let writer = rusqlite::Connection::open(index).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready.send(()).unwrap();
+            std::thread::sleep(hold);
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
+            writer.execute_batch("ROLLBACK").unwrap();
+        })
+    };
+    held.recv().unwrap();
+    (released, thread)
+}
+
+/// Store a compile as the wrapper does after a miss, with the index's write
+/// lock held elsewhere for `busy` when given. Also says whether the wrapper
+/// was done while that lock was still held.
+async fn store_now(
+    compiled: &Compiled,
+    busy: Option<Duration>,
+) -> (RustcStore, Option<KeyLock>, bool) {
     tokio::task::block_in_place(|| {
         let store = Store::open(&compiled.config).unwrap();
         let compiler = RustcCompiler::new();
@@ -162,35 +405,73 @@ async fn hand_off_now(compiled: &Compiled) -> (CcHandoffOutcome, Option<KeyLock>
             BuildClaim::Acquired(lock) => Some(lock),
             _ => panic!("a fresh key"),
         };
-        // A loaded test machine can take longer than the production budget
-        // to answer; what these tests pin is what happens once it has.
-        let outcome = hand_off_within(
+        let held = busy.map(|hold| hold_index_lock(&compiled.config, hold));
+        let outcome = store_within(
             &compiled.config,
             &store,
             &mut lock,
             handoff(compiled, &compiler, std::time::Instant::now()),
             Duration::from_secs(10),
+            true,
         );
-        (outcome, lock)
+        let while_held = held.is_some_and(|(released, thread)| {
+            let while_held = !released.load(std::sync::atomic::Ordering::SeqCst);
+            thread.join().unwrap();
+            while_held
+        });
+        (outcome, lock, while_held)
     })
 }
 
-fn handoff_requests(config: &Config) -> usize {
-    std::fs::read_dir(crate::daemon_publish::handoff_dir(config)).map_or(0, Iterator::count)
+/// With a daemon running and the index free, a miss stores as it always
+/// did: before the wrapper returns, under its own key lock, with nothing
+/// handed to the daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_a_free_index_the_miss_is_stored_before_the_wrapper_returns() {
+    let compiled = compiled("free-index");
+    let daemon = PendingDaemon::listen(&compiled.config);
+    let written = std::fs::read(&compiled.rlib).unwrap();
+
+    let (outcome, lock, _) = store_now(&compiled, None).await;
+    assert!(
+        matches!(outcome, RustcStore::Stored(Ok(_))),
+        "stored by the wrapper, not handed off"
+    );
+    assert!(lock.is_some(), "the wrapper kept its key lock");
+    let store = Store::open(&compiled.config).unwrap();
+    let meta = store
+        .get(&compiled.key)
+        .unwrap()
+        .expect("visible when the wrapper returns");
+    assert_eq!(
+        std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+        written
+    );
+    assert_eq!(daemon.daemon.publish_queue().progress().pending(), 0);
+    assert_eq!(
+        handoff_requests(&compiled.config),
+        0,
+        "no snapshot was taken"
+    );
 }
 
-/// The wrapper is done once the daemon accepted: nothing is committed yet,
-/// and a peer looking the key up meanwhile finds no entry (never a partial
-/// one) and the key held, so it waits. Once the daemon stores, the entry
-/// holds exactly the bytes the compiler wrote, and the event is the daemon's.
+/// With the index's write lock held by another connection, the wrapper does
+/// not wait for it: it hands the staged entry to the daemon and returns
+/// while the lock is still held. Nothing is committed and a peer waits on
+/// the key until the daemon registers the entry, which then holds exactly
+/// the bytes the compiler wrote; the event is the daemon's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_wrapper_returns_before_the_store_commits_and_a_peer_waits() {
-    let compiled = compiled("returns-before-commit");
+async fn on_a_busy_index_the_wrapper_returns_and_the_daemon_commits_after() {
+    let compiled = compiled("busy-index");
     let mut daemon = PendingDaemon::listen(&compiled.config);
     let written = std::fs::read(&compiled.rlib).unwrap();
 
-    let (outcome, lock) = hand_off_now(&compiled).await;
-    assert!(matches!(outcome, CcHandoffOutcome::Accepted));
+    let (outcome, lock, while_held) = store_now(&compiled, Some(BUSY)).await;
+    assert!(matches!(outcome, RustcStore::HandedOff));
+    assert!(
+        while_held,
+        "the wrapper returned while another connection still held the index"
+    );
     assert!(lock.is_none(), "the daemon holds the key now");
 
     let store = Store::open(&compiled.config).unwrap();
@@ -205,12 +486,6 @@ async fn the_wrapper_returns_before_the_store_commits_and_a_peer_waits() {
             BuildClaim::Contended
         ),
         "a peer finds the key held and waits for the commit"
-    );
-    assert!(
-        !store
-            .wait_for_committed_with_timeout(&compiled.key, Duration::from_millis(50))
-            .unwrap(),
-        "and finds nothing while the store is pending"
     );
     assert!(
         crate::events::read_events(&compiled.config.event_log_path())
@@ -261,184 +536,4 @@ async fn the_wrapper_returns_before_the_store_commits_and_a_peer_waits() {
         events[0].store_error
     );
     assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
-}
-
-/// An output rewritten in place after the wrapper returned (the snapshot is
-/// a link to the same inode) is never stored under the compile's key: the
-/// daemon's put sees other bytes than the wrapper hashed and commits
-/// nothing, and the key is free again for the next build to compile.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_output_rewritten_after_the_wrapper_returned_is_not_stored() {
-    let compiled = compiled("rewritten-after-return");
-    let mut daemon = PendingDaemon::listen(&compiled.config);
-
-    let (outcome, _) = hand_off_now(&compiled).await;
-    assert!(matches!(outcome, CcHandoffOutcome::Accepted));
-    {
-        use std::io::{Seek, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&compiled.rlib)
-            .unwrap();
-        file.seek(std::io::SeekFrom::Start(1000)).unwrap();
-        file.write_all(b"post-processed").unwrap();
-    }
-    let rewritten = crate::cache_key::hash_file(&compiled.rlib).unwrap();
-
-    daemon.publish_all().await;
-
-    let store = Store::open(&compiled.config).unwrap();
-    assert!(store.get(&compiled.key).unwrap().is_none(), "no entry");
-    assert!(
-        !store.blob_path(&rewritten).exists(),
-        "no blob of the new bytes"
-    );
-    assert!(matches!(
-        store.claim_build(&compiled.key).unwrap(),
-        BuildClaim::Acquired(_)
-    ));
-    let events = crate::events::read_events(&compiled.config.event_log_path()).unwrap();
-    assert!(
-        events[0].store_error.contains("changed after the compile"),
-        "{}",
-        events[0].store_error
-    );
-    assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
-}
-
-/// An output replaced by a new file after the wrapper returned does not
-/// touch the snapshot's inode: the entry is what the compiler wrote, and the
-/// new file gets no memo row under the stored digest.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_output_replaced_after_the_wrapper_returned_keeps_the_compiled_bytes() {
-    let compiled = compiled("replaced-after-return");
-    let mut daemon = PendingDaemon::listen(&compiled.config);
-    let written = std::fs::read(&compiled.rlib).unwrap();
-
-    let (outcome, _) = hand_off_now(&compiled).await;
-    assert!(matches!(outcome, CcHandoffOutcome::Accepted));
-    let replacement = compiled.rlib.with_extension("new");
-    std::fs::write(&replacement, vec![b'n'; 96 << 10]).unwrap();
-    std::fs::rename(&replacement, &compiled.rlib).unwrap();
-
-    daemon.publish_all().await;
-
-    let store = Store::open(&compiled.config).unwrap();
-    let meta = store.get(&compiled.key).unwrap().expect("committed");
-    assert_eq!(
-        std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
-        written
-    );
-    assert!(matches!(
-        store.file_hash_cache().lookup_cached(&compiled.rlib),
-        crate::cache_key::FileHashLookup::NeedsHash(_)
-    ));
-}
-
-/// Without a daemon the wrapper stores the compile itself: the hand-off is
-/// not wanted, and offering it anyway gives the key back and leaves no
-/// snapshot behind.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn without_a_daemon_the_wrapper_stores_itself() {
-    let compiled = compiled("no-daemon");
-    let store = Store::open(&compiled.config).unwrap();
-    assert!(!wanted(&compiled.config, &store));
-
-    let (outcome, lock) = hand_off_now(&compiled).await;
-    assert!(matches!(outcome, CcHandoffOutcome::Publish));
-    assert!(lock.is_some(), "the wrapper stores under its own lock");
-    assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
-    assert!(store.get(&compiled.key).unwrap().is_none());
-}
-
-/// A daemon from before rustc hand-offs answers the unknown request with an
-/// error; the wrapper then stores the compile itself.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_older_daemon_leaves_the_store_to_the_wrapper() {
-    let compiled = compiled("older-daemon");
-    let older = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let server = {
-        use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
-        let socket = compiled.config.socket_path();
-        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let listener = crate::transport::ListenerOptions::new()
-            .name(crate::transport::socket_name(&socket).unwrap())
-            .create_tokio()
-            .unwrap();
-        let older = Arc::clone(&older);
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-            while let Ok(stream) = listener.accept().await {
-                let (read, mut write) = stream.split();
-                let mut line = String::new();
-                let _ = tokio::io::BufReader::new(read).read_line(&mut line).await;
-                older.lock().unwrap().push(line.clone());
-                // What an older daemon says to a variant it does not know.
-                let _ = write
-                    .write_all(b"{\"ok\":false,\"error\":\"invalid request: unknown variant\"}\n")
-                    .await;
-            }
-        })
-    };
-
-    let (outcome, lock) = hand_off_now(&compiled).await;
-    server.abort();
-    assert!(matches!(outcome, CcHandoffOutcome::Publish));
-    assert!(lock.is_some());
-    let requests = older.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .any(|line| line.contains("\"publish_rustc\"")),
-        "{requests:?}"
-    );
-    assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
-}
-
-/// A daemon that dies with a rustc store queued commits nothing: dropping
-/// the job releases the key, no entry appears, and the request directory it
-/// left is reclaimed by the handoff sweep, as is one a wrapper left when it
-/// died between snapshotting and handing off.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_daemon_that_dies_mid_store_leaves_no_entry_and_its_staging_is_swept() {
-    let compiled = compiled("daemon-dies");
-    let mut daemon = PendingDaemon::listen(&compiled.config);
-
-    let (outcome, _) = hand_off_now(&compiled).await;
-    assert!(matches!(outcome, CcHandoffOutcome::Accepted));
-    // The daemon goes away with the job queued: the job, its key lock and
-    // its queue are dropped without a put.
-    let rx = daemon.rx.take().unwrap();
-    drop(rx);
-    drop(daemon);
-    // A wrapper that died after its snapshot, before the hand-off.
-    let (orphan, _) =
-        crate::daemon_publish::snapshot_rustc_outputs(&compiled.config, &compiled.files).unwrap();
-    assert!(handoff_requests(&compiled.config) >= 1);
-
-    let store = Store::open(&compiled.config).unwrap();
-    assert!(
-        store.get(&compiled.key).unwrap().is_none(),
-        "nothing committed"
-    );
-    assert!(
-        matches!(
-            store.claim_build(&compiled.key).unwrap(),
-            BuildClaim::Acquired(_)
-        ),
-        "the key is free for the next build"
-    );
-    let swept = crate::daemon_publish::sweep_orphaned_handoffs(&compiled.config, Duration::ZERO);
-    assert!(swept.removed >= 1);
-    assert_eq!(
-        handoff_requests(&compiled.config),
-        0,
-        "every request directory is gone"
-    );
-    assert!(!Path::new(&orphan[0].path).exists());
-    assert_eq!(
-        std::fs::read(&compiled.rlib).unwrap(),
-        vec![b'r'; 96 << 10],
-        "the sweep never touches the output a snapshot linked"
-    );
 }

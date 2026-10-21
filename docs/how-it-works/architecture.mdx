@@ -56,7 +56,7 @@ A miss stores its outputs without waiting for an fsync. The daemon flushes the n
 The daemon owns remote work and periodic maintenance:
 
 - exact remote checks and downloads
-- storing finished C/C++ and rustc compiles that wrappers hand over (`cache.daemon_publish`, `cache.daemon_publish_rustc`)
+- storing finished C/C++ compiles that wrappers hand over, and registering rustc stores the index was too busy for (`cache.daemon_publish`, `cache.daemon_publish_rustc`)
 - background uploads and durable upload replay
 - speculative prefetch, and fetching and publishing input records on the remote
 - seeding a new checkout's target directory with registry units another checkout built (`cache.seed_new_targets`)

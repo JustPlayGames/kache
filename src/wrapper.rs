@@ -4991,9 +4991,13 @@ fn run_parsed_rustc(
 
     let mut lock = Some(lock);
     let store_start = std::time::Instant::now();
-    // The put and everything after it are on the build's critical path:
-    // hand them to the daemon when it will take them (`rustc_handoff`).
-    if rustc_handoff::wanted(config, &store) {
+    let trace_store = crate::phase_trace::phase("store");
+    let mut store_put = StorePutResult::default();
+    let mut store_error = String::new();
+    // The put is on the build's critical path. When the index is too busy
+    // to register the entry at once, the daemon may finish it
+    // (`rustc_handoff`).
+    let put = if rustc_handoff::wanted(config, &store) {
         let handoff = rustc_handoff::RustcHandoff {
             cache_key: &cache_key,
             crate_name,
@@ -5017,30 +5021,29 @@ fn run_parsed_rustc(
             start,
             store_start,
         };
-        match rustc_handoff::hand_off(config, &store, &mut lock, handoff) {
-            CcHandoffOutcome::Accepted | CcHandoffOutcome::Done => {
+        match rustc_handoff::store(config, &store, &mut lock, handoff) {
+            rustc_handoff::RustcStore::HandedOff => {
+                drop(trace_store);
                 record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
                 clean_incremental_dir(config, args);
                 return Ok(result.exit_code);
             }
-            CcHandoffOutcome::Publish => {}
+            rustc_handoff::RustcStore::Stored(put) => put,
         }
-    }
-    let trace_store = crate::phase_trace::phase("store");
-    let mut store_put = StorePutResult::default();
-    let mut store_error = String::new();
-    let put = store.put_with_compile_time(
-        &cache_key,
-        crate_name,
-        &args.crate_types,
-        &args.features,
-        target,
-        profile,
-        &prepared_store.files,
-        &result.stdout,
-        &result.stderr,
-        compile_time_ms,
-    );
+    } else {
+        store.put_with_compile_time(
+            &cache_key,
+            crate_name,
+            &args.crate_types,
+            &args.features,
+            target,
+            profile,
+            &prepared_store.files,
+            &result.stdout,
+            &result.stderr,
+            compile_time_ms,
+        )
+    };
     // A stored entry grew the store: throttled size check and a detached
     // background GC if over budget (kunobi-ninja/kache#497). A put refused for
     // lack of space asks for recovery. Neither blocks the compile.
