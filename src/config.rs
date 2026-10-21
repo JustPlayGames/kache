@@ -489,13 +489,18 @@ pub struct Config {
     /// false` keeps every put in the wrapper. Without a reachable daemon the
     /// wrapper stores on its own either way.
     pub daemon_publish: bool,
-    /// Hand a finished rustc compile's store to the daemon the same way: the
-    /// wrapper snapshots the outputs (hardlinks, read back for their
-    /// digests) and returns to Cargo, and the daemon stores them, refusing
-    /// any output rewritten since. On by default on Unix;
-    /// `KACHE_DAEMON_PUBLISH_RUSTC=0` or `[cache] daemon_publish_rustc =
-    /// false` keeps every rustc store in the wrapper. Without a reachable
-    /// daemon, and on Windows, the wrapper stores on its own either way.
+    /// Let the daemon finish a rustc store when the index is busy. The
+    /// wrapper stages, hashes and publishes the outputs as a store always
+    /// does, then waits a few milliseconds at most for the index's write
+    /// lock: granted, it registers the entry itself, so on a quiet index the
+    /// entry is there when the wrapper returns. Held longer by another
+    /// writer, the wrapper links the staged blobs into the store's staging
+    /// area, hands the entry to the daemon and returns to Cargo; the daemon
+    /// registers it once the index lets it, refusing any blob whose bytes
+    /// changed since. On by default on Unix; `KACHE_DAEMON_PUBLISH_RUSTC=0`
+    /// or `[cache] daemon_publish_rustc = false` makes the wrapper wait for
+    /// the lock itself. Without a reachable daemon, and on Windows, it waits
+    /// either way.
     pub daemon_publish_rustc: bool,
     /// The project's `[cache] exclude` and `bypass_*` rule lists, read once
     /// with the rest of the file. Every wrapper invocation consults them

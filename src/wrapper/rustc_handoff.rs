@@ -1,30 +1,34 @@
-//! A finished rustc compile's store, handed to the daemon
-//! (`cache.daemon_publish_rustc`).
+//! A finished rustc compile's store, finished by the daemon when the index
+//! is busy (`cache.daemon_publish_rustc`).
 //!
 //! A store sits between rustc's exit and the wrapper's return, so every
-//! unit's dependents wait for it. Most stores take milliseconds, but one
-//! that queues for the index's write lock, or copies a large binary on a
-//! busy disk, takes seconds (on a shared build machine over a day: p50 7 ms,
-//! p99 3.9 s, max 22 s). The wrapper therefore does only what fixes the
-//! entry's content and hands the rest to the daemon, as the C/C++ path does
-//! ([`crate::daemon_publish`]):
+//! unit's dependents wait for it. On a quiet index a store is staging and
+//! hashing plus a write transaction of a few milliseconds, and the wrapper
+//! does it all, as it always did: the entry is visible when it returns. The
+//! slow stores are the ones that queue for the index's write lock behind a
+//! burst of other stores or a sweep (on a shared build machine over a day:
+//! p50 7 ms, p99 3.9 s, max 22 s). Only that wait goes to the daemon:
 //!
-//! - It hardlinks each output into a request directory under the store's
-//!   staging area and reads each snapshot's digest. That is the address the
-//!   entry gets: the bytes rustc wrote, read before Cargo or anything else
-//!   has had the file.
+//! - The wrapper stages, hashes and publishes every output as a blob (a
+//!   put's Phase 1), then asks for the write lock once with a short wait
+//!   ([`INDEX_BUSY_WAIT`]). Granted, it registers the entry itself.
+//! - Still held elsewhere, it links each blob into a request directory under
+//!   the store's staging area and offers the staged entry to the daemon in a
+//!   `PublishRustc` request. Nothing is staged or hashed again for it.
 //! - The daemon takes the key's lock before it accepts, so a peer that looks
 //!   the key up meanwhile finds no entry, then the key contended, and waits
-//!   for the commit as it would for a wrapper still storing.
-//! - The daemon stores the snapshots with `Store::put_handed_off`, which
-//!   hashes each again once it is staged (and read-only, when linked) and
-//!   commits nothing if one differs: an output rewritten in place after the
-//!   wrapper returned (the link shares its inode) costs the entry, never its
-//!   correctness. An output replaced by a new file leaves the link's inode,
-//!   and so the entry, as rustc wrote it.
+//!   for the commit as it would for a wrapper still storing. The blobs are
+//!   unreferenced until then, so no peer can find a partial entry.
+//! - The daemon registers the entry with `Store::put_staged_handed_off`,
+//!   which hashes each link first and commits nothing if one differs: a blob
+//!   sharing its inode with an output rewritten in place after the wrapper
+//!   returned costs the entry, never its correctness.
 //! - Anything that keeps the daemon from accepting (no daemon, an older
-//!   daemon, a full queue, a busy daemon past the hand-off budget) falls
-//!   back to the wrapper's own store, with the key lock taken back.
+//!   daemon, a full queue, a busy daemon past the hand-off budget) leaves
+//!   the registration to the wrapper, which then waits for the lock as a put
+//!   does, with the key lock taken back. A daemon that dies with the entry
+//!   queued commits nothing: its blobs are orphans for the orphan sweep and
+//!   its request directory is the handoff sweep's.
 //!
 //! Windows keeps the synchronous store; the hand-off has not been tried
 //! there.
@@ -35,9 +39,11 @@ use crate::args::RustcArgs;
 use crate::compiler::rustc::RustcCompiler;
 use crate::compiler::{Artifact, ArtifactKind};
 use crate::config::Config;
-use crate::daemon_publish::{Handoff, PrestageHint, PublishCcRequest, RustcOutput, RustcPublish};
+use crate::daemon_publish::{
+    Handoff, PrestageHint, PublishCcRequest, RustcOutput, RustcPublish, StagedPublish,
+};
 use crate::events::EventResult;
-use crate::store::{KeyLock, Store};
+use crate::store::{KeyLock, PutAttempt, StagedPut, Store, StorePutResult};
 
 use super::{CcHandoffOutcome, EventInputs};
 
@@ -64,9 +70,23 @@ pub(super) struct RustcHandoff<'a> {
     pub(super) store_start: std::time::Instant,
 }
 
-/// Whether to offer this compile's store to the daemon: the setting is on,
-/// the entry goes to the main store (a `[cache.volumes]` shard stays with
-/// the wrapper, as for C/C++), and a daemon holds its run lock.
+/// How long a rustc miss waits for the index's write lock before it hands
+/// the registration to the daemon. A quiet index's writers hold the lock for
+/// a few milliseconds, so a store that finds it held only by one of them
+/// still registers here, and waits that long at most otherwise.
+pub(super) const INDEX_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// How long a wrapper whose index is busy waits for the daemon to take the
+/// staged entry. Longer than a C/C++ hand-off's budget: the wrapper would
+/// otherwise wait for a lock another writer holds, for seconds under a burst
+/// of stores, and a burst is when hundreds of wrappers hand off at once and
+/// the daemon answers them in turn.
+pub(super) const BUSY_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether a busy index may hand this compile's registration to the daemon:
+/// the setting is on, the entry goes to the main store (a `[cache.volumes]`
+/// shard stays with the wrapper, as for C/C++), and a daemon holds its run
+/// lock.
 pub(super) fn wanted(config: &Config, store: &Store) -> bool {
     cfg!(unix)
         && config.daemon_publish_rustc
@@ -74,53 +94,121 @@ pub(super) fn wanted(config: &Config, store: &Store) -> bool {
         && crate::daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false)
 }
 
-/// Offer the compile to the daemon. `Accepted`: the daemon holds the key and
-/// stores the entry and its event. `Done`: a peer took the key after the
-/// daemon declined; its entry counts and the event is written. `Publish`:
-/// store here, with the key lock back in `build_lock` when it could be taken.
-pub(super) fn hand_off(
+/// What became of a rustc miss's store.
+pub(super) enum RustcStore {
+    /// Stored here, or failed here: the caller finishes as after a put.
+    Stored(anyhow::Result<StorePutResult>),
+    /// The daemon took the entry (or a peer stored the key meanwhile); the
+    /// event is whoever stores it's.
+    HandedOff,
+}
+
+/// Store a rustc miss: here when the index lets it register at once, else
+/// by the daemon when it takes the staged entry, else here after all.
+/// `build_lock` is the key's lock; after `HandedOff` it is the daemon's.
+pub(super) fn store(
     config: &Config,
     store: &Store,
     build_lock: &mut Option<KeyLock>,
     handoff: RustcHandoff<'_>,
-) -> CcHandoffOutcome {
-    hand_off_within(
+) -> RustcStore {
+    store_within(
         config,
         store,
         build_lock,
         handoff,
-        crate::daemon_publish::PUBLISH_HANDOFF_TIMEOUT,
+        BUSY_HANDOFF_BUDGET,
+        wanted(config, store),
     )
 }
 
-/// [`hand_off`] with the wait for the daemon's answer supplied.
-fn hand_off_within(
+/// [`store`] with the wait for the daemon's answer, and whether to offer
+/// it at all, supplied.
+fn store_within(
     config: &Config,
     store: &Store,
     build_lock: &mut Option<KeyLock>,
     handoff: RustcHandoff<'_>,
     budget: std::time::Duration,
+    hand_off_when_busy: bool,
+) -> RustcStore {
+    let (args, files) = (handoff.args, handoff.files);
+    if !hand_off_when_busy {
+        return RustcStore::Stored(store.put_with_compile_time(
+            handoff.cache_key,
+            handoff.crate_name,
+            &args.crate_types,
+            &args.features,
+            handoff.target,
+            handoff.profile,
+            files,
+            handoff.stdout,
+            handoff.stderr,
+            handoff.compile_time_ms,
+        ));
+    }
+    let staged = match store.put_with_compile_time_unless_busy(
+        handoff.cache_key,
+        handoff.crate_name,
+        &args.crate_types,
+        &args.features,
+        handoff.target,
+        handoff.profile,
+        files,
+        handoff.stdout,
+        handoff.stderr,
+        handoff.compile_time_ms,
+        INDEX_BUSY_WAIT,
+    ) {
+        Ok(PutAttempt::Stored(result)) => return RustcStore::Stored(Ok(result)),
+        Ok(PutAttempt::Busy(staged)) => staged,
+        Err(error) => return RustcStore::Stored(Err(error)),
+    };
+    match hand_off_staged(config, store, build_lock, handoff, &staged, budget) {
+        CcHandoffOutcome::Accepted | CcHandoffOutcome::Done => RustcStore::HandedOff,
+        CcHandoffOutcome::Publish => RustcStore::Stored(store.register_staged_put(&staged)),
+    }
+}
+
+/// Offer a staged entry the index was too busy to register to the daemon.
+/// `Accepted`: the daemon holds the key and registers the entry and its
+/// event. `Done`: a peer took the key after the daemon declined; its entry
+/// counts and the event is written. `Publish`: register it here, with the
+/// key lock back in `build_lock` when it could be taken.
+fn hand_off_staged(
+    config: &Config,
+    store: &Store,
+    build_lock: &mut Option<KeyLock>,
+    handoff: RustcHandoff<'_>,
+    staged: &StagedPut,
+    budget: std::time::Duration,
 ) -> CcHandoffOutcome {
-    if handoff.artifacts.len() != handoff.files.len() {
+    let stored = staged.files();
+    if handoff.artifacts.len() != handoff.files.len() || stored.len() != handoff.files.len() {
         return CcHandoffOutcome::Publish;
     }
+    // As the synchronous path does after its put, so the memo rows the
+    // daemon seeds carry the date Cargo leaves.
     let redated = redate_check_outputs(handoff.args, handoff.files);
-    let (snapshots, digests) =
-        match crate::daemon_publish::snapshot_rustc_outputs(config, handoff.files) {
-            Ok(snapshots) => snapshots,
-            Err(error) => {
-                tracing::debug!("rustc hand-off: could not snapshot outputs: {error:#}");
-                return CcHandoffOutcome::Publish;
-            }
-        };
+    let blobs: Vec<(PathBuf, String)> = stored
+        .iter()
+        .map(|file| (store.blob_path(&file.hash), file.name.clone()))
+        .collect();
+    let snapshots = match crate::daemon_publish::snapshot_staged_blobs(config, &blobs) {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            tracing::debug!("rustc hand-off: could not link the staged blobs: {error:#}");
+            return CcHandoffOutcome::Publish;
+        }
+    };
     let outputs = handoff
         .artifacts
         .iter()
         .zip(handoff.files)
-        .zip(digests)
+        .zip(stored)
         .zip(redated)
-        .map(|(((artifact, (path, _)), hash), redated)| RustcOutput {
-            hash,
+        .map(|(((artifact, (path, _)), file), redated)| RustcOutput {
+            hash: file.hash.clone(),
             output: compiler_owned(artifact, path).then(|| path.to_string_lossy().into_owned()),
             redated,
         })
@@ -134,6 +222,7 @@ fn hand_off_within(
             .store_ms(handoff.store_start.elapsed().as_millis() as u64),
     );
     event.elapsed_ms = elapsed;
+    let result = staged.result();
     let request = PublishCcRequest {
         client_epoch: crate::daemon::build_epoch(),
         client_version: Some(crate::VERSION.to_owned()),
@@ -154,6 +243,12 @@ fn hand_off_within(
             outputs,
             unit: handoff.args.get_codegen_opt("metadata").map(str::to_string),
             prestage,
+            staged: Some(StagedPublish {
+                files: stored.to_vec(),
+                output_blobs: result.output_blobs,
+                duplicate_blobs: result.duplicate_blobs,
+                new_blobs: result.new_blobs,
+            }),
         }),
     };
     // The daemon takes the key itself before it answers; ours must be gone
@@ -196,7 +291,7 @@ fn compiler_owned(artifact: &Artifact, path: &Path) -> bool {
 
 /// For a check unit, set each `.rmeta`'s mtime to the invocation time Cargo
 /// is about to give it, as the synchronous path does after its put, so the
-/// stored fingerprint is the one Cargo leaves. One flag per file: whether it
+/// fingerprint the daemon seeds is the one Cargo leaves. One flag per file: whether it
 /// now carries that date.
 fn redate_check_outputs(args: &RustcArgs, files: &[(PathBuf, String)]) -> Vec<bool> {
     let invoked = super::cargo_check_redate_ns(args);
