@@ -3625,16 +3625,20 @@ impl Daemon {
             // A stamp that had changed within the settle window when it was
             // observed can be kept by a second write in the same tick, so
             // its hash goes back to this caller and is remembered nowhere.
-            let settled = crate::cache_key::stamp_is_settled(
-                &crate::cache_key::FileFingerprint {
-                    path: file.path.clone(),
-                    size: file.size,
-                    mtime_ns: file.mtime_ns,
-                    ctime_ns: file.ctime_ns,
-                    inode: file.inode,
-                },
-                observed_ns,
-            );
+            let requested = crate::cache_key::FileFingerprint {
+                path: file.path.clone(),
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                ctime_ns: file.ctime_ns,
+                inode: file.inode,
+            };
+            let settled = crate::cache_key::stamp_is_settled(&requested, observed_ns);
+            // Set when the bytes read match a re-dated row for the requested
+            // stamp: Cargo's re-date of an output kache wrote, which may be
+            // remembered like a settled stamp ([`FileHashCache::redated_pin`]).
+            // The units that read it next often ask at once, before the
+            // flush tick writes its row.
+            let mut pinned = false;
 
             // #281: hold the hash store only for the cheap cache lookup; run
             // the blake3 read of the whole file OUTSIDE the lock, and leave the
@@ -3648,13 +3652,15 @@ impl Daemon {
                             // The lookup took its own stamp, after `observed_ns`.
                             // An unsettled one may be Cargo's re-date of an
                             // output kache wrote with these bytes.
-                            if crate::cache_key::stamp_is_settled(&fp, observed_ns)
-                                || self
+                            let settled_now = crate::cache_key::stamp_is_settled(&fp, observed_ns);
+                            let redated = !settled_now
+                                && self
                                     .with_hash_store(|store| {
                                         Ok(store.file_hash_cache().redated_pin(&fp, &hash))
                                     })
-                                    .unwrap_or(false)
-                            {
+                                    .unwrap_or(false);
+                            pinned = redated && fp == requested;
+                            if settled_now || redated {
                                 // Written in a batch by the flush tick, off
                                 // this request's path.
                                 if let Ok(mut pending) = self.pending_file_hashes.lock() {
@@ -3673,7 +3679,9 @@ impl Daemon {
 
             match computed {
                 Ok((hash, cache_hit, bytes_hashed)) => {
-                    if settled && let Ok(mut cache) = self.file_hash_cache.lock() {
+                    if (settled || pinned)
+                        && let Ok(mut cache) = self.file_hash_cache.lock()
+                    {
                         if cache.len() >= FILE_HASH_MEMORY_CACHE_CAP {
                             cache.clear();
                         }
