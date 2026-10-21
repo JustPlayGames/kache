@@ -120,8 +120,8 @@ pub(crate) struct RustcPublish {
     pub prestage: Vec<PrestageHint>,
     /// The wrapper staged and published the entry's blobs itself and only
     /// the index was too busy to register it: the files are links to those
-    /// blobs, registered with `Store::put_staged_handed_off` without staging
-    /// them again. `None`: the files are snapshots of the outputs, stored
+    /// blobs, registered in a batch (`Store::register_handed_off_batch`)
+    /// without staging them again. `None`: the files are snapshots of the outputs, stored
     /// with `Store::put_handed_off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged: Option<StagedPublish>,
@@ -1270,7 +1270,7 @@ fn snapshot_into(
             .join(format!("{index}-{}", handoff_file_name(store_name)));
         // A link shares the source's inode: C/C++ sources are private
         // staging files, and a rustc blob's bytes are checked against its
-        // digest before the daemon registers it (`put_staged_handed_off`).
+        // digest before the daemon registers it (`check_staged_handed_off`).
         if std::fs::hard_link(source, &target).is_err() {
             std::fs::copy(source, &target)
                 .with_context(|| format!("snapshotting {} for the daemon", source.display()))?;
