@@ -484,6 +484,11 @@ pub(crate) enum Request {
     /// of allowing an ambiguous timeout to publish and log twice.
     #[serde(rename = "publish_cc_v2")]
     PublishCc(Box<crate::daemon_publish::PublishCcRequest>),
+    /// A wrapper hands the daemon a finished rustc compile to store: its
+    /// outputs' snapshots and the digests read from them before the
+    /// wrapper returned. Older daemons reject the unknown variant, and the
+    /// wrapper then stores the compile itself.
+    PublishRustc(Box<crate::daemon_publish::PublishCcRequest>),
     /// A wrapper with no local input prediction row asks for the remote's
     /// (kunobi-ninja/kache#1011). Older daemons reject the unknown variant,
     /// which the wrapper reads as no row.
@@ -531,7 +536,7 @@ impl Request {
             Request::Stats(req) => req.client_version.as_deref(),
             Request::BuildStarted(req) => req.client_version.as_deref(),
             Request::CompileStarted(req) => req.client_version.as_deref(),
-            Request::PublishCc(req) => req.client_version.as_deref(),
+            Request::PublishCc(req) | Request::PublishRustc(req) => req.client_version.as_deref(),
             _ => None,
         }
     }
@@ -3108,6 +3113,7 @@ impl Daemon {
             | Request::BatchRemoteCheck(_)
             | Request::Prefetch(_)
             | Request::PublishCc(_)
+            | Request::PublishRustc(_)
             | Request::PredictionFetch(_)
             | Request::PredictionPublish(_)
             | Request::Prestage(_)
@@ -8467,6 +8473,7 @@ async fn handle_connection_started_at(
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
             Ok(Request::CompileFinished(req)) => daemon.handle_compile_finished(&req),
             Ok(Request::PublishCc(req)) => daemon.handle_publish_cc(*req).await,
+            Ok(Request::PublishRustc(req)) => daemon.handle_publish_rustc(*req).await,
             Ok(Request::PredictionFetch(req)) => daemon.handle_prediction_fetch(&req).await,
             Ok(Request::PredictionPublish(req)) => daemon.handle_prediction_publish(req),
             Ok(Request::Shutdown) => {

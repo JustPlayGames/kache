@@ -38,6 +38,8 @@ mod cc_diagnostics;
 mod rustc_hit;
 use rustc_hit::RustcHitContext;
 
+mod rustc_handoff;
+
 /// Check whether progress lines should be shown ([`crate::notice`]).
 ///
 /// Controlled by `KACHE_PROGRESS` env var (off by default):
@@ -4978,7 +4980,43 @@ fn run_parsed_rustc(
         return Ok(result.exit_code);
     };
 
+    let mut lock = Some(lock);
     let store_start = std::time::Instant::now();
+    // The put and everything after it are on the build's critical path:
+    // hand them to the daemon when it will take them (`rustc_handoff`).
+    if rustc_handoff::wanted(config, &store) {
+        let handoff = rustc_handoff::RustcHandoff {
+            cache_key: &cache_key,
+            crate_name,
+            target,
+            profile,
+            args,
+            compiler,
+            artifacts: result.artifacts.outputs(),
+            files: &prepared_store.files,
+            stdout: &result.stdout,
+            stderr: &result.stderr,
+            compile_time_ms,
+            event: EventInputs::new(&event_root, crate_name, EventResult::Miss, 0)
+                .rebuilt_observed(rebuilt.clone())
+                .compile_time_ms(compile_time_ms)
+                .size(result.artifacts.total_size())
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record.clone()),
+            size: result.artifacts.total_size(),
+            start,
+            store_start,
+        };
+        match rustc_handoff::hand_off(config, &store, &mut lock, handoff) {
+            CcHandoffOutcome::Accepted | CcHandoffOutcome::Done => {
+                record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
+                clean_incremental_dir(config, args);
+                return Ok(result.exit_code);
+            }
+            CcHandoffOutcome::Publish => {}
+        }
+    }
     let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
@@ -5167,6 +5205,7 @@ fn hand_off_cc_store(
         publishes_to_remote: compiler_upload_enabled(config, handoff.publishes_to_remote),
         event,
         memo: handoff.memo,
+        rustc: None,
     };
     // The daemon takes the key itself before it answers; ours must be gone
     // first, since a file lock cannot be shared across processes.
@@ -5179,35 +5218,55 @@ fn hand_off_cc_store(
         Handoff::Declined(reason) => {
             tracing::debug!("cc hand-off declined for {}: {reason}", handoff.crate_name);
             crate::daemon_publish::remove_handoff_files(&request.files);
-            match reclaim_after_declined_handoff(store, handoff.cache_key, HANDOFF_HOLDER_WAIT) {
-                Ok(BuildClaim::Acquired(lock)) => {
-                    *build_lock = Some(lock);
-                    CcHandoffOutcome::Publish
-                }
-                Ok(BuildClaim::Committed(_)) | Ok(BuildClaim::Contended) => {
-                    // A peer holds or stored the key in the gap; it publishes.
-                    let mut event = request.event;
-                    event.elapsed_ms = handoff.start.elapsed().as_millis() as u64;
-                    // An independent peer won the key. That is ordinary
-                    // contention, not a failed store. An accepted daemon job
-                    // is resolved by its receipt before reaching this branch.
-                    write_event(config, &event);
-                    print_progress(
-                        handoff.crate_name,
-                        EventResult::Miss,
-                        event.elapsed_ms,
-                        handoff.size,
-                    );
-                    CcHandoffOutcome::Done
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "reclaiming {} after a declined hand-off failed: {error:#}; storing without a lock",
-                        handoff.crate_name
-                    );
-                    CcHandoffOutcome::Publish
-                }
-            }
+            resolve_declined_handoff(
+                config,
+                store,
+                build_lock,
+                request.event,
+                handoff.cache_key,
+                handoff.crate_name,
+                handoff.start,
+                handoff.size,
+            )
+        }
+    }
+}
+
+/// After the daemon declined a hand-off: take the key back and publish
+/// here, or, when a peer holds or stored the key in the gap, write the
+/// compile's `event` and leave the entry to that peer.
+#[allow(clippy::too_many_arguments)]
+fn resolve_declined_handoff(
+    config: &Config,
+    store: &Store,
+    build_lock: &mut Option<KeyLock>,
+    event: BuildEvent,
+    cache_key: &str,
+    crate_name: &str,
+    start: std::time::Instant,
+    size: u64,
+) -> CcHandoffOutcome {
+    match reclaim_after_declined_handoff(store, cache_key, HANDOFF_HOLDER_WAIT) {
+        Ok(BuildClaim::Acquired(lock)) => {
+            *build_lock = Some(lock);
+            CcHandoffOutcome::Publish
+        }
+        Ok(BuildClaim::Committed(_)) | Ok(BuildClaim::Contended) => {
+            // A peer holds or stored the key in the gap; it publishes.
+            let mut event = event;
+            event.elapsed_ms = start.elapsed().as_millis() as u64;
+            // An independent peer won the key. That is ordinary
+            // contention, not a failed store. An accepted daemon job
+            // is resolved by its receipt before reaching this branch.
+            write_event(config, &event);
+            print_progress(crate_name, EventResult::Miss, event.elapsed_ms, size);
+            CcHandoffOutcome::Done
+        }
+        Err(error) => {
+            tracing::warn!(
+                "reclaiming {crate_name} after a declined hand-off failed: {error:#}; storing without a lock",
+            );
+            CcHandoffOutcome::Publish
         }
     }
 }
@@ -5553,11 +5612,14 @@ fn remember_prestaged_executables(
         return;
     };
     for file in &meta.files {
-        let kind = compiler.classify_output(args, &file.name);
-        if file.size >= crate::prestage::MIN_BYTES
-            && restore_link_strategy(kind, file.executable, shared_loadable)
-                == link::LinkStrategy::Copy
-        {
+        if prestages(
+            compiler,
+            args,
+            &file.name,
+            file.size,
+            file.executable,
+            shared_loadable,
+        ) {
             crate::prestage::remember(
                 &config.cache_dir,
                 &target_dir,
@@ -5567,6 +5629,24 @@ fn remember_prestaged_executables(
             );
         }
     }
+}
+
+/// Whether a stored file is a large executable the restore copies, which
+/// [`crate::prestage`] records for the next build of its target directory.
+fn prestages(
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    name: &str,
+    size: u64,
+    executable: bool,
+    shared_loadable: Option<ArtifactKind>,
+) -> bool {
+    size >= crate::prestage::MIN_BYTES
+        && restore_link_strategy(
+            compiler.classify_output(args, name),
+            executable,
+            shared_loadable,
+        ) == link::LinkStrategy::Copy
 }
 
 /// How to materialize one restored artifact.
