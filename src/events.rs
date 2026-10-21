@@ -301,6 +301,11 @@ pub struct BuildEvent {
     /// Background publication time; excluded from wrapper phase totals.
     #[serde(default)]
     pub daemon_store_ms: u64,
+    /// How many handed-off entries the daemon registered in the one
+    /// transaction that registered this one; 0 when it was registered alone
+    /// or not at all. `serde(default)`, no schema bump.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub daemon_store_batch: u32,
     /// Why an existing entry for this exact key was rejected before the
     /// compiler ran (kunobi-ninja/kache#655).
     ///
@@ -453,6 +458,10 @@ impl BuildEvent {
     pub fn unattributed_ms(&self) -> u64 {
         self.overhead_ms().saturating_sub(self.attributed_ms())
     }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1998,6 +2007,7 @@ impl BuildEvent {
             store_error: String::new(),
             store_handed_off: false,
             daemon_store_ms: 0,
+            daemon_store_batch: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
@@ -2168,6 +2178,7 @@ mod tests {
             store_error: String::new(),
             store_handed_off: false,
             daemon_store_ms: 0,
+            daemon_store_batch: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,

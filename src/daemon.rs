@@ -3446,6 +3446,17 @@ impl Daemon {
         Response::ok()
     }
 
+    /// Keep memo rows the publish worker could not write at once for the
+    /// next flush, as rows a wrapper hands over; past
+    /// [`MAX_PENDING_MEMO_ROWS`] waiting they are dropped (they only save a
+    /// later hash).
+    pub(crate) fn defer_memo_rows(&self, rows: Vec<crate::store::MemoRow>) {
+        if let Ok(mut pending) = self.pending_memo_rows.lock() {
+            let room = MAX_PENDING_MEMO_ROWS.saturating_sub(pending.len());
+            pending.extend(rows.into_iter().take(room));
+        }
+    }
+
     /// Write the memo rows wrappers handed over, in one transaction on the
     /// hash store's connection. Rows that no longer describe their file are
     /// left out ([`Store::write_handed_memo_rows`]); a batch the index

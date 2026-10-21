@@ -596,6 +596,119 @@ fn hand_off_now(compiled: &Compiled) -> (RustcStore, Option<KeyLock>, Duration) 
     })
 }
 
+/// The events the daemon logged, as written: field by field, whatever this
+/// release's `BuildEvent` knows.
+fn raw_events(config: &Config) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(config.event_log_path())
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Hand-offs that queue while another connection holds the index's write
+/// lock are registered together once it lets go: one transaction for all of
+/// them, so a lock that is free only now and then is taken once, not once
+/// per entry. Each entry is the compiler's bytes, and each event says how
+/// many entries its transaction committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
+    const COUNT: usize = 12;
+    let (_root, compiled) = compiled_many(COUNT);
+    let config = &compiled[0].config;
+    let mut daemon = PendingDaemon::listen_queueing(config, 64);
+
+    let (released, holder) = hold_index_lock(config, BUSY);
+    for one in &compiled {
+        let (outcome, lock, _) = hand_off_now(one);
+        assert!(matches!(outcome, RustcStore::HandedOff));
+        assert!(lock.is_none());
+    }
+    let worker = daemon.start_worker();
+    assert!(
+        !released.load(std::sync::atomic::Ordering::SeqCst),
+        "every hand-off queued while the index was held"
+    );
+    tokio::task::block_in_place(|| holder.join().unwrap());
+    daemon.drain(worker).await;
+
+    let store = Store::open(config).unwrap();
+    for one in &compiled {
+        let meta = store.get(&one.key).unwrap().expect("committed");
+        assert_eq!(
+            std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+            std::fs::read(&one.rlib).unwrap()
+        );
+    }
+    let events = raw_events(config);
+    assert_eq!(events.len(), COUNT);
+    for event in &events {
+        assert_eq!(event["store_error"], serde_json::Value::Null, "{event}");
+        assert_eq!(event["daemon_store_batch"], COUNT, "{event}");
+    }
+    assert_eq!(handoff_requests(config), 0, "no snapshot is left");
+}
+
+/// An output rewritten in place after its wrapper returned costs its own
+/// entry only: the rest of the batch commits, and the changed blob is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rewritten_output_costs_only_its_own_entry_in_a_batch() {
+    use std::os::unix::fs::PermissionsExt;
+    const COUNT: usize = 6;
+    let (_root, compiled) = compiled_many(COUNT);
+    let config = &compiled[0].config;
+    let mut daemon = PendingDaemon::listen_queueing(config, 64);
+    let bad = &compiled[2];
+    let bad_hash = crate::cache_key::hash_file(&bad.rlib).unwrap();
+
+    let (_, holder) = hold_index_lock(config, BUSY);
+    for one in &compiled {
+        assert!(matches!(hand_off_now(one).0, RustcStore::HandedOff));
+    }
+    std::fs::set_permissions(&bad.rlib, std::fs::Permissions::from_mode(0o644)).unwrap();
+    {
+        use std::io::{Seek, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bad.rlib)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start(1000)).unwrap();
+        file.write_all(b"post-processed").unwrap();
+    }
+    let worker = daemon.start_worker();
+    tokio::task::block_in_place(|| holder.join().unwrap());
+    daemon.drain(worker).await;
+
+    let store = Store::open(config).unwrap();
+    assert!(store.get(&bad.key).unwrap().is_none(), "no entry");
+    assert!(!store.blob_path(&bad_hash).exists(), "no changed blob");
+    assert!(matches!(
+        store.claim_build(&bad.key).unwrap(),
+        BuildClaim::Acquired(_)
+    ));
+    for one in compiled.iter().filter(|one| one.key != bad.key) {
+        assert!(store.get(&one.key).unwrap().is_some(), "committed");
+    }
+    let events = raw_events(config);
+    assert_eq!(events.len(), COUNT);
+    let (failed, stored): (Vec<_>, Vec<_>) = events
+        .iter()
+        .partition(|event| event["store_error"].is_string());
+    assert_eq!(failed.len(), 1);
+    assert!(
+        failed[0]["store_error"]
+            .as_str()
+            .unwrap()
+            .contains("changed after the compile"),
+        "{}",
+        failed[0]
+    );
+    for event in stored {
+        assert_eq!(event["daemon_store_batch"], COUNT - 1, "{event}");
+    }
+    assert_eq!(handoff_requests(config), 0, "no snapshot is left");
+}
+
 /// The daemon answers a hand-off at once whatever else it is doing: its
 /// worker waiting for the index's write lock with an entry, and its own
 /// store connection taken by other work, cost the wrapper nothing.
