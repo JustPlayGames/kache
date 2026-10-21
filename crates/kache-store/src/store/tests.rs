@@ -5522,6 +5522,51 @@ fn claim_build_rechecks_entry_after_acquiring_lock() {
     );
 }
 
+/// A key claimed without the index ([`try_lock_key_in`]) is the key a
+/// store claims: held, it is contended for a store; its `meta.json` says
+/// whether the index must be asked; and the re-check under that lock finds
+/// what a claim finds.
+#[test]
+fn a_key_claimed_without_the_index_is_the_stores_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "claimed_without_the_index";
+
+    let lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    assert!(matches!(
+        store.claim_build(cache_key).unwrap(),
+        BuildClaim::Contended
+    ));
+    assert!(try_lock_key_in(&store_dir, cache_key).unwrap().is_none());
+    assert!(!entry_meta_exists_in(&store_dir, cache_key));
+    let output = dir.path().join("lib.rlib");
+    fs::write(&output, b"output").unwrap();
+    store
+        .put(
+            cache_key,
+            "c",
+            &["rlib".to_string()],
+            &[],
+            "host",
+            "dev",
+            &[(output, "lib.rlib".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+    assert!(entry_meta_exists_in(&store_dir, cache_key));
+    assert!(matches!(
+        store.claim_build_locked(cache_key, lock).unwrap(),
+        BuildClaim::Committed(_)
+    ));
+    assert!(
+        try_lock_key_in(&store_dir, cache_key).unwrap().is_some(),
+        "the committed entry released the claim"
+    );
+}
+
 #[test]
 fn claim_build_evicts_empty_committed_entry() {
     let dir = tempfile::tempdir().unwrap();
