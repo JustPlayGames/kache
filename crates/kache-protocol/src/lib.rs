@@ -115,6 +115,27 @@ pub struct RecordFileHashesRequest {
     pub rows: Vec<FileHashRow>,
 }
 
+/// Target roots a wrapper's index was too busy to record. The daemon records
+/// each in its own store when the index lets it, under the same checks as the
+/// wrapper (`Store::remember_target_root_built_by`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordTargetRootsRequest {
+    /// The cache directory of the store the rows belong to. The daemon
+    /// writes only to its own store and refuses any other.
+    pub cache_dir: String,
+    pub roots: Vec<TargetRootRow>,
+}
+
+/// A Cargo target directory a build wrote into, the workspace that owns it,
+/// and the `rustc -vV` that built there (`None` keeps the recorded one).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TargetRootRow {
+    pub target: String,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub rustc: Option<String>,
+}
+
 /// `hash` is the content of the file at exactly this stamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileHashRow {

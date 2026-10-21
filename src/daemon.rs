@@ -9,9 +9,9 @@ pub use kache_protocol::{
     BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest, CompileStartedRequest,
     DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome, HashFileRequest,
     HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest, PrefetchRequest,
-    PrefetchStatsSnapshot, PrestageRequest, RecordFileHashesRequest, RemoteCheckRequest,
-    SeedTargetRequest, StampHitsRequest, StatsEntry, StatsRequest, TransferDirection,
-    TransferEvent, UploadJob,
+    PrefetchStatsSnapshot, PrestageRequest, RecordFileHashesRequest, RecordTargetRootsRequest,
+    RemoteCheckRequest, SeedTargetRequest, StampHitsRequest, StatsEntry, StatsRequest,
+    TransferDirection, TransferEvent, UploadJob,
 };
 use kunobi_daemon::Lifecycle;
 #[path = "daemon_lifecycle.rs"]
@@ -481,6 +481,10 @@ pub(crate) enum Request {
     /// them ([`Daemon::flush_file_hash_records`]). Older daemons reject the
     /// unknown variant and the wrapper drops the rows, as it did before.
     RecordFileHashes(RecordFileHashesRequest),
+    /// A wrapper hands over the target root its index was too busy to
+    /// record ([`Daemon::flush_handed_rows`]). Older daemons reject the
+    /// unknown variant, and the build's next unit records it.
+    RecordTargetRoots(RecordTargetRootsRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),
@@ -2280,6 +2284,9 @@ pub(crate) struct Daemon {
     /// Memo rows wrappers handed over (RecordFileHashes), written by
     /// [`Daemon::flush_file_hash_records`]; a batch the index refused stays.
     pending_memo_rows: Mutex<Vec<crate::store::MemoRow>>,
+    /// Target roots wrappers handed over (RecordTargetRoots), by target
+    /// path, written by [`Daemon::flush_handed_rows`].
+    pending_target_roots: Mutex<HashMap<String, kache_protocol::TargetRootRow>>,
     /// Hits' access stamps taken by StampHits and not yet written, with the
     /// number of hits each, written by [`Daemon::flush_hit_stamps`]. Until
     /// then the daemon's sweeps keep these entries ([`Daemon::pending_pins`]).
@@ -2435,6 +2442,7 @@ impl Daemon {
             checkpoint_store: OnceLock::new(),
             pending_file_hashes: Mutex::new(Vec::new()),
             pending_memo_rows: Mutex::new(Vec::new()),
+            pending_target_roots: Mutex::new(HashMap::new()),
             pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
             stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
@@ -3117,6 +3125,7 @@ impl Daemon {
             Request::HashFiles(req) => self.handle_hash_files(req),
             Request::StampHits(req) => self.handle_stamp_hits(req),
             Request::RecordFileHashes(req) => self.handle_record_file_hashes(req),
+            Request::RecordTargetRoots(req) => self.handle_record_target_roots(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
@@ -3511,23 +3520,7 @@ impl Daemon {
             }
             _ => return,
         };
-        let written = (|| -> Result<()> {
-            let lock = match self.stamp_store.get() {
-                Some(lock) => lock,
-                None => {
-                    let store = Store::open(&self.config)?;
-                    defer_checkpoints_under_mutex(&store);
-                    let _ = self.stamp_store.set(Mutex::new(store));
-                    self.stamp_store
-                        .get()
-                        .ok_or_else(|| anyhow::anyhow!("daemon stamp store failed to initialize"))?
-                }
-            };
-            let store = lock
-                .lock()
-                .map_err(|_| anyhow::anyhow!("daemon stamp store mutex poisoned"))?;
-            store.stamp_hits(&batch)
-        })();
+        let written = self.with_stamp_store(|store| store.stamp_hits(&batch));
         if let Err(error) = written {
             tracing::debug!("hit stamps not written yet: {error:#}");
             return;
@@ -3540,6 +3533,88 @@ impl Daemon {
                         slot.remove();
                     } else {
                         *slot.get_mut() = left;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The stamp connection: writes on it may wait for the index's write
+    /// lock, and no wrapper waits for them.
+    fn with_stamp_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let lock = match self.stamp_store.get() {
+            Some(lock) => lock,
+            None => {
+                let store = Store::open(&self.config)?;
+                defer_checkpoints_under_mutex(&store);
+                let _ = self.stamp_store.set(Mutex::new(store));
+                self.stamp_store
+                    .get()
+                    .ok_or_else(|| anyhow::anyhow!("daemon stamp store failed to initialize"))?
+            }
+        };
+        let store = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon stamp store mutex poisoned"))?;
+        f(&store)
+    }
+
+    /// Take target roots a wrapper's index was too busy to record. Refused
+    /// for another store, or when [`MAX_PENDING_HANDED_ROWS`] are waiting.
+    pub fn handle_record_target_roots(&self, req: &RecordTargetRootsRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("target roots for another store");
+        }
+        let Ok(mut pending) = self.pending_target_roots.lock() else {
+            return Response::err("target root queue poisoned");
+        };
+        if pending.len() + req.roots.len() > MAX_PENDING_HANDED_ROWS {
+            return Response::err("target root queue full");
+        }
+        for root in &req.roots {
+            pending.insert(root.target.clone(), root.clone());
+        }
+        Response::ok()
+    }
+
+    /// Record the target roots wrappers handed over, in one transaction on
+    /// the stamp connection, each under the wrapper's own checks read again
+    /// now: a directory gone or replaced since is skipped or recorded as it
+    /// is now, as a later unit of its build would. A batch the index refused
+    /// stays for the next call, unless a newer row for the same target
+    /// arrived meanwhile.
+    pub(crate) fn flush_handed_rows(&self) {
+        let roots = match self.pending_target_roots.lock() {
+            Ok(mut pending) if !pending.is_empty() => std::mem::take(&mut *pending),
+            _ => return,
+        };
+        let written = self.with_stamp_store(|store| {
+            store.with_write_transaction(|store| {
+                for root in roots.values() {
+                    if let Err(error) = store.remember_target_root_built_by(
+                        Path::new(&root.target),
+                        Path::new(&root.workspace_root),
+                        root.rustc.as_deref(),
+                    ) {
+                        tracing::debug!(
+                            "handed target root {} not recorded: {error:#}",
+                            root.target
+                        );
+                    }
+                }
+                Ok(())
+            })
+        });
+        match written {
+            Ok(()) => tracing::debug!(roots = roots.len(), "handed target roots recorded"),
+            Err(error) => {
+                tracing::debug!("handed target roots not recorded yet: {error:#}");
+                if let Ok(mut pending) = self.pending_target_roots.lock() {
+                    for (target, root) in roots {
+                        if pending.len() >= MAX_PENDING_HANDED_ROWS {
+                            break;
+                        }
+                        pending.entry(target).or_insert(root);
                     }
                 }
             }
@@ -7261,7 +7336,11 @@ async fn server_main(
         loop {
             interval.tick().await;
             let daemon = hit_stamps_daemon.clone();
-            let _ = tokio::task::spawn_blocking(move || daemon.flush_hit_stamps()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                daemon.flush_hit_stamps();
+                daemon.flush_handed_rows();
+            })
+            .await;
         }
     });
 
@@ -7477,6 +7556,7 @@ async fn server_main(
     daemon.flush_file_hash_records();
     hit_stamps_handle.abort();
     daemon.flush_hit_stamps();
+    daemon.flush_handed_rows();
 
     // Accepted hand-offs hold their key locks. Let the worker finish them
     // for as long as it keeps making progress: a job it never reaches is an
@@ -8549,6 +8629,7 @@ async fn handle_connection_started_at(
             }
             Ok(Request::StampHits(req)) => daemon.handle_stamp_hits(&req),
             Ok(Request::RecordFileHashes(req)) => daemon.handle_record_file_hashes(&req),
+            Ok(Request::RecordTargetRoots(req)) => daemon.handle_record_target_roots(&req),
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
@@ -8991,6 +9072,10 @@ const MAX_PENDING_HIT_STAMPS: usize = 1 << 16;
 /// ([`Daemon::handle_record_file_hashes`]).
 const MAX_PENDING_MEMO_ROWS: usize = 1 << 16;
 
+/// Target roots the daemon holds before it refuses more
+/// ([`Daemon::handle_record_target_roots`]).
+const MAX_PENDING_HANDED_ROWS: usize = 1 << 12;
+
 /// How long a hit waits for the daemon's answer to its access stamp
 /// ([`send_hit_stamp`]). A daemon that refuses (an older release, another
 /// store) answers well within it; one slower than this still reads the
@@ -9057,6 +9142,27 @@ pub fn send_memo_rows(
                 redated: row.redated,
             })
             .collect(),
+    });
+    send_request_fire_and_forget(socket_path, &req).is_ok()
+}
+
+/// Hand a target root the index was too busy to record to the daemon
+/// ([`Request::RecordTargetRoots`]), without waiting for its answer. True
+/// once the request is in the daemon's socket; a daemon that refuses it
+/// leaves the root to the build's next unit. False when no daemon runs or
+/// none could be reached.
+pub fn send_target_root(
+    socket_path: &Path,
+    cache_dir: &Path,
+    root: kache_protocol::TargetRootRow,
+) -> bool {
+    #[cfg(unix)]
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::RecordTargetRoots(RecordTargetRootsRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        roots: vec![root],
     });
     send_request_fire_and_forget(socket_path, &req).is_ok()
 }
