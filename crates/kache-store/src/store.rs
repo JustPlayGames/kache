@@ -293,6 +293,19 @@ fn unlink_blob(blob: &Path) {
     }
 }
 
+/// Where a put's source files come from.
+#[derive(Clone, Copy)]
+enum PutSources<'a> {
+    /// The compiler's own outputs, which may share an inode with their blobs
+    /// and are memoised once stored.
+    Outputs,
+    /// Disposable C/C++ staging files: never hardlinked, never memoised.
+    Independent,
+    /// Snapshots a wrapper handed off, each with the digest it read from it
+    /// before returning ([`ArtifactStore::put_handed_off`]).
+    Snapshots(&'a [String]),
+}
+
 fn hardlink_eligible<P: ArtifactPolicy>(store_name: &str, executable: bool) -> bool {
     if executable {
         return false;
@@ -3113,7 +3126,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stdout,
             stderr,
             compile_time_ms,
-            true,
+            PutSources::Outputs,
         )
     }
 
@@ -3144,8 +3157,100 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stdout,
             stderr,
             compile_time_ms,
-            false,
+            PutSources::Independent,
         )
+    }
+
+    /// Store outputs a wrapper snapshotted and handed to another process
+    /// (the daemon) to store after the compile returned.
+    ///
+    /// Each `output_files` source is a snapshot the wrapper took before it
+    /// returned to Cargo: a hardlink of the compiler's output, or a private
+    /// copy. `expected` holds, per file, the digest the wrapper read from that
+    /// snapshot then, which is the address the entry records. A snapshot that
+    /// hashes differently when it is staged here was rewritten after the
+    /// compile (a link shares the output's inode), and the put fails without
+    /// committing anything: the entry is either exactly what the compiler
+    /// wrote or absent.
+    ///
+    /// Hardlinks are allowed as for [`Self::put_with_compile_time`], so the
+    /// output ends up sharing the read-only blob as a synchronous put leaves
+    /// it. The snapshot paths are temporary, so the file-hash memo is not
+    /// seeded for them; see [`Self::record_shared_output_hash`].
+    pub fn put_handed_off(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        expected: &[String],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+    ) -> Result<StorePutResult> {
+        anyhow::ensure!(
+            expected.len() == output_files.len(),
+            "a handed-off put needs one expected digest per file"
+        );
+        self.put_with_compile_time_policy(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            PutSources::Snapshots(expected),
+        )
+    }
+
+    /// Seed the file-hash memo for a compiler output whose entry a handed-off
+    /// put ([`Self::put_handed_off`]) just stored, when the output at
+    /// `output` is still the very inode of the blob `hash` names.
+    ///
+    /// That blob was hashed by the put after it was made read-only, so its
+    /// bytes are `hash` unless a writer ignored the read-only bit, which a
+    /// synchronous put's seed equally trusts. An output that was replaced
+    /// since (a new inode), stored by copy or reflink (a different inode), or
+    /// is gone is not seeded: its bytes are not known here. The fingerprint
+    /// recorded is the one whose inode was checked, so a replacement between
+    /// the check and the write cannot be recorded under `hash`.
+    ///
+    /// `redated` records the row under the re-date rule, for a check unit's
+    /// `.rmeta` whose mtime the wrapper set as Cargo is about to.
+    pub fn record_shared_output_hash(&self, output: &Path, hash: &str, redated: bool) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Ok(blob) = kache_fs::file_identity(&self.blob_path(hash)) else {
+            return false;
+        };
+        let Ok(current) = kache_fs::file_identity(output) else {
+            return false;
+        };
+        if current != blob {
+            return false;
+        }
+        let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) =
+            self.file_hash_cache().lookup_cached(output)
+        else {
+            return false;
+        };
+        if u64::try_from(fingerprint.inode).ok() != Some(blob.ino) {
+            return false;
+        }
+        if redated {
+            self.record_redated_file_hashes(&[(fingerprint, hash)]);
+        } else {
+            self.file_hash_cache().record_cached(&fingerprint, hash);
+        }
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3161,9 +3266,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stdout: &str,
         stderr: &str,
         compile_time_ms: u64,
-        allow_source_hardlinks: bool,
+        sources_kind: PutSources<'_>,
     ) -> Result<StorePutResult> {
         self.refuse_write("store an entry")?;
+        let allow_source_hardlinks = !matches!(sources_kind, PutSources::Independent);
+        let expected = match sources_kind {
+            PutSources::Snapshots(expected) => Some(expected),
+            PutSources::Outputs | PutSources::Independent => None,
+        };
         let entry_dir = self.entry_dir(cache_key);
 
         // Phase 1: stage every output into a private snapshot and hash THE
@@ -3182,7 +3292,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let mut seen_output_blobs = std::collections::HashSet::new();
         let mut put_result = StorePutResult::default();
         let mut total_size = 0u64;
-        for (source_path, store_name) in output_files {
+        for (index, (source_path, store_name)) in output_files.iter().enumerate() {
+            let expected_hash = expected.and_then(|expected| expected.get(index));
             // Every writer funnels through here, and the index checks over
             // committed metadata read these names back, so the same predicate
             // gates both: a name the verifier would call corrupt metadata must
@@ -3233,7 +3344,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // snapshot is staged in (`stage_blob_beside`), and the snapshot's
             // own digest below is still the address. An unreadable output
             // stages in `staging/` as before.
-            let predicted = crate::file_hash::hash_file(source_path).ok();
+            // A handed-off snapshot's digest was read by the wrapper before
+            // the compile returned: that, not whatever the file holds now,
+            // is the address.
+            let predicted = match expected_hash {
+                Some(hash) => Some(hash.clone()),
+                None => crate::file_hash::hash_file(source_path).ok(),
+            };
             if let Some(hash) = &predicted
                 && let Ok(blob_meta) = fs::metadata(self.blob_path(hash))
                 && blob_meta.is_file()
@@ -3284,7 +3401,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             total_size += size;
 
-            let hash = crate::file_hash::hash_file(&staged)?;
+            let hash = match crate::file_hash::hash_file(&staged) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    Self::discard_staged_blob(&staged);
+                    unshare(None);
+                    return Err(error);
+                }
+            };
+            if let Some(expected_hash) = expected_hash
+                && hash != *expected_hash
+            {
+                Self::discard_staged_blob(&staged);
+                unshare(None);
+                anyhow::bail!(
+                    "{store_name} changed after the compile returned (the compiler wrote {expected_hash}, \
+                     the snapshot now hashes to {hash}); refusing to store it"
+                );
+            }
             if seen_output_blobs.insert(hash.clone()) {
                 put_result.output_blobs += 1;
                 if self.blob_path(&hash).is_file() {
@@ -3410,7 +3544,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // blob and mark the shared inode read-only, changing ctime. Seed only
         // after the transaction's final rematerialization. Independent (C/C++)
         // puts use disposable staging paths and deliberately do not seed them.
-        if allow_source_hardlinks {
+        if matches!(sources_kind, PutSources::Outputs) {
             for (file, (source, _)) in meta.files.iter().zip(&sources) {
                 // The Rust wrapper expands dep-info back to absolute paths
                 // immediately after `put`, so it is not stable here.

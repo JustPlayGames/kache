@@ -95,6 +95,54 @@ pub(crate) struct PublishCcRequest {
     /// build script would otherwise wait for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memo: Option<CcMemoHandoff>,
+    /// What only a rustc compile carries. Present exactly on a
+    /// [`crate::daemon::Request::PublishRustc`] hand-off: a daemon that does
+    /// not know that request refuses it, so a wrapper never has a rustc
+    /// compile stored as a C/C++ object without its digest checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc: Option<RustcPublish>,
+}
+
+/// The rest of a rustc compile's store: what `Store::put_handed_off` and
+/// the bookkeeping after a synchronous rustc put need.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RustcPublish {
+    pub crate_types: Vec<String>,
+    pub features: Vec<String>,
+    pub profile: String,
+    /// One per [`PublishCcRequest::files`] entry, in the same order.
+    pub outputs: Vec<RustcOutput>,
+    /// Cargo's `-C metadata` unit, recorded with the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Large executables to record for [`crate::prestage`] once stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prestage: Vec<PrestageHint>,
+}
+
+/// One snapshotted rustc output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct RustcOutput {
+    /// The digest the wrapper read from the snapshot before it returned to
+    /// Cargo: the bytes the compiler wrote. The put refuses a snapshot that
+    /// no longer hashes to it.
+    pub hash: String,
+    /// The compiler's output the snapshot links, whose file-hash memo is
+    /// seeded once the entry is stored. `None` for a file of the wrapper's
+    /// own (normalized dep-info, a debug bundle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// The wrapper re-dated this check unit's `.rmeta` as Cargo is about to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redated: bool,
+}
+
+/// A large executable the next build may want staged ahead of its restore.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct PrestageHint {
+    pub target_dir: String,
+    pub dest: String,
+    pub store_name: String,
 }
 
 /// A preprocess memo as the wrapper captured it: the fingerprints and
@@ -227,6 +275,28 @@ impl Daemon {
     /// room. Claiming happens before the answer: from the wrapper's return
     /// onwards a peer must see the key as contended, not absent.
     pub(crate) async fn handle_publish_cc(self: &Arc<Self>, request: PublishCcRequest) -> Response {
+        if request.rustc.is_some() {
+            return refused("a rustc compile came as a C/C++ one");
+        }
+        self.handle_publish(request).await
+    }
+
+    /// [`Self::handle_publish_cc`] for a rustc compile
+    /// ([`crate::daemon::Request::PublishRustc`]).
+    pub(crate) async fn handle_publish_rustc(
+        self: &Arc<Self>,
+        request: PublishCcRequest,
+    ) -> Response {
+        let Some(rustc) = &request.rustc else {
+            return refused("a rustc hand-off without its rustc fields");
+        };
+        if rustc.outputs.len() != request.files.len() {
+            return refused("a digest is missing for some file");
+        }
+        self.handle_publish(request).await
+    }
+
+    async fn handle_publish(self: &Arc<Self>, request: PublishCcRequest) -> Response {
         if !crate::cache_key::is_valid_cache_key(&request.cache_key) {
             return refused("invalid cache key");
         }
@@ -410,21 +480,40 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
         .collect();
     let bytes_before = StoreBytes::snapshot();
     let mut event = request.event.clone();
-    let put = store.put_with_compile_time_independent(
-        &request.cache_key,
-        &request.crate_name,
-        &[],
-        &[],
-        &request.target,
-        "",
-        &files,
-        &request.stdout,
-        &request.stderr,
-        request.compile_time_ms,
-    );
+    let put = match &request.rustc {
+        Some(rustc) => {
+            let expected: Vec<String> = rustc.outputs.iter().map(|o| o.hash.clone()).collect();
+            store.put_handed_off(
+                &request.cache_key,
+                &request.crate_name,
+                &rustc.crate_types,
+                &rustc.features,
+                &request.target,
+                &rustc.profile,
+                &files,
+                &expected,
+                &request.stdout,
+                &request.stderr,
+                request.compile_time_ms,
+            )
+        }
+        None => store.put_with_compile_time_independent(
+            &request.cache_key,
+            &request.crate_name,
+            &[],
+            &[],
+            &request.target,
+            "",
+            &files,
+            &request.stdout,
+            &request.stderr,
+            request.compile_time_ms,
+        ),
+    };
     // As after a wrapper's put: a size check after a stored entry, recovery
     // after one refused for lack of space.
     crate::wrapper::after_store(config, store, put.as_ref().err());
+    let stored = put.is_ok();
     match put {
         Ok(put) => {
             event.result = if put.is_full_dup() {
@@ -445,6 +534,9 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             {
                 tracing::debug!("daemon could not record the cc memo: {error}");
             }
+            if let Some(rustc) = &request.rustc {
+                finish_rustc_store(config, store, &request.cache_key, rustc);
+            }
             if request.publishes_to_remote && config.remote.is_some() {
                 enqueue_upload(daemon, config, &request);
             }
@@ -452,7 +544,12 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
         Err(error) => {
             event.store_error = crate::wrapper::store_error_for_event(&error);
             tracing::warn!(
-                "daemon could not store the cc entry for {}: {}",
+                "daemon could not store the {} entry for {}: {}",
+                if request.rustc.is_some() {
+                    "rustc"
+                } else {
+                    "cc"
+                },
                 request.crate_name,
                 event.store_error
             );
@@ -466,9 +563,53 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
     // done. Drop the lock only after the files are gone: a peer that takes
     // the key next must find a committed entry, and nothing of ours left.
     discard_handoff_files(&request);
+    // After the snapshots are gone: removing a link changes the inode's
+    // ctime, which a memo row recorded before would no longer match.
+    if stored && let Some(rustc) = &request.rustc {
+        seed_rustc_outputs(store, rustc);
+    }
     crate::wrapper::write_event(config, &event);
     drop(_lock);
     daemon.publish_queue().progress.finished();
+}
+
+/// What a wrapper does after a synchronous rustc put, for a stored
+/// hand-off: the entry's unit and the prestage records. The outputs' memo
+/// rows follow once the snapshots are gone ([`seed_rustc_outputs`]).
+fn finish_rustc_store(config: &Config, store: &Store, cache_key: &str, rustc: &RustcPublish) {
+    if let Some(unit) = &rustc.unit
+        && let Err(error) = store.record_entry_unit(cache_key, unit)
+    {
+        tracing::debug!("recording the unit of {cache_key} failed: {error}");
+    }
+    if rustc.prestage.is_empty() {
+        return;
+    }
+    let Some(meta) = store.stored_meta(cache_key) else {
+        return;
+    };
+    for hint in &rustc.prestage {
+        if let Some(file) = meta.files.iter().find(|file| file.name == hint.store_name) {
+            crate::prestage::remember(
+                &config.cache_dir,
+                Path::new(&hint.target_dir),
+                Path::new(&hint.dest),
+                &file.hash,
+                file.size,
+            );
+        }
+    }
+}
+
+/// Seed the file-hash memo of a stored hand-off's outputs, as a synchronous
+/// put does, but only for an output still sharing its blob's inode
+/// (`Store::record_shared_output_hash`): dependents then skip hashing it.
+fn seed_rustc_outputs(store: &Store, rustc: &RustcPublish) {
+    for output in &rustc.outputs {
+        if let Some(path) = &output.output {
+            store.record_shared_output_hash(Path::new(path), &output.hash, output.redated);
+        }
+    }
 }
 
 fn discard_handoff_files(request: &PublishCcRequest) {
@@ -677,9 +818,7 @@ fn send_handoff(socket: &Path, request: &PublishCcRequest, budget: Duration) -> 
             .filter(|duration| !duration.is_zero())
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "cc handoff deadline"))
     };
-    let mut line = serde_json::to_vec(&crate::daemon::Request::PublishCc(Box::new(
-        request.clone(),
-    )))?;
+    let mut line = serde_json::to_vec(&publish_request(request))?;
     line.push(b'\n');
     let mut stream = ConnectOptions::new()
         .name(crate::transport::socket_name(socket)?)
@@ -728,11 +867,17 @@ fn send_handoff_windows(
     request: &PublishCcRequest,
     budget: Duration,
 ) -> Result<String> {
-    crate::daemon::send_request_with_timeout(
-        socket,
-        &crate::daemon::Request::PublishCc(Box::new(request.clone())),
-        budget,
-    )
+    crate::daemon::send_request_with_timeout(socket, &publish_request(request), budget)
+}
+
+/// The request a hand-off travels in: a rustc compile's own, so a daemon
+/// that predates it refuses it rather than storing it as a C/C++ object.
+fn publish_request(request: &PublishCcRequest) -> crate::daemon::Request {
+    if request.rustc.is_some() {
+        crate::daemon::Request::PublishRustc(Box::new(request.clone()))
+    } else {
+        crate::daemon::Request::PublishCc(Box::new(request.clone()))
+    }
 }
 
 /// Snapshot `files` (each `(source, store_name)`) into the handoff directory
@@ -743,13 +888,55 @@ pub(crate) fn snapshot_for_handoff(
     config: &Config,
     files: &[(PathBuf, String)],
 ) -> Result<Vec<HandoffFile>> {
+    snapshot_into(config, CC_BATCH_PREFIX, files)
+}
+
+/// Snapshot a rustc compile's outputs for the daemon and read each
+/// snapshot's digest, all before the wrapper returns to Cargo.
+///
+/// A compiler output is snapshotted by hardlink: no bytes are copied, and
+/// the link keeps the inode the compiler wrote alive whatever later
+/// replaces the path. What a link cannot keep out is a write into that
+/// same inode after the wrapper returned, so the digest read here, from
+/// the snapshot and before anything but the compiler has had the file, is
+/// what the daemon's put must find again (`Store::put_handed_off`). A
+/// file that cannot be linked is copied, and its copy is private.
+pub(crate) fn snapshot_rustc_outputs(
+    config: &Config,
+    files: &[(PathBuf, String)],
+) -> Result<(Vec<HandoffFile>, Vec<String>)> {
+    let snapshots = snapshot_into(config, RUSTC_BATCH_PREFIX, files)?;
+    let _trace = crate::phase_trace::phase("handoff_hash");
+    let mut digests = Vec::with_capacity(snapshots.len());
+    for snapshot in &snapshots {
+        match crate::cache_key::hash_file(Path::new(&snapshot.path)) {
+            Ok(digest) => digests.push(digest),
+            Err(error) => {
+                remove_handoff_files(&snapshots);
+                return Err(error);
+            }
+        }
+    }
+    Ok((snapshots, digests))
+}
+
+/// Request directories of C/C++ hand-offs, and of the daemon's own links.
+const CC_BATCH_PREFIX: &str = "cc-";
+/// Request directories of rustc hand-offs.
+const RUSTC_BATCH_PREFIX: &str = "rs-";
+
+fn snapshot_into(
+    config: &Config,
+    prefix: &str,
+    files: &[(PathBuf, String)],
+) -> Result<Vec<HandoffFile>> {
     let _trace = crate::phase_trace::phase("handoff_snapshot");
     let dir = handoff_dir(config);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating handoff directory {}", dir.display()))?;
     // Each request has its own directory. PID-based names can collide with
     // a previous request still queued in the daemon, or with a reused PID.
-    let batch = tempfile::Builder::new().prefix("cc-").tempdir_in(&dir)?;
+    let batch = tempfile::Builder::new().prefix(prefix).tempdir_in(&dir)?;
     // Temp dirs are 0700: in a store shared through a group, another
     // account's staging sweep must be able to clear a leftover one.
     kache_fs::share_in_group_store(batch.path());
@@ -758,7 +945,9 @@ pub(crate) fn snapshot_for_handoff(
         let target = batch
             .path()
             .join(format!("{index}-{}", handoff_file_name(store_name)));
-        // Inputs are private staging files, never compiler-owned outputs.
+        // A link shares the source's inode: C/C++ sources are private
+        // staging files, and a rustc output's bytes are checked against the
+        // digest read right after this (`snapshot_rustc_outputs`).
         if std::fs::hard_link(source, &target).is_err() {
             std::fs::copy(source, &target)
                 .with_context(|| format!("snapshotting {} for the daemon", source.display()))?;
@@ -823,7 +1012,7 @@ fn newest_mtime(dir: &Path) -> Option<(std::time::SystemTime, u64)> {
 /// One whose newest entry is older than `grace` belongs to no live request:
 /// the daemon that accepted it died, or the wrapper died before handing it
 /// over. The store's own staging sweep only looks at files and so never
-/// reached these. Only `cc-` directories directly under the handoff directory
+/// reached these. Only `cc-` and `rs-` directories directly under the handoff directory
 /// are considered, a link is never followed, and nothing else in the store is
 /// walked.
 pub(crate) fn sweep_orphaned_handoffs(config: &Config, grace: Duration) -> HandoffSweep {
@@ -834,7 +1023,10 @@ pub(crate) fn sweep_orphaned_handoffs(config: &Config, grace: Duration) -> Hando
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_request = entry.file_name().to_string_lossy().starts_with("cc-")
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_request = (name.starts_with(CC_BATCH_PREFIX)
+            || name.starts_with(RUSTC_BATCH_PREFIX))
             && std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
         if !is_request {
             continue;
@@ -1034,6 +1226,7 @@ mod tests {
             publishes_to_remote: false,
             event: crate::events::BuildEvent::new_for_test("a.c", EventResult::Miss),
             memo: None,
+            rustc: None,
         }
     }
 
@@ -1800,6 +1993,7 @@ mod tests {
             publishes_to_remote: false,
             event: crate::events::BuildEvent::new_for_test("a.c", crate::events::EventResult::Miss),
             memo: None,
+            rustc: None,
         };
         let started = std::time::Instant::now();
         let outcome = hand_off_cc_publish(&config, &request);

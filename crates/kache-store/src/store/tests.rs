@@ -14447,3 +14447,180 @@ fn handed_memo_rows_are_written_only_while_they_describe_their_file() {
     let current = crate::file_hash::FileFingerprint::from_path(&plain_path).unwrap();
     assert_eq!(store.file_hash_at(&current), None);
 }
+
+/// A handed-off put of an output (a link to the compiler's file) that still
+/// holds the bytes the wrapper hashed stores it, and the output then shares
+/// the read-only blob as after a synchronous put.
+#[cfg(unix)]
+#[test]
+fn a_handed_off_snapshot_is_stored_under_the_digest_the_wrapper_read() {
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("libfoo.rlib");
+    fs::write(&output, vec![7u8; 100 << 10]).unwrap();
+    let snapshot = dir.path().join("snapshot.rlib");
+    fs::hard_link(&output, &snapshot).unwrap();
+    let digest = crate::file_hash::hash_file(&snapshot).unwrap();
+    store
+        .put_handed_off(
+            "handed_off_key",
+            "foo",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(snapshot.clone(), "libfoo.rlib".to_string())],
+            std::slice::from_ref(&digest),
+            "",
+            "",
+            0,
+        )
+        .unwrap();
+    let meta = store.get("handed_off_key").unwrap().expect("committed");
+    assert_eq!(meta.files[0].hash, digest);
+    assert!(
+        paths_share_inode(&output, &store.blob_path(&digest)),
+        "the output shares the blob, as after a synchronous put"
+    );
+    // The snapshot path is temporary: no memo row is written for it.
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&snapshot),
+        crate::file_hash::FileHashLookup::NeedsHash(_)
+    ));
+    assert!(store.record_shared_output_hash(&output, &digest, false));
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&output),
+        crate::file_hash::FileHashLookup::Hit(hash) if hash == digest
+    ));
+}
+
+/// An output rewritten in place after the wrapper hashed it (and returned to
+/// Cargo) is never stored under the compile's key: the put fails, commits
+/// nothing and publishes no blob of the new bytes, and the output gets its
+/// mode back.
+#[cfg(unix)]
+#[test]
+fn a_handed_off_snapshot_rewritten_after_the_compile_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    for (label, size) in [("small", 100usize), ("large", 300 << 10)] {
+        let key = format!("rewritten_{label}");
+        let output = dir.path().join(format!("lib{label}.rlib"));
+        fs::write(&output, vec![1u8; size]).unwrap();
+        let snapshot = dir.path().join(format!("{label}.snapshot"));
+        fs::hard_link(&output, &snapshot).unwrap();
+        let digest = crate::file_hash::hash_file(&snapshot).unwrap();
+        // Same length, new bytes, same inode: what an in-place post-processor
+        // would leave behind.
+        fs::write(&output, vec![2u8; size]).unwrap();
+        let rewritten = crate::file_hash::hash_file(&output).unwrap();
+        let error = store
+            .put_handed_off(
+                &key,
+                label,
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(snapshot.clone(), format!("lib{label}.rlib"))],
+                std::slice::from_ref(&digest),
+                "",
+                "",
+                0,
+            )
+            .expect_err("a rewritten output must not be stored");
+        assert!(
+            format!("{error:#}").contains("changed after the compile"),
+            "{label}: {error:#}"
+        );
+        assert!(
+            store.get(&key).unwrap().is_none(),
+            "{label}: nothing committed"
+        );
+        assert!(!store.contains(&key), "{label}");
+        assert!(
+            !store.blob_path(&rewritten).exists(),
+            "{label}: no blob of the new bytes"
+        );
+        assert!(
+            !store.blob_path(&digest).exists(),
+            "{label}: no blob under the old address"
+        );
+        let mode = fs::metadata(&output).unwrap().permissions().mode();
+        assert_ne!(mode & 0o200, 0, "{label}: the output is writable again");
+        assert!(!store.record_shared_output_hash(&output, &digest, false));
+    }
+}
+
+/// The memo is seeded only for an output that is still the blob's inode: a
+/// replaced output (a new file renamed over it), or one stored by copy, keeps
+/// no row under the stored digest.
+#[cfg(unix)]
+#[test]
+fn a_replaced_output_is_never_seeded_with_the_stored_digest() {
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("libbar.rlib");
+    fs::write(&output, vec![3u8; 100 << 10]).unwrap();
+    let snapshot = dir.path().join("bar.snapshot");
+    fs::hard_link(&output, &snapshot).unwrap();
+    let digest = crate::file_hash::hash_file(&snapshot).unwrap();
+    store
+        .put_handed_off(
+            "replaced_key",
+            "bar",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(snapshot, "libbar.rlib".to_string())],
+            std::slice::from_ref(&digest),
+            "",
+            "",
+            0,
+        )
+        .unwrap();
+    let replacement = dir.path().join("libbar.rlib.new");
+    fs::write(&replacement, vec![4u8; 100 << 10]).unwrap();
+    fs::rename(&replacement, &output).unwrap();
+    assert!(!store.record_shared_output_hash(&output, &digest, false));
+    assert!(!store.record_shared_output_hash(&output, &digest, true));
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&output),
+        crate::file_hash::FileHashLookup::NeedsHash(_)
+    ));
+    let copy = dir.path().join("copy.rlib");
+    fs::copy(store.blob_path(&digest), &copy).unwrap();
+    assert!(!store.record_shared_output_hash(&copy, &digest, false));
+}
+
+/// A handed-off put needs a digest for every file.
+#[test]
+fn a_handed_off_put_without_a_digest_per_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("libbaz.rlib");
+    fs::write(&output, b"baz").unwrap();
+    assert!(
+        store
+            .put_handed_off(
+                "no_digest_key",
+                "baz",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output, "libbaz.rlib".to_string())],
+                &[],
+                "",
+                "",
+                0,
+            )
+            .is_err()
+    );
+    assert!(store.get("no_digest_key").unwrap().is_none());
+}

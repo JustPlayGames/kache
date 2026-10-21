@@ -402,7 +402,7 @@ impl Client {
         serde_json::from_slice(&output.stdout).expect("report should be valid json")
     }
 
-    /// The report once it holds an event for `crate_name`. A C miss with a
+    /// The report once it holds an event for `crate_name`. A miss with a
     /// daemon running is published in the background, and the daemon logs
     /// its event only after the store put, so an immediate report can miss it.
     fn report_with_event(&self, crate_name: &str) -> serde_json::Value {
@@ -521,7 +521,7 @@ fn a_predicted_key_reaches_the_remote_without_a_pre_pass() {
 
     // Cold: compiles, records the closure, publishes to the folder.
     client.compile_checkout(source.path(), out.path());
-    let cold = crate_event(&client.report(), "fsremote").clone();
+    let cold = crate_event(&client.report_with_event("fsremote"), "fsremote").clone();
     assert!(
         cold["result"] == "miss" || cold["result"] == "dup",
         "the first compile must be a real compile: {cold}"
@@ -598,7 +598,7 @@ fn a_stale_prediction_still_finds_the_true_key_on_the_remote() {
     let out_a = TempDir::new().unwrap();
     alpha.start_daemon();
     alpha.compile_checkout(tree.path(), out_a.path());
-    let recorded = crate_event(&alpha.report(), "fsremote").clone();
+    let recorded = crate_event(&alpha.report_with_event("fsremote"), "fsremote").clone();
     assert_eq!(recorded["dep_info_runs"], 1, "{recorded}");
     alpha.stop_daemon_and_wait();
 
@@ -616,7 +616,7 @@ fn a_stale_prediction_still_finds_the_true_key_on_the_remote() {
     let out_b = TempDir::new().unwrap();
     beta.start_daemon();
     beta.compile_checkout(tree.path(), out_b.path());
-    let published = crate_event(&beta.report(), "fsremote").clone();
+    let published = crate_event(&beta.report_with_event("fsremote"), "fsremote").clone();
     assert_ne!(
         published["cache_key"], recorded["cache_key"],
         "a bigger closure must key differently: {published}"
@@ -666,7 +666,7 @@ fn daemon_upload_reaches_an_independent_client_through_one_folder() {
     let out_a = TempDir::new().unwrap();
     alpha.start_daemon();
     alpha.compile_checkout(producer_source.path(), out_a.path());
-    let alpha_report = alpha.report();
+    let alpha_report = alpha.report_with_event("fsremote");
     let alpha_event = crate_event(&alpha_report, "fsremote");
     assert!(
         alpha_event["result"] == "miss" || alpha_event["result"] == "dup",
@@ -819,6 +819,8 @@ fn two_job_runtimes_share_one_store_across_daemon_restart() {
 
     let out_a = TempDir::new().unwrap();
     alpha.compile(&src, out_a.path());
+    // Alpha's daemon stores the miss, and logs it, after the compile.
+    alpha.report_with_event("fsremote");
     assert!(
         alpha
             .results()
@@ -1082,6 +1084,8 @@ fn a_vanished_remote_pack_falls_back_to_recompile() {
     let out_b = TempDir::new().unwrap();
     beta.start_daemon();
     beta.compile(&src, out_b.path());
+    // Beta's miss is stored, and its event logged, by its daemon.
+    beta.report_with_event("fsremote");
     let beta_results = beta.results();
     assert!(
         beta_results.iter().any(|r| r == "miss"),
