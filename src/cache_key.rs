@@ -655,6 +655,12 @@ pub(crate) fn fold_labeled(base: String, label: &str, value: &str) -> String {
 /// contains the old `\n`/`=` delimiter (build-script cfgs, env-dep values,
 /// codegen flag arguments) can no longer be confused with an adjacent field
 /// (kunobi-ninja/kache#324).
+/// Whether a parsed diagnostic flag (`--flag=value`) is `--diagnostic-width`,
+/// which the key leaves out (see the `diagnostics` group).
+fn is_diagnostic_width(flag: &str) -> bool {
+    flag == "--diagnostic-width" || flag.starts_with("--diagnostic-width=")
+}
+
 fn fold_field<H: KeyFold>(hasher: &mut H, label: &[u8], value: &[u8]) {
     hasher.update(label);
     hasher.update(&(value.len() as u64).to_le_bytes());
@@ -4756,9 +4762,23 @@ fn compute_key_into(
 
     // Always fold the version tag, including when no format was explicit:
     // older clients stored arbitrary diagnostic formats under that default key.
+    //
+    // `--diagnostic-width` is left out. It only sets the column at which
+    // rustc wraps the text of a diagnostic it prints; it changes neither an
+    // output nor the format of what is replayed (human or JSON, colour or
+    // not, which stay keyed). Cargo passes it whenever its stderr is a
+    // terminal, with that terminal's width, so keying it gave the same unit
+    // one entry per terminal size in use: builds from a terminal and from a
+    // pipe, or from two terminals, compiled each other's units again with
+    // identical outputs. A hit may print a stored warning wrapped at another
+    // width; nothing else differs.
     hasher.set_group("diagnostics");
     fold_field(&mut hasher, b"diagnostics.v1:", b"");
-    for flag in &args.diagnostic_flags {
+    for flag in args
+        .diagnostic_flags
+        .iter()
+        .filter(|flag| !is_diagnostic_width(flag))
+    {
         fold_field(&mut hasher, b"diagnostic_arg:", flag.as_bytes());
     }
 
