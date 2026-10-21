@@ -82,12 +82,7 @@ fn a_relative_kache_symlink_installs_an_executable_pin() {
     let bin = fixture.path().join("bin");
     fs::create_dir_all(&cell).unwrap();
     fs::create_dir(&bin).unwrap();
-    // A copy where the temporary directory is on another filesystem (a
-    // tmpfs /tmp) and the hard link cannot be made.
-    let installed = cell.join("kache");
-    if fs::hard_link(env!("CARGO_BIN_EXE_kache"), &installed).is_err() {
-        fs::copy(env!("CARGO_BIN_EXE_kache"), &installed).unwrap();
-    }
+    fs::copy(env!("CARGO_BIN_EXE_kache"), cell.join("kache")).unwrap();
     let symlink = bin.join("kache");
     std::os::unix::fs::symlink("../Cellar/kache/1/bin/kache", &symlink).unwrap();
     let output = fixture.compile(&symlink);
