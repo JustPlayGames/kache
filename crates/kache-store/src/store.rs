@@ -306,6 +306,82 @@ enum PutSources<'a> {
     Snapshots(&'a [String]),
 }
 
+/// An entry whose outputs a put has staged, hashed and published as blobs
+/// (its Phase 1), not yet registered in the index.
+///
+/// Its blobs are published but unreferenced: nothing can look the entry up
+/// until it is registered, and an entry that never is leaves only orphan
+/// blobs for the orphan sweep. [`ArtifactStore::put_with_compile_time_unless_busy`]
+/// returns one when the index's write lock is held elsewhere;
+/// [`ArtifactStore::register_staged_put`] registers it, waiting for the lock
+/// as a put does.
+#[derive(Debug)]
+pub struct StagedPut {
+    meta: EntryMeta,
+    meta_json: String,
+    crate_type_str: String,
+    num_features: i64,
+    total_size: u64,
+    content_hash: String,
+    /// Per file, the path Phase 2 re-materializes a blob from if a concurrent
+    /// removal unlinked it, and whether it may hardlink it.
+    sources: Vec<(PathBuf, bool)>,
+    result: StorePutResult,
+    /// Seed the file-hash memo for the sources once registered: they are the
+    /// compiler's own outputs.
+    seed_outputs: bool,
+}
+
+impl StagedPut {
+    pub fn cache_key(&self) -> &str {
+        &self.meta.cache_key
+    }
+
+    /// The entry's files, each with the digest of its published blob.
+    pub fn files(&self) -> &[CachedFile] {
+        &self.meta.files
+    }
+
+    /// What Phase 1 found: how many blobs were new and how many existed.
+    pub fn result(&self) -> StorePutResult {
+        self.result
+    }
+}
+
+/// What [`ArtifactStore::put_with_compile_time_unless_busy`] did.
+#[derive(Debug)]
+pub enum PutAttempt {
+    /// The entry is registered, as after a put.
+    Stored(StorePutResult),
+    /// The index's write lock was held elsewhere past the wait: the outputs
+    /// are staged and published, and the entry is not registered yet.
+    Busy(Box<StagedPut>),
+}
+
+/// How long [`ArtifactStore::register_staged`] waits for the index's write lock.
+#[derive(Debug, Clone, Copy)]
+enum RegistrationWait {
+    /// As every put: the busy timeout, asked for again up to
+    /// [`STORE_LOCK_ATTEMPTS`] times.
+    Patient,
+    /// One attempt with at most this busy timeout.
+    AtMost(Duration),
+}
+
+/// The fields of an entry's metadata a put takes from its caller.
+#[derive(Clone, Copy)]
+struct EntryFields<'a> {
+    cache_key: &'a str,
+    crate_name: &'a str,
+    crate_types: &'a [String],
+    features: &'a [String],
+    target: &'a str,
+    profile: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+    compile_time_ms: u64,
+}
+
 fn hardlink_eligible<P: ArtifactPolicy>(store_name: &str, executable: bool) -> bool {
     if executable {
         return false;
@@ -3210,6 +3286,164 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         )
     }
 
+    /// [`Self::put_with_compile_time`] that does not wait for a busy index.
+    ///
+    /// Phase 1 runs as in every put: each output is staged, hashed and
+    /// published as a blob. Phase 2 then waits at most `wait` for the index's
+    /// write lock. When it is still held elsewhere, nothing is registered and
+    /// the staged entry comes back ([`PutAttempt::Busy`]) for whoever
+    /// registers it: [`Self::register_staged_put`] here, or another process
+    /// given links to its blobs ([`Self::put_staged_handed_off`]). Until then
+    /// no lookup finds the entry, and one never registered leaves only
+    /// unreferenced blobs for the orphan sweep.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_with_compile_time_unless_busy(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        wait: Duration,
+    ) -> Result<PutAttempt> {
+        let staged = self.stage_put(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            PutSources::Outputs,
+        )?;
+        Ok(
+            match self.register_staged(&staged, RegistrationWait::AtMost(wait))? {
+                Some(result) => PutAttempt::Stored(result),
+                None => PutAttempt::Busy(Box::new(staged)),
+            },
+        )
+    }
+
+    /// Register an entry [`Self::put_with_compile_time_unless_busy`] staged,
+    /// waiting for the index's write lock as a put does.
+    pub fn register_staged_put(&self, staged: &StagedPut) -> Result<StorePutResult> {
+        self.register_staged(staged, RegistrationWait::Patient)?
+            .context("registering a staged entry")
+    }
+
+    /// Register an entry another process staged
+    /// ([`Self::put_with_compile_time_unless_busy`]) and handed over:
+    /// `files` is its file list, each with the digest of the blob that
+    /// process published, and `snapshots` holds, per file, a link to that
+    /// blob, which keeps its inode whatever happens to the blob's path.
+    ///
+    /// Nothing is staged again. Each snapshot is hashed, and one whose bytes
+    /// are no longer its digest (the blob shares an inode with a compiler
+    /// output a writer changed in place since, read-only bit or not) commits
+    /// nothing; that blob is unlinked when no entry references it, so no
+    /// later put adopts it under the digest. A blob a concurrent removal
+    /// unlinked is re-materialized from its snapshot and verified, as in
+    /// every put's Phase 2. `result` is what the staging put found.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_staged_handed_off(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        snapshots: &[PathBuf],
+        files: &[CachedFile],
+        result: StorePutResult,
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+    ) -> Result<StorePutResult> {
+        self.refuse_write("store an entry")?;
+        anyhow::ensure!(
+            !files.is_empty() && snapshots.len() == files.len(),
+            "a staged hand-off needs one snapshot per file"
+        );
+        for (snapshot, file) in snapshots.iter().zip(files) {
+            anyhow::ensure!(
+                kache_format::is_safe_stored_artifact_name(&file.name),
+                "refusing to cache an artifact with an unsafe name: {}",
+                file.name
+            );
+            anyhow::ensure!(
+                kache_format::is_blob_hash(&file.hash),
+                "malformed blob hash for {}: {:?}",
+                file.name,
+                file.hash
+            );
+            let size = fs::metadata(snapshot)
+                .with_context(|| format!("stating the staged blob of {}", file.name))?
+                .len();
+            let hash = crate::file_hash::hash_file(snapshot)?;
+            if hash != file.hash || size != file.size {
+                self.discard_unreferenced_blob(&file.hash, snapshot);
+                anyhow::bail!(
+                    "{} changed after the compile returned (stored as {}, its blob now hashes \
+                     to {hash}); refusing to store it",
+                    file.name,
+                    file.hash
+                );
+            }
+        }
+        let staged = self.staged_entry(
+            EntryFields {
+                cache_key,
+                crate_name,
+                crate_types,
+                features,
+                target,
+                profile,
+                stdout,
+                stderr,
+                compile_time_ms,
+            },
+            files.to_vec(),
+            snapshots.iter().map(|path| (path.clone(), true)).collect(),
+            result,
+            false,
+        )?;
+        self.register_staged_put(&staged)
+    }
+
+    /// Unlink the blob `hash` names when it is still the inode of `snapshot`
+    /// and no entry references it, under the write lock as every blob unlink.
+    /// Its bytes are no longer `hash`, and a put of `hash` would otherwise
+    /// adopt the file as it stands.
+    fn discard_unreferenced_blob(&self, hash: &str, snapshot: &Path) {
+        let blob = self.blob_path(hash);
+        let (Ok(blob_identity), Ok(snapshot_identity)) = (
+            kache_fs::file_identity(&blob),
+            kache_fs::file_identity(snapshot),
+        ) else {
+            return;
+        };
+        if blob_identity != snapshot_identity || self.db.execute_batch("BEGIN IMMEDIATE").is_err() {
+            return;
+        }
+        let referenced = self
+            .db
+            .query_row("SELECT 1 FROM blobs WHERE hash = ?1", [hash], |_| Ok(()))
+            .optional();
+        if matches!(referenced, Ok(None)) {
+            unlink_blob(&blob);
+        }
+        let _ = self.db.execute_batch("COMMIT");
+    }
+
     /// Seed the file-hash memo for a compiler output whose entry a handed-off
     /// put ([`Self::put_handed_off`]) just stored, when the output at
     /// `output` is still the very inode of the blob `hash` names.
@@ -3268,13 +3502,46 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         compile_time_ms: u64,
         sources_kind: PutSources<'_>,
     ) -> Result<StorePutResult> {
+        let staged = self.stage_put(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            sources_kind,
+        )?;
+        self.register_staged(&staged, RegistrationWait::Patient)?
+            .context("registering a stored entry")
+    }
+
+    /// Phase 1 of a put: stage, hash and publish every output as a blob and
+    /// build the entry's metadata, without touching the index.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_put(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        sources_kind: PutSources<'_>,
+    ) -> Result<StagedPut> {
         self.refuse_write("store an entry")?;
         let allow_source_hardlinks = !matches!(sources_kind, PutSources::Independent);
         let expected = match sources_kind {
             PutSources::Snapshots(expected) => Some(expected),
             PutSources::Outputs | PutSources::Independent => None,
         };
-        let entry_dir = self.entry_dir(cache_key);
 
         // Phase 1: stage every output into a private snapshot and hash THE
         // SNAPSHOT — never the live build output — before any committed entry
@@ -3291,7 +3558,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let mut sources: Vec<(PathBuf, bool)> = Vec::new();
         let mut seen_output_blobs = std::collections::HashSet::new();
         let mut put_result = StorePutResult::default();
-        let mut total_size = 0u64;
         for (index, (source_path, store_name)) in output_files.iter().enumerate() {
             let expected_hash = expected.and_then(|expected| expected.get(index));
             // Every writer funnels through here, and the index checks over
@@ -3359,7 +3625,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
                     anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
                 }
-                total_size += size;
                 if seen_output_blobs.insert(hash.clone()) {
                     put_result.output_blobs += 1;
                     put_result.duplicate_blobs += 1;
@@ -3399,7 +3664,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 unshare(None);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
-            total_size += size;
 
             let hash = match crate::file_hash::hash_file(&staged) {
                 Ok(hash) => hash,
@@ -3441,6 +3705,47 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             sources.push((source_path.clone(), use_source_hardlink));
         }
 
+        self.staged_entry(
+            EntryFields {
+                cache_key,
+                crate_name,
+                crate_types,
+                features,
+                target,
+                profile,
+                stdout,
+                stderr,
+                compile_time_ms,
+            },
+            cached_files,
+            sources,
+            put_result,
+            matches!(sources_kind, PutSources::Outputs),
+        )
+    }
+
+    /// The metadata of an entry whose blobs are published, ready for
+    /// [`Self::register_staged`].
+    fn staged_entry(
+        &self,
+        fields: EntryFields<'_>,
+        cached_files: Vec<CachedFile>,
+        sources: Vec<(PathBuf, bool)>,
+        result: StorePutResult,
+        seed_outputs: bool,
+    ) -> Result<StagedPut> {
+        let EntryFields {
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            stdout,
+            stderr,
+            compile_time_ms,
+        } = fields;
+        let total_size = cached_files.iter().map(|file| file.size).sum();
         let content_hash = compute_content_hash(&cached_files);
 
         // Record which rustc `--emit` kinds this entry actually contains, derived
@@ -3471,8 +3776,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         };
         let meta_json =
             serde_json::to_string_pretty(&meta).context("serializing entry metadata")?;
-        let meta_path = entry_dir.join("meta.json");
+        Ok(StagedPut {
+            meta,
+            meta_json,
+            crate_type_str: crate_types.join(","),
+            num_features: features.len() as i64,
+            total_size,
+            content_hash,
+            sources,
+            result,
+            seed_outputs,
+        })
+    }
 
+    /// Phase 2 of a put: register a staged entry and its blob references in
+    /// one transaction. With [`RegistrationWait::AtMost`], an index whose
+    /// write lock is still held elsewhere after that wait registers nothing
+    /// and returns `None`: the blobs stay published and unreferenced, and the
+    /// staged entry can be registered later, here or by another process.
+    fn register_staged(
+        &self,
+        staged: &StagedPut,
+        wait: RegistrationWait,
+    ) -> Result<Option<StorePutResult>> {
+        self.refuse_write("store an entry")?;
+        let cache_key = staged.meta.cache_key.as_str();
+        let entry_dir = self.entry_dir(cache_key);
+        let meta_path = entry_dir.join("meta.json");
         // Phase 2: register the entry and all of its blob references in a single
         // transaction, flipping `committed = 1` only once every blob is durable
         // on disk. Either the whole entry (with correct refcounts) becomes
@@ -3486,9 +3816,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // row for this key yet and deletes the directory, fresh meta included
         // — stranding this put's committed row with no artifacts and leaking
         // its refcounts until doctor or an index rebuild.
-        let crate_type_str = crate_types.join(",");
-        let num_features = features.len() as i64;
-        let tx = self.begin_entry_registration()?;
+        let tx = match wait {
+            RegistrationWait::Patient => self.begin_entry_registration()?,
+            RegistrationWait::AtMost(wait) => match self.try_begin_entry_registration(wait) {
+                Ok(tx) => tx,
+                Err(error) if is_sqlite_busy(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            },
+        };
         // A prior generation of this cache_key may still hold blob
         // references, most commonly a stranded row whose removal was
         // refused (#276) and that this put is about to overwrite via
@@ -3500,7 +3835,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // nothing to decrement by); those remain `doctor --repair` /
         // reconcile territory.
         release_entry_blob_refs(&tx, cache_key)?;
-        for (file, (source, use_source_hardlink)) in meta.files.iter().zip(sources.iter()) {
+        for (file, (source, use_source_hardlink)) in
+            staged.meta.files.iter().zip(staged.sources.iter())
+        {
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                 params![file.hash, file.size as i64],
@@ -3519,7 +3856,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // since the re-ingest reads the LIVE source (review finding #3).
             self.rematerialize_and_verify(source, &file.hash, &file.name, *use_source_hardlink)?;
         }
-        record_entry_blobs(&tx, cache_key, &meta.files)?;
+        record_entry_blobs(&tx, cache_key, &staged.meta.files)?;
         // The write lock is held from the statements above (record_entry_blobs
         // always issues at least the DELETE). Materialize meta.json under it:
         // a concurrent removal's cleanup pass takes the same lock before it
@@ -3532,11 +3869,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // fsync makes the new name durable alongside the contents.
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
         let durable = self.durable_writes();
-        crate::atomic::atomic_replace_deferrable(&meta_path, meta_json.as_bytes(), durable)
+        crate::atomic::atomic_replace_deferrable(&meta_path, staged.meta_json.as_bytes(), durable)
             .context("writing entry metadata")?;
         tx.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable],
+            params![cache_key, staged.meta.crate_name, staged.crate_type_str, staged.meta.profile, staged.num_features, staged.total_size as i64, staged.content_hash, staged.meta.compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable],
         )?;
         tx.commit()?;
 
@@ -3544,8 +3881,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // blob and mark the shared inode read-only, changing ctime. Seed only
         // after the transaction's final rematerialization. Independent (C/C++)
         // puts use disposable staging paths and deliberately do not seed them.
-        if matches!(sources_kind, PutSources::Outputs) {
-            for (file, (source, _)) in meta.files.iter().zip(&sources) {
+        if staged.seed_outputs {
+            for (file, (source, _)) in staged.meta.files.iter().zip(&staged.sources) {
                 // The Rust wrapper expands dep-info back to absolute paths
                 // immediately after `put`, so it is not stable here.
                 if P::stable_after_store(&file.name) {
@@ -3554,7 +3891,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        Ok(put_result)
+        Ok(Some(staged.result))
     }
 
     /// Open the write transaction that registers a stored entry, the write
@@ -3578,6 +3915,22 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 started => return started,
             }
         }
+    }
+
+    /// [`Self::begin_entry_registration`] in one attempt that waits at most
+    /// `wait` for the write lock, the connection's own busy timeout given
+    /// back afterwards.
+    fn try_begin_entry_registration(
+        &self,
+        wait: Duration,
+    ) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        let _ = self.db.busy_timeout(wait);
+        let started = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        );
+        let _ = self.db.busy_timeout(Duration::from_millis(5000));
+        started
     }
 
     /// Import a remotely downloaded entry into the database.

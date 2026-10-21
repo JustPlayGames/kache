@@ -14624,3 +14624,226 @@ fn a_handed_off_put_without_a_digest_per_file_is_refused() {
     );
     assert!(store.get("no_digest_key").unwrap().is_none());
 }
+
+/// One rlib of `fill` bytes in `dir`, as `(output, store name)`.
+fn staged_put_output(dir: &Path, fill: u8) -> (PathBuf, String) {
+    let output = dir.join("libstaged.rlib");
+    fs::write(&output, vec![fill; 100 << 10]).unwrap();
+    (output, "libstaged.rlib".to_string())
+}
+
+fn put_unless_busy(store: &Store, key: &str, files: &[(PathBuf, String)]) -> PutAttempt {
+    store
+        .put_with_compile_time_unless_busy(
+            key,
+            "staged",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            files,
+            "",
+            "warning: kept\n",
+            3,
+            Duration::from_millis(5),
+        )
+        .unwrap()
+}
+
+/// Stage `files` while another connection holds the index's write lock.
+fn put_while_the_index_is_busy(
+    store: &Store,
+    config: &Config,
+    key: &str,
+    files: &[(PathBuf, String)],
+) -> Box<StagedPut> {
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let attempt = put_unless_busy(store, key, files);
+    let waited = started.elapsed();
+    writer.execute_batch("ROLLBACK").unwrap();
+    let PutAttempt::Busy(staged) = attempt else {
+        panic!("a busy index registers nothing: {attempt:?}");
+    };
+    // A put waits up to four busy timeouts of 5 s for the lock.
+    assert!(
+        waited < Duration::from_secs(4),
+        "the put did not wait out the lock ({waited:?})"
+    );
+    staged
+}
+
+/// On a free index the put registers the entry at once, as a put does.
+#[test]
+fn a_put_unless_busy_on_a_free_index_registers_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let files = [staged_put_output(dir.path(), 4)];
+    let attempt = put_unless_busy(&store, "free_index", &files);
+    assert!(matches!(attempt, PutAttempt::Stored(result) if result.new_blobs == 1));
+    let meta = store.get("free_index").unwrap().expect("registered");
+    assert_eq!(meta.stderr, "warning: kept\n");
+    assert_eq!(
+        meta.files[0].hash,
+        crate::file_hash::hash_file(&files[0].0).unwrap()
+    );
+}
+
+/// With the index's write lock held elsewhere, the put stages and publishes
+/// the outputs, registers nothing a lookup could find, and hands the staged
+/// entry back; registering it later stores the entry a put would have.
+#[test]
+fn a_put_unless_busy_on_a_busy_index_registers_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 5)];
+    let staged = put_while_the_index_is_busy(&store, &config, "busy_index", &files);
+    assert_eq!(staged.cache_key(), "busy_index");
+    assert_eq!(staged.result().new_blobs, 1);
+    let hash = staged.files()[0].hash.clone();
+    assert!(store.blob_path(&hash).is_file(), "the blob is published");
+    assert!(
+        store.get("busy_index").unwrap().is_none(),
+        "nothing registered"
+    );
+    assert!(!store.contains("busy_index"));
+
+    let result = store.register_staged_put(&staged).unwrap();
+    assert_eq!(result.new_blobs, 1);
+    let meta = store.get("busy_index").unwrap().expect("registered");
+    assert_eq!(meta.files[0].hash, hash);
+    assert_eq!(meta.compile_time_ms, 3);
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&files[0].0),
+        crate::file_hash::FileHashLookup::Hit(seeded) if seeded == hash
+    ));
+}
+
+/// A link to each blob of a busy put, as a wrapper hands it over.
+#[cfg(unix)]
+fn link_staged_blobs(store: &Store, staged: &StagedPut, dir: &Path) -> Vec<PathBuf> {
+    fs::create_dir_all(dir).unwrap();
+    staged
+        .files()
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let link = dir.join(format!("{index}-{}", file.name));
+            fs::hard_link(store.blob_path(&file.hash), &link).unwrap();
+            link
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn put_staged_links(
+    store: &Store,
+    staged: &StagedPut,
+    links: &[PathBuf],
+) -> Result<StorePutResult> {
+    store.put_staged_handed_off(
+        staged.cache_key(),
+        "staged",
+        &["lib".to_string()],
+        &[],
+        "x86_64-unknown-linux-gnu",
+        "dev",
+        links,
+        staged.files(),
+        staged.result(),
+        "",
+        "warning: kept\n",
+        3,
+    )
+}
+
+/// Another process registers a busy put from links to its blobs, without
+/// staging anything again: the entry is the one the put staged, and the
+/// output still shares its read-only blob.
+#[cfg(unix)]
+#[test]
+fn a_staged_put_handed_over_registers_from_links_to_its_blobs() {
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 6)];
+    let staged = put_while_the_index_is_busy(&store, &config, "handed_staged", &files);
+    let links = link_staged_blobs(&store, &staged, &dir.path().join("handoff"));
+
+    let daemon = Store::open(config).unwrap();
+    let result = put_staged_links(&daemon, &staged, &links).unwrap();
+    assert_eq!(result, staged.result(), "what the staging put found");
+    let meta = store.get("handed_staged").unwrap().expect("registered");
+    assert_eq!(meta.files, staged.files());
+    assert_eq!(meta.stderr, "warning: kept\n");
+    assert!(paths_share_inode(
+        &files[0].0,
+        &store.blob_path(&meta.files[0].hash)
+    ));
+    // The links are temporary: no memo row is written for them.
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&links[0]),
+        crate::file_hash::FileHashLookup::NeedsHash(_)
+    ));
+}
+
+/// A blob that shares its inode with an output a writer changed in place
+/// before the entry was registered (ignoring the read-only bit) commits
+/// nothing, and the blob is unlinked so no later put adopts it.
+#[cfg(unix)]
+#[test]
+fn a_staged_blob_changed_before_it_was_handed_over_is_refused_and_unlinked() {
+    use std::os::unix::fs::PermissionsExt;
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 7)];
+    let staged = put_while_the_index_is_busy(&store, &config, "changed_staged", &files);
+    let hash = staged.files()[0].hash.clone();
+    let links = link_staged_blobs(&store, &staged, &dir.path().join("handoff"));
+    assert!(paths_share_inode(&files[0].0, &store.blob_path(&hash)));
+    fs::set_permissions(&files[0].0, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&files[0].0, vec![8u8; 100 << 10]).unwrap();
+
+    let error = put_staged_links(&store, &staged, &links).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed after the compile"),
+        "{error:#}"
+    );
+    assert!(store.get("changed_staged").unwrap().is_none());
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "the blob no longer holding its digest is gone"
+    );
+}
+
+/// A busy put whose blobs the orphan sweep reclaimed before anyone
+/// registered it (a daemon that died with it queued, then a sweep) is
+/// re-materialized from the links when it is registered after all.
+#[cfg(unix)]
+#[test]
+fn a_staged_put_whose_blobs_were_swept_registers_from_its_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 9)];
+    let staged = put_while_the_index_is_busy(&store, &config, "swept_staged", &files);
+    let hash = staged.files()[0].hash.clone();
+    let links = link_staged_blobs(&store, &staged, &dir.path().join("handoff"));
+    assert_eq!(store.sweep_orphan_blobs(Duration::ZERO).unwrap().removed, 1);
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "an unregistered blob is an orphan"
+    );
+
+    put_staged_links(&store, &staged, &links).unwrap();
+    let meta = store.get("swept_staged").unwrap().expect("registered");
+    assert_eq!(
+        crate::file_hash::hash_file(&store.blob_path(&meta.files[0].hash)).unwrap(),
+        hash
+    );
+}

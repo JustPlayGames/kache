@@ -15467,3 +15467,52 @@ fn a_hit_stamp_is_handed_off_only_to_a_daemon_that_takes_it() {
         "the hit waited {waited:?}"
     );
 }
+
+/// Memo rows go to the daemon without waiting for its answer: a restore that
+/// found the index busy is done once the request is in the daemon's socket,
+/// however slowly the daemon answers, and whatever it answers.
+#[cfg(unix)]
+#[test]
+fn memo_rows_are_handed_off_without_waiting_for_the_answer() {
+    use interprocess::local_socket::traits::ListenerExt as _;
+    use std::io::{BufRead, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let row = crate::store::MemoRow {
+        fingerprint: crate::cache_key::FileFingerprint {
+            path: "/x".into(),
+            size: 1 << 20,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            inode: 1,
+        },
+        hash: "h".into(),
+        redated: false,
+    };
+    let socket = fresh_endpoint(&dir.path().join("daemon.sock"));
+    let listener = bind_sync_listener(&socket);
+    let (received, got) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .unwrap();
+        received.send(line).unwrap();
+        // A daemon busy elsewhere, then refusing them.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let refused = serde_json::to_string(&Response::err("memo row queue full")).unwrap();
+        let _ = stream.write_all(format!("{refused}\n").as_bytes());
+    });
+    let started = std::time::Instant::now();
+    assert!(send_memo_rows(&socket, &dir.path().join("cache"), &[row]));
+    let waited = started.elapsed();
+    assert!(
+        got.recv().unwrap().contains("record_file_hashes"),
+        "the daemon got the rows"
+    );
+    server.join().unwrap();
+    assert!(
+        waited < std::time::Duration::from_millis(250),
+        "the restore waited {waited:?}"
+    );
+}

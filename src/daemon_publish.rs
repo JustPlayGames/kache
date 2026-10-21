@@ -118,6 +118,49 @@ pub(crate) struct RustcPublish {
     /// Large executables to record for [`crate::prestage`] once stored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prestage: Vec<PrestageHint>,
+    /// The wrapper staged and published the entry's blobs itself and only
+    /// the index was too busy to register it: the files are links to those
+    /// blobs, registered with `Store::put_staged_handed_off` without staging
+    /// them again. `None`: the files are snapshots of the outputs, stored
+    /// with `Store::put_handed_off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<StagedPublish>,
+}
+
+/// A rustc entry the wrapper staged ([`RustcPublish::staged`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct StagedPublish {
+    /// The entry's files as the wrapper staged them, one per
+    /// [`PublishCcRequest::files`] entry, in the same order.
+    pub files: Vec<crate::store::CachedFile>,
+    /// What the wrapper's staging found (`StorePutResult`).
+    pub output_blobs: u32,
+    pub duplicate_blobs: u32,
+    pub new_blobs: u32,
+}
+
+impl StagedPublish {
+    fn result(&self) -> crate::store::StorePutResult {
+        crate::store::StorePutResult {
+            output_blobs: self.output_blobs,
+            duplicate_blobs: self.duplicate_blobs,
+            new_blobs: self.new_blobs,
+        }
+    }
+
+    /// One file per link, each under the store name and digest the request
+    /// gives it elsewhere.
+    fn matches(&self, request: &PublishCcRequest, rustc: &RustcPublish) -> bool {
+        self.files.len() == request.files.len()
+            && self
+                .files
+                .iter()
+                .zip(&request.files)
+                .zip(&rustc.outputs)
+                .all(|((file, link), output)| {
+                    file.name == link.store_name && file.hash == output.hash
+                })
+    }
 }
 
 /// One snapshotted rustc output.
@@ -292,6 +335,11 @@ impl Daemon {
         };
         if rustc.outputs.len() != request.files.len() {
             return refused("a digest is missing for some file");
+        }
+        if let Some(staged) = &rustc.staged
+            && !staged.matches(&request, rustc)
+        {
+            return refused("the staged files do not match the request's");
         }
         self.handle_publish(request).await
     }
@@ -481,6 +529,28 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
     let bytes_before = StoreBytes::snapshot();
     let mut event = request.event.clone();
     let put = match &request.rustc {
+        Some(
+            rustc @ RustcPublish {
+                staged: Some(staged),
+                ..
+            },
+        ) => {
+            let links: Vec<PathBuf> = files.iter().map(|(path, _)| path.clone()).collect();
+            store.put_staged_handed_off(
+                &request.cache_key,
+                &request.crate_name,
+                &rustc.crate_types,
+                &rustc.features,
+                &request.target,
+                &rustc.profile,
+                &links,
+                &staged.files,
+                staged.result(),
+                &request.stdout,
+                &request.stderr,
+                request.compile_time_ms,
+            )
+        }
         Some(rustc) => {
             let expected: Vec<String> = rustc.outputs.iter().map(|o| o.hash.clone()).collect();
             store.put_handed_off(
@@ -524,7 +594,15 @@ fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: Publis
             event.store_output_blobs = put.output_blobs;
             event.store_duplicate_blobs = put.duplicate_blobs;
             event.store_new_blobs = put.new_blobs;
-            bytes_before.charge(&mut event);
+            // A staged entry's bytes were moved by the wrapper, whose event
+            // already counts them.
+            if !request
+                .rustc
+                .as_ref()
+                .is_some_and(|rustc| rustc.staged.is_some())
+            {
+                bytes_before.charge(&mut event);
+            }
             if let Some(memo) = &request.memo
                 && let Err(error) = store.file_hash_cache().put_cc_preprocess_memo_inputs(
                     &memo.memo_key,
@@ -891,33 +969,15 @@ pub(crate) fn snapshot_for_handoff(
     snapshot_into(config, CC_BATCH_PREFIX, files)
 }
 
-/// Snapshot a rustc compile's outputs for the daemon and read each
-/// snapshot's digest, all before the wrapper returns to Cargo.
-///
-/// A compiler output is snapshotted by hardlink: no bytes are copied, and
-/// the link keeps the inode the compiler wrote alive whatever later
-/// replaces the path. What a link cannot keep out is a write into that
-/// same inode after the wrapper returned, so the digest read here, from
-/// the snapshot and before anything but the compiler has had the file, is
-/// what the daemon's put must find again (`Store::put_handed_off`). A
-/// file that cannot be linked is copied, and its copy is private.
-pub(crate) fn snapshot_rustc_outputs(
+/// Link the blobs a rustc put staged (`(blob path, store name)`) into a
+/// request directory for the daemon, when the index was too busy to register
+/// them ([`RustcPublish::staged`]). The links keep each blob's inode for the
+/// daemon whatever happens to the blob's path; nothing is copied or hashed.
+pub(crate) fn snapshot_staged_blobs(
     config: &Config,
-    files: &[(PathBuf, String)],
-) -> Result<(Vec<HandoffFile>, Vec<String>)> {
-    let snapshots = snapshot_into(config, RUSTC_BATCH_PREFIX, files)?;
-    let _trace = crate::phase_trace::phase("handoff_hash");
-    let mut digests = Vec::with_capacity(snapshots.len());
-    for snapshot in &snapshots {
-        match crate::cache_key::hash_file(Path::new(&snapshot.path)) {
-            Ok(digest) => digests.push(digest),
-            Err(error) => {
-                remove_handoff_files(&snapshots);
-                return Err(error);
-            }
-        }
-    }
-    Ok((snapshots, digests))
+    blobs: &[(PathBuf, String)],
+) -> Result<Vec<HandoffFile>> {
+    snapshot_into(config, RUSTC_BATCH_PREFIX, blobs)
 }
 
 /// Request directories of C/C++ hand-offs, and of the daemon's own links.
@@ -946,8 +1006,8 @@ fn snapshot_into(
             .path()
             .join(format!("{index}-{}", handoff_file_name(store_name)));
         // A link shares the source's inode: C/C++ sources are private
-        // staging files, and a rustc output's bytes are checked against the
-        // digest read right after this (`snapshot_rustc_outputs`).
+        // staging files, and a rustc blob's bytes are checked against its
+        // digest before the daemon registers it (`put_staged_handed_off`).
         if std::fs::hard_link(source, &target).is_err() {
             std::fs::copy(source, &target)
                 .with_context(|| format!("snapshotting {} for the daemon", source.display()))?;
@@ -1532,6 +1592,66 @@ mod tests {
             !lifecycle.accepting_calls(),
             "a newer wrapper drains the daemon"
         );
+    }
+
+    /// A staged rustc hand-off whose file list disagrees with its links or
+    /// digests is refused before the key is taken, and leaves the wrapper to
+    /// register the entry itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_rustc_handoff_with_mismatched_files_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        daemon.publish_queue().set_sender(tx);
+        let store = Store::open(&config).unwrap();
+        let hash = blake3::hash(b"object bytes").to_hex().to_string();
+        let staged_request = |file_hash: &str, name: &str| {
+            let mut request = handoff_request(&config, &key(name), dir.path());
+            request.rustc = Some(RustcPublish {
+                crate_types: vec!["lib".to_string()],
+                features: Vec::new(),
+                profile: "dev".to_string(),
+                outputs: vec![RustcOutput {
+                    hash: hash.clone(),
+                    output: None,
+                    redated: false,
+                }],
+                unit: None,
+                prestage: Vec::new(),
+                staged: Some(StagedPublish {
+                    files: vec![crate::store::CachedFile {
+                        name: name.to_string(),
+                        size: 12,
+                        hash: file_hash.to_string(),
+                        executable: false,
+                    }],
+                    output_blobs: 1,
+                    duplicate_blobs: 0,
+                    new_blobs: 1,
+                }),
+            });
+            request
+        };
+        for request in [
+            // Another digest than the output's.
+            staged_request(&"0".repeat(64), "a.o"),
+            // Another store name than the link's.
+            staged_request(&hash, "b.o"),
+        ] {
+            let _receipt = HandoffReceipt::new(&request).unwrap();
+            let response = daemon.handle_publish_rustc(request.clone()).await;
+            assert!(!response.ok);
+            assert!(
+                response.error.as_deref().unwrap().contains("do not match"),
+                "{:?}",
+                response.error
+            );
+            assert!(matches!(
+                store.claim_build(&request.cache_key).unwrap(),
+                BuildClaim::Acquired(_)
+            ));
+        }
     }
 
     /// Refusals never take the key: a full queue, a foreign path, a key a
