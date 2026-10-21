@@ -330,6 +330,9 @@ pub struct StagedPut {
     /// Seed the file-hash memo for the sources once registered: they are the
     /// compiler's own outputs.
     seed_outputs: bool,
+    /// Cargo's `-C metadata` unit, registered with the entry; empty when
+    /// the caller records it afterwards ([`ArtifactStore::record_entry_unit`]).
+    unit: String,
 }
 
 impl StagedPut {
@@ -356,6 +359,55 @@ pub enum PutAttempt {
     /// The index's write lock was held elsewhere past the wait: the outputs
     /// are staged and published, and the entry is not registered yet.
     Busy(Box<StagedPut>),
+}
+
+/// A staged entry another process handed over, checked against the links to
+/// its blobs ([`ArtifactStore::check_staged_handed_off`]) and waiting to be
+/// registered with others in one transaction
+/// ([`ArtifactStore::register_handed_off_batch`]).
+#[derive(Debug)]
+pub struct CheckedHandoff(std::result::Result<StagedPut, RefusedHandoff>);
+
+#[derive(Debug)]
+struct RefusedHandoff {
+    error: anyhow::Error,
+    /// The digest of a blob whose bytes are no longer that digest, and the
+    /// link that showed it: unlinked under the registration's write lock
+    /// when no entry references it, so no later put adopts it.
+    changed: Option<(String, PathBuf)>,
+}
+
+impl CheckedHandoff {
+    fn refused(error: anyhow::Error) -> Self {
+        Self(Err(RefusedHandoff {
+            error,
+            changed: None,
+        }))
+    }
+
+    /// Whether the entry passed its checks and can be registered.
+    pub fn is_ready(&self) -> bool {
+        self.0.is_ok()
+    }
+
+    fn with_unit(mut self, unit: &str) -> Self {
+        if let Ok(staged) = &mut self.0 {
+            staged.unit = unit.to_string();
+        }
+        self
+    }
+}
+
+/// What [`ArtifactStore::register_handed_off_batch`] did.
+#[derive(Debug)]
+pub enum BatchAttempt {
+    /// One result per entry, in the batch's order: those that passed their
+    /// checks were registered together in one transaction, and an entry
+    /// that failed (a check, its own registration) registered nothing.
+    Registered(Vec<Result<StorePutResult>>),
+    /// The index's write lock was held elsewhere past the wait: nothing was
+    /// registered, and the batch comes back to be offered again.
+    Busy(Vec<CheckedHandoff>),
 }
 
 /// How long [`ArtifactStore::register_staged`] waits for the index's write lock.
@@ -2087,6 +2139,28 @@ fn floor_blob_refs_at_mappings(
 /// name a blob that has no row (nothing was ever counted for it); released
 /// afterwards, that mapping would consume the reference just taken and
 /// delete the new generation's row.
+/// Unlink the blob `blob` (digest `hash`) when it is still the inode of
+/// `snapshot` and no entry references it. Its bytes are no longer `hash`,
+/// and a put of `hash` would otherwise adopt the file as it stands. `conn`
+/// holds the index's write lock, under which every blob unlink happens.
+fn discard_changed_blob(conn: &rusqlite::Connection, blob: &Path, hash: &str, snapshot: &Path) {
+    let (Ok(blob_identity), Ok(snapshot_identity)) = (
+        kache_fs::file_identity(blob),
+        kache_fs::file_identity(snapshot),
+    ) else {
+        return;
+    };
+    if blob_identity != snapshot_identity {
+        return;
+    }
+    let referenced = conn
+        .query_row("SELECT 1 FROM blobs WHERE hash = ?1", [hash], |_| Ok(()))
+        .optional();
+    if matches!(referenced, Ok(None)) {
+        unlink_blob(blob);
+    }
+}
+
 fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusqlite::Result<()> {
     floor_blob_refs_at_mappings(conn, cache_key)?;
     conn.execute(
@@ -3362,17 +3436,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Register an entry another process staged
     /// ([`Self::put_with_compile_time_unless_busy`]) and handed over:
-    /// `files` is its file list, each with the digest of the blob that
-    /// process published, and `snapshots` holds, per file, a link to that
-    /// blob, which keeps its inode whatever happens to the blob's path.
-    ///
-    /// Nothing is staged again. Each snapshot is hashed, and one whose bytes
-    /// are no longer its digest (the blob shares an inode with a compiler
-    /// output a writer changed in place since, read-only bit or not) commits
-    /// nothing; that blob is unlinked when no entry references it, so no
-    /// later put adopts it under the digest. A blob a concurrent removal
-    /// unlinked is re-materialized from its snapshot and verified, as in
-    /// every put's Phase 2. `result` is what the staging put found.
+    /// [`Self::check_staged_handed_off`], then
+    /// [`Self::register_handed_off_batch`] for it alone, waiting for the
+    /// index's write lock as a put does.
     #[allow(clippy::too_many_arguments)]
     pub fn put_staged_handed_off(
         &self,
@@ -3389,35 +3455,100 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stderr: &str,
         compile_time_ms: u64,
     ) -> Result<StorePutResult> {
-        self.refuse_write("store an entry")?;
-        anyhow::ensure!(
-            !files.is_empty() && snapshots.len() == files.len(),
-            "a staged hand-off needs one snapshot per file"
+        let checked = self.check_staged_handed_off(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            snapshots,
+            files,
+            result,
+            stdout,
+            stderr,
+            compile_time_ms,
+            "",
         );
+        match self.register_batch(vec![checked], RegistrationWait::Patient) {
+            BatchAttempt::Registered(mut results) => {
+                results.pop().context("registering a handed-off entry")?
+            }
+            BatchAttempt::Busy(_) => anyhow::bail!("the index stayed busy"),
+        }
+    }
+
+    /// Check an entry another process staged
+    /// ([`Self::put_with_compile_time_unless_busy`]) and handed over, for
+    /// [`Self::register_handed_off_batch`]: `files` is its file list, each
+    /// with the digest of the blob that process published, and `snapshots`
+    /// holds, per file, a link to that blob, which keeps its inode whatever
+    /// happens to the blob's path. `unit` is Cargo's `-C metadata` unit,
+    /// registered with the entry (empty: none).
+    ///
+    /// Nothing is staged again. Each snapshot is hashed, and one whose bytes
+    /// are no longer its digest (the blob shares an inode with a compiler
+    /// output a writer changed in place since, read-only bit or not) refuses
+    /// the entry; the registration then unlinks that blob when no entry
+    /// references it, so no later put adopts it under the digest. `result`
+    /// is what the staging put found. No lock is taken and the index is
+    /// only read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_staged_handed_off(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        snapshots: &[PathBuf],
+        files: &[CachedFile],
+        result: StorePutResult,
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        unit: &str,
+    ) -> CheckedHandoff {
+        if let Err(error) = self.refuse_write("store an entry") {
+            return CheckedHandoff::refused(error);
+        }
+        if files.is_empty() || snapshots.len() != files.len() {
+            return CheckedHandoff::refused(anyhow::anyhow!(
+                "a staged hand-off needs one snapshot per file"
+            ));
+        }
         for (snapshot, file) in snapshots.iter().zip(files) {
-            anyhow::ensure!(
-                kache_format::is_safe_stored_artifact_name(&file.name),
-                "refusing to cache an artifact with an unsafe name: {}",
-                file.name
-            );
-            anyhow::ensure!(
-                kache_format::is_blob_hash(&file.hash),
-                "malformed blob hash for {}: {:?}",
-                file.name,
-                file.hash
-            );
-            let size = fs::metadata(snapshot)
-                .with_context(|| format!("stating the staged blob of {}", file.name))?
-                .len();
-            let hash = crate::file_hash::hash_file(snapshot)?;
-            if hash != file.hash || size != file.size {
-                self.discard_unreferenced_blob(&file.hash, snapshot);
-                anyhow::bail!(
-                    "{} changed after the compile returned (stored as {}, its blob now hashes \
-                     to {hash}); refusing to store it",
+            if !kache_format::is_safe_stored_artifact_name(&file.name) {
+                return CheckedHandoff::refused(anyhow::anyhow!(
+                    "refusing to cache an artifact with an unsafe name: {}",
+                    file.name
+                ));
+            }
+            if !kache_format::is_blob_hash(&file.hash) {
+                return CheckedHandoff::refused(anyhow::anyhow!(
+                    "malformed blob hash for {}: {:?}",
                     file.name,
                     file.hash
-                );
+                ));
+            }
+            let read = fs::metadata(snapshot)
+                .with_context(|| format!("stating the staged blob of {}", file.name))
+                .and_then(|meta| Ok((meta.len(), crate::file_hash::hash_file(snapshot)?)));
+            let (size, hash) = match read {
+                Ok(read) => read,
+                Err(error) => return CheckedHandoff::refused(error),
+            };
+            if hash != file.hash || size != file.size {
+                return CheckedHandoff(Err(RefusedHandoff {
+                    error: anyhow::anyhow!(
+                        "{} changed after the compile returned (stored as {}, its blob now \
+                         hashes to {hash}); refusing to store it",
+                        file.name,
+                        file.hash
+                    ),
+                    changed: Some((file.hash.clone(), snapshot.clone())),
+                }));
             }
         }
         let staged = self.staged_entry(
@@ -3436,33 +3567,121 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             snapshots.iter().map(|path| (path.clone(), true)).collect(),
             result,
             false,
-        )?;
-        self.register_staged_put(&staged)
+        );
+        CheckedHandoff(staged.map_err(|error| RefusedHandoff {
+            error,
+            changed: None,
+        }))
+        .with_unit(unit)
     }
 
-    /// Unlink the blob `hash` names when it is still the inode of `snapshot`
-    /// and no entry references it, under the write lock as every blob unlink.
-    /// Its bytes are no longer `hash`, and a put of `hash` would otherwise
-    /// adopt the file as it stands.
-    fn discard_unreferenced_blob(&self, hash: &str, snapshot: &Path) {
-        let blob = self.blob_path(hash);
-        let (Ok(blob_identity), Ok(snapshot_identity)) = (
-            kache_fs::file_identity(&blob),
-            kache_fs::file_identity(snapshot),
-        ) else {
-            return;
+    /// Register checked hand-offs ([`Self::check_staged_handed_off`]) in one
+    /// transaction, waiting at most `wait` for the index's write lock.
+    ///
+    /// Under the lock, each blob a check found changed is unlinked when no
+    /// entry references it, and an entry of the batch that names one is
+    /// refused too: its check may have read the blob before the writer got
+    /// to it. Each other entry registers as a put's Phase 2 does, in a
+    /// savepoint of its own, so one that fails (a blob that cannot be
+    /// re-materialized) registers nothing and the rest commit together. A
+    /// peer sees each entry whole or not at all, and a crash commits none.
+    pub fn register_handed_off_batch(
+        &self,
+        batch: Vec<CheckedHandoff>,
+        wait: Duration,
+    ) -> BatchAttempt {
+        self.register_batch(batch, RegistrationWait::AtMost(wait))
+    }
+
+    fn register_batch(&self, batch: Vec<CheckedHandoff>, wait: RegistrationWait) -> BatchAttempt {
+        let refuse_all = |batch: Vec<CheckedHandoff>, error: &dyn std::fmt::Display| {
+            BatchAttempt::Registered(
+                batch
+                    .into_iter()
+                    .map(|checked| match checked.0 {
+                        Ok(_) => Err(anyhow::anyhow!("registering a handed-off entry: {error}")),
+                        Err(refused) => Err(refused.error),
+                    })
+                    .collect(),
+            )
         };
-        if blob_identity != snapshot_identity || self.db.execute_batch("BEGIN IMMEDIATE").is_err() {
-            return;
+        if let Err(error) = self.refuse_write("store an entry") {
+            return refuse_all(batch, &format!("{error:#}"));
         }
-        let referenced = self
-            .db
-            .query_row("SELECT 1 FROM blobs WHERE hash = ?1", [hash], |_| Ok(()))
-            .optional();
-        if matches!(referenced, Ok(None)) {
-            unlink_blob(&blob);
+        let changed: Vec<(String, PathBuf)> = batch
+            .iter()
+            .filter_map(|checked| checked.0.as_ref().err()?.changed.clone())
+            .collect();
+        if changed.is_empty() && !batch.iter().any(CheckedHandoff::is_ready) {
+            return refuse_all(batch, &"refused");
         }
-        let _ = self.db.execute_batch("COMMIT");
+        let started = match wait {
+            RegistrationWait::Patient => self.begin_entry_registration(),
+            RegistrationWait::AtMost(wait) => self.try_begin_entry_registration(wait),
+        };
+        let mut tx = match started {
+            Ok(tx) => tx,
+            Err(error) if matches!(wait, RegistrationWait::AtMost(_)) && is_sqlite_busy(&error) => {
+                return BatchAttempt::Busy(batch);
+            }
+            Err(error) => return refuse_all(batch, &error),
+        };
+        for (hash, snapshot) in &changed {
+            discard_changed_blob(&tx, &self.blob_path(hash), hash, snapshot);
+        }
+        let mut results = Vec::with_capacity(batch.len());
+        let mut registered = Vec::new();
+        for checked in batch {
+            let staged = match checked.0 {
+                Ok(staged) => staged,
+                Err(refused) => {
+                    results.push(Err(refused.error));
+                    continue;
+                }
+            };
+            if let Some(file) = staged
+                .meta
+                .files
+                .iter()
+                .find(|file| changed.iter().any(|(hash, _)| *hash == file.hash))
+            {
+                results.push(Err(anyhow::anyhow!(
+                    "{} shares its blob {} with an output changed after its compile \
+                     returned; refusing to store it",
+                    file.name,
+                    file.hash
+                )));
+                continue;
+            }
+            let outcome = tx
+                .savepoint()
+                .map_err(anyhow::Error::from)
+                .and_then(|savepoint| {
+                    self.register_in(&savepoint, &staged)?;
+                    savepoint.commit()?;
+                    Ok(())
+                });
+            match outcome {
+                Ok(()) => {
+                    results.push(Ok(staged.result));
+                    registered.push(staged);
+                }
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        if let Err(error) = tx.commit() {
+            let error = format!("committing a batch of handed-off entries: {error}");
+            for result in &mut results {
+                if result.is_ok() {
+                    *result = Err(anyhow::anyhow!("{error}"));
+                }
+            }
+            return BatchAttempt::Registered(results);
+        }
+        for staged in &registered {
+            self.seed_registered(staged);
+        }
+        BatchAttempt::Registered(results)
     }
 
     /// Seed the file-hash memo for a compiler output whose entry a handed-off
@@ -3480,32 +3699,47 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// `redated` records the row under the re-date rule, for a check unit's
     /// `.rmeta` whose mtime the wrapper set as Cargo is about to.
     pub fn record_shared_output_hash(&self, output: &Path, hash: &str, redated: bool) -> bool {
-        if self.read_only {
+        let Some(row) = self.shared_output_memo_row(output, hash, redated) else {
             return false;
+        };
+        if redated {
+            self.record_redated_file_hashes(&[(row.fingerprint, hash)]);
+        } else {
+            self.file_hash_cache().record_cached(&row.fingerprint, hash);
         }
-        let Ok(blob) = kache_fs::file_identity(&self.blob_path(hash)) else {
-            return false;
-        };
-        let Ok(current) = kache_fs::file_identity(output) else {
-            return false;
-        };
+        true
+    }
+
+    /// The memo row [`Self::record_shared_output_hash`] would write, for a
+    /// caller that writes the rows of many outputs at once
+    /// ([`Self::write_handed_memo_rows`]). `None` when it would write none.
+    pub fn shared_output_memo_row(
+        &self,
+        output: &Path,
+        hash: &str,
+        redated: bool,
+    ) -> Option<MemoRow> {
+        if self.read_only {
+            return None;
+        }
+        let blob = kache_fs::file_identity(&self.blob_path(hash)).ok()?;
+        let current = kache_fs::file_identity(output).ok()?;
         if current != blob {
-            return false;
+            return None;
         }
         let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) =
             self.file_hash_cache().lookup_cached(output)
         else {
-            return false;
+            return None;
         };
         if u64::try_from(fingerprint.inode).ok() != Some(blob.ino) {
-            return false;
+            return None;
         }
-        if redated {
-            self.record_redated_file_hashes(&[(fingerprint, hash)]);
-        } else {
-            self.file_hash_cache().record_cached(&fingerprint, hash);
-        }
-        true
+        Some(MemoRow {
+            fingerprint,
+            hash: hash.to_string(),
+            redated,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3807,6 +4041,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             sources,
             result,
             seed_outputs,
+            unit: String::new(),
         })
     }
 
@@ -3821,6 +4056,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         wait: RegistrationWait,
     ) -> Result<Option<StorePutResult>> {
         self.refuse_write("store an entry")?;
+        let tx = match wait {
+            RegistrationWait::Patient => self.begin_entry_registration()?,
+            RegistrationWait::AtMost(wait) => match self.try_begin_entry_registration(wait) {
+                Ok(tx) => tx,
+                Err(error) if is_sqlite_busy(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            },
+        };
+        self.register_in(&tx, staged)?;
+        tx.commit()?;
+        self.seed_registered(staged);
+        Ok(Some(staged.result))
+    }
+
+    /// Register a staged entry and its blob references on `conn`, which
+    /// holds the index's write lock in a transaction (or a savepoint of one)
+    /// that the caller commits.
+    fn register_in(&self, conn: &rusqlite::Connection, staged: &StagedPut) -> Result<()> {
         let cache_key = staged.meta.cache_key.as_str();
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -3837,14 +4090,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // row for this key yet and deletes the directory, fresh meta included
         // — stranding this put's committed row with no artifacts and leaking
         // its refcounts until doctor or an index rebuild.
-        let tx = match wait {
-            RegistrationWait::Patient => self.begin_entry_registration()?,
-            RegistrationWait::AtMost(wait) => match self.try_begin_entry_registration(wait) {
-                Ok(tx) => tx,
-                Err(error) if is_sqlite_busy(&error) => return Ok(None),
-                Err(error) => return Err(error.into()),
-            },
-        };
+        //
         // A prior generation of this cache_key may still hold blob
         // references, most commonly a stranded row whose removal was
         // refused (#276) and that this put is about to overwrite via
@@ -3855,16 +4101,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // backfill hasn't materialized yet still slip through (there is
         // nothing to decrement by); those remain `doctor --repair` /
         // reconcile territory.
-        release_entry_blob_refs(&tx, cache_key)?;
+        release_entry_blob_refs(conn, cache_key)?;
         for (file, (source, use_source_hardlink)) in
             staged.meta.files.iter().zip(staged.sources.iter())
         {
-            let inserted = tx.execute(
+            let inserted = conn.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                 params![file.hash, file.size as i64],
             )?;
             if inserted == 0 {
-                tx.execute(
+                conn.execute(
                     "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
                     params![file.hash],
                 )?;
@@ -3877,7 +4123,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // since the re-ingest reads the LIVE source (review finding #3).
             self.rematerialize_and_verify(source, &file.hash, &file.name, *use_source_hardlink)?;
         }
-        record_entry_blobs(&tx, cache_key, &staged.meta.files)?;
+        record_entry_blobs(conn, cache_key, &staged.meta.files)?;
         // The write lock is held from the statements above (record_entry_blobs
         // always issues at least the DELETE). Materialize meta.json under it:
         // a concurrent removal's cleanup pass takes the same lock before it
@@ -3892,12 +4138,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let durable = self.durable_writes();
         crate::atomic::atomic_replace_deferrable(&meta_path, staged.meta_json.as_bytes(), durable)
             .context("writing entry metadata")?;
-        tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1)",
-            params![cache_key, staged.meta.crate_name, staged.crate_type_str, staged.meta.profile, staged.num_features, staged.total_size as i64, staged.content_hash, staged.meta.compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable],
+        conn.execute(
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled, unit_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1, ?11)",
+            params![cache_key, staged.meta.crate_name, staged.crate_type_str, staged.meta.profile, staged.num_features, staged.total_size as i64, staged.content_hash, staged.meta.compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, durable, staged.unit],
         )?;
-        tx.commit()?;
+        Ok(())
+    }
 
+    /// What follows a staged entry's registration once committed.
+    fn seed_registered(&self, staged: &StagedPut) {
         // Both ingest phases may hardlink a compiler output to the immutable
         // blob and mark the shared inode read-only, changing ctime. Seed only
         // after the transaction's final rematerialization. Independent (C/C++)
@@ -3911,8 +4160,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-
-        Ok(Some(staged.result))
     }
 
     /// Open the write transaction that registers a stored entry, the write
