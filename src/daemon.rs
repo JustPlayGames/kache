@@ -9,8 +9,9 @@ pub use kache_protocol::{
     BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest, CompileStartedRequest,
     DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome, HashFileRequest,
     HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest, PrefetchRequest,
-    PrefetchStatsSnapshot, PrestageRequest, RemoteCheckRequest, SeedTargetRequest, StampHitsRequest, StatsEntry,
-    StatsRequest, TransferDirection, TransferEvent, UploadJob,
+    PrefetchStatsSnapshot, PrestageRequest, RecordFileHashesRequest, RemoteCheckRequest,
+    SeedTargetRequest, StampHitsRequest, StatsEntry, StatsRequest, TransferDirection,
+    TransferEvent, UploadJob,
 };
 use kunobi_daemon::Lifecycle;
 #[path = "daemon_lifecycle.rs"]
@@ -475,6 +476,11 @@ pub(crate) enum Request {
     /// ([`Daemon::flush_hit_stamps`]). Older daemons reject the unknown
     /// variant and the wrapper stamps the index itself.
     StampHits(StampHitsRequest),
+    /// A wrapper hands over the file-hash memo rows its index was too busy
+    /// to take, so the restore that learned them neither waits nor loses
+    /// them ([`Daemon::flush_file_hash_records`]). Older daemons reject the
+    /// unknown variant and the wrapper drops the rows, as it did before.
+    RecordFileHashes(RecordFileHashesRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),
@@ -2266,6 +2272,9 @@ pub(crate) struct Daemon {
     /// File-hash rows HashFiles learned, written in one batch by
     /// [`Daemon::flush_file_hash_records`].
     pending_file_hashes: Mutex<Vec<(crate::cache_key::FileFingerprint, String)>>,
+    /// Memo rows wrappers handed over (RecordFileHashes), written by
+    /// [`Daemon::flush_file_hash_records`]; a batch the index refused stays.
+    pending_memo_rows: Mutex<Vec<crate::store::MemoRow>>,
     /// Hits' access stamps taken by StampHits and not yet written, with the
     /// number of hits each, written by [`Daemon::flush_hit_stamps`]. Until
     /// then the daemon's sweeps keep these entries ([`Daemon::pending_pins`]).
@@ -2420,6 +2429,7 @@ impl Daemon {
             hash_store: OnceLock::new(),
             checkpoint_store: OnceLock::new(),
             pending_file_hashes: Mutex::new(Vec::new()),
+            pending_memo_rows: Mutex::new(Vec::new()),
             pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
             stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
@@ -3101,6 +3111,7 @@ impl Daemon {
             Request::Health => self.handle_health(),
             Request::HashFiles(req) => self.handle_hash_files(req),
             Request::StampHits(req) => self.handle_stamp_hits(req),
+            Request::RecordFileHashes(req) => self.handle_record_file_hashes(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
@@ -3385,6 +3396,7 @@ impl Daemon {
     /// reads (settled hashes are in the in-memory cache already), so a busy
     /// index drops them rather than holding anyone up.
     pub(crate) fn flush_file_hash_records(&self) {
+        self.flush_handed_memo_rows();
         let batch = match self.pending_file_hashes.lock() {
             Ok(mut pending) if !pending.is_empty() => std::mem::take(&mut *pending),
             _ => return,
@@ -3398,6 +3410,55 @@ impl Daemon {
             Ok(())
         }) {
             tracing::debug!("file hash rows not written: {error:#}");
+        }
+    }
+
+    /// Take memo rows a wrapper's index was too busy for. Refused for another
+    /// store, or when [`MAX_PENDING_MEMO_ROWS`] are waiting (an index that has
+    /// refused writes for that long): the wrapper then drops them.
+    pub fn handle_record_file_hashes(&self, req: &RecordFileHashesRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("memo rows for another store");
+        }
+        let Ok(mut pending) = self.pending_memo_rows.lock() else {
+            return Response::err("memo row queue poisoned");
+        };
+        if pending.len() + req.rows.len() > MAX_PENDING_MEMO_ROWS {
+            return Response::err("memo row queue full");
+        }
+        pending.extend(req.rows.iter().map(|row| crate::store::MemoRow {
+            fingerprint: crate::cache_key::FileFingerprint {
+                path: row.path.clone(),
+                size: row.size,
+                mtime_ns: row.mtime_ns,
+                ctime_ns: row.ctime_ns,
+                inode: row.inode,
+            },
+            hash: row.hash.clone(),
+            redated: row.redated,
+        }));
+        Response::ok()
+    }
+
+    /// Write the memo rows wrappers handed over, in one transaction on the
+    /// hash store's connection. Rows that no longer describe their file are
+    /// left out ([`Store::write_handed_memo_rows`]); a batch the index
+    /// refused stays for the next call.
+    fn flush_handed_memo_rows(&self) {
+        let batch = match self.pending_memo_rows.lock() {
+            Ok(mut pending) if !pending.is_empty() => std::mem::take(&mut *pending),
+            _ => return,
+        };
+        match self.with_hash_store(|store| Ok(store.write_handed_memo_rows(&batch)?)) {
+            Ok(written) => tracing::debug!(rows = batch.len(), written, "handed memo rows"),
+            Err(error) => {
+                tracing::debug!("handed memo rows not written yet: {error:#}");
+                if let Ok(mut pending) = self.pending_memo_rows.lock() {
+                    let room = MAX_PENDING_MEMO_ROWS.saturating_sub(pending.len());
+                    let kept: Vec<_> = batch.into_iter().take(room).collect();
+                    pending.splice(0..0, kept);
+                }
+            }
         }
     }
 
@@ -8460,6 +8521,7 @@ async fn handle_connection_started_at(
                 offload(move || d.handle_hash_files(&req)).await
             }
             Ok(Request::StampHits(req)) => daemon.handle_stamp_hits(&req),
+            Ok(Request::RecordFileHashes(req)) => daemon.handle_record_file_hashes(&req),
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
@@ -8897,6 +8959,10 @@ pub fn send_prediction_publish(
 /// Hit stamps the daemon holds before it refuses more ([`Daemon::handle_stamp_hits`]).
 const MAX_PENDING_HIT_STAMPS: usize = 1 << 16;
 
+/// Memo rows the daemon holds before it refuses more
+/// ([`Daemon::handle_record_file_hashes`]).
+const MAX_PENDING_MEMO_ROWS: usize = 1 << 16;
+
 /// How long a hit waits for the daemon's answer to its access stamp
 /// ([`send_hit_stamp`]). A daemon that refuses (an older release, another
 /// store) answers well within it; one slower than this still reads the
@@ -8922,6 +8988,48 @@ pub fn send_hit_stamp(socket_path: &Path, cache_dir: &Path, key: &str) -> bool {
     match send_request_with_timeout(socket_path, &req, HIT_STAMP_HANDOFF_WAIT) {
         Ok(line) => serde_json::from_str::<Response>(&line).is_ok_and(|resp| resp.ok),
         // Written, no answer in time: the daemon may hold it.
+        Err(error) => error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            })
+        }),
+    }
+}
+
+/// Hand memo rows the index was too busy for to the daemon
+/// ([`Request::RecordFileHashes`]). True when the daemon took them, or will
+/// (no answer within [`HIT_STAMP_HANDOFF_WAIT`]: the request is in its
+/// socket). False when no daemon took them: none runs, or one that refused
+/// (an older release, another store, a full queue).
+#[cfg(unix)]
+pub fn send_memo_rows(
+    socket_path: &Path,
+    cache_dir: &Path,
+    rows: &[crate::store::MemoRow],
+) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::RecordFileHashes(RecordFileHashesRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        rows: rows
+            .iter()
+            .map(|row| kache_protocol::FileHashRow {
+                path: row.fingerprint.path.clone(),
+                size: row.fingerprint.size,
+                mtime_ns: row.fingerprint.mtime_ns,
+                ctime_ns: row.fingerprint.ctime_ns,
+                inode: row.fingerprint.inode,
+                hash: row.hash.clone(),
+                redated: row.redated,
+            })
+            .collect(),
+    });
+    match send_request_with_timeout(socket_path, &req, HIT_STAMP_HANDOFF_WAIT) {
+        Ok(line) => serde_json::from_str::<Response>(&line).is_ok_and(|resp| resp.ok),
         Err(error) => error.chain().any(|cause| {
             cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
                 matches!(
