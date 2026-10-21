@@ -1,4 +1,5 @@
 mod hit;
+mod restore_memo;
 mod rustc_hit;
 
 use super::*;
@@ -5131,7 +5132,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
     std::fs::remove_file(&target).unwrap();
     std::fs::write(&target, &replacement).unwrap();
 
-    record_known_file_hashes(&store, &[(fingerprint, hash.as_str())]);
+    record_known_file_hashes(&store, &[(fingerprint, hash.as_str())], &[]);
 
     assert!(
         matches!(

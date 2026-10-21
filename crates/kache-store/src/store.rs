@@ -1235,7 +1235,36 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     /// ([`Self::pin_entries_with`]); eviction keeps them like freshly
     /// stamped ones.
     pending_pins: Option<PendingPins>,
+    /// Where memo rows go that this store's index was too busy to take
+    /// ([`Self::send_busy_memo_rows_to`]).
+    busy_memo_rows: Option<MemoRowSink>,
 }
+
+/// A file-hash memo row: `hash` is the content of the file at exactly
+/// `fingerprint`. `redated` marks a [`FILE_HASH_RULE_REDATED`] row.
+///
+/// [`FILE_HASH_RULE_REDATED`]: crate::file_hash::FILE_HASH_RULE_REDATED
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoRow {
+    pub fingerprint: crate::file_hash::FileFingerprint,
+    pub hash: String,
+    pub redated: bool,
+}
+
+/// Takes memo rows the index was too busy to take, and returns `true` when it
+/// will write them ([`ArtifactStore::write_handed_memo_rows`]). `false` drops
+/// them, as a busy index did before there was anywhere to send them.
+pub type MemoRowSink = Box<dyn Fn(&[MemoRow]) -> bool + Send + Sync>;
+
+/// How long a store with a [`MemoRowSink`] waits for the index's write lock
+/// before it hands its memo rows over: a restore that waited the full
+/// [`MEMO_ROW_WAIT`] stalled its hit for that long and often lost the rows
+/// all the same. When the sink does not take them (no daemon runs), the
+/// store waits the full time after all.
+const MEMO_ROW_HANDOFF_WAIT: Duration = Duration::from_millis(5);
+
+/// How long a store without a sink waits before it drops its memo rows.
+const MEMO_ROW_WAIT: Duration = Duration::from_millis(100);
 
 /// Takes a hit's access stamp off the hit path: called with the entry's key
 /// when [`ArtifactStore::get`] would stamp it, and returns `true` when it has
@@ -2363,6 +2392,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             read_only: false,
             hit_stamps: None,
             pending_pins: None,
+            busy_memo_rows: None,
         };
 
         // A quarantined index comes back empty, but the blobs and every entry's
@@ -2452,6 +2482,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             read_only: true,
             hit_stamps: None,
             pending_pins: None,
+            busy_memo_rows: None,
         })
     }
 
@@ -2572,54 +2603,143 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// [`Self::record_verified_file_hash`] for every restored file of one
     /// hit, in one transaction with a short wait: the rows only save a later
-    /// hash, so a busy index (a miss's store transaction elsewhere) drops them
-    /// instead of stalling the hit.
+    /// hash, so a busy index (a miss's store transaction elsewhere) does not
+    /// stall the hit for them. They go to the [`MemoRowSink`] instead, or
+    /// are dropped without one.
     pub fn record_verified_file_hashes(
         &self,
         restored: &[(crate::file_hash::FileFingerprint, &str)],
     ) {
-        if self.read_only || restored.is_empty() {
-            return;
-        }
-        let _ = self.db.busy_timeout(std::time::Duration::from_millis(100));
-        let written = (|| -> rusqlite::Result<()> {
-            self.db.execute_batch("BEGIN IMMEDIATE")?;
-            for (fingerprint, hash) in restored {
-                self.file_hash_cache().record_verified(fingerprint, hash);
-            }
-            self.db.execute_batch("COMMIT")
-        })();
-        let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
-        if let Err(error) = written {
-            let _ = self.db.execute_batch("ROLLBACK");
-            tracing::debug!("restored file hashes not memoised (index busy): {error}");
-        }
+        self.record_restored_file_hashes(restored, &[]);
     }
 
     /// [`Self::record_verified_file_hashes`] for outputs whose mtime was just
     /// set to the time Cargo re-dates them to after the unit
-    /// ([`crate::file_hash::FILE_HASH_RULE_REDATED`]). Same short wait: the
-    /// rows only save later reads.
+    /// ([`crate::file_hash::FILE_HASH_RULE_REDATED`]).
     pub fn record_redated_file_hashes(
         &self,
         redated: &[(crate::file_hash::FileFingerprint, &str)],
     ) {
-        if self.read_only || redated.is_empty() {
+        self.record_restored_file_hashes(&[], redated);
+    }
+
+    /// Both of the above for one hit, in one transaction: each takes the
+    /// index's write lock, which a burst of hits and stores queues on.
+    pub fn record_restored_file_hashes(
+        &self,
+        verified: &[(crate::file_hash::FileFingerprint, &str)],
+        redated: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        if self.read_only {
             return;
         }
-        let _ = self.db.busy_timeout(std::time::Duration::from_millis(100));
+        let rows: Vec<MemoRow> = verified
+            .iter()
+            .map(|row| (row, false))
+            .chain(redated.iter().map(|row| (row, true)))
+            .filter(|((fingerprint, _), _)| {
+                fingerprint.size >= crate::file_hash::MIN_PERSISTED_HASH_BYTES
+            })
+            .map(|((fingerprint, hash), redated)| MemoRow {
+                fingerprint: fingerprint.clone(),
+                hash: (*hash).to_string(),
+                redated,
+            })
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let wait = if self.busy_memo_rows.is_some() {
+            MEMO_ROW_HANDOFF_WAIT
+        } else {
+            MEMO_ROW_WAIT
+        };
+        let Err(mut error) = self.write_memo_rows(&rows, wait) else {
+            return;
+        };
+        if self.busy_memo_rows.as_ref().is_some_and(|sink| sink(&rows)) {
+            tracing::debug!(
+                rows = rows.len(),
+                "memo rows handed off (index busy): {error}"
+            );
+            return;
+        }
+        // Nowhere took them: wait as long as a store without a sink would.
+        if wait < MEMO_ROW_WAIT {
+            match self.write_memo_rows(&rows, MEMO_ROW_WAIT) {
+                Ok(()) => return,
+                Err(again) => error = again,
+            }
+        }
+        tracing::debug!(
+            rows = rows.len(),
+            "memo rows not written (index busy): {error}"
+        );
+    }
+
+    /// Write rows a [`MemoRowSink`] took, in one transaction with a short
+    /// wait. A row is written only while it still describes its file: the
+    /// file's stamp is the row's, or for a re-dated row the row's but for a
+    /// ctime at most [`REDATE_CTIME_WINDOW_NS`] later, with no row for the
+    /// current stamp to overwrite. Any other row could never be served, and
+    /// could replace one that can. Returns how many were written; an error
+    /// (a busy index) writes none, and the caller may try again.
+    ///
+    /// [`REDATE_CTIME_WINDOW_NS`]: crate::file_hash::REDATE_CTIME_WINDOW_NS
+    pub fn write_handed_memo_rows(&self, rows: &[MemoRow]) -> rusqlite::Result<usize> {
+        if self.read_only {
+            return Ok(0);
+        }
+        let live: Vec<MemoRow> = rows
+            .iter()
+            .filter(|row| self.handed_memo_row_applies(row))
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            return Ok(0);
+        }
+        self.write_memo_rows(&live, MEMO_ROW_WAIT)?;
+        Ok(live.len())
+    }
+
+    fn handed_memo_row_applies(&self, row: &MemoRow) -> bool {
+        let recorded = &row.fingerprint;
+        let Ok(current) = crate::file_hash::FileFingerprint::from_path(Path::new(&recorded.path))
+        else {
+            return false;
+        };
+        if current == *recorded {
+            return true;
+        }
+        row.redated
+            && current.size == recorded.size
+            && current.mtime_ns == recorded.mtime_ns
+            && current.inode == recorded.inode
+            && current.ctime_ns >= recorded.ctime_ns
+            && current.ctime_ns - recorded.ctime_ns <= crate::file_hash::REDATE_CTIME_WINDOW_NS
+            && self.file_hash_at(&current).is_none()
+    }
+
+    /// One transaction for `rows`, waiting at most `wait` for the write lock.
+    fn write_memo_rows(&self, rows: &[MemoRow], wait: Duration) -> rusqlite::Result<()> {
+        let _ = self.db.busy_timeout(wait);
         let written = (|| -> rusqlite::Result<()> {
             self.db.execute_batch("BEGIN IMMEDIATE")?;
-            for (fingerprint, hash) in redated {
-                self.file_hash_cache().put_redated(fingerprint, hash)?;
+            let cache = self.file_hash_cache();
+            for row in rows {
+                if row.redated {
+                    cache.put_redated(&row.fingerprint, &row.hash)?;
+                } else if row.fingerprint.size >= crate::file_hash::MIN_PERSISTED_HASH_BYTES {
+                    cache.put(&row.fingerprint, &row.hash)?;
+                }
             }
             self.db.execute_batch("COMMIT")
         })();
-        let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
-        if let Err(error) = written {
+        let _ = self.db.busy_timeout(Duration::from_millis(5000));
+        if written.is_err() && !self.db.is_autocommit() {
             let _ = self.db.execute_batch("ROLLBACK");
-            tracing::debug!("re-dated output hashes not memoised (index busy): {error}");
         }
+        written
     }
 
     /// The memoised hash for `path` at its current stamp, read-only.
@@ -2823,6 +2943,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// its own sweeps meanwhile ([`Self::pin_entries_with`]).
     pub fn send_hit_stamps_to(&mut self, sink: HitStampSink) {
         self.hit_stamps = Some(sink);
+    }
+
+    /// Hand memo rows this store's index is too busy to take to `sink`
+    /// instead of dropping them ([`MemoRowSink`]). The sink must write them
+    /// to this store's index ([`Self::write_handed_memo_rows`]).
+    pub fn send_busy_memo_rows_to(&mut self, sink: MemoRowSink) {
+        self.busy_memo_rows = Some(sink);
     }
 
     /// Keep the entries `pending` names, as if stamped just now, in this

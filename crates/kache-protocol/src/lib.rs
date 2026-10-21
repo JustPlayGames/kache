@@ -105,6 +105,30 @@ pub struct StampHitsRequest {
     pub keys: Vec<String>,
 }
 
+/// File-hash memo rows a wrapper's store could not write because its index
+/// was busy. The daemon writes them to its own store when the index lets it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordFileHashesRequest {
+    /// The cache directory of the store the rows belong to. The daemon
+    /// writes only to its own store and refuses any other.
+    pub cache_dir: String,
+    pub rows: Vec<FileHashRow>,
+}
+
+/// `hash` is the content of the file at exactly this stamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileHashRow {
+    pub path: String,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub inode: i64,
+    pub hash: String,
+    /// Recorded for an output Cargo re-dates after the unit.
+    #[serde(default)]
+    pub redated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HashFilesRequest {
     pub files: Vec<HashFileRequest>,

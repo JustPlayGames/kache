@@ -4852,6 +4852,66 @@ fn handle_hash_files_remembers_a_hash_only_if_its_stamp_had_settled() {
     ));
 }
 
+/// Cargo's re-date of a check output kache restored moves only its ctime,
+/// so the stamp the next units ask about has not settled. The bytes read
+/// for the first of them match the re-dated row, which lets the daemon
+/// remember the hash for that stamp: the others asking at once are served
+/// from memory instead of each reading the file before the row lands.
+/// Other bytes under the same stamp are not remembered.
+#[cfg(unix)]
+#[test]
+fn handle_hash_files_remembers_a_redated_output_it_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let redate = |file: &Path| {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(file).unwrap());
+        filetime::set_file_mtime(file, mtime).unwrap();
+    };
+    let ask_twice = |file: &Path| {
+        let (req, settles_at) = hash_files_request(file);
+        let results: Vec<_> = (0..2)
+            .map(|_| {
+                let resp = daemon.handle_hash_files_at(&req, || settles_at - 1);
+                resp.hash_results.unwrap().remove(0)
+            })
+            .collect();
+        (results[0].clone(), results[1].clone())
+    };
+
+    let file = dir.path().join("libdep.rmeta");
+    std::fs::write(&file, vec![3u8; 70 * 1024]).unwrap();
+    let recorded = crate::cache_key::FileFingerprint::from_path(&file).unwrap();
+    let hash = crate::cache_key::hash_file(&file).unwrap();
+    crate::store::Store::open(&config)
+        .unwrap()
+        .record_redated_file_hashes(&[(recorded, hash.as_str())]);
+    redate(&file);
+    let (first, second) = ask_twice(&file);
+    assert_eq!(first.hash.as_deref(), Some(hash.as_str()));
+    assert!(!first.cache_hit && first.bytes_hashed > 0);
+    assert!(second.cache_hit, "the re-dated stamp is remembered");
+    assert_eq!(second.bytes_hashed, 0);
+
+    // Same size and mtime, other bytes: the row does not vouch for them.
+    let other = dir.path().join("libother.rmeta");
+    std::fs::write(&other, vec![4u8; 70 * 1024]).unwrap();
+    let recorded = crate::cache_key::FileFingerprint::from_path(&other).unwrap();
+    crate::store::Store::open(&config)
+        .unwrap()
+        .record_redated_file_hashes(&[(recorded, hash.as_str())]);
+    redate(&other);
+    let (first, second) = ask_twice(&other);
+    assert_ne!(first.hash.as_deref(), Some(hash.as_str()));
+    assert!(
+        !second.cache_hit,
+        "bytes the row does not describe are not kept"
+    );
+    assert!(second.bytes_hashed > 0);
+}
+
 /// #281: the lock-narrowed HashFiles path (cache lookup on the hash store,
 /// blake3 outside its lock, the row written by the flush) must preserve the
 /// PERSISTENT cache. A second daemon with a fresh in-memory cache but the
@@ -15266,6 +15326,100 @@ fn hit_stamps_for_another_store_or_past_the_queue_bound_are_refused() {
         !daemon.handle_stamp_hits(&stamp_request(&config, &["one-more"])).ok,
         "a full queue sends the hit back to stamping the index itself"
     );
+}
+
+fn memo_row_request(config: &Config, path: &Path) -> (RecordFileHashesRequest, String) {
+    let fingerprint = crate::cache_key::FileFingerprint::from_path(path).unwrap();
+    let hash = crate::cache_key::hash_file(path).unwrap();
+    let row = kache_protocol::FileHashRow {
+        path: fingerprint.path,
+        size: fingerprint.size,
+        mtime_ns: fingerprint.mtime_ns,
+        ctime_ns: fingerprint.ctime_ns,
+        inode: fingerprint.inode,
+        hash: hash.clone(),
+        redated: false,
+    };
+    let req = RecordFileHashesRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows: vec![row],
+    };
+    (req, hash)
+}
+
+/// Memo rows a wrapper handed over stay queued while the index refuses
+/// them, and land once it lets them.
+#[test]
+fn handed_memo_rows_stay_queued_while_the_index_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    daemon.with_hash_store(|_| Ok(())).unwrap();
+    let file = dir.path().join("libdep.rmeta");
+    std::fs::write(&file, vec![b'm'; 128 * 1024]).unwrap();
+    let (req, hash) = memo_row_request(&config, &file);
+    let fingerprint = crate::cache_key::FileFingerprint::from_path(&file).unwrap();
+
+    assert!(daemon.handle_record_file_hashes(&req).ok);
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    daemon.flush_file_hash_records();
+    assert_eq!(
+        daemon.pending_memo_rows.lock().unwrap().len(),
+        1,
+        "refused, still queued"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+
+    daemon.flush_file_hash_records();
+    assert!(daemon.pending_memo_rows.lock().unwrap().is_empty());
+    let store = Store::open(&config).unwrap();
+    assert_eq!(store.file_hash_at(&fingerprint), Some(hash));
+}
+
+#[test]
+fn handed_memo_rows_for_another_store_or_past_the_queue_bound_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let file = dir.path().join("libdep.rmeta");
+    std::fs::write(&file, vec![b'm'; 128 * 1024]).unwrap();
+    let (mut req, _) = memo_row_request(&config, &file);
+
+    let mut other = req.clone();
+    other.cache_dir = dir.path().join("elsewhere").to_string_lossy().into_owned();
+    assert!(!daemon.handle_record_file_hashes(&other).ok);
+
+    let row = req.rows[0].clone();
+    req.rows = vec![row; MAX_PENDING_MEMO_ROWS];
+    assert!(daemon.handle_record_file_hashes(&req).ok);
+    req.rows.truncate(1);
+    assert!(
+        !daemon.handle_record_file_hashes(&req).ok,
+        "a full queue sends the rows back to the wrapper, which drops them"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn memo_rows_are_not_handed_off_without_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = crate::store::MemoRow {
+        fingerprint: crate::cache_key::FileFingerprint {
+            path: "/x".into(),
+            size: 1 << 20,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            inode: 1,
+        },
+        hash: "h".into(),
+        redated: false,
+    };
+    assert!(!send_memo_rows(
+        &dir.path().join("none.sock"),
+        &dir.path().join("cache"),
+        &[row]
+    ));
 }
 
 /// The wrapper's side: a stamp counts as handed off only when a daemon took

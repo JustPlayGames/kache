@@ -14340,3 +14340,110 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     let cache = crate::file_hash::FileHashCache::Borrowed(&db);
     assert!(cache.get_cc_preprocess_memo("absent").unwrap().is_none());
 }
+
+fn memo_row_for(path: &Path, redated: bool) -> MemoRow {
+    MemoRow {
+        fingerprint: crate::file_hash::FileFingerprint::from_path(path).unwrap(),
+        hash: crate::file_hash::hash_file(path).unwrap(),
+        redated,
+    }
+}
+
+/// A store with a sink hands its memo rows over when the index is busy,
+/// rather than waiting for the lock and then dropping them.
+#[test]
+fn busy_memo_rows_go_to_the_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(test_config(dir.path())).unwrap();
+    let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&handed);
+    store.send_busy_memo_rows_to(Box::new(move |rows| {
+        sink.lock().unwrap().extend_from_slice(rows);
+        true
+    }));
+    let file = dir.path().join("libdep.rlib");
+    fs::write(&file, vec![b'l'; 128 * 1024]).unwrap();
+    let row = memo_row_for(&file, false);
+
+    let writer = Connection::open(dir.path().join("index.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.record_verified_file_hashes(&[(row.fingerprint.clone(), row.hash.as_str())]);
+    writer.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(*handed.lock().unwrap(), vec![row.clone()]);
+    assert_eq!(store.file_hash_at(&row.fingerprint), None);
+    assert_eq!(store.write_handed_memo_rows(std::slice::from_ref(&row)).unwrap(), 1);
+    assert_eq!(store.file_hash_at(&row.fingerprint), Some(row.hash));
+}
+
+/// A free index takes the rows at once; nothing is handed over.
+#[test]
+fn memo_rows_are_written_in_place_when_the_index_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(test_config(dir.path())).unwrap();
+    store.send_busy_memo_rows_to(Box::new(|_| panic!("the index was free")));
+    let plain = dir.path().join("libdep.rlib");
+    let redated = dir.path().join("libdep.rmeta");
+    fs::write(&plain, vec![b'l'; 128 * 1024]).unwrap();
+    fs::write(&redated, vec![b'm'; 128 * 1024]).unwrap();
+    let plain = memo_row_for(&plain, false);
+    let redated = memo_row_for(&redated, true);
+
+    store.record_restored_file_hashes(
+        &[(plain.fingerprint.clone(), plain.hash.as_str())],
+        &[(redated.fingerprint.clone(), redated.hash.as_str())],
+    );
+
+    assert_eq!(store.file_hash_at(&plain.fingerprint), Some(plain.hash));
+    assert_eq!(
+        store.file_hash_at(&redated.fingerprint),
+        Some(redated.hash.clone())
+    );
+    assert!(
+        store
+            .file_hash_cache()
+            .redated_pin(&redated.fingerprint, &redated.hash),
+        "the re-dated row keeps its rule"
+    );
+}
+
+/// A handed-over row is written only while it still describes its file. A
+/// re-dated row also survives Cargo's re-date, which moves only the ctime.
+#[cfg(unix)]
+#[test]
+fn handed_memo_rows_are_written_only_while_they_describe_their_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let plain_path = dir.path().join("libdep.rlib");
+    let redated_path = dir.path().join("libdep.rmeta");
+    fs::write(&plain_path, vec![b'l'; 128 * 1024]).unwrap();
+    fs::write(&redated_path, vec![b'm'; 128 * 1024]).unwrap();
+    let plain = memo_row_for(&plain_path, false);
+    let redated = memo_row_for(&redated_path, true);
+
+    // The same mtime set again, as Cargo's re-date does: only the ctime moves.
+    std::thread::sleep(Duration::from_millis(30));
+    for path in [&plain_path, &redated_path] {
+        let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(path).unwrap());
+        filetime::set_file_mtime(path, mtime).unwrap();
+    }
+    let gone = MemoRow {
+        fingerprint: crate::file_hash::FileFingerprint {
+            path: dir.path().join("gone.rlib").to_string_lossy().into_owned(),
+            ..plain.fingerprint.clone()
+        },
+        ..plain.clone()
+    };
+
+    assert_eq!(
+        store
+            .write_handed_memo_rows(&[plain.clone(), redated.clone(), gone])
+            .unwrap(),
+        1,
+        "only the re-dated row still applies"
+    );
+    let current = crate::file_hash::FileFingerprint::from_path(&redated_path).unwrap();
+    assert!(store.file_hash_cache().redated_pin(&current, &redated.hash));
+    let current = crate::file_hash::FileFingerprint::from_path(&plain_path).unwrap();
+    assert_eq!(store.file_hash_at(&current), None);
+}
