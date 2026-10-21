@@ -2548,6 +2548,44 @@ fn inputs_a_file_added_inside_the_package_where_a_macro_lists_misses() {
     assert_eq!(unit.build(&a, false, None).cache_key, added.cache_key);
 }
 
+/// Inside the package, the first file added to a directory a re-exported
+/// macro lists misses under the inputs guard when the directory was there
+/// but empty at the cold build, as it does when the directory is new. The
+/// closure names nothing in it, so the guard tells which of the package's
+/// directories next to the closure hold no file. A file added elsewhere in
+/// the package (`tests/`) still keeps the record.
+#[test]
+fn inputs_the_first_file_of_an_empty_directory_where_a_macro_lists_misses() {
+    build_kache();
+    for empty in [None, Some("kt/assets")] {
+        let unit = WorkspaceUnit::new(false)
+            .inputs()
+            .with_facade()
+            .with_file("kt/tests/t.rs", "#[test]\nfn t() {}\n");
+        let a = unit.checkout("a");
+        if let Some(empty) = empty {
+            std::fs::create_dir_all(a.join(empty)).unwrap();
+        }
+        let cold = unit.build(&a, true, None);
+        assert_eq!(cold.result, "miss", "empty={empty:?}");
+        std::fs::write(a.join("kt/tests/new.rs"), "#[test]\nfn n() {}\n").unwrap();
+        let warm = unit.build(&a, true, None);
+        assert_eq!(warm.result, "local_hit", "empty={empty:?}");
+        assert_eq!(warm.dep_info_runs, 0, "empty={empty:?}");
+
+        std::fs::create_dir_all(a.join("kt/assets")).unwrap();
+        std::fs::write(a.join("kt/assets/first.txt"), "first\n").unwrap();
+        let first = unit.build(&a, true, None);
+        assert_eq!(first.result, "miss", "empty={empty:?}");
+        assert_ne!(first.cache_key, cold.cache_key, "empty={empty:?}");
+        assert_eq!(
+            unit.build(&a, false, None).cache_key,
+            first.cache_key,
+            "empty={empty:?}"
+        );
+    }
+}
+
 /// A file a macro reads without telling rustc, declared in the member's
 /// `kache.toml`, is in the key: under the inputs guard an edit to it misses,
 /// though its directory is no directory of the closure.
