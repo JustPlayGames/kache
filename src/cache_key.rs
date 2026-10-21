@@ -3158,7 +3158,9 @@ pub(crate) fn scoped_workspace_guard() -> bool {
 ///   holds a file of the recorded closure, and of each directory between it
 ///   and the package, so a module file that appears, goes or moves next to
 ///   the closure (`foo/mod.rs` beside `foo.rs`, a renamed module) and a file
-///   added where a macro lists and includes are seen;
+///   added where a macro lists and includes are seen, and which of their
+///   subdirectories hold no file, so the first file of an empty `assets/`
+///   beside `src/` is seen as a new `assets/` is;
 /// - `OUT_DIR`, the way up to the workspace root and the closure's
 ///   directories outside the package, as the scoped guard has them.
 ///
@@ -3171,7 +3173,8 @@ pub(crate) fn scoped_workspace_guard() -> bool {
 /// What it gives up, on top of the scoped guard: a proc macro that reads a
 /// file of its package that rustc is not told about (not `include_*!`d,
 /// not declared in `kache.toml`) and includes something else because of it,
-/// or that lists a package directory holding no file of the closure, or
+/// or that lists a package directory holding no file of the closure but
+/// other files (or one deeper than beside the closure's directories), or
 /// probes for a file there. Only a workspace whose macros declare what they
 /// read (`kache.toml` `extra_inputs`) should turn it on.
 pub(crate) fn inputs_workspace_guard() -> bool {
@@ -3682,7 +3685,12 @@ fn portable_dir_label(directory: &Path, root: &Path) -> Option<String> {
 ///
 /// With `in_package` (the inputs guard, [`inputs_workspace_guard`]), the
 /// directories of the sources inside the package count too, each with every
-/// directory between it and the package, the package's own included.
+/// directory between it and the package, the package's own included, and
+/// with them which of their subdirectories hold no file at any depth
+/// ([`holds_no_file`]): a macro that lists such a directory (`assets/`
+/// beside `src/`) finds nothing there, so the closure names nothing in it,
+/// and only this tells its first file from the empty directory it lands in.
+/// A new directory already shows as a new name.
 fn closure_dirs_digest(
     sources: &[PathBuf],
     workspace: &WorkspaceRoots,
@@ -3717,7 +3725,7 @@ fn closure_dirs_digest(
                 // from the source's own up to the package.
                 let mut directory = absolute.parent();
                 while let Some(dir) = directory.filter(|dir| dir.starts_with(&package)) {
-                    directories.insert(portable_dir_label(dir, &root)?, dir.to_path_buf());
+                    directories.insert(portable_dir_label(dir, &root)?, (dir.to_path_buf(), true));
                     directory = dir.parent();
                 }
             }
@@ -3734,11 +3742,11 @@ fn closure_dirs_digest(
         if package.starts_with(&directory) {
             continue;
         }
-        directories.insert(label, directory);
+        directories.insert(label, (directory, false));
     }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"kache-closure-dirs-v1\n");
-    for (label, directory) in directories {
+    for (label, (directory, inside)) in directories {
         if let Some(not_after) = not_after {
             let metadata = std::fs::metadata(&directory).ok()?;
             let stamp = FileFingerprint {
@@ -3752,7 +3760,7 @@ fn closure_dirs_digest(
                 return None;
             }
         }
-        let mut entries: Vec<(Vec<u8>, &'static str)> = std::fs::read_dir(&directory)
+        let mut entries: Vec<(Vec<u8>, &'static str, PathBuf)> = std::fs::read_dir(&directory)
             .ok()?
             .map(|entry| {
                 let entry = entry.ok()?;
@@ -3768,20 +3776,85 @@ fn closure_dirs_digest(
                 if kind == "d" && crate::tree_stamp::holds_cargo_build_tag(&entry.path()) {
                     return Some(None);
                 }
-                Some(Some((entry.file_name().into_encoded_bytes(), kind)))
+                Some(Some((
+                    entry.file_name().into_encoded_bytes(),
+                    kind,
+                    entry.path(),
+                )))
             })
             .collect::<Option<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect();
-        entries.retain(|(name, _)| name.as_slice() != b".git");
+        entries.retain(|(name, _, _)| name.as_slice() != b".git");
         entries.sort();
         fold_field(&mut hasher, b"dir:", label.as_bytes());
-        for (name, kind) in entries {
+        for (name, kind, path) in entries {
             fold_field(&mut hasher, kind.as_bytes(), &name);
+            if inside && kind == "d" && holds_no_file(&path, not_after)? {
+                fold_field(&mut hasher, b"empty:", &name);
+            }
         }
     }
     Some(hasher.finalize().to_hex().to_string())
+}
+
+/// Does `directory` hold no file at any depth: nothing but directories,
+/// `.git` and the build directories Cargo tagged aside? A symlink counts as a
+/// file. `None` when a directory cannot be listed or the walk passes
+/// [`CRATE_TREE_MAX_ENTRIES`] entries.
+///
+/// With `not_after` (a time from [`stamp_clock_ns`]), a file found where a
+/// directory on the way to it shows a change at or after that time
+/// ([`stamp_written_since`]) gives `None` too: it may have arrived after the
+/// compile found the directory empty, and a record that called it occupied
+/// would then match the build that adds it. Each stamp is read after its
+/// listing, so a change the listing missed still shows in it. Finding no
+/// file needs no stamp: a file the compile saw and that is gone since is in
+/// the closure, which no longer resolves.
+fn holds_no_file(directory: &Path, not_after: Option<i64>) -> Option<bool> {
+    let changed_since = |path: &Path, not_after: i64| {
+        std::fs::metadata(path).map_or(true, |metadata| {
+            let stamp = FileFingerprint {
+                path: String::new(),
+                size: 0,
+                mtime_ns: metadata_mtime_ns(&metadata),
+                ctime_ns: metadata_ctime_ns(&metadata),
+                inode: 0,
+            };
+            stamp_written_since(&stamp, not_after)
+        })
+    };
+    let mut pending = vec![directory.to_path_buf()];
+    let mut budget = CRATE_TREE_MAX_ENTRIES;
+    while let Some(listed) = pending.pop() {
+        let entries = std::fs::read_dir(&listed)
+            .ok()?
+            .collect::<std::io::Result<Vec<_>>>()
+            .ok()?;
+        for entry in entries {
+            budget = budget.checked_sub(1)?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if !entry.file_type().ok()?.is_dir() {
+                if let Some(not_after) = not_after
+                    && listed
+                        .ancestors()
+                        .take_while(|dir| dir.starts_with(directory))
+                        .any(|dir| changed_since(dir, not_after))
+                {
+                    return None;
+                }
+                return Some(false);
+            }
+            let path = entry.path();
+            if !crate::tree_stamp::holds_cargo_build_tag(&path) {
+                pending.push(path);
+            }
+        }
+    }
+    Some(true)
 }
 
 /// The guard a record of `sources` must carry: `guard` itself, or for a
