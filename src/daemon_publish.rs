@@ -398,9 +398,29 @@ impl Daemon {
             Ok(Err(error)) => return refused(&format!("claim failed: {error:#}")),
             Err(error) => return refused(&format!("claim task failed: {error}")),
         };
+        let staged = request
+            .rustc
+            .as_ref()
+            .is_some_and(|rustc| rustc.staged.is_some());
         // Own separate links before acknowledging. A client may time out
         // after acceptance and remove every path it sent us.
         let claimed = tokio::task::spawn_blocking(move || {
+            if staged {
+                // A staged rustc entry's files are the wrapper's links to
+                // its blobs, which nothing but the daemon writes or removes
+                // once the receipt is accepted (`finish_handoff`): they are
+                // the daemon's from the rename on, with nothing to link or
+                // copy before the answer. A wrapper that cancelled first
+                // removes them and registers the entry itself.
+                return match accept_receipt(&request) {
+                    Ok(()) => Ok(Some(PublishJob {
+                        request,
+                        _lock: lock,
+                    })),
+                    Err(error) if receipt_cancelled(&error) => Ok(None),
+                    Err(error) => Err(error),
+                };
+            }
             let files = request
                 .files
                 .iter()
@@ -1667,6 +1687,86 @@ mod tests {
                 BuildClaim::Acquired(_)
             ));
         }
+    }
+
+    /// A staged rustc entry's files are links the wrapper made to its blobs:
+    /// accepted, the job takes those very links, with nothing linked again
+    /// before the answer. A wrapper that cancelled first keeps them, and the
+    /// key is left for it to take back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_staged_rustc_handoff_takes_the_wrappers_links_as_they_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        daemon.publish_queue().set_sender(tx);
+        let store = Store::open(&config).unwrap();
+        let hash = blake3::hash(b"object bytes").to_hex().to_string();
+        let staged_request = |label: &str| {
+            let mut request = handoff_request(&config, &key(label), dir.path());
+            request.rustc = Some(RustcPublish {
+                crate_types: vec!["lib".to_string()],
+                features: Vec::new(),
+                profile: "dev".to_string(),
+                outputs: vec![RustcOutput {
+                    hash: hash.clone(),
+                    output: None,
+                    redated: false,
+                }],
+                unit: None,
+                prestage: Vec::new(),
+                staged: Some(StagedPublish {
+                    files: vec![crate::store::CachedFile {
+                        name: "a.o".to_string(),
+                        size: 12,
+                        hash: hash.clone(),
+                        executable: false,
+                    }],
+                    output_blobs: 1,
+                    duplicate_blobs: 0,
+                    new_blobs: 1,
+                }),
+            });
+            request
+        };
+
+        let request = staged_request("taken");
+        let receipt = HandoffReceipt::new(&request).unwrap();
+        let response = daemon.handle_publish_rustc(request.clone()).await;
+        assert!(response.ok, "{response:?}");
+        let job = rx.try_recv().expect("queued");
+        assert_eq!(job.request.files, request.files, "the wrapper's own links");
+        assert_eq!(
+            finish_handoff(&receipt, Ok(String::new())),
+            Handoff::Accepted
+        );
+        drop(receipt);
+        assert_eq!(
+            std::fs::read(&job.request.files[0].path).unwrap(),
+            b"object bytes"
+        );
+        assert_eq!(
+            std::fs::read_dir(handoff_dir(&config)).unwrap().count(),
+            1,
+            "no second request directory"
+        );
+        drop(job);
+
+        let request = staged_request("withdrawn");
+        let receipt = HandoffReceipt::new(&request).unwrap();
+        assert!(matches!(
+            finish_handoff(&receipt, Err(anyhow::anyhow!("timed out"))),
+            Handoff::Declined(_)
+        ));
+        let response = daemon.handle_publish_rustc(request.clone()).await;
+        assert!(!response.ok);
+        assert!(refusal_is_routine(response.error.as_deref().unwrap()));
+        assert!(rx.try_recv().is_err(), "nothing queued");
+        assert!(Path::new(&request.files[0].path).exists(), "the wrapper's");
+        assert!(matches!(
+            store.claim_build(&request.cache_key).unwrap(),
+            BuildClaim::Acquired(_)
+        ));
     }
 
     /// Refusals never take the key: a full queue, a foreign path, a key a
