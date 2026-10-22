@@ -1323,6 +1323,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         shared_hardlink_restores: false,
         deferred_discovery: true,
         out_dir_alias: true,
+        out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
@@ -15045,11 +15046,15 @@ async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
             std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
             let listener = bind_listener(&socket);
             let server = runtime.spawn(async move {
-                while let Ok(stream) = listener.accept().await {
-                    let _ =
-                        handle_connection(stream, &server_daemon, &Arc::new(Lifecycle::default()))
-                            .await;
-                }
+                accept_loop(
+                    &listener,
+                    &server_daemon,
+                    &Arc::new(Lifecycle::default()),
+                    None,
+                    Duration::from_secs(1),
+                    std::future::pending(),
+                )
+                .await;
             });
             server_tx.send(server).unwrap();
             Ok(true)

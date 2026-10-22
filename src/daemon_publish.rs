@@ -21,6 +21,8 @@
 //!   A refusal before the daemon holds the key falls back to the wrapper.
 //!   A cancellation after the daemon has snapshotted and holds the key is
 //!   published by the daemon, so a slow snapshot cannot drop the compile.
+//!   The cancelled wrapper keeps event ownership; only an accepted receipt
+//!   transfers both publication and the event to the daemon.
 //! - The daemon owns the handoff files from acceptance on and removes them
 //!   once the put has copied them. A daemon that dies with jobs queued loses
 //!   those stores, never a build: the compile has already produced its
@@ -138,6 +140,7 @@ fn memo_input_from_wire(
 /// A job the handler accepted: the request plus the key lock it holds.
 pub(crate) struct PublishJob {
     request: PublishCcRequest,
+    owns_event: bool,
     _lock: KeyLock,
 }
 
@@ -351,6 +354,7 @@ impl Daemon {
                 return match accept_receipt(&request) {
                     Ok(()) => Ok(Some(PublishJob {
                         request,
+                        owns_event: true,
                         _lock: lock,
                     })),
                     Err(error) if receipt_cancelled(&error) => Ok(None),
@@ -371,17 +375,20 @@ impl Daemon {
             // Exactly one wins, even if the socket reply is lost. A missing
             // receipt means the wrapper already gave up. It publishes only if
             // it can take the key back, so keep these snapshots and the claim.
-            if let Err(error) = accept_receipt(&request)
-                && !receipt_cancelled(&error)
-            {
-                remove_handoff_files(&owned);
-                return Err(error);
-            }
+            let owns_event = match accept_receipt(&request) {
+                Ok(()) => true,
+                Err(error) if receipt_cancelled(&error) => false,
+                Err(error) => {
+                    remove_handoff_files(&owned);
+                    return Err(error);
+                }
+            };
             remove_handoff_files(&request.files);
             let mut request = request;
             request.files = owned;
             Ok::<_, anyhow::Error>(Some(PublishJob {
                 request,
+                owns_event,
                 _lock: lock,
             }))
         })
@@ -510,8 +517,8 @@ impl PublishJob {
 }
 
 /// Store one handed-off compile, log its event, and release what the job
-/// held. Every failure is recorded on the event; none of them can reach a
-/// build.
+/// held. Store failures are logged and included in events owned by the daemon;
+/// none of them can reach a build.
 fn publish_one(daemon: &Arc<Daemon>, config: &Config, store: &Store, job: PublishJob) {
     let store_started = std::time::Instant::now();
     let bytes_before = StoreBytes::snapshot();
@@ -838,10 +845,12 @@ fn record_put(
     Published { job, event, stored }
 }
 
-/// Log a published job's event and let go of its key, once its files are
-/// gone.
+/// Log a published job's event (unless its wrapper kept the event: a
+/// cancelled receipt) and let go of its key, once its files are gone.
 fn release(daemon: &Arc<Daemon>, config: &Config, published: Published) {
-    crate::wrapper::write_event(config, &published.event);
+    if published.job.owns_event {
+        crate::wrapper::write_event(config, &published.event);
+    }
     drop(published.job);
     daemon.publish_queue().progress.finished();
 }
@@ -1522,6 +1531,7 @@ mod tests {
                 &store,
                 PublishJob {
                     request,
+                    owns_event: true,
                     _lock: lock,
                 },
             );
@@ -1737,6 +1747,7 @@ mod tests {
                     &store,
                     PublishJob {
                         request,
+                        owns_event: true,
                         _lock: lock,
                     },
                 );
@@ -2196,7 +2207,7 @@ mod tests {
     /// that job is queued the wrapper's reclaim sees the key held; after the
     /// put it sees a commit and does not store a second copy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_cancelled_receipt_is_published_when_the_daemon_holds_the_key() {
+    async fn cancelled_handoff_publishes_without_taking_the_wrappers_event() {
         let dir = tempfile::tempdir().unwrap();
         let config = crate::test_support::test_config(dir.path().join("cache"));
         let daemon = Arc::new(Daemon::new(config.clone()));
@@ -2229,7 +2240,14 @@ mod tests {
             BuildClaim::Committed(_)
         ));
         let events = crate::events::read_events(&config.event_log_path()).unwrap();
-        assert_eq!(events.len(), 1);
+        assert!(
+            events.is_empty(),
+            "cancelling the receipt leaves event ownership with the wrapper"
+        );
+        crate::wrapper::write_event(&config, &request.event);
+        let events = crate::events::read_events(&config.event_log_path()).unwrap();
+        assert_eq!(events.len(), 1, "the compile is counted once");
+        assert!(!events[0].store_handed_off);
         assert!(
             events[0].store_error.is_empty(),
             "{:?}",
