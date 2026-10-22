@@ -1032,6 +1032,27 @@ fn warn_no_cow_restore_once(
     reflink_err: &anyhow::Error,
     layout_advice: bool,
 ) {
+    // Ask the cheap question first: on NTFS every copied file comes here,
+    // and once this session's advisory is out nothing below can print, so
+    // the volume queries (four GetVolumePathNameW, GetDiskFreeSpaceW and
+    // GetVolumeInformationW) would be spent for nothing. The marker is the
+    // invocation's (`InvocationLinkScope`), else the process's: a daemon
+    // runs many invocations, each with a marker of its own.
+    let marker = cow_warn_marker();
+    if marker.is_none() && NO_MARKER_WARNED.is_completed() {
+        return;
+    }
+    let layout_open = layout_bucket_open(marker.as_deref(), layout_advice);
+    let mut asked_has_cow = None;
+    if !copy_restore_may_warn(layout_open, || {
+        *asked_has_cow.insert(windows_volume_supports_block_clone(target_path))
+    }) {
+        tracing::debug!(
+            "copy-restored {} (this session's storage-layout advice is already out)",
+            target_path.display()
+        );
+        return;
+    }
     let cache_vol = windows_volume_root(store_path);
     let build_vol = windows_volume_root(target_path);
     // A file with no cluster-aligned range can't be block-cloned on ANY volume.
@@ -1042,7 +1063,7 @@ fn warn_no_cow_restore_once(
     let cause = classify_copy_restore(
         cache_vol.as_deref(),
         build_vol.as_deref(),
-        windows_volume_supports_block_clone(target_path),
+        asked_has_cow.unwrap_or_else(|| windows_volume_supports_block_clone(target_path)),
         sub_cluster,
     );
 
@@ -1152,12 +1173,40 @@ fn warn_no_cow_restore_once(
         }
         // No marker configured (unit tests, non-wrapper entrypoints): fall back
         // to once-per-process rather than going silent.
-        None => {
-            use std::sync::Once;
-            static WARNED: Once = Once::new();
-            WARNED.call_once(|| sink.emit(&message));
-        }
+        None => NO_MARKER_WARNED.call_once(|| sink.emit(&message)),
     }
+}
+
+/// The once-per-process copy-restore advisory when no marker is configured.
+#[cfg_attr(not(windows), allow(dead_code))]
+static NO_MARKER_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Can the storage-layout bucket of the copy-restore advisory still print?
+/// Not when the restore's strategy or `[cache] storage_layout_advice` mutes
+/// it, nor once this session's marker (or, without one, this process) has
+/// printed it. Only reads the marker: no volume query.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn layout_bucket_open(marker: Option<&Path>, layout_advice: bool) -> bool {
+    if !layout_advice || !storage_layout_advice_enabled() {
+        return false;
+    }
+    match marker {
+        Some(base) => !crate::markers::marker_is_fresh(
+            &bucket_marker(base, "cow"),
+            crate::markers::WARN_SESSION_SECS,
+        ),
+        None => !NO_MARKER_WARNED.is_completed(),
+    }
+}
+
+/// Whether a copy-restore can still print anything, asked before the volume
+/// queries that classify it. With the layout bucket closed only a fault can
+/// print, and a fault needs a build volume that block-clones, so `has_cow`
+/// (one volume query) runs only then and the rest are skipped unless it says
+/// yes.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copy_restore_may_warn(layout_open: bool, has_cow: impl FnOnce() -> Option<bool>) -> bool {
+    layout_open || has_cow() == Some(true)
 }
 
 /// Derive a per-bucket marker path from the base marker (`…/kache-cow-warn-<hash>`
@@ -1775,24 +1824,30 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
             .with_context(|| format!("sampling write clock next to {}", path.display()))?;
 
         // On Windows, hardlinked files share permissions with the store
-        // blob, which is read-only. Temporarily make it writable to update
-        // the mtime, then restore the read-only flag.
+        // blob, which is read-only, and a read-only file refuses the write
+        // handle the stamp needs. Restored copies and clones are writable,
+        // so stamp first and only on a refusal from a read-only file make it
+        // writable for the stamp, then restore the read-only flag. That
+        // saves the attribute read every writable restore used to pay.
         #[cfg(windows)]
-        {
-            let meta = fs::metadata(path)?;
-            let was_readonly = meta.permissions().readonly();
-            if was_readonly {
-                let mut perms = meta.permissions();
+        match filetime::set_file_mtime(path, now) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) =>
+            {
+                let mut perms = fs::metadata(path)?.permissions();
                 perms.set_readonly(false);
                 fs::set_permissions(path, perms)?;
-            }
-            let result = filetime::set_file_mtime(path, now);
-            if was_readonly {
+                let result = filetime::set_file_mtime(path, now);
                 let mut perms = fs::metadata(path)?.permissions();
                 perms.set_readonly(true);
                 let _ = fs::set_permissions(path, perms);
+                result.with_context(|| format!("updating mtime of {}", path.display()))?;
             }
-            result.with_context(|| format!("updating mtime of {}", path.display()))?;
+            Err(error) => {
+                return Err(error).with_context(|| format!("updating mtime of {}", path.display()));
+            }
         }
 
         #[cfg(not(windows))]
@@ -2608,6 +2663,53 @@ mod tests {
         let emitted = crate::markers::take_emitted();
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, crate::markers::WarnSink::Log);
+    }
+
+    #[test]
+    fn a_closed_layout_bucket_asks_the_volume_only_whether_it_clones() {
+        // Open: classify as before, without the early question.
+        let asked = Cell::new(0);
+        assert!(copy_restore_may_warn(true, || {
+            asked.set(asked.get() + 1);
+            Some(false)
+        }));
+        assert_eq!(asked.get(), 0);
+        // Closed on NTFS (or unknown): nothing can print, no other query.
+        for has_cow in [Some(false), None] {
+            let asked = Cell::new(0);
+            assert!(!copy_restore_may_warn(false, || {
+                asked.set(asked.get() + 1);
+                has_cow
+            }));
+            assert_eq!(asked.get(), 1);
+        }
+        // Closed on a volume that clones: a fault may still print.
+        assert!(copy_restore_may_warn(false, || Some(true)));
+    }
+
+    #[test]
+    fn the_layout_bucket_closes_once_its_marker_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cow-warn");
+        assert!(layout_bucket_open(Some(&base), true));
+        // The Copy strategy never gives layout advice.
+        assert!(!layout_bucket_open(Some(&base), false));
+        // A fault bucket's marker does not close the layout bucket.
+        crate::markers::warn_once_per_session_to(
+            &bucket_marker(&base, "cow-fault"),
+            crate::markers::WARN_SESSION_SECS,
+            "fault",
+            crate::markers::WarnSink::Log,
+        );
+        assert!(layout_bucket_open(Some(&base), true));
+        crate::markers::warn_once_per_session_to(
+            &bucket_marker(&base, "cow"),
+            crate::markers::WARN_SESSION_SECS,
+            "advice",
+            crate::markers::WarnSink::Log,
+        );
+        assert!(!layout_bucket_open(Some(&base), true));
+        let _ = crate::markers::take_emitted();
     }
 
     #[test]
@@ -3711,6 +3813,33 @@ mod tests {
     /// immediately after — that inversion is the entire #677 bug. The
     /// before-bound also proves the touch moved the mtime forward from an
     /// arbitrarily old value.
+    /// A read-only file (a hardlink to a store blob under the Windows
+    /// hardlink opt-in) is stamped and stays read-only; a writable one is
+    /// stamped directly.
+    #[cfg(windows)]
+    #[test]
+    fn touch_write_clock_stamps_readonly_and_writable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let past = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        for readonly in [false, true] {
+            let file = dir.path().join(format!("touched-{readonly}.rlib"));
+            fs::write(&file, b"content").unwrap();
+            filetime::set_file_mtime(&file, past).unwrap();
+            let mut perms = fs::metadata(&file).unwrap().permissions();
+            perms.set_readonly(readonly);
+            fs::set_permissions(&file, perms).unwrap();
+
+            touch_mtime_write_clock(&file).unwrap();
+
+            let meta = fs::metadata(&file).unwrap();
+            assert!(filetime::FileTime::from_last_modification_time(&meta) > past);
+            assert_eq!(meta.permissions().readonly(), readonly);
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&file, perms).unwrap();
+        }
+    }
+
     #[test]
     fn test_touch_write_clock_orders_with_file_writes() {
         let dir = tempfile::tempdir().unwrap();

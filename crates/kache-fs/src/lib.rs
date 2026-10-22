@@ -9,12 +9,16 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(any(windows, test))]
+mod block_clone;
 pub mod paths;
 #[cfg(feature = "testing")]
 pub mod process_state_test;
 pub mod volume;
 
 mod copy;
+#[cfg(windows)]
+mod windows_clone;
 #[cfg(windows)]
 pub use copy::windows_cluster_size;
 pub use copy::{copy_writable, set_writable_permissions, try_clone_extents_into, try_reflink};

@@ -282,13 +282,11 @@ impl RustcCompiler {
     ) -> Result<CompileResult> {
         // The invocation and key must use the same path-normalization rules.
         let workspace_root = parsed.path_normalization_root();
-        let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+        let path_normalizer = crate::path_normalizer::PathNormalizer::for_invocation(
             workspace_root,
             &self.invocation_env,
-        )
-        .with_target_dir(parsed.target_dir().as_deref())
-        .with_base_dirs(&self.base_dirs)
-        .with_rust_src_rule(
+            parsed.target_dir().as_deref(),
+            &self.base_dirs,
             crate::cache_key::get_rustc_sysroot_for(parsed, &self.invocation_env).as_deref(),
             crate::cache_key::get_rustc_commit_hash_for(&parsed.rustc, &self.invocation_env)
                 .as_deref(),

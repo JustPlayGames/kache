@@ -760,6 +760,7 @@ fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() 
         WindowsNativeLinkSearchDirs {
             rustc: vec![native.clone()],
             linker: vec![native, libpath],
+            files: vec![],
         }
     );
 
@@ -799,6 +800,80 @@ fn windows_native_link_search_dirs_include_l_and_libpath_and_reject_ambiguity() 
             "unmodeled Windows link input must fail closed: {linker_arg}: {error:#}"
         );
     }
+}
+
+/// Absolute inputs LINK merges into the image are keyed by their bytes
+/// instead of refusing the link: a resource script's `.res` (winresource,
+/// embed-resource) and a `/MANIFESTINPUT` (ripgrep), in argument order.
+#[test]
+fn windows_native_link_search_dirs_key_absolute_merged_inputs() {
+    let args = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-type=bin".into(),
+        r"-Clink-arg=C:\w\target\debug\build\app-1\out\resource.res".into(),
+        "-Clink-arg=/MANIFEST:EMBED".into(),
+        r"-Clink-arg=/MANIFESTINPUT:C:\w\pkg\windows\Manifest.xml".into(),
+        "-Clink-arg=/WX".into(),
+        r"-Clink-args=/DEBUG C:\w\extra.obj".into(),
+    ])
+    .unwrap();
+    assert_eq!(
+        windows_native_link_search_dirs(&args).unwrap().files,
+        vec![
+            PathBuf::from(r"C:\w\target\debug\build\app-1\out\resource.res"),
+            PathBuf::from(r"C:\w\pkg\windows\Manifest.xml"),
+            PathBuf::from(r"C:\w\extra.obj"),
+        ]
+    );
+
+    // One unmodeled argument beside them still refuses the whole link.
+    let mixed = RustcArgs::parse(&[
+        "rustc".into(),
+        "--crate-type=bin".into(),
+        r"-Clink-arg=C:\w\resource.res".into(),
+        r"-Clink-arg=/DEF:C:\w\exports.def".into(),
+    ])
+    .unwrap();
+    assert!(windows_native_link_search_dirs(&mixed).is_err());
+}
+
+#[test]
+fn windows_link_argument_files_key_their_bytes_and_fail_closed_when_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let res = dir.path().join("resource.res");
+    let manifest = dir.path().join("Manifest.xml");
+    std::fs::write(&res, b"resource v1").unwrap();
+    std::fs::write(&manifest, b"<assembly/>").unwrap();
+    let files = vec![res.clone(), manifest.clone()];
+    let identity = |files: &[PathBuf]| {
+        let mut identity = String::from("linker=LINK 14");
+        append_windows_link_argument_files(&mut identity, files, |path| {
+            Ok(blake3::hash(&std::fs::read(path)?).to_hex().to_string())
+        })
+        .map(|()| identity)
+    };
+    let first = identity(&files).unwrap();
+    assert!(first.starts_with("linker=LINK 14\nlink_arg_input.v1=0="));
+    assert_eq!(first.matches("link_arg_input.v1=").count(), 2);
+    assert_eq!(
+        identity(&files).unwrap(),
+        first,
+        "same bytes, same identity"
+    );
+
+    // A resource rebuilt in place under the same name changes the key.
+    std::fs::write(&res, b"resource v2").unwrap();
+    assert_ne!(identity(&files).unwrap(), first);
+    // So does the order LINK reads them in.
+    std::fs::write(&res, b"resource v1").unwrap();
+    assert_ne!(identity(&[manifest.clone(), res.clone()]).unwrap(), first);
+
+    std::fs::remove_file(&manifest).unwrap();
+    let error = identity(&files).unwrap_err();
+    assert!(
+        error.to_string().contains("not a regular file"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -867,6 +942,7 @@ fn windows_lld_libpath_preserves_shadowing_order() {
         WindowsNativeLinkSearchDirs {
             rustc: Vec::new(),
             linker: vec![first, second],
+            files: vec![],
         }
     );
 }
@@ -913,6 +989,7 @@ fn windows_native_link_search_dirs_honor_only_linker_visible_l_kinds() {
                 PathBuf::from(unknown.clone())
             ],
             linker: vec![native, all, bare, PathBuf::from(unknown), libpath],
+            files: vec![],
         }
     );
 }
@@ -6153,6 +6230,43 @@ fn env_text_key_bytes_preserves_utf8_and_distinguishes_invalid() {
         // Tagged: cannot collide with any valid-UTF-8 value's bytes.
         assert_eq!(a[0], 0xff);
     }
+}
+
+/// A wrapper computes a tool's fingerprint once; every other process keeps
+/// computing it per read, so a long-lived one still sees a toolchain update.
+#[test]
+fn a_wrapper_computes_a_tool_fingerprint_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("rustc-probe");
+    std::fs::write(&binary, b"not really rustc").unwrap();
+    let computed = || TOOL_FINGERPRINTS_COMPUTED.with(std::cell::Cell::get);
+    let env = InvocationEnv::capture();
+
+    let before = computed();
+    let first = tool_fingerprint_hash(&binary, &env, true).unwrap();
+    let second = tool_fingerprint_hash(&binary, &env, true).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(computed() - before, 1, "the second lookup is remembered");
+
+    let before = computed();
+    let fresh = tool_fingerprint_hash(&binary, &env, false).unwrap();
+    assert_eq!(
+        fresh, first,
+        "the memo gives what a fresh computation gives"
+    );
+    let _ = tool_fingerprint_hash(&binary, &env, false).unwrap();
+    assert_eq!(
+        computed() - before,
+        2,
+        "without the memo every lookup computes"
+    );
+
+    // Another binary is its own entry.
+    let other = dir.path().join("other-rustc");
+    std::fs::write(&other, b"another").unwrap();
+    let before = computed();
+    let _ = tool_fingerprint_hash(&other, &env, true).unwrap();
+    assert_eq!(computed() - before, 1);
 }
 
 /// The write persists where the read looks, creating the cache directory

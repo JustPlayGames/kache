@@ -379,7 +379,7 @@ Missing, changed or incomplete evidence keeps the units. Unsupported layouts, sy
 
 | Environment | TOML key | Default | Purpose |
 | --- | --- | --- | --- |
-| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | Linux/macOS: `true`; Windows: `false` | Cache eligible Rust bins and test executables |
+| `KACHE_CACHE_EXECUTABLES` | `cache.cache_executables` | Linux/macOS/Windows: `true` | Cache eligible Rust bins and test executables |
 | `KACHE_CACHE_CC_LINKS` | `cache.cache_cc_links` | `false` | Opt into caching eligible C/C++ links with explicit file inputs and their sidecars. Links using named libraries (`-l`, `--library`) or response files pass through. |
 | `KACHE_TRUST_CODEGEN_BACKENDS` | `cache.trust_codegen_backends` | `false` | Cache rustc compiles that load a codegen backend dylib (`-Zcodegen-backend=<path>`), keyed by the dylib's contents. The backend must be passed as a path, and libraries it loads at run time are not part of the key. Off because a backend can write files rustc does not report, and a cache hit would not restore them. |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove tracked incremental directories during cleanup |
@@ -648,6 +648,7 @@ Every GC driver (the daemon's sweep and its eviction after an upload, the auto-G
 | `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache stats --full` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |
 | `KACHE_STORAGE_LAYOUT_ADVICE` | `cache.storage_layout_advice` | `true` | Warn when storage layout forces copies. CLI commands print the advice; compiler wrappers log it at `warn` (see `KACHE_LOG`) so it never lands in compiler output |
 | `KACHE_WINDOWS_HARDLINK` | `cache.windows_hardlink` | `false` | Unsafe opt-in hardlink restores on non-CoW Windows volumes |
+| `KACHE_WINDOWS_BLOCK_CLONE` | none | on | On Windows, block-clone restores and stores on ReFS and Dev Drive volumes, where each copy shares the cache blob's blocks yet stays an independent file. kache asks each pair of volumes once per process and copies straight away on NTFS or across volumes. Set to `0` to copy every file instead. |
 | `KACHE_DEFERRED_DISCOVERY` | `cache.deferred_discovery` | `true` | On a certain miss (no closure record, no remote), compile first and key from the dep-info rustc emits instead of running the dep-info pre-pass; a C compile with no recorded read set likewise compiles first and keys from the dependency file it writes. Set to `0` to keep the pre-pass and the preprocessor probe on every miss. |
 | `KACHE_OUT_DIR_ALIAS` | `cache.out_dir_alias` | `true` | On Unix, compile a registry proc macro whose `OUT_DIR` is empty, or a registry lib that only proc macros link, against one shared read-only directory under `<cache>/out-dirs` instead of its own `OUT_DIR`, so the path it bakes in is the same in every checkout. A macro that writes debug output there fails with a hint; set to `0` to turn this off. |
 | `KACHE_DEFERRED_DURABILITY` | `cache.deferred_durability` | `true` | Store a miss without an fsync and let a background worker flush it a moment later; a hit on an entry not yet flushed verifies its bytes first. Set to `0` to flush every entry inside the compile that stored it. |

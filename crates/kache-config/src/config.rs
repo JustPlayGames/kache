@@ -3811,9 +3811,22 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 ///   the entry; restore materializes it next to the binary, where `lldb`
 ///   prefers it over the stale debug map. Source-level debugging of restored
 ///   executables works, so on by default.
-/// - **Windows**: the `.exe` references its `.pdb` by recorded path, the same
-///   external-reference problem. Off pending the equivalent investigation
-///   (the `.pdb` path remains untouched).
+/// - **Windows**: an MSVC `.exe` names its `.pdb` in a CodeView record (GUID,
+///   age, path), but rustc links with `/PDBALTPATH:%_PDB%`, so the path is
+///   the bare file name (`foo-<hash>.pdb`) and the same in every target
+///   directory. The `.pdb` is one of the unit's outputs (`{stem}.pdb`) and is
+///   stored and restored with the `.exe`, so a debugger finds the matching
+///   pair next to it, as after a fresh link. A store checks that pairing (the
+///   engine's `pe_pdb` module) and keeps out of the cache any `.exe` that
+///   names its `.pdb` by path, or whose `.pdb` is missing or does not match.
+///   Cargo's uplift into `target/<profile>` (and of the `.pdb`) runs after
+///   rustc and is unchanged. A restore over an `.exe` that is still running
+///   fails to remove it, as link.exe would fail to open it; the unit then
+///   compiles instead and meets the same error. One thing a debugger sees
+///   changes: a passthrough compile kept real source paths, and a cached one
+///   is remapped (`/kache/workspace/...`), so stepping through the binary's
+///   or the test harness's own crate needs the source mapping every cached
+///   library crate already needs on Windows. On by default.
 ///
 /// A split-debuginfo configuration (`-Csplit-debuginfo=unpacked`) moves Linux
 /// into the same external-reference shape, but the sidecars are themselves
@@ -3823,7 +3836,7 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 /// Override either way with `KACHE_CACHE_EXECUTABLES` or
 /// `[cache] cache_executables`.
 pub fn default_cache_executables() -> bool {
-    cfg!(target_os = "linux") || cfg!(target_os = "macos")
+    cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows")
 }
 
 /// Where probe memos (CRT placements, build-script tree digests) live: under
