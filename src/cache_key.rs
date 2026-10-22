@@ -1790,6 +1790,8 @@ thread_local! {
     /// A closure handed in by the wrapper after such a compile: the next key
     /// computation uses it instead of a record or a pre-pass.
     static PROVIDED_DEP_INFO: std::cell::RefCell<Option<(DepInfo, Option<TreeGuard>)>> = const { std::cell::RefCell::new(None) };
+    /// How many [`InvocationKeyScope`]s are open on this thread.
+    static KEY_SCOPE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Own discovery state for one synchronous compiler invocation on this thread.
@@ -1800,13 +1802,16 @@ pub(crate) struct InvocationKeyScope {
     compile_while_keying: bool,
     provided_dep_info: Option<(DepInfo, Option<TreeGuard>)>,
     remote_rows: Option<RemoteRows>,
+    tool_fingerprints: Option<Vec<(ToolFingerprintKey, String)>>,
     _normalizers: crate::path_normalizer::InvocationNormalizerScope,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl InvocationKeyScope {
     pub(crate) fn enter() -> Self {
+        KEY_SCOPE_DEPTH.with(|depth| depth.set(depth.get() + 1));
         Self {
+            tool_fingerprints: TOOL_FINGERPRINTS.with(|slot| slot.replace(None)),
             _normalizers: crate::path_normalizer::InvocationNormalizerScope::enter(),
             defer_discovery: DEFER_DISCOVERY.with(|cell| cell.replace(false)),
             compile_while_keying: COMPILE_WHILE_KEYING.with(|cell| cell.replace(false)),
@@ -1824,9 +1829,12 @@ impl Drop for InvocationKeyScope {
         let discarded_dep_info =
             PROVIDED_DEP_INFO.with(|cell| cell.replace(self.provided_dep_info.take()));
         let discarded_remote = REMOTE_ROWS.with(|cell| cell.replace(self.remote_rows.take()));
+        let discarded_fingerprints =
+            TOOL_FINGERPRINTS.with(|cell| cell.replace(self.tool_fingerprints.take()));
+        KEY_SCOPE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
         // Release callback captures after every slot has been restored and
         // outside the RefCell borrow, so their destructors can observe it.
-        drop((discarded_dep_info, discarded_remote));
+        drop((discarded_dep_info, discarded_remote, discarded_fingerprints));
     }
 }
 
@@ -11527,33 +11535,39 @@ fn tool_version_cache_path_for(
     prefix: &str,
     env: &InvocationEnv,
 ) -> Option<PathBuf> {
-    let hash = tool_fingerprint_hash(
-        binary,
-        env,
-        TOOL_FINGERPRINT_MEMO.load(std::sync::atomic::Ordering::Relaxed),
-    )?;
+    let hash = tool_fingerprint_hash(binary, env)?;
     Some(crate::config::probe_memo_dir_for(env).ok()?.join(format!("{prefix}-{hash}.txt")))
 }
 
-/// Set at rustc wrapper entry: remember each tool's fingerprint for the rest
-/// of the process. See [`memoize_tool_fingerprints`].
-static TOOL_FINGERPRINT_MEMO: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// The tool fingerprints the current rustc invocation on this thread
+    /// remembers: `None` unless [`memoize_tool_fingerprints`] turned the memo
+    /// on inside the current [`InvocationKeyScope`], which clears it.
+    static TOOL_FINGERPRINTS: std::cell::RefCell<Option<Vec<(ToolFingerprintKey, String)>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Remember each tool's version-cache fingerprint for the rest of this
-/// process instead of recomputing it on every read and write.
+/// compiler invocation instead of recomputing it on every read and write.
 ///
 /// A rustc hit reads the version cache three to five times (`-vV` for the
 /// key and again for the commit hash, the sysroot, the cwd-remap probe),
 /// and each read canonicalized the binary, statted it, tried both
 /// toolchain-file spellings in every directory from the cwd up, read
 /// rustup's `settings.toml`, listed the installed toolchains and statted
-/// each one's rustc. A wrapper lives for one compile, so a toolchain that
-/// changes under it would race the compile anyway. Long-lived processes
-/// (the daemon, CLI commands) never call this and keep noticing a
-/// `rustup update` at once (#1406).
+/// each one's rustc. One compile that sees a toolchain change under it
+/// would race the compile anyway. The memo ends with the invocation's
+/// [`InvocationKeyScope`]: the daemon runs one compile after another on
+/// the same threads and must notice a `rustup update` between them, as must
+/// every other long-lived caller, which never turns it on (#1406). Outside
+/// a scope (a caller that never entered one) this does nothing.
 pub(crate) fn memoize_tool_fingerprints() {
-    TOOL_FINGERPRINT_MEMO.store(true, std::sync::atomic::Ordering::Relaxed);
+    if KEY_SCOPE_DEPTH.with(std::cell::Cell::get) == 0 {
+        return;
+    }
+    TOOL_FINGERPRINTS.with(|slot| {
+        slot.borrow_mut().get_or_insert_with(Vec::new);
+    });
 }
 
 /// What a remembered tool fingerprint was computed from.
@@ -11568,11 +11582,10 @@ struct ToolFingerprintKey {
 }
 
 /// The 16-hex-digit hash naming `binary`'s version-cache files, remembered
-/// for the process when `memo` is set (see [`memoize_tool_fingerprints`]).
-fn tool_fingerprint_hash(binary: &Path, env: &InvocationEnv, memo: bool) -> Option<String> {
-    static REMEMBERED: std::sync::Mutex<Vec<(ToolFingerprintKey, String)>> =
-        std::sync::Mutex::new(Vec::new());
+/// for the invocation once [`memoize_tool_fingerprints`] turned that on.
+fn tool_fingerprint_hash(binary: &Path, env: &InvocationEnv) -> Option<String> {
     const MAX_REMEMBERED: usize = 8;
+    let memo = TOOL_FINGERPRINTS.with(|slot| slot.borrow().is_some());
     let key = memo.then(|| ToolFingerprintKey {
         binary: binary.to_path_buf(),
         path_var: env.var_os("PATH"),
@@ -11582,22 +11595,28 @@ fn tool_fingerprint_hash(binary: &Path, env: &InvocationEnv, memo: bool) -> Opti
         rustup_home: rustup_home_for(env),
     });
     if let Some(key) = &key {
-        let remembered = REMEMBERED
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((_, hash)) = remembered.iter().find(|(known, _)| known == key) {
-            return Some(hash.clone());
+        let known = TOOL_FINGERPRINTS.with(|slot| {
+            slot.borrow().as_ref().and_then(|remembered| {
+                remembered
+                    .iter()
+                    .find(|(known, _)| known == key)
+                    .map(|(_, hash)| hash.clone())
+            })
+        });
+        if known.is_some() {
+            return known;
         }
     }
     let hash = compute_tool_fingerprint_hash(binary, env)?;
     if let Some(key) = key {
-        let mut remembered = REMEMBERED
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if remembered.len() >= MAX_REMEMBERED {
-            remembered.remove(0);
-        }
-        remembered.push((key, hash.clone()));
+        TOOL_FINGERPRINTS.with(|slot| {
+            if let Some(remembered) = slot.borrow_mut().as_mut() {
+                if remembered.len() >= MAX_REMEMBERED {
+                    remembered.remove(0);
+                }
+                remembered.push((key, hash.clone()));
+            }
+        });
     }
     Some(hash)
 }

@@ -6232,41 +6232,62 @@ fn env_text_key_bytes_preserves_utf8_and_distinguishes_invalid() {
     }
 }
 
-/// A wrapper computes a tool's fingerprint once; every other process keeps
-/// computing it per read, so a long-lived one still sees a toolchain update.
+/// A rustc invocation computes a tool's fingerprint once; every other caller
+/// keeps computing it per read, so a long-lived one still sees a toolchain
+/// update, and so does the daemon's next invocation on the same thread.
 #[test]
-fn a_wrapper_computes_a_tool_fingerprint_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let binary = dir.path().join("rustc-probe");
-    std::fs::write(&binary, b"not really rustc").unwrap();
-    let computed = || TOOL_FINGERPRINTS_COMPUTED.with(std::cell::Cell::get);
-    let env = InvocationEnv::capture();
+fn a_rustc_invocation_computes_a_tool_fingerprint_once() {
+    std::thread::spawn(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("rustc-probe");
+        std::fs::write(&binary, b"not really rustc").unwrap();
+        let computed = || TOOL_FINGERPRINTS_COMPUTED.with(std::cell::Cell::get);
+        let env = InvocationEnv::capture();
 
-    let before = computed();
-    let first = tool_fingerprint_hash(&binary, &env, true).unwrap();
-    let second = tool_fingerprint_hash(&binary, &env, true).unwrap();
-    assert_eq!(first, second);
-    assert_eq!(computed() - before, 1, "the second lookup is remembered");
+        // No scope: turning the memo on does nothing.
+        memoize_tool_fingerprints();
+        let before = computed();
+        let fresh = tool_fingerprint_hash(&binary, &env).unwrap();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        assert_eq!(computed() - before, 2, "without the memo every lookup computes");
 
-    let before = computed();
-    let fresh = tool_fingerprint_hash(&binary, &env, false).unwrap();
-    assert_eq!(
-        fresh, first,
-        "the memo gives what a fresh computation gives"
-    );
-    let _ = tool_fingerprint_hash(&binary, &env, false).unwrap();
-    assert_eq!(
-        computed() - before,
-        2,
-        "without the memo every lookup computes"
-    );
+        {
+            let _invocation = InvocationKeyScope::enter();
+            // A scope alone does not remember: only a rustc wrapper asks.
+            let before = computed();
+            let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+            let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+            assert_eq!(computed() - before, 2);
 
-    // Another binary is its own entry.
-    let other = dir.path().join("other-rustc");
-    std::fs::write(&other, b"another").unwrap();
-    let before = computed();
-    let _ = tool_fingerprint_hash(&other, &env, true).unwrap();
-    assert_eq!(computed() - before, 1);
+            memoize_tool_fingerprints();
+            let before = computed();
+            let first = tool_fingerprint_hash(&binary, &env).unwrap();
+            let second = tool_fingerprint_hash(&binary, &env).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(first, fresh, "the memo gives what a fresh computation gives");
+            assert_eq!(computed() - before, 1, "the second lookup is remembered");
+
+            // Another binary is its own entry.
+            let other = dir.path().join("other-rustc");
+            std::fs::write(&other, b"another").unwrap();
+            let before = computed();
+            let _ = tool_fingerprint_hash(&other, &env).unwrap();
+            assert_eq!(computed() - before, 1);
+        }
+
+        // The next invocation on this thread starts without the memo.
+        let _next = InvocationKeyScope::enter();
+        let before = computed();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        assert_eq!(computed() - before, 1);
+        memoize_tool_fingerprints();
+        let before = computed();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        assert_eq!(computed() - before, 1, "and remembers nothing of the last one");
+    })
+    .join()
+    .unwrap();
 }
 
 /// The write persists where the read looks, creating the cache directory
