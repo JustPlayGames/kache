@@ -10,7 +10,7 @@ Filesystem measurements, file identity, and native cloning and copying. Built fo
 - `measure_file` separates logical length, allocated bytes and private extents. Private allocation is `None` when the platform cannot tell.
 - `probe_for` picks a platform probe for directory walks. APFS uses attribute queries, including bulk directory reads. Linux uses a bounded FIEMAP walk and discards incomplete extent maps. `InodeLedger` counts hardlinks once.
 - `try_reflink` creates an independent file that shares blocks where the filesystem supports it. It refuses an existing destination and returns the error so you can fall back.
-  On Windows it block-clones on ReFS and Dev Drive (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), asks each pair of volumes once per process, and fails at once where they cannot clone; `KACHE_WINDOWS_BLOCK_CLONE=0` turns it off.
+  On Windows it block-clones on ReFS and Dev Drive (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), asks each pair of volumes once per process, and fails at once where they cannot clone; `KACHE_WINDOWS_BLOCK_CLONE=0` turns it off (read once per process, so the daemon's own environment decides for the compiles it runs).
 - `copy_writable` copies bytes with an explicit writable mode.
 - `file_identity` and `directory_identity` return the device and inode (the volume serial and file index on Windows).
 
