@@ -181,61 +181,100 @@ fn peer_uid_is_self(peer_uid: u32) -> bool {
     peer_uid == self_uid()
 }
 
-/// How long a synchronous client waits for a busy daemon pipe on Windows
-/// before it gives up as if no daemon ran.
+/// How long a client waits for a busy daemon pipe on Windows before it gives
+/// up as if no daemon ran.
 ///
-/// `SyncStream::connect` waits without limit: when every instance of the
-/// pipe is taken (`ERROR_PIPE_BUSY`) it blocks in `WaitNamedPipeW` until one
-/// frees, so a stalled daemon would hang every wrapper that probes or hands
-/// it work. A missing pipe still fails at once.
+/// When every instance of the daemon's pipe is taken (`ERROR_PIPE_BUSY`), a
+/// plain connect blocks in `WaitNamedPipeW` until one frees, so a stalled
+/// daemon would hang every wrapper that probes it or hands it work. A missing
+/// pipe still fails at once.
 pub const BUSY_PIPE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Connect a synchronous client to `name`. On Windows the wait for a busy
-/// pipe ends after `busy_wait` with `TimedOut`, which callers treat as the
-/// failed connection a missing daemon gives. On Unix this is
+/// The named pipe a daemon socket path stands for on Windows: the pipe
+/// `socket_name` names, spelled as a path.
+#[cfg(windows)]
+pub fn pipe_path(socket: &Path) -> String {
+    format!(r"\\.\pipe\{}", daemon_endpoint(socket))
+}
+
+/// Connect a synchronous client to the daemon socket at `socket`.
+///
+/// On Windows a pipe still busy after `busy_wait` fails with `TimedOut`,
+/// which callers treat as the failed connection a missing daemon gives. This
+/// goes through interprocess's named-pipe layer: its local-socket layer drops
+/// the wait mode of `ConnectOptions` on Windows (interprocess 2.4.4 to 2.4.6
+/// call `connect_by_path`, an unbounded wait, whatever the options say), so a
+/// `ConnectWaitMode::Timeout` set there never takes effect. On Unix this is
 /// `SyncStream::connect`, unchanged.
-pub fn connect_sync(name: Name<'_>, busy_wait: std::time::Duration) -> std::io::Result<SyncStream> {
+pub fn connect_sync(socket: &Path, busy_wait: std::time::Duration) -> std::io::Result<SyncStream> {
     #[cfg(windows)]
     {
-        interprocess::local_socket::ConnectOptions::new()
-            .name(name)
-            .wait_mode(interprocess::ConnectWaitMode::Timeout(busy_wait))
-            .connect_sync()
+        use interprocess::os::windows::named_pipe::{DuplexPipeStream, local_socket, pipe_mode};
+        let pipe = DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
+            pipe_path(socket),
+            interprocess::ConnectWaitMode::Timeout(busy_wait),
+        )?;
+        Ok(local_socket::Stream::from(pipe).into())
     }
     #[cfg(not(windows))]
     {
         use interprocess::local_socket::traits::Stream as _;
         let _ = busy_wait;
-        SyncStream::connect(name)
+        SyncStream::connect(socket_name(socket).map_err(std::io::Error::other)?)
     }
 }
 
-/// Connect a Tokio client to `name`, with [`connect_sync`]'s bound on a busy
-/// Windows pipe.
+/// Connect a Tokio client to the daemon socket at `socket`, with
+/// [`connect_sync`]'s bound on a busy Windows pipe.
 ///
-/// `TokioStream::connect` waits for a busy pipe in a blocking task with no
-/// limit. A timeout around the request does not end that task, and dropping
-/// the runtime that owns it waits for it, so a caller's own timeout can
-/// still hang. On Unix this is `TokioStream::connect`, unchanged.
+/// Without it the connect waits for a busy pipe in a blocking task with no
+/// limit: a timeout around the request does not end that task, and dropping
+/// the runtime that owns it waits for it, so a caller's own timeout can still
+/// hang. On Unix this is `TokioStream::connect`, unchanged.
 #[cfg(feature = "async")]
 pub async fn connect_tokio(
-    name: Name<'_>,
+    socket: &Path,
     busy_wait: std::time::Duration,
 ) -> std::io::Result<TokioStream> {
     #[cfg(windows)]
     {
-        interprocess::local_socket::ConnectOptions::new()
-            .name(name)
-            .wait_mode(interprocess::ConnectWaitMode::Timeout(busy_wait))
-            .connect_tokio()
-            .await
+        use interprocess::os::windows::named_pipe::{local_socket, pipe_mode, tokio};
+        let pipe = tokio::DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
+            pipe_path(socket),
+            interprocess::ConnectWaitMode::Timeout(busy_wait),
+        )
+        .await?;
+        Ok(local_socket::tokio::Stream::from(pipe).into())
     }
     #[cfg(not(windows))]
     {
         use interprocess::local_socket::traits::tokio::Stream as _;
         let _ = busy_wait;
-        TokioStream::connect(name).await
+        TokioStream::connect(socket_name(socket).map_err(std::io::Error::other)?).await
     }
+}
+
+/// Run `work` on a helper thread and wait for it until `deadline`.
+///
+/// `None` when it is not done by then (or no thread could be started): the
+/// caller goes on as if the work failed, and the helper finishes or blocks on
+/// its own, ending at the latest with the process. For I/O that has no
+/// timeout of its own, such as a write to a Windows named pipe whose reader
+/// stalled, or a library's connect that waits for a busy pipe without limit.
+pub fn finish_by<T: Send + 'static>(
+    deadline: std::time::Instant,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (done, finished) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("kache-bounded-io".into())
+        .spawn(move || {
+            let _ = done.send(work());
+        })
+        .ok()?;
+    finished
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok()
 }
 
 /// True if a daemon socket / named pipe at `path` accepts a connection
@@ -243,10 +282,7 @@ pub async fn connect_tokio(
 /// is responsive, only whether *something* is listening. A Windows pipe
 /// still busy after [`BUSY_PIPE_WAIT`] counts as unreachable.
 pub fn is_reachable(path: &Path) -> bool {
-    let Ok(name) = socket_name(path) else {
-        return false;
-    };
-    connect_sync(name, BUSY_PIPE_WAIT).is_ok()
+    connect_sync(path, BUSY_PIPE_WAIT).is_ok()
 }
 
 #[cfg(test)]
@@ -337,10 +373,7 @@ mod tests {
         let probe = path.clone();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let result = connect_sync(
-                socket_name(&probe).unwrap(),
-                std::time::Duration::from_millis(300),
-            );
+            let result = connect_sync(&probe, std::time::Duration::from_millis(300));
             let _ = done.send((result.map(|_| ()), started.elapsed()));
         });
         let (result, elapsed) = finished
@@ -371,10 +404,8 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
-            let result = runtime.block_on(connect_tokio(
-                socket_name(&probe).unwrap(),
-                std::time::Duration::from_millis(300),
-            ));
+            let result =
+                runtime.block_on(connect_tokio(&probe, std::time::Duration::from_millis(300)));
             // Dropping the runtime must not wait on a connect still blocked.
             drop(runtime);
             let _ = done.send(result.map(|_| ()));
@@ -383,6 +414,109 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("Tokio connect to a busy pipe hung");
         assert!(result.is_err(), "a busy pipe cannot take a second client");
+    }
+
+    /// A free instance: the bounded connect takes it at once, and the stream
+    /// it returns carries bytes both ways like `SyncStream::connect`'s.
+    #[cfg(windows)]
+    #[test]
+    fn a_free_pipe_connects_and_carries_bytes_both_ways() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("free.sock");
+        let listener = ListenerOptions::new()
+            .name(socket_name(&path).unwrap())
+            .create_sync()
+            .expect("bind listener");
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().expect("accept");
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            stream.write_all(&[byte[0] + 1]).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let mut client =
+            connect_sync(&path, std::time::Duration::from_millis(300)).expect("connect");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        client.write_all(&[41]).unwrap();
+        let mut reply = [0u8; 1];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, [42]);
+        server.join().unwrap();
+        assert!(!is_reachable_within_test(&path), "the pipe is gone with its listener");
+    }
+
+    /// The same for the Tokio client.
+    #[cfg(all(windows, feature = "async"))]
+    #[test]
+    fn a_free_pipe_connects_a_tokio_client_and_carries_bytes() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("free-tokio.sock");
+        let listener = ListenerOptions::new()
+            .name(socket_name(&path).unwrap())
+            .create_sync()
+            .expect("bind listener");
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().expect("accept");
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            stream.write_all(&[byte[0] + 1]).unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let reply = runtime.block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut client = connect_tokio(&path, std::time::Duration::from_millis(300))
+                .await
+                .expect("connect");
+            client.write_all(&[41]).await.unwrap();
+            let mut reply = [0u8; 1];
+            client.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+        assert_eq!(reply, [42]);
+        server.join().unwrap();
+    }
+
+    /// The pipe disappears once its listener is gone; probing it again must
+    /// not wait for anything.
+    #[cfg(windows)]
+    fn is_reachable_within_test(path: &Path) -> bool {
+        let started = std::time::Instant::now();
+        let reachable = is_reachable(path);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        reachable
+    }
+
+    #[test]
+    fn finish_by_returns_what_finishes_in_time() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        assert_eq!(finish_by(deadline, || 7), Some(7));
+    }
+
+    #[test]
+    fn finish_by_stops_waiting_at_the_deadline() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_millis(200);
+        let result = finish_by(deadline, move || {
+            // Blocks until the test lets go: work that never ends on its own.
+            let _ = blocked.recv();
+            1
+        });
+        assert_eq!(result, None);
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "{waited:?}"
+        );
+        assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+        drop(release);
     }
 
     #[cfg(unix)]
