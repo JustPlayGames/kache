@@ -19720,11 +19720,18 @@ mod build_script_target_paths {
                     None,
                 )
             };
-            assert_distinct_link(
-                key(&a, &out_a),
-                key(&b, &out_b),
-                &format!("{kind} {crate_type} {extra:?}"),
-            );
+            // Ours drops the target folder's name from every `-L` kind under the unit's
+            // target (a search path's spelling never reaches an output; what it finds is
+            // keyed by the scans), upstream only from rlib native paths in OUT_DIR. Units
+            // whose sources keep absolute paths (trybuild, coverage) stay apart by other
+            // fields in both.
+            let (ka, kb) = (key(&a, &out_a), key(&b, &out_b));
+            let label = format!("{kind} {crate_type} {extra:?}");
+            if matches!(extra, ["--cfg=trybuild"] | ["-Cinstrument-coverage"]) {
+                assert_ne!(ka.0, kb.0, "{label}");
+            } else {
+                assert_eq!(ka.0, kb.0, "{label}: inside the unit's target folder");
+            }
         }
         let mut no_remap = unit;
         no_remap.invocation = InvocationEnv::from_parts(
@@ -19740,10 +19747,15 @@ mod build_script_target_paths {
         let key = |target: &Path, out: &Path| {
             no_remap.key(Some(target), Some(out), &[native(out)], "rlib", &[], None)
         };
-        assert_distinct_link(
-            key(&a, &out_a),
-            key(&b, &out_b),
-            "normalization opt-out retains search path identity",
+        // Ours: the `-L` rule does not depend on remapping (the spelling of a search
+        // path never reaches an output), so the search-path group matches; upstream keeps
+        // the name there. Unremapped units still key apart by their absolute sources.
+        let (ka, kb) = (key(&a, &out_a), key(&b, &out_b));
+        assert_ne!(ka.0, kb.0, "normalization opt-out keeps units apart");
+        assert_eq!(
+            ka.1.fields.unwrap()["link"],
+            kb.1.fields.unwrap()["link"],
+            "normalization opt-out: the -L rule still applies"
         );
     }
 
@@ -19808,12 +19820,24 @@ mod build_script_target_paths {
                 )
             });
             let [a, b] = keys;
-            assert_distinct_link(a, b, case);
+            // Ours (tasty.8): an `-L` lexically under the unit's target folder that stays
+            // inside it once resolved is keyed `<UNIT_TARGET>/...`, whatever the OUT_DIR, so
+            // one unit built into two target folders shares its entry. Upstream keeps the
+            // name outside its narrower native OUT_DIR alias. Both keep it for a path that
+            // is relative, outside the target, or escapes it (`..`, a symlink).
+            if matches!(
+                case,
+                "no-out-dir" | "relative-out-dir" | "outside-out-dir" | "parent-component" | "empty-suffix"
+            ) {
+                assert_eq!(a.0, b.0, "{case}: inside the unit's target folder");
+            } else {
+                assert_distinct_link(a, b, case);
+            }
         }
     }
 
     #[test]
-    fn generated_source_file_macro_keeps_the_compiler_visible_target_name() {
+    fn generated_sources_key_without_the_target_folder_name() {
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let unit = Unit::new(dir.path());
@@ -19846,15 +19870,21 @@ mod build_script_target_paths {
                 )
             });
             let [a, b] = keys;
-            assert_ne!(
-                a.0, b.0,
-                "file!() exposes the generated source's remapped spelling"
+            // Ours (tasty.8): a source under the unit's OUT_DIR is keyed
+            // `<OUT_DIR:unit>/...` without the target folder's name, so a unit built
+            // into two target folders hits; its file!() then names the folder that
+            // stored it (upstream keeps the name instead). Coverage and trybuild units
+            // stay apart by other fields.
+            assert_eq!(
+                a.1.fields.as_ref().unwrap()["sources"],
+                b.1.fields.as_ref().unwrap()["sources"],
+                "OUT_DIR sources keyed without the target folder's name"
             );
-            assert_ne!(
-                a.1.fields.unwrap()["sources"],
-                b.1.fields.unwrap()["sources"],
-                "OUT_DIR env folding cannot hide a source-path collision"
-            );
+            if extra.is_empty() {
+                assert_eq!(a.0, b.0, "one unit in two target folders shares its key");
+            } else {
+                assert_ne!(a.0, b.0, "{extra:?} keeps units apart");
+            }
         }
     }
 
@@ -19887,6 +19917,39 @@ mod build_script_target_paths {
             b,
             "only resolved directories covered by the archive scan can alias",
         );
+    }
+
+    /// Ours drops the target folder's name from any `-L` under the unit's
+    /// target, but not from one that leaves it through a symlink: the files it
+    /// names are no scan's and can differ per target folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_search_path_that_symlinks_out_of_the_target_keeps_its_name() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        for (kind, crate_type) in [("all=", "rlib"), ("native=", "staticlib"), ("", "bin")] {
+            let keys = ["target-a", "target-b"].map(|name| {
+                let target = unit.workspace.join(name);
+                let external = unit.workspace.join(format!("external-{name}-{crate_type}"));
+                std::fs::create_dir_all(&external).unwrap();
+                std::fs::write(external.join("libfoo.a"), gnu_ar_one_object(name.as_bytes())).unwrap();
+                let inside = target.join("debug/deps");
+                std::fs::create_dir_all(&inside).unwrap();
+                let alias = inside.join(format!("escape-{crate_type}"));
+                std::os::unix::fs::symlink(&external, &alias).unwrap();
+                let out = Unit::out_dir(&target);
+                let search = [format!("{kind}{}", alias.display())];
+                let inside_only = [format!("{kind}{}", inside.display())];
+                (
+                    unit.key(Some(&target), Some(&out), &search, crate_type, &[], None),
+                    unit.key(Some(&target), Some(&out), &inside_only, crate_type, &[], None),
+                )
+            });
+            let [(escape_a, inside_a), (escape_b, inside_b)] = keys;
+            assert_eq!(inside_a.0, inside_b.0, "{kind}{crate_type}: a folder inside the target aliases");
+            assert_distinct_link(escape_a, escape_b, &format!("{kind}{crate_type}: a symlink out of the target"));
+        }
     }
 
     #[cfg(unix)]

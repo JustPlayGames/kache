@@ -1998,7 +1998,14 @@ fn out_dir_source_identity(file: &Path, out_dir: Option<&OsStr>) -> Option<Vec<u
     if unit.is_empty() {
         return None;
     }
-    let rest = rest.to_str()?.replace('\\', "/");
+    // A backslash is a separator on Windows only: on Unix it is part of a
+    // file name, and `a\\b` must not key like `a/b`.
+    let rest = rest.to_str()?;
+    let rest = if cfg!(windows) {
+        rest.replace('\\', "/")
+    } else {
+        rest.to_string()
+    };
     Some(format!("<OUT_DIR:{unit}>/{rest}").into_bytes())
 }
 
@@ -2039,6 +2046,22 @@ fn out_dir_native_search_identity(
         return None;
     }
     Some(env_os_key_bytes(rest.as_os_str()))
+}
+
+/// Whether `path`, lexically under the unit's target folder `dir`, stays
+/// inside it once resolved, so `-L` may name it `<UNIT_TARGET>/...` without
+/// the folder's name. One that leaves it (a symlink, a `..`) names files no
+/// scan here covers and that can differ per target folder: it keeps its
+/// path, as upstream's native OUT_DIR alias does (#1682). A path that does
+/// not exist has nothing to read.
+fn resolves_inside(path: &Path, dir: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
+        (Ok(path), Ok(dir)) => path.starts_with(dir),
+        (Err(_), _) => !path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir),
+        (Ok(_), Err(_)) => false,
+    }
 }
 
 /// The prediction identity of one rustc invocation, or `None` when there is
@@ -4811,14 +4834,15 @@ fn compute_key_into(
             fold_field(&mut hasher, b"link_search_native_out_dir.v1:", &identity);
             continue;
         }
-        let normalized = match unit_target_dir
-            .as_deref()
-            .and_then(|dir| Path::new(path).strip_prefix(dir).ok())
-        {
-            Some(rest) => format!(
+        let normalized = match unit_target_dir.as_deref().and_then(|dir| {
+            let rest = Path::new(path).strip_prefix(dir).ok()?;
+            resolves_inside(Path::new(path), dir).then_some(rest)
+        }) {
+            Some(rest) if cfg!(windows) => format!(
                 "<UNIT_TARGET>/{}",
                 rest.to_string_lossy().replace('\\', "/")
             ),
+            Some(rest) => format!("<UNIT_TARGET>/{}", rest.to_string_lossy()),
             None => path_normalizer.normalize(path),
         };
         hasher.update(b"link_search:");
