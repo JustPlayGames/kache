@@ -2517,6 +2517,11 @@ mod tests {
                         let first = dir.path().join("first.rlib");
                         let second = dir.path().join("second.rlib");
                         fs::write(&blob, b"cache bytes").unwrap();
+                        // A store blob is read-only; a writable one is never
+                        // shared (see hardlink_or_copy).
+                        let mut permissions = fs::metadata(&blob).unwrap().permissions();
+                        permissions.set_readonly(true);
+                        fs::set_permissions(&blob, permissions).unwrap();
                         fs::hard_link(&blob, &first).unwrap();
                         hardlink_or_copy(&blob, &second, 11).unwrap();
                         assert_eq!(

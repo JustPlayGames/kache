@@ -18061,6 +18061,8 @@ fn edits_still_miss_under_a_shared_workspace_walk() {
         Some(manifest_dir.as_os_str()),
     );
     let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    // The arguments carry the environment and directory they were parsed in.
+    let args = reparse_for_client(&args, &InvocationEnv::capture());
     // Old times, so the edits below show on any clock.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
     for path in [&lib, &root.join("kt/assets/a.txt")] {
@@ -18433,6 +18435,8 @@ fn a_stale_local_row_gives_way_to_a_row_made_under_this_tree() {
         Some(manifest_dir.as_os_str()),
     );
     let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    // The arguments carry the environment and directory they were parsed in.
+    let args = reparse_for_client(&args, &InvocationEnv::capture());
     let hasher = |name: &str| FileHasher::persistent(&base.join(name)).with_input_predictions(true);
     let inside = DepInfo {
         source_files: vec![PathBuf::from("kt/src/lib.rs"), root.join("kt/assets/a.txt")],

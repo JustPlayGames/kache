@@ -5058,6 +5058,9 @@ pull_request_prefix = "pr/42"
             &[
                 ("KACHE_HOST_CONFIG", ""),
                 ("KACHE_KEY_SALT", "second"),
+                // Off by default in this fork: opt in, so each snapshot
+                // still resolves its own value.
+                ("KACHE_SEED_INCREMENTAL", "1"),
                 ("KACHE_TRUST_DOMAIN", "two"),
             ],
         );
