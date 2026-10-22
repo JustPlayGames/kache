@@ -1406,16 +1406,14 @@ const MEMO_ROW_HANDOFF_WAIT: Duration = Duration::from_millis(5);
 /// How long a store without a sink waits before it drops its memo rows.
 const MEMO_ROW_WAIT: Duration = Duration::from_millis(100);
 
-/// Whether a daemon took bookkeeping rows (memo rows, a target root,
-/// prediction rows) this process's index was too busy for.
-static BOOKKEEPING_HANDED_OFF: AtomicBool = AtomicBool::new(false);
-
-/// Note that a daemon took bookkeeping rows a busy index refused.
+/// Note that a daemon took bookkeeping rows (memo rows, a target root,
+/// prediction rows) a busy index refused. It holds for the current
+/// invocation scope (`InvocationLinkScope`), else for the process.
 pub fn note_bookkeeping_handed_off() {
-    BOOKKEEPING_HANDED_OFF.store(true, Ordering::Relaxed);
+    crate::link::note_bookkeeping_handed_off();
 }
 
-/// How long this process's next bookkeeping write waits for the index's
+/// How long this invocation's next bookkeeping write waits for the index's
 /// write lock: `wait`, or none once a daemon took rows a busy index refused
 /// ([`note_bookkeeping_handed_off`]). A wrapper's memo rows, target root and
 /// prediction rows each waited for the lock in turn (165 ms a unit in a
@@ -1425,7 +1423,7 @@ pub fn note_bookkeeping_handed_off() {
 /// holds it. Without a daemon nothing is ever handed off, and every write
 /// waits as before.
 pub fn bookkeeping_wait(wait: Duration) -> Duration {
-    if BOOKKEEPING_HANDED_OFF.load(Ordering::Relaxed) {
+    if crate::link::bookkeeping_handed_off() {
         Duration::ZERO
     } else {
         wait
