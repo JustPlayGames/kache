@@ -713,8 +713,10 @@ impl PathNormalizer {
 
     /// `from_invocation(workspace_root, env).with_target_dir(target_dir)
     /// .with_base_dirs(base_dirs)`, then `.with_rust_src_rule(sysroot,
-    /// commit_hash)` when both are given, built once per process for the same
-    /// inputs and cloned after that.
+    /// commit_hash)` when both are given, built once per compiler invocation
+    /// for the same inputs and cloned after that (see
+    /// [`InvocationNormalizerScope`]); outside an invocation scope it is
+    /// built afresh on every call.
     ///
     /// A rustc miss builds this normalizer three or four times (the key, the
     /// compile's remap flags, the dep-info roots, build-script inputs), each
@@ -722,7 +724,11 @@ impl PathNormalizer {
     /// short names). The result depends only on the arguments and on the
     /// invocation's working, home and temporary directories and the
     /// environment variables `from_invocation` reads, all part of the memo's
-    /// key, so a changed input builds a new one.
+    /// key, so a changed input builds a new one. The memo lives no longer
+    /// than the invocation: a daemon runs many invocations, from other
+    /// workspaces, environments and toolchains, one after another on the same
+    /// threads, and a normalizer canonicalizes paths whose targets can change
+    /// between them (a directory created, a junction moved).
     pub(crate) fn for_invocation(
         workspace_root: Option<&Path>,
         env: &crate::invocation::InvocationEnv,
@@ -731,9 +737,6 @@ impl PathNormalizer {
         sysroot: Option<&Path>,
         commit_hash: Option<&str>,
     ) -> Self {
-        static BUILT: std::sync::Mutex<Vec<(InvocationKey, PathNormalizer)>> =
-            std::sync::Mutex::new(Vec::new());
-        const MAX_BUILT: usize = 8;
         let key = InvocationKey {
             cwd: env.cwd().map(Path::to_path_buf),
             home: env.home_dir().map(Path::to_path_buf),
@@ -746,10 +749,7 @@ impl PathNormalizer {
                 .zip(commit_hash)
                 .map(|(sysroot, hash)| (sysroot.to_path_buf(), hash.to_owned())),
         };
-        let mut built = BUILT
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(normalizer) = remembered(&built, &key) {
+        if let Some(normalizer) = remembered(&key) {
             return normalizer;
         }
         // The rust-src rule goes on top of the same base the callers without
@@ -758,13 +758,13 @@ impl PathNormalizer {
             rust_src: None,
             ..key.clone()
         };
-        let base = match remembered(&built, &base_key) {
+        let base = match remembered(&base_key) {
             Some(base) => base,
             None => {
                 let base = Self::from_invocation(workspace_root, env)
                     .with_target_dir(target_dir)
                     .with_base_dirs(base_dirs);
-                remember(&mut built, MAX_BUILT, base_key, &base);
+                remember(base_key, &base);
                 base
             }
         };
@@ -772,7 +772,7 @@ impl PathNormalizer {
             return base;
         }
         let normalizer = base.with_rust_src_rule(sysroot, commit_hash);
-        remember(&mut built, MAX_BUILT, key, &normalizer);
+        remember(key, &normalizer);
         normalizer
     }
 
@@ -1710,26 +1710,63 @@ struct InvocationKey {
     rust_src: Option<(PathBuf, String)>,
 }
 
-fn remembered(
-    built: &[(InvocationKey, PathNormalizer)],
-    key: &InvocationKey,
-) -> Option<PathNormalizer> {
-    built
-        .iter()
-        .find(|(known, _)| known == key)
-        .map(|(_, normalizer)| normalizer.clone())
+/// How many normalizers one invocation remembers: a rustc unit asks for two
+/// (with and without the rust-src rule).
+const MAX_BUILT: usize = 8;
+
+thread_local! {
+    /// The normalizers the current invocation on this thread built, `None`
+    /// outside an [`InvocationNormalizerScope`].
+    static INVOCATION_NORMALIZERS: std::cell::RefCell<Option<Vec<(InvocationKey, PathNormalizer)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-fn remember(
-    built: &mut Vec<(InvocationKey, PathNormalizer)>,
-    max: usize,
-    key: InvocationKey,
-    normalizer: &PathNormalizer,
-) {
-    if built.len() >= max {
-        built.remove(0);
+/// Remember [`PathNormalizer::for_invocation`]'s normalizers for one
+/// synchronous compiler invocation on this thread, which starts with none.
+/// Nested scopes restore their parent on drop. A wrapper was a process per
+/// compile; since the daemon runs compiles on reused worker threads, the
+/// memo must end with the compile, as a process did.
+pub(crate) struct InvocationNormalizerScope {
+    previous: Option<Vec<(InvocationKey, PathNormalizer)>>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationNormalizerScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: INVOCATION_NORMALIZERS.with(|slot| slot.replace(Some(Vec::new()))),
+            _thread: std::marker::PhantomData,
+        }
     }
-    built.push((key, normalizer.clone()));
+}
+
+impl Drop for InvocationNormalizerScope {
+    fn drop(&mut self) {
+        let discarded = INVOCATION_NORMALIZERS.with(|slot| slot.replace(self.previous.take()));
+        drop(discarded);
+    }
+}
+
+fn remembered(key: &InvocationKey) -> Option<PathNormalizer> {
+    INVOCATION_NORMALIZERS.with(|slot| {
+        slot.borrow().as_ref().and_then(|built| {
+            built
+                .iter()
+                .find(|(known, _)| known == key)
+                .map(|(_, normalizer)| normalizer.clone())
+        })
+    })
+}
+
+fn remember(key: InvocationKey, normalizer: &PathNormalizer) {
+    INVOCATION_NORMALIZERS.with(|slot| {
+        if let Some(built) = slot.borrow_mut().as_mut() {
+            if built.len() >= MAX_BUILT {
+                built.remove(0);
+            }
+            built.push((key, normalizer.clone()));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1743,7 +1780,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_invocation_builds_its_normalizer_once_per_process() {
+    fn an_invocation_builds_its_normalizer_once() {
+        let _scope = InvocationNormalizerScope::enter();
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("ws");
         let target = workspace.join("target");
@@ -1792,6 +1830,46 @@ mod tests {
         let before = FROM_ENV_BUILDS.with(std::cell::Cell::get);
         let _ = build(&other);
         assert_eq!(FROM_ENV_BUILDS.with(std::cell::Cell::get) - before, 1);
+    }
+
+    /// A daemon worker thread runs one invocation after another: the next
+    /// one builds its own normalizer, and outside a scope nothing is kept.
+    #[test]
+    fn a_normalizer_is_remembered_only_within_its_invocation() {
+        std::thread::spawn(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("ws");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let env = crate::invocation::InvocationEnv::capture();
+            let build = || {
+                let _ = PathNormalizer::for_invocation(
+                    Some(&workspace),
+                    &env,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+            };
+            let builds = || FROM_ENV_BUILDS.with(std::cell::Cell::get);
+            let before = builds();
+            build();
+            build();
+            assert_eq!(builds() - before, 2, "no scope, no memo");
+            {
+                let _first = InvocationNormalizerScope::enter();
+                let before = builds();
+                build();
+                build();
+                assert_eq!(builds() - before, 1);
+            }
+            let _second = InvocationNormalizerScope::enter();
+            let before = builds();
+            build();
+            assert_eq!(builds() - before, 1, "a new invocation starts empty");
+        })
+        .join()
+        .unwrap();
     }
     use std::fs;
     use tempfile::TempDir;

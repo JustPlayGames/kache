@@ -1800,12 +1800,14 @@ pub(crate) struct InvocationKeyScope {
     compile_while_keying: bool,
     provided_dep_info: Option<(DepInfo, Option<TreeGuard>)>,
     remote_rows: Option<RemoteRows>,
+    _normalizers: crate::path_normalizer::InvocationNormalizerScope,
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl InvocationKeyScope {
     pub(crate) fn enter() -> Self {
         Self {
+            _normalizers: crate::path_normalizer::InvocationNormalizerScope::enter(),
             defer_discovery: DEFER_DISCOVERY.with(|cell| cell.replace(false)),
             compile_while_keying: COMPILE_WHILE_KEYING.with(|cell| cell.replace(false)),
             provided_dep_info: PROVIDED_DEP_INFO.with(|cell| cell.replace(None)),
