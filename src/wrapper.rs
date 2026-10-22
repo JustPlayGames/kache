@@ -7853,7 +7853,7 @@ fn cargo_invocation_stamp(args: &RustcArgs) -> Option<PathBuf> {
     let parent = out_dir.parent()?;
     let folder = match out_dir.file_name()?.to_str()? {
         "deps" => {
-            let package = std::env::var("CARGO_PKG_NAME").ok()?;
+            let package = args.invocation_env().var("CARGO_PKG_NAME").ok()?;
             parent.join(".fingerprint").join(format!("{package}{extra}"))
         }
         "out" if parent.file_name()? == unit_hash => parent.join("fingerprint"),

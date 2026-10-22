@@ -47,12 +47,15 @@ const VERSION: &[u8] = b"kache-session-tree-v1\n";
 
 /// The invocation this process belongs to, if sharing is on and one can be
 /// named.
-pub(crate) fn session_id() -> Option<String> {
+pub(crate) fn session_id(env: &crate::invocation::InvocationEnv) -> Option<String> {
     // Tests share one process, and so one parent: a test names its session.
     #[cfg(test)]
-    return TEST_SESSION.with(|session| session.borrow().clone());
+    {
+        let _ = env;
+        TEST_SESSION.with(|session| session.borrow().clone())
+    }
     #[cfg(not(test))]
-    session_from_env()
+    session_from_env(env)
 }
 
 #[cfg(test)]
@@ -67,11 +70,14 @@ pub(crate) fn set_test_session(session: Option<&str>) {
 }
 
 #[cfg_attr(test, allow(dead_code))]
-fn session_from_env() -> Option<String> {
-    if std::env::var_os("KACHE_TREE_SESSION").is_some_and(|value| value == "off" || value == "0") {
+fn session_from_env(env: &crate::invocation::InvocationEnv) -> Option<String> {
+    if env
+        .var_os("KACHE_TREE_SESSION")
+        .is_some_and(|value| value == "off" || value == "0")
+    {
         return None;
     }
-    if let Some(id) = std::env::var_os("KACHE_TREE_SESSION_ID") {
+    if let Some(id) = env.var_os("KACHE_TREE_SESSION_ID") {
         let id = id.to_str()?;
         return (!id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
             .then(|| id.to_string());
@@ -152,11 +158,12 @@ fn read(path: &Path) -> Option<SharedRoot> {
 /// all walking. Without a session, or when the session cannot be written,
 /// `compute` alone answers.
 pub(crate) fn shared_or(
+    env: &crate::invocation::InvocationEnv,
     memo_dir: &Path,
     key: &[u8],
     compute: impl FnOnce() -> Option<SharedRoot>,
 ) -> Option<SharedRoot> {
-    let Some(session) = session_id() else {
+    let Some(session) = session_id(env) else {
         return compute();
     };
     shared_in(memo_dir, &session, key, compute)
