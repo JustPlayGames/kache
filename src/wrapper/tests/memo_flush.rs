@@ -1,5 +1,5 @@
-//! The file-hash memo rows a unit's key learns, when another process
-//! holds the index's write lock.
+//! The file-hash memo rows a unit's key learns, and the unit's other
+//! bookkeeping writes, when another process holds the index's write lock.
 
 use super::*;
 use std::sync::Mutex;
@@ -152,4 +152,57 @@ fn without_a_daemon_a_busy_index_drops_a_keys_memo_rows() {
     let next = store.file_hasher();
     assert_eq!(next.hash(&input).unwrap(), hash);
     assert_eq!(next.stats().bytes_hashed, INPUT_BYTES as u64);
+}
+
+/// A unit's bookkeeping writes on a busy index (its key's memo rows before
+/// the compile, its target root and prediction rows after it) cost one short
+/// wait together, not one each: once the daemon took rows, the later writes
+/// only try the lock. Before, they waited 5 + 25 + 25 ms (100 + 25 + 25 ms
+/// before the memo rows had somewhere to go). The rows still all reach the
+/// daemon.
+#[test]
+fn a_units_bookkeeping_on_a_busy_index_pays_one_short_wait() {
+    let fixture = Fixture::new();
+    let scratch = fixture.input.parent().unwrap();
+    let workspace = scratch.join("ws");
+    let target = cargo_target_in(&workspace);
+    let source = scratch.join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let closure = crate::cache_key::DepInfo {
+        source_files: vec![source],
+        env_deps: Vec::new(),
+    };
+
+    let writer = fixture.hold_the_write_lock();
+    let started = Instant::now();
+    {
+        let hasher = fixture.store.file_hasher();
+        hasher.hash(&fixture.input).unwrap();
+        hasher.flush_memo_as_if_settled();
+    }
+    register_target_root(
+        &fixture.config,
+        &fixture.store,
+        &target,
+        &workspace,
+        Some("rustc 1"),
+    );
+    let predictions = fixture.store.file_hasher().with_input_predictions(true);
+    predictions.record_input_prediction("unit-a", Some("a"), &closure, None);
+    let waited = started.elapsed();
+    drop(writer);
+    assert!(
+        waited < Duration::from_millis(40),
+        "the unit waited {waited:?} for its bookkeeping"
+    );
+    assert_eq!(fixture.handed.lock().unwrap().len(), 1);
+    assert_eq!(
+        predictions
+            .take_busy_predictions()
+            .iter()
+            .map(|row| row.identity.as_str())
+            .collect::<Vec<_>>(),
+        ["unit-a"],
+        "the prediction row is kept for the daemon"
+    );
 }
