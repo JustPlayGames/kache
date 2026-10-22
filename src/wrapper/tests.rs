@@ -1,4 +1,5 @@
 mod hit;
+mod memo_flush;
 mod restore_memo;
 mod rustc_hit;
 
