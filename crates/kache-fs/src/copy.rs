@@ -99,106 +99,10 @@ fn native_reflink_linux(src: &Path, dst: &Path) -> io::Result<()> {
     }
 }
 
+/// Block-clone on ReFS and Dev Drive volumes; see `windows_clone`.
 #[cfg(windows)]
 fn native_reflink_windows(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom};
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::System::IO::DeviceIoControl;
-    use windows_sys::Win32::System::Ioctl::{
-        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-    };
-
-    let mut src_file = fs::File::open(src)?;
-    let len = src_file.metadata()?.len();
-
-    // Create a new, writable destination without replacing an existing name.
-    let mut dst_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(dst)?;
-
-    let result = (|| -> io::Result<()> {
-        if len == 0 {
-            return Ok(()); // empty file: dst already created empty, nothing to clone
-        }
-
-        // Cluster size of the destination volume; clone ranges must be aligned to
-        // it. A file smaller than one cluster has no aligned range at all, so bail
-        // before the FSCTL rather than issuing a call that cannot succeed — this is
-        // the common case for the small files.
-        let cluster = windows_cluster_size(dst)?;
-        if len < cluster {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "file smaller than one cluster",
-            ));
-        }
-
-        let clone_len = (len / cluster) * cluster;
-
-        // Allocate the destination clusters and set EOF to the cloned prefix.
-        dst_file.set_len(clone_len)?;
-
-        let src_h = src_file.as_raw_handle();
-        let dst_h = dst_file.as_raw_handle();
-        // Each FSCTL range must be cluster-aligned and strictly < 4 GiB.
-        let max_chunk = (((4u64 << 30) - 1) / cluster) * cluster;
-        if max_chunk == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cluster exceeds clone range",
-            ));
-        }
-        let mut off = 0u64;
-        while off < clone_len {
-            let chunk = (clone_len - off).min(max_chunk);
-            let data = DUPLICATE_EXTENTS_DATA {
-                FileHandle: src_h as _,
-                SourceFileOffset: off as i64,
-                TargetFileOffset: off as i64,
-                ByteCount: chunk as i64,
-            };
-            let mut returned: u32 = 0;
-            let ok = unsafe {
-                DeviceIoControl(
-                    dst_h as _,
-                    FSCTL_DUPLICATE_EXTENTS_TO_FILE,
-                    &data as *const DUPLICATE_EXTENTS_DATA as *const _,
-                    size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut returned,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            off += chunk;
-        }
-
-        // Byte-copy the sub-cluster tail, if any, then set the exact final length.
-        if clone_len < len {
-            src_file.seek(SeekFrom::Start(clone_len))?;
-            dst_file.seek(SeekFrom::Start(clone_len))?;
-            let copied = std::io::copy(&mut (&mut src_file).take(len - clone_len), &mut dst_file)?;
-            if copied != len - clone_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "short tail copy",
-                ));
-            }
-        }
-        dst_file.set_len(len)?;
-        Ok(())
-    })();
-    drop(dst_file);
-    if result.is_err() {
-        let _ = fs::remove_file(dst);
-    }
-    result
+    crate::windows_clone::clone_file(src, dst)
 }
 
 /// Allocation (cluster) size of the volume that holds `path`, in bytes.
