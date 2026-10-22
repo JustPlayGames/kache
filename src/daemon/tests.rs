@@ -15728,3 +15728,27 @@ fn handed_rows_are_sent_without_waiting_for_the_answer() {
     assert!(started.elapsed() < std::time::Duration::from_millis(250));
     check();
 }
+
+/// Daemon requests share one client runtime instead of building one each,
+/// and two threads can run on it at once.
+#[test]
+fn daemon_requests_share_one_client_runtime() {
+    let first = daemon_client_runtime().unwrap() as *const tokio::runtime::Runtime;
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            std::thread::spawn(|| {
+                let runtime = daemon_client_runtime().unwrap();
+                let value = runtime.block_on(async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    7
+                });
+                (runtime as *const tokio::runtime::Runtime as usize, value)
+            })
+        })
+        .collect();
+    for thread in threads {
+        let (runtime, value) = thread.join().unwrap();
+        assert_eq!(runtime, first as usize);
+        assert_eq!(value, 7);
+    }
+}
