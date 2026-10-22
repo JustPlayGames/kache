@@ -210,6 +210,34 @@ pub fn connect_sync(name: Name<'_>, busy_wait: std::time::Duration) -> std::io::
     }
 }
 
+/// Connect a Tokio client to `name`, with [`connect_sync`]'s bound on a busy
+/// Windows pipe.
+///
+/// `TokioStream::connect` waits for a busy pipe in a blocking task with no
+/// limit. A timeout around the request does not end that task, and dropping
+/// the runtime that owns it waits for it, so a caller's own timeout can
+/// still hang. On Unix this is `TokioStream::connect`, unchanged.
+#[cfg(feature = "async")]
+pub async fn connect_tokio(
+    name: Name<'_>,
+    busy_wait: std::time::Duration,
+) -> std::io::Result<TokioStream> {
+    #[cfg(windows)]
+    {
+        interprocess::local_socket::ConnectOptions::new()
+            .name(name)
+            .wait_mode(interprocess::ConnectWaitMode::Timeout(busy_wait))
+            .connect_tokio()
+            .await
+    }
+    #[cfg(not(windows))]
+    {
+        use interprocess::local_socket::traits::tokio::Stream as _;
+        let _ = busy_wait;
+        TokioStream::connect(name).await
+    }
+}
+
 /// True if a daemon socket / named pipe at `path` accepts a connection
 /// right now. Used by liveness probes — does not check whether the daemon
 /// is responsive, only whether *something* is listening. A Windows pipe
@@ -320,6 +348,41 @@ mod tests {
             .expect("connect to a busy pipe hung");
         assert!(result.is_err(), "a busy pipe cannot take a second client");
         assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    /// The Tokio client gives up on a busy pipe too, so dropping its runtime
+    /// afterwards has no blocking task left to wait for.
+    #[cfg(all(windows, feature = "async"))]
+    #[test]
+    fn a_busy_pipe_fails_within_the_wait_for_a_tokio_client() {
+        use interprocess::local_socket::traits::Stream as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy-tokio.sock");
+        let _listener = ListenerOptions::new()
+            .name(socket_name(&path).unwrap())
+            .create_sync()
+            .expect("bind listener");
+        let _first = SyncStream::connect(socket_name(&path).unwrap()).expect("first client");
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(connect_tokio(
+                socket_name(&probe).unwrap(),
+                std::time::Duration::from_millis(300),
+            ));
+            // Dropping the runtime must not wait on a connect still blocked.
+            drop(runtime);
+            let _ = done.send(result.map(|_| ()));
+        });
+        let result = finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("Tokio connect to a busy pipe hung");
+        assert!(result.is_err(), "a busy pipe cannot take a second client");
     }
 
     #[cfg(unix)]
