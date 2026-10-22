@@ -57,8 +57,11 @@ pub fn run(version: &str) -> Result<i32> {
                 if let Some(exit) = execution.try_execute(&socket)? {
                     return Ok(exit);
                 }
+                // A daemon that is there but not answering is not started again.
                 #[cfg(windows)]
-                if let Some(exit) = windows::try_bootstrap(&execution, &socket, config.disabled)? {
+                if !kache_ipc::execution::daemon_unresponsive(&socket)
+                    && let Some(exit) = windows::try_bootstrap(&execution, &socket, config.disabled)?
+                {
                     return Ok(exit);
                 }
             }
