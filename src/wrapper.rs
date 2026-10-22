@@ -4811,7 +4811,10 @@ fn run_parsed_rustc(
     // fault that caused it (kunobi-ninja/kache#1326).
     let degraded = kache_format::reports_debug_info_tool_failure(&result.stderr)
         .then(|| "rustc could not post-process its debug info".to_string());
-    if let Some(reason) = unaudited.or(degraded) {
+    // A Windows executable finds its `.pdb` by the GUID, age and name it
+    // records: it is cached only with that very `.pdb`, named by file name.
+    let unpaired = unpaired_executable_debug_info(&result.artifacts);
+    if let Some(reason) = unaudited.or(degraded).or(unpaired) {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
@@ -5542,6 +5545,19 @@ fn find_executable_output(
         .iter()
         .find(|a| compiler.classify_output(args, &a.store_name) == ArtifactKind::Executable)
         .map(|a| (a.path.clone(), a.store_name.clone()))
+}
+
+/// Why a unit's Windows executable must not be cached, `None` when every
+/// `.exe` among its outputs carries no external debug info or is stored with
+/// the `.pdb` it names ([`crate::pe_pdb`]).
+fn unpaired_executable_debug_info(artifacts: &crate::compiler::ArtifactSet) -> Option<String> {
+    let outputs = artifacts
+        .outputs()
+        .iter()
+        .map(|a| (a.path.as_path(), a.store_name.as_str()));
+    crate::pe_pdb::check_outputs(outputs)
+        .err()
+        .map(|error| format!("its executable cannot be cached with its .pdb: {error:#}"))
 }
 
 /// Bundle debug info for cached user binaries unless the invocation opts out
@@ -6864,12 +6880,13 @@ fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
 }
 
 /// Whether `args` compiles an executable kept out of the cache because
-/// `cache_executables` is off (Windows by default: an `.exe` names its
-/// `.pdb`). A Cargo build script built without debug info is cached all the
-/// same: Cargo runs it, nobody debugs it, and rustc names its `.pdb` by file
-/// name alone (`/PDBALTPATH:%_PDB%`), which the store keeps and restores with
-/// it. Kept out, every new target directory compiled each build script again
-/// (92 in a Windows build of five Studio crates, 2026-10-18).
+/// `cache_executables` is off (by configuration: it is on by default where a
+/// restored executable debugs like a linked one). A Cargo build script built
+/// without debug info is cached all the same: Cargo runs it, nobody debugs
+/// it, and rustc names its `.pdb` by file name alone (`/PDBALTPATH:%_PDB%`),
+/// which the store keeps and restores with it. Kept out, every new target
+/// directory compiled each build script again (92 in a Windows build of five
+/// Studio crates, 2026-10-18).
 fn skips_cache_as_user_facing(args: &RustcArgs, cache_executables: bool) -> bool {
     args.is_user_facing_executable()
         && !cache_executables
