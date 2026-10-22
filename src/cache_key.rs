@@ -8527,7 +8527,9 @@ impl FileHasher<'static> {
 /// How long a prediction record waits for the index's write lock
 /// ([`FileHasher::take_busy_predictions`] holds the rows it could not write).
 /// A record saves a later pre-pass; in a burst of misses the full busy
-/// timeout made a unit wait over a second for it after its compile.
+/// timeout made a unit wait over a second for it after its compile. Once
+/// the daemon took bookkeeping rows of this unit, a record does not wait at
+/// all ([`crate::store::bookkeeping_wait`]).
 const PREDICTION_RECORD_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// How long [`FileHasher::flush_memo`] waits for the index's write lock
@@ -8606,7 +8608,7 @@ impl<'db> FileHasher<'db> {
         }
         let _trace = crate::phase_trace::phase("memo_flush");
         let wait = match self.memo_handoff {
-            Some(_) => MEMO_HANDOFF_WAIT,
+            Some(_) => crate::store::bookkeeping_wait(MEMO_HANDOFF_WAIT),
             None => MEMO_FLUSH_WAIT,
         };
         let Err(mut error) = write_memo_rows(cache, &pending, wait) else {
@@ -8945,7 +8947,7 @@ impl<'db> FileHasher<'db> {
             return;
         }
         let db = cache.db();
-        let _ = db.busy_timeout(PREDICTION_RECORD_WAIT);
+        let _ = db.busy_timeout(crate::store::bookkeeping_wait(PREDICTION_RECORD_WAIT));
         let written = match &row.keep_under {
             Some((prefix, keep)) => cache.put_input_prediction_keeping(
                 prefix,

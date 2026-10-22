@@ -7026,6 +7026,9 @@ fn hand_busy_predictions(
     let count = rows.len();
     let handed = store.cache_dir() == config.cache_dir
         && crate::daemon::send_prediction_rows(&config.socket_path(), &config.cache_dir, rows);
+    if handed {
+        crate::store::note_bookkeeping_handed_off();
+    }
     tracing::debug!(
         rows = count,
         handed,
@@ -8461,7 +8464,8 @@ fn prepare_worktree_compiler_args(
 }
 
 /// How long a unit waits for the index's write lock to record its target
-/// root ([`register_target_root`]).
+/// root ([`register_target_root`]); not at all once the daemon took
+/// bookkeeping rows of this unit ([`crate::store::bookkeeping_wait`]).
 const TARGET_ROOT_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Record that a build wrote into `target`, owned by `workspace_root`, with
@@ -8483,9 +8487,8 @@ fn register_target_root(
     workspace_root: &Path,
     rustc: Option<&str>,
 ) {
-    let Err(error) =
-        store.remember_target_root_waiting(target, workspace_root, rustc, TARGET_ROOT_WAIT)
-    else {
+    let wait = crate::store::bookkeeping_wait(TARGET_ROOT_WAIT);
+    let Err(error) = store.remember_target_root_waiting(target, workspace_root, rustc, wait) else {
         return;
     };
     if !crate::store::is_sqlite_contention(&error) {
@@ -8505,6 +8508,9 @@ fn register_target_root(
                 rustc: rustc.map(str::to_owned),
             },
         );
+    if handed {
+        crate::store::note_bookkeeping_handed_off();
+    }
     tracing::debug!(
         handed,
         "target root {} not recorded yet (index busy)",

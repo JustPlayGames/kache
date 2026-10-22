@@ -1407,6 +1407,32 @@ const MEMO_ROW_HANDOFF_WAIT: Duration = Duration::from_millis(5);
 /// How long a store without a sink waits before it drops its memo rows.
 const MEMO_ROW_WAIT: Duration = Duration::from_millis(100);
 
+/// Whether a daemon took bookkeeping rows (memo rows, a target root,
+/// prediction rows) this process's index was too busy for.
+static BOOKKEEPING_HANDED_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Note that a daemon took bookkeeping rows a busy index refused.
+pub fn note_bookkeeping_handed_off() {
+    BOOKKEEPING_HANDED_OFF.store(true, Ordering::Relaxed);
+}
+
+/// How long this process's next bookkeeping write waits for the index's
+/// write lock: `wait`, or none once a daemon took rows a busy index refused
+/// ([`note_bookkeeping_handed_off`]). A wrapper's memo rows, target root and
+/// prediction rows each waited for the lock in turn (165 ms a unit in a
+/// burst of misses on an index held 7 s of every 8.5 s), though the daemon
+/// takes whatever they cannot write. Once it has taken some, each later
+/// write only tries the lock and hands its rows on when another process
+/// holds it. Without a daemon nothing is ever handed off, and every write
+/// waits as before.
+pub fn bookkeeping_wait(wait: Duration) -> Duration {
+    if BOOKKEEPING_HANDED_OFF.load(Ordering::Relaxed) {
+        Duration::ZERO
+    } else {
+        wait
+    }
+}
+
 /// Takes a hit's access stamp off the hit path: called with the entry's key
 /// when [`ArtifactStore::get`] would stamp it, and returns `true` when it has
 /// taken the stamp and will write it ([`ArtifactStore::stamp_hits`]), so the
@@ -2827,7 +2853,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return;
         }
         let wait = if self.busy_memo_rows.is_some() {
-            MEMO_ROW_HANDOFF_WAIT
+            bookkeeping_wait(MEMO_ROW_HANDOFF_WAIT)
         } else {
             MEMO_ROW_WAIT
         };
@@ -3137,7 +3163,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// when it refused them (no daemon runs, or one that will not take
     /// them), and the caller then waits for the index or drops them.
     pub fn hand_busy_memo_rows(&self, rows: &[MemoRow]) -> bool {
-        self.busy_memo_rows.as_ref().is_some_and(|sink| sink(rows))
+        let handed = self.busy_memo_rows.as_ref().is_some_and(|sink| sink(rows));
+        if handed {
+            note_bookkeeping_handed_off();
+        }
+        handed
     }
 
     /// Hand memo rows this store's index is too busy to take to `sink`
