@@ -3,7 +3,9 @@
 #![cfg(unix)]
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+
+#[allow(dead_code)]
+mod common;
 
 fn script(path: &Path, body: &str) {
     kache_fs::testutil::write_executable(path, format!("#!/bin/sh\n{body}\n"));
@@ -12,6 +14,7 @@ fn script(path: &Path, body: &str) {
 #[test]
 fn untrusted_codegen_backend_runs_rustc_directly_every_time() {
     let dir = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), dir.path().join("cache"));
     let rustc = dir.path().join("rustc");
     let fallback = dir.path().join("fallback");
     let calls = dir.path().join("calls");
@@ -37,34 +40,38 @@ printf 'binary' > app
 
     for _ in 0..2 {
         fs::remove_file(dir.path().join("kernel.ptx")).ok();
-        let output = Command::new(env!("CARGO_BIN_EXE_kache"))
-            .arg(&rustc)
-            .args([
-                "--crate-name",
-                "app",
-                "main.rs",
-                "--crate-type",
-                "bin",
-                "--emit=link",
-                "-o",
-                "app",
-            ])
-            .arg(format!(
-                "-Zcodegen-backend={}",
-                dir.path().join("backend.so").display()
-            ))
-            .current_dir(dir.path())
-            .env("KACHE_CONFIG", dir.path().join("absent.toml"))
-            .env("KACHE_HOST_CONFIG", "")
-            .env("KACHE_CACHE_DIR", dir.path().join("cache"))
-            .env("KACHE_FALLBACK", &fallback)
-            .env("KACHE_CACHE_EXECUTABLES", "true")
-            .env("KACHE_REMOTE", "")
-            .env_remove("KACHE_TRUST_CODEGEN_BACKENDS")
-            .env_remove("KACHE_DISABLED")
-            .env("TEST_CALLS", &calls)
-            .output()
-            .unwrap();
+        let output = common::hermetic_command(
+            env!("CARGO_BIN_EXE_kache"),
+            &dir.path().join("cache"),
+            Some(&dir.path().join("absent.toml")),
+        )
+        .arg(&rustc)
+        .args([
+            "--crate-name",
+            "app",
+            "main.rs",
+            "--crate-type",
+            "bin",
+            "--emit=link",
+            "-o",
+            "app",
+        ])
+        .arg(format!(
+            "-Zcodegen-backend={}",
+            dir.path().join("backend.so").display()
+        ))
+        .current_dir(dir.path())
+        .env("KACHE_CONFIG", dir.path().join("absent.toml"))
+        .env("KACHE_HOST_CONFIG", "")
+        .env("KACHE_CACHE_DIR", dir.path().join("cache"))
+        .env("KACHE_FALLBACK", &fallback)
+        .env("KACHE_CACHE_EXECUTABLES", "true")
+        .env("KACHE_REMOTE", "")
+        .env_remove("KACHE_TRUST_CODEGEN_BACKENDS")
+        .env_remove("KACHE_DISABLED")
+        .env("TEST_CALLS", &calls)
+        .output()
+        .unwrap();
         assert!(
             output.status.success(),
             "{}",
