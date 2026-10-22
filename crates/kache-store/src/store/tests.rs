@@ -15055,3 +15055,24 @@ fn a_changed_blob_refuses_only_the_entries_of_a_batch_that_name_it() {
         "the blob no longer holding its digest is gone"
     );
 }
+
+/// A wrapper's key hands over the rows of small files too: the tree guard
+/// reads a workspace file's hash from its memo row whatever its size, so a
+/// handed row of a small file is written like any other.
+#[test]
+fn a_handed_memo_row_of_a_small_file_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let file = dir.path().join("lib.rs");
+    fs::write(&file, "pub fn f() {}\n").unwrap();
+    let row = memo_row_for(&file, false);
+    assert!(row.fingerprint.size < crate::file_hash::MIN_PERSISTED_HASH_BYTES);
+
+    assert_eq!(
+        store
+            .write_handed_memo_rows(std::slice::from_ref(&row))
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.file_hash_at(&row.fingerprint), Some(row.hash));
+}

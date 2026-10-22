@@ -2834,7 +2834,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let Err(mut error) = self.write_memo_rows(&rows, wait) else {
             return;
         };
-        if self.busy_memo_rows.as_ref().is_some_and(|sink| sink(&rows)) {
+        if self.hand_busy_memo_rows(&rows) {
             tracing::debug!(
                 rows = rows.len(),
                 "memo rows handed off (index busy): {error}"
@@ -2904,9 +2904,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             self.db.execute_batch("BEGIN IMMEDIATE")?;
             let cache = self.file_hash_cache();
             for row in rows {
+                // A row of any size holds for exactly its stamp. A restore
+                // hands over only rows above the memo's floor, but a key's
+                // rows include small workspace files, whose rows the tree
+                // guard reads.
                 if row.redated {
                     cache.put_redated(&row.fingerprint, &row.hash)?;
-                } else if row.fingerprint.size >= crate::file_hash::MIN_PERSISTED_HASH_BYTES {
+                } else {
                     cache.put(&row.fingerprint, &row.hash)?;
                 }
             }
@@ -3120,6 +3124,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// its own sweeps meanwhile ([`Self::pin_entries_with`]).
     pub fn send_hit_stamps_to(&mut self, sink: HitStampSink) {
         self.hit_stamps = Some(sink);
+    }
+
+    /// Whether this store hands memo rows a busy index refuses to a
+    /// [`MemoRowSink`] ([`Self::send_busy_memo_rows_to`]).
+    pub fn hands_busy_memo_rows(&self) -> bool {
+        self.busy_memo_rows.is_some()
+    }
+
+    /// Give `rows`, which this store's index was too busy to take, to its
+    /// [`MemoRowSink`]. True when the sink took them; false without one, or
+    /// when it refused them (no daemon runs, or one that will not take
+    /// them), and the caller then waits for the index or drops them.
+    pub fn hand_busy_memo_rows(&self, rows: &[MemoRow]) -> bool {
+        self.busy_memo_rows.as_ref().is_some_and(|sink| sink(rows))
     }
 
     /// Hand memo rows this store's index is too busy to take to `sink`
