@@ -31,21 +31,95 @@ mod unix;
 #[cfg(unix)]
 use unix::Connection;
 
+/// How long every client runs its compiles locally once a daemon let one
+/// request wait out [`PREPARE_TIMEOUT`] (stopped, swapping, or stuck in IO).
+/// Without it each compile of a build waits the timeout again, one after the
+/// other: a few seconds per unit instead of none.
+const UNRESPONSIVE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A request that failed only after waiting this long found the daemon there
+/// but not answering; quicker failures (no daemon, a refused or reset
+/// connection, an older daemon declining) say nothing about its health.
+const UNRESPONSIVE_AFTER: Duration = Duration::from_secs(2);
+
+/// The marker beside the daemon's endpoint that tells clients it did not
+/// answer: its modification time is when that was last seen.
+pub fn unresponsive_marker(socket: &Path) -> std::path::PathBuf {
+    let mut name = socket.file_name().unwrap_or_default().to_owned();
+    name.push(".unresponsive");
+    socket.with_file_name(name)
+}
+
+/// Whether clients should leave the daemon behind `socket` alone for now: it
+/// did not answer a request less than [`UNRESPONSIVE_BACKOFF`] ago.
+pub fn daemon_unresponsive(socket: &Path) -> bool {
+    marker_age(&unresponsive_marker(socket)).is_some_and(|age| age < UNRESPONSIVE_BACKOFF)
+}
+
+fn marker_age(marker: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(marker).ok()?.modified().ok()?;
+    // A time in the future (a clock step) counts as fresh.
+    Some(modified.elapsed().unwrap_or_default())
+}
+
+/// Note that the daemon did not answer (or that this client is the one that
+/// tries it again once the backoff is over): the marker's time becomes now.
+fn mark_unresponsive(marker: &Path) {
+    let touched = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(marker)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    if let Err(error) = touched {
+        tracing::debug!(%error, marker = %marker.display(), "could not mark the daemon unresponsive");
+    }
+}
+
 /// `None` permits local execution. An error means Commit may have reached the
 /// daemon and the caller must not run the compiler again.
+///
+/// A daemon that did not answer one client in [`PREPARE_TIMEOUT`] is skipped
+/// by every client for [`UNRESPONSIVE_BACKOFF`]; then one client tries it
+/// again (it renews the marker first, so the others keep going locally
+/// meanwhile) and clears the marker once it answers.
 pub fn try_execute(
     socket: &Path,
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
 ) -> Result<Option<i32>> {
+    let marker = unresponsive_marker(socket);
+    let marked = match marker_age(&marker) {
+        Some(age) if age < UNRESPONSIVE_BACKOFF => {
+            tracing::debug!("daemon did not answer {age:?} ago; compiling locally");
+            return Ok(None);
+        }
+        Some(_) => {
+            mark_unresponsive(&marker);
+            true
+        }
+        None => false,
+    };
+    let started = std::time::Instant::now();
     let mut committed = false;
-    match exchange(
+    let result = exchange(
         socket,
         request,
         #[cfg(unix)]
         descriptors,
         &mut committed,
-    ) {
+    );
+    if committed || result.is_ok() {
+        if marked {
+            let _ = std::fs::remove_file(&marker);
+        }
+    } else if started.elapsed() >= UNRESPONSIVE_AFTER {
+        mark_unresponsive(&marker);
+    } else if marked {
+        // Not a hang: the daemon is gone or declined. Nothing to wait out.
+        let _ = std::fs::remove_file(&marker);
+    }
+    match result {
         Ok(exit) => Ok(Some(exit)),
         Err(error) if !committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
@@ -445,6 +519,105 @@ mod protocol_tests {
         let mut source = &large[..];
         assert!(read_reply(&mut source).is_err());
         assert_eq!(source.len(), 10);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unresponsive_tests {
+    use super::*;
+    use kache_protocol::execution::{ExecutionChannels, ExecutionEntry, NativeString};
+    use std::os::unix::net::UnixListener;
+
+    fn request(root: &Path) -> ExecutionRequest {
+        let native = |value: &std::ffi::OsStr| NativeString::capture(value);
+        ExecutionRequest {
+            version: EXECUTION_VERSION,
+            entry: ExecutionEntry::Compiler,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            client_pid: std::process::id(),
+            creation_mask: Some(0o022),
+            argv: vec![native("/bin/true".as_ref())],
+            env: vec![],
+            cwd: native(root.as_os_str()),
+            home: None,
+            temp: native(root.as_os_str()),
+            cache: None,
+            executable: native(std::env::current_exe().unwrap().as_os_str()),
+            startup_micros: 0,
+            channels: ExecutionChannels::Unix {
+                terminal: false,
+                jobserver: vec![],
+            },
+        }
+    }
+
+    fn set_age(marker: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(marker)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// A daemon that accepts but never answers (stopped, stuck in IO) costs
+    /// one client the timeout; the next ones compile locally at once, and
+    /// after the backoff one client tries it again.
+    #[test]
+    fn a_daemon_that_does_not_answer_is_skipped_by_the_next_clients() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = root.path().join("daemon.sock");
+        // Bound and listening, never accepted: connects succeed, replies never come.
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let request = request(root.path());
+        let marker = unresponsive_marker(&socket);
+        assert_eq!(marker.file_name().unwrap(), "daemon.sock.unresponsive");
+        assert!(!daemon_unresponsive(&socket));
+
+        let started = std::time::Instant::now();
+        assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        assert!(started.elapsed() >= UNRESPONSIVE_AFTER);
+        assert!(daemon_unresponsive(&socket), "the timeout is remembered");
+
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        }
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+
+        // Past the backoff, one client tries again: it renews the marker first,
+        // so the others keep compiling locally while it waits.
+        set_age(&marker, UNRESPONSIVE_BACKOFF + Duration::from_secs(1));
+        assert!(!daemon_unresponsive(&socket));
+        std::thread::scope(|threads| {
+            let prober = threads.spawn(|| try_execute(&socket, &request, &[]).unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !daemon_unresponsive(&socket) {
+                assert!(std::time::Instant::now() < deadline, "the prober did not renew the marker");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(prober.join().unwrap(), None);
+        });
+        assert!(daemon_unresponsive(&socket), "still not answering");
+    }
+
+    /// No daemon at all is no hang: nothing is remembered, and a stale marker
+    /// goes once a quick failure shows there is nothing to wait out.
+    #[test]
+    fn a_missing_daemon_leaves_no_marker() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = root.path().join("daemon.sock");
+        let request = request(root.path());
+        let marker = unresponsive_marker(&socket);
+        assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        assert!(!marker.exists());
+        std::fs::write(&marker, b"").unwrap();
+        set_age(&marker, UNRESPONSIVE_BACKOFF * 2);
+        assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        assert!(!marker.exists());
     }
 }
 
