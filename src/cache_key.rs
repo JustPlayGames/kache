@@ -2002,6 +2002,45 @@ fn out_dir_source_identity(file: &Path, out_dir: Option<&OsStr>) -> Option<Vec<u
     Some(format!("<OUT_DIR:{unit}>/{rest}").into_bytes())
 }
 
+/// Identity of an explicit native search directory an rlib can bundle from.
+///
+/// Rlib native inputs beneath this unit's OUT_DIR are all content-keyed by
+/// `native_scan_dirs`, including archive member names and timestamps. Rustc
+/// bundles those members without recording their absolute search directory.
+/// Linked outputs and framework/all search paths keep their existing identity.
+/// Source files always use `source_path_identity`: rustc can expose their
+/// spelling through file!(), caller locations and debug information.
+fn out_dir_native_search_identity(
+    args: &RustcArgs,
+    path: &Path,
+    out_dir: Option<&OsStr>,
+) -> Option<Vec<u8>> {
+    if args.is_test || !args.emits_rlib() || args.links_native_closure() || args.skip_path_remap() {
+        return None;
+    }
+    let target = args.target_dir()?;
+    let out_dir = Path::new(out_dir?);
+    if !out_dir.is_absolute() {
+        return None;
+    }
+    // target_dir is resolved against the invocation, so this prefix match
+    // also requires an absolute search path.
+    let rest = path.strip_prefix(&target).ok()?;
+    if rest.as_os_str().is_empty()
+        || rest
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    // Use the same resolved containment as the native archive scan. A lexical
+    // child can be a symlink to an unscanned directory outside this OUT_DIR.
+    if dirs_under_for(&[path.to_path_buf()], out_dir, args.invocation_env()).is_empty() {
+        return None;
+    }
+    Some(env_os_key_bytes(rest.as_os_str()))
+}
+
 /// The prediction identity of one rustc invocation, or `None` when there is
 /// nothing to predict.
 ///
@@ -4762,6 +4801,15 @@ fn compute_key_into(
         }
         if kind == Some("framework") {
             framework_search_dirs.push(file_hasher.resolve_path(Path::new(path))?);
+        }
+        if kind == Some("native")
+            && let Some(identity) =
+                out_dir_native_search_identity(args, Path::new(path), out_dir.as_deref())
+        {
+            // A separate length-prefixed namespace avoids both old key-only
+            // aliases and separator ambiguity in a literal Unix filename.
+            fold_field(&mut hasher, b"link_search_native_out_dir.v1:", &identity);
+            continue;
         }
         let normalized = match unit_target_dir
             .as_deref()
