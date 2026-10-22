@@ -9918,12 +9918,11 @@ async fn send_request_with_async_transport(
 /// This avoids the read-timeout failures that occur when the daemon's runtime
 /// is saturated (e.g. during S3 key-cache population at startup).
 fn send_request_fire_and_forget(socket_path: &Path, req: &Request) -> Result<()> {
-    use crate::transport::SyncStream;
     use interprocess::local_socket::traits::Stream as _;
     use std::io::Write;
 
     let name = socket_name(socket_path)?;
-    let mut stream = SyncStream::connect(name)
+    let mut stream = crate::transport::connect_sync(name, crate::transport::BUSY_PIPE_WAIT)
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
         .context(DaemonConnectionFailure)?;
 

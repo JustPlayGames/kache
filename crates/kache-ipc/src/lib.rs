@@ -181,15 +181,44 @@ fn peer_uid_is_self(peer_uid: u32) -> bool {
     peer_uid == self_uid()
 }
 
+/// How long a synchronous client waits for a busy daemon pipe on Windows
+/// before it gives up as if no daemon ran.
+///
+/// `SyncStream::connect` waits without limit: when every instance of the
+/// pipe is taken (`ERROR_PIPE_BUSY`) it blocks in `WaitNamedPipeW` until one
+/// frees, so a stalled daemon would hang every wrapper that probes or hands
+/// it work. A missing pipe still fails at once.
+pub const BUSY_PIPE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Connect a synchronous client to `name`. On Windows the wait for a busy
+/// pipe ends after `busy_wait` with `TimedOut`, which callers treat as the
+/// failed connection a missing daemon gives. On Unix this is
+/// `SyncStream::connect`, unchanged.
+pub fn connect_sync(name: Name<'_>, busy_wait: std::time::Duration) -> std::io::Result<SyncStream> {
+    #[cfg(windows)]
+    {
+        interprocess::local_socket::ConnectOptions::new()
+            .name(name)
+            .wait_mode(interprocess::ConnectWaitMode::Timeout(busy_wait))
+            .connect_sync()
+    }
+    #[cfg(not(windows))]
+    {
+        use interprocess::local_socket::traits::Stream as _;
+        let _ = busy_wait;
+        SyncStream::connect(name)
+    }
+}
+
 /// True if a daemon socket / named pipe at `path` accepts a connection
 /// right now. Used by liveness probes — does not check whether the daemon
-/// is responsive, only whether *something* is listening.
+/// is responsive, only whether *something* is listening. A Windows pipe
+/// still busy after [`BUSY_PIPE_WAIT`] counts as unreachable.
 pub fn is_reachable(path: &Path) -> bool {
-    use interprocess::local_socket::traits::Stream as _;
     let Ok(name) = socket_name(path) else {
         return false;
     };
-    SyncStream::connect(name).is_ok()
+    connect_sync(name, BUSY_PIPE_WAIT).is_ok()
 }
 
 #[cfg(test)]
@@ -259,6 +288,38 @@ mod tests {
             .create_sync()
             .expect("bind listener");
         assert!(is_reachable(&path));
+    }
+
+    /// Every pipe instance taken: the second client gets `ERROR_PIPE_BUSY`.
+    /// An unbounded connect would wait forever; this one must give up.
+    #[cfg(windows)]
+    #[test]
+    fn a_busy_pipe_fails_within_the_wait_instead_of_hanging() {
+        use interprocess::local_socket::traits::Stream as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.sock");
+        // One instance, never accepted: the first client takes it.
+        let _listener = ListenerOptions::new()
+            .name(socket_name(&path).unwrap())
+            .create_sync()
+            .expect("bind listener");
+        let _first = SyncStream::connect(socket_name(&path).unwrap()).expect("first client");
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = connect_sync(
+                socket_name(&probe).unwrap(),
+                std::time::Duration::from_millis(300),
+            );
+            let _ = done.send((result.map(|_| ()), started.elapsed()));
+        });
+        let (result, elapsed) = finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("connect to a busy pipe hung");
+        assert!(result.is_err(), "a busy pipe cannot take a second client");
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[cfg(unix)]
