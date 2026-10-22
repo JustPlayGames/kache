@@ -3652,9 +3652,13 @@ fn resolve_located_build_script_inputs(
     let normalizer = std::cell::OnceCell::new();
     let outside = |path: &Path| {
         let normalizer = normalizer.get_or_init(|| {
-            crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-                .with_target_dir(args.target_dir().as_deref())
-                .with_base_dirs(&config.base_dirs)
+            crate::path_normalizer::PathNormalizer::for_invocation(
+                workspace_root,
+                args.target_dir().as_deref(),
+                &config.base_dirs,
+                None,
+                None,
+            )
         });
         crate::cache_key::source_path_identity(path, normalizer)
     };
@@ -5468,13 +5472,17 @@ fn configured_rustc_depinfo_roots(
     workspace_root: Option<&Path>,
     target_dir: Option<&Path>,
 ) -> Vec<(PathBuf, String, u8)> {
-    crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-        .with_target_dir(target_dir)
-        .with_base_dirs(&config.base_dirs)
-        .depinfo_source_roots()
-        .into_iter()
-        .map(|root| (root.root, root.depinfo_sentinel, root.priority))
-        .collect()
+    crate::path_normalizer::PathNormalizer::for_invocation(
+        workspace_root,
+        target_dir,
+        &config.base_dirs,
+        None,
+        None,
+    )
+    .depinfo_source_roots()
+    .into_iter()
+    .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+    .collect()
 }
 
 fn validate_extra_inputs_dep_info_before_store(
@@ -7300,14 +7308,14 @@ fn compute_rustc_cache_key(
     // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
     // `RustcCompiler::execute`, or the key would represent one remap rule set
     // and the binary another.
-    let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-        .with_target_dir(args.target_dir().as_deref())
-        .with_base_dirs(&config.base_dirs)
-        .with_path_only_env_vars(config.path_only_env_vars.clone())
-        .with_rust_src_rule(
-            crate::cache_key::get_rustc_sysroot(args).as_deref(),
-            crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
-        );
+    let path_normalizer = crate::path_normalizer::PathNormalizer::for_invocation(
+        workspace_root,
+        args.target_dir().as_deref(),
+        &config.base_dirs,
+        crate::cache_key::get_rustc_sysroot(args).as_deref(),
+        crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
+    )
+    .with_path_only_env_vars(config.path_only_env_vars.clone());
     let key_ctx = KeyCtx {
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,

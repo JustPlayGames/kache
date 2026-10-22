@@ -220,6 +220,8 @@ impl PathNormalizer {
     /// purely for relocate-style scenarios where build artifacts
     /// flow through tempdirs.
     pub fn from_env(workspace_root: Option<&Path>) -> Self {
+        #[cfg(test)]
+        FROM_ENV_BUILDS.with(|builds| builds.set(builds.get() + 1));
         let mut rules = Vec::new();
         let mut source_restore_roots = Vec::new();
 
@@ -682,6 +684,67 @@ impl PathNormalizer {
         let mut seen = std::collections::HashSet::new();
         self.rules.retain(|r| seen.insert(r.prefix.clone()));
         self
+    }
+
+    /// `from_env(workspace_root).with_target_dir(target_dir)
+    /// .with_base_dirs(base_dirs)`, then `.with_rust_src_rule(sysroot,
+    /// commit_hash)` when both are given, built once per process for the same
+    /// inputs and cloned after that.
+    ///
+    /// A rustc miss builds this normalizer three or four times (the key, the
+    /// compile's remap flags, the dep-info roots, build-script inputs), each
+    /// canonicalizing about ten paths (and on Windows asking about twenty
+    /// short names). The result depends only on the arguments, the working
+    /// directory and the environment variables `from_env` reads, all part of
+    /// the memo's key, so a changed input builds a new one.
+    pub(crate) fn for_invocation(
+        workspace_root: Option<&Path>,
+        target_dir: Option<&Path>,
+        base_dirs: &[String],
+        sysroot: Option<&Path>,
+        commit_hash: Option<&str>,
+    ) -> Self {
+        static BUILT: std::sync::Mutex<Vec<(InvocationKey, PathNormalizer)>> =
+            std::sync::Mutex::new(Vec::new());
+        const MAX_BUILT: usize = 8;
+        let key = InvocationKey {
+            cwd: std::env::current_dir().ok(),
+            env: FROM_ENV_VARS.iter().map(std::env::var_os).collect(),
+            workspace_root: workspace_root.map(Path::to_path_buf),
+            target_dir: target_dir.map(Path::to_path_buf),
+            base_dirs: base_dirs.to_vec(),
+            rust_src: sysroot
+                .zip(commit_hash)
+                .map(|(sysroot, hash)| (sysroot.to_path_buf(), hash.to_owned())),
+        };
+        let mut built = BUILT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(normalizer) = remembered(&built, &key) {
+            return normalizer;
+        }
+        // The rust-src rule goes on top of the same base the callers without
+        // one use, so a miss builds the base once for both.
+        let base_key = InvocationKey {
+            rust_src: None,
+            ..key.clone()
+        };
+        let base = match remembered(&built, &base_key) {
+            Some(base) => base,
+            None => {
+                let base = Self::from_env(workspace_root)
+                    .with_target_dir(target_dir)
+                    .with_base_dirs(base_dirs);
+                remember(&mut built, MAX_BUILT, base_key, &base);
+                base
+            }
+        };
+        if key.rust_src.is_none() {
+            return base;
+        }
+        let normalizer = base.with_rust_src_rule(sysroot, commit_hash);
+        remember(&mut built, MAX_BUILT, key, &normalizer);
+        normalizer
     }
 
     /// A normalizer with no rules — leaves every input unchanged.
@@ -1624,9 +1687,109 @@ fn lowercase_drive_letter(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// The environment variables [`PathNormalizer::from_env`] reads, directly or
+/// through `dirs::home_dir` and `std::env::temp_dir`: part of the key of
+/// [`PathNormalizer::for_invocation`].
+const FROM_ENV_VARS: &[&str] = &[
+    "KACHE_BASE_DIR",
+    "CARGO_TARGET_DIR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+];
+
+/// What a [`PathNormalizer::for_invocation`] result depends on.
+#[derive(Clone, PartialEq)]
+struct InvocationKey {
+    cwd: Option<PathBuf>,
+    env: Vec<Option<std::ffi::OsString>>,
+    workspace_root: Option<PathBuf>,
+    target_dir: Option<PathBuf>,
+    base_dirs: Vec<String>,
+    rust_src: Option<(PathBuf, String)>,
+}
+
+fn remembered(
+    built: &[(InvocationKey, PathNormalizer)],
+    key: &InvocationKey,
+) -> Option<PathNormalizer> {
+    built
+        .iter()
+        .find(|(known, _)| known == key)
+        .map(|(_, normalizer)| normalizer.clone())
+}
+
+fn remember(
+    built: &mut Vec<(InvocationKey, PathNormalizer)>,
+    max: usize,
+    key: InvocationKey,
+    normalizer: &PathNormalizer,
+) {
+    if built.len() >= max {
+        built.remove(0);
+    }
+    built.push((key, normalizer.clone()));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread ran [`PathNormalizer::from_env`].
+    static FROM_ENV_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invocation_builds_its_normalizer_once_per_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let target = workspace.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let base_dirs = vec![workspace.display().to_string()];
+        let build = |target: &Path| {
+            PathNormalizer::for_invocation(Some(&workspace), Some(target), &base_dirs, None, None)
+        };
+        let before = FROM_ENV_BUILDS.with(std::cell::Cell::get);
+        let first = build(&target);
+        let second = build(&target);
+        assert_eq!(FROM_ENV_BUILDS.with(std::cell::Cell::get) - before, 1);
+        // The same rules the chain it stands for builds.
+        let chain = PathNormalizer::from_env(Some(&workspace))
+            .with_target_dir(Some(&target))
+            .with_base_dirs(&base_dirs);
+        assert_eq!(format!("{first:?}"), format!("{chain:?}"));
+        assert_eq!(format!("{second:?}"), format!("{chain:?}"));
+        // The rust-src rule goes on the same base without building it again.
+        let sysroot = dir.path().join("sysroot");
+        let rust_src = sysroot.join("lib/rustlib/src/rust");
+        std::fs::create_dir_all(&rust_src).unwrap();
+        let before = FROM_ENV_BUILDS.with(std::cell::Cell::get);
+        let with_src = PathNormalizer::for_invocation(
+            Some(&workspace),
+            Some(&target),
+            &base_dirs,
+            Some(&sysroot),
+            Some("abc"),
+        );
+        assert_eq!(FROM_ENV_BUILDS.with(std::cell::Cell::get) - before, 0);
+        let chain_with_src = chain.with_rust_src_rule(Some(&sysroot), Some("abc"));
+        assert_eq!(format!("{with_src:?}"), format!("{chain_with_src:?}"));
+        // Another input builds again.
+        let other = dir.path().join("other-target");
+        std::fs::create_dir_all(&other).unwrap();
+        let before = FROM_ENV_BUILDS.with(std::cell::Cell::get);
+        let _ = build(&other);
+        assert_eq!(FROM_ENV_BUILDS.with(std::cell::Cell::get) - before, 1);
+    }
     use std::fs;
     use tempfile::TempDir;
 
