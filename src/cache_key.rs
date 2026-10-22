@@ -10850,6 +10850,90 @@ fn tool_version_cache_path_in(
     prefix: &str,
     path_var: Option<&OsStr>,
 ) -> Option<std::path::PathBuf> {
+    let hash = tool_fingerprint_hash(
+        binary,
+        path_var,
+        TOOL_FINGERPRINT_MEMO.load(std::sync::atomic::Ordering::Relaxed),
+    )?;
+    Some(crate::config::default_cache_dir().join(format!("{prefix}-{hash}.txt")))
+}
+
+/// Set at rustc wrapper entry: remember each tool's fingerprint for the rest
+/// of the process. See [`memoize_tool_fingerprints`].
+static TOOL_FINGERPRINT_MEMO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Remember each tool's version-cache fingerprint for the rest of this
+/// process instead of recomputing it on every read and write.
+///
+/// A rustc hit reads the version cache three to five times (`-vV` for the
+/// key and again for the commit hash, the sysroot, the cwd-remap probe),
+/// and each read canonicalized the binary, statted it, tried both
+/// toolchain-file spellings in every directory from the cwd up, read
+/// rustup's `settings.toml`, listed the installed toolchains and statted
+/// each one's rustc. A wrapper lives for one compile, so a toolchain that
+/// changes under it would race the compile anyway. Long-lived processes
+/// (the daemon, CLI commands) never call this and keep noticing a
+/// `rustup update` at once (#1406).
+pub(crate) fn memoize_tool_fingerprints() {
+    TOOL_FINGERPRINT_MEMO.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What a remembered tool fingerprint was computed from.
+#[derive(Clone, PartialEq)]
+struct ToolFingerprintKey {
+    binary: std::path::PathBuf,
+    path_var: Option<std::ffi::OsString>,
+    rustup_toolchain: Option<std::ffi::OsString>,
+    cwd: Option<std::path::PathBuf>,
+    rustup_home: Option<std::path::PathBuf>,
+}
+
+/// The 16-hex-digit hash naming `binary`'s version-cache files, remembered
+/// for the process when `memo` is set (see [`memoize_tool_fingerprints`]).
+fn tool_fingerprint_hash(binary: &Path, path_var: Option<&OsStr>, memo: bool) -> Option<String> {
+    static REMEMBERED: std::sync::Mutex<Vec<(ToolFingerprintKey, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_REMEMBERED: usize = 8;
+    let key = memo.then(|| ToolFingerprintKey {
+        binary: binary.to_path_buf(),
+        path_var: path_var.map(OsStr::to_os_string),
+        rustup_toolchain: std::env::var_os("RUSTUP_TOOLCHAIN"),
+        cwd: std::env::current_dir().ok(),
+        rustup_home: rustup_home(),
+    });
+    if let Some(key) = &key {
+        let remembered = REMEMBERED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, hash)) = remembered.iter().find(|(known, _)| known == key) {
+            return Some(hash.clone());
+        }
+    }
+    let hash = compute_tool_fingerprint_hash(binary, path_var)?;
+    if let Some(key) = key {
+        let mut remembered = REMEMBERED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if remembered.len() >= MAX_REMEMBERED {
+            remembered.remove(0);
+        }
+        remembered.push((key, hash.clone()));
+    }
+    Some(hash)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread computed a tool fingerprint.
+    pub(crate) static TOOL_FINGERPRINTS_COMPUTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The fingerprint behind [`tool_version_cache_path`], computed afresh.
+fn compute_tool_fingerprint_hash(binary: &Path, path_var: Option<&OsStr>) -> Option<String> {
+    #[cfg(test)]
+    TOOL_FINGERPRINTS_COMPUTED.with(|computed| computed.set(computed.get() + 1));
     let canon = std::fs::canonicalize(program_path(binary, path_var)?).ok()?;
     let mtime = std::fs::metadata(&canon)
         .ok()?
@@ -10879,7 +10963,7 @@ fn tool_version_cache_path_in(
         )
     );
     let hash = blake3::hash(key.as_bytes()).to_hex();
-    Some(crate::config::default_cache_dir().join(format!("{}-{}.txt", prefix, &hash[..16])))
+    Some(hash[..16].to_string())
 }
 
 /// The rustup toolchain-selection state that can redirect an unchanged shim

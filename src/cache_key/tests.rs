@@ -6032,6 +6032,42 @@ fn env_text_key_bytes_preserves_utf8_and_distinguishes_invalid() {
     }
 }
 
+/// A wrapper computes a tool's fingerprint once; every other process keeps
+/// computing it per read, so a long-lived one still sees a toolchain update.
+#[test]
+fn a_wrapper_computes_a_tool_fingerprint_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("rustc-probe");
+    std::fs::write(&binary, b"not really rustc").unwrap();
+    let computed = || TOOL_FINGERPRINTS_COMPUTED.with(std::cell::Cell::get);
+
+    let before = computed();
+    let first = tool_fingerprint_hash(&binary, None, true).unwrap();
+    let second = tool_fingerprint_hash(&binary, None, true).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(computed() - before, 1, "the second lookup is remembered");
+
+    let before = computed();
+    let fresh = tool_fingerprint_hash(&binary, None, false).unwrap();
+    assert_eq!(
+        fresh, first,
+        "the memo gives what a fresh computation gives"
+    );
+    let _ = tool_fingerprint_hash(&binary, None, false).unwrap();
+    assert_eq!(
+        computed() - before,
+        2,
+        "without the memo every lookup computes"
+    );
+
+    // Another binary is its own entry.
+    let other = dir.path().join("other-rustc");
+    std::fs::write(&other, b"another").unwrap();
+    let before = computed();
+    let _ = tool_fingerprint_hash(&other, None, true).unwrap();
+    assert_eq!(computed() - before, 1);
+}
+
 /// The write persists where the read looks, creating the cache directory
 /// on a fresh machine. Skipped where that directory cannot be created
 /// (a sandboxed build with no writable home).
