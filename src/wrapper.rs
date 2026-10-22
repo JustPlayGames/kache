@@ -3377,6 +3377,7 @@ fn cc_try_remote_hit(
 pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     let _trace = crate::phase_trace::start("rustc", wrapper_args);
     let start = wrapper_entry();
+    crate::cache_key::memoize_tool_fingerprints();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
