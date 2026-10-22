@@ -1683,24 +1683,30 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
             .with_context(|| format!("sampling write clock next to {}", path.display()))?;
 
         // On Windows, hardlinked files share permissions with the store
-        // blob, which is read-only. Temporarily make it writable to update
-        // the mtime, then restore the read-only flag.
+        // blob, which is read-only, and a read-only file refuses the write
+        // handle the stamp needs. Restored copies and clones are writable,
+        // so stamp first and only on a refusal from a read-only file make it
+        // writable for the stamp, then restore the read-only flag. That
+        // saves the attribute read every writable restore used to pay.
         #[cfg(windows)]
-        {
-            let meta = fs::metadata(path)?;
-            let was_readonly = meta.permissions().readonly();
-            if was_readonly {
-                let mut perms = meta.permissions();
+        match filetime::set_file_mtime(path, now) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) =>
+            {
+                let mut perms = fs::metadata(path)?.permissions();
                 perms.set_readonly(false);
                 fs::set_permissions(path, perms)?;
-            }
-            let result = filetime::set_file_mtime(path, now);
-            if was_readonly {
+                let result = filetime::set_file_mtime(path, now);
                 let mut perms = fs::metadata(path)?.permissions();
                 perms.set_readonly(true);
                 let _ = fs::set_permissions(path, perms);
+                result.with_context(|| format!("updating mtime of {}", path.display()))?;
             }
-            result.with_context(|| format!("updating mtime of {}", path.display()))?;
+            Err(error) => {
+                return Err(error).with_context(|| format!("updating mtime of {}", path.display()));
+            }
         }
 
         #[cfg(not(windows))]
@@ -3500,6 +3506,33 @@ mod tests {
     /// immediately after — that inversion is the entire #677 bug. The
     /// before-bound also proves the touch moved the mtime forward from an
     /// arbitrarily old value.
+    /// A read-only file (a hardlink to a store blob under the Windows
+    /// hardlink opt-in) is stamped and stays read-only; a writable one is
+    /// stamped directly.
+    #[cfg(windows)]
+    #[test]
+    fn touch_write_clock_stamps_readonly_and_writable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let past = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        for readonly in [false, true] {
+            let file = dir.path().join(format!("touched-{readonly}.rlib"));
+            fs::write(&file, b"content").unwrap();
+            filetime::set_file_mtime(&file, past).unwrap();
+            let mut perms = fs::metadata(&file).unwrap().permissions();
+            perms.set_readonly(readonly);
+            fs::set_permissions(&file, perms).unwrap();
+
+            touch_mtime_write_clock(&file).unwrap();
+
+            let meta = fs::metadata(&file).unwrap();
+            assert!(filetime::FileTime::from_last_modification_time(&meta) > past);
+            assert_eq!(meta.permissions().readonly(), readonly);
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&file, perms).unwrap();
+        }
+    }
+
     #[test]
     fn test_touch_write_clock_orders_with_file_writes() {
         let dir = tempfile::tempdir().unwrap();
