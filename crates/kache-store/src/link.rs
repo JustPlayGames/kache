@@ -13,6 +13,7 @@ struct LinkPolicy {
     storage_layout_advice: Cell<bool>,
     mapped_target: Cell<bool>,
     layout_advice_to_log: Cell<bool>,
+    bookkeeping_handed_off: Cell<bool>,
 }
 
 impl Default for LinkPolicy {
@@ -24,6 +25,7 @@ impl Default for LinkPolicy {
             storage_layout_advice: Cell::new(true),
             mapped_target: Cell::new(false),
             layout_advice_to_log: Cell::new(false),
+            bookkeeping_handed_off: Cell::new(false),
         }
     }
 }
@@ -90,6 +92,26 @@ fn cow_warn_marker() -> Option<PathBuf> {
 fn shared_hardlink_restores_enabled() -> bool {
     policy_bool(&SHARED_HARDLINK_RESTORES, |policy| {
         &policy.shared_hardlink_restores
+    })
+}
+
+/// Whether a daemon took bookkeeping rows this invocation's index was too
+/// busy for (`crate::store::note_bookkeeping_handed_off`). Per invocation
+/// scope, so a daemon running many compiler requests keeps one request's
+/// note out of the next; process-wide without a scope.
+static BOOKKEEPING_HANDED_OFF: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn note_bookkeeping_handed_off() {
+    set_policy_bool(
+        &BOOKKEEPING_HANDED_OFF,
+        |policy| &policy.bookkeeping_handed_off,
+        true,
+    );
+}
+
+pub(crate) fn bookkeeping_handed_off() -> bool {
+    policy_bool(&BOOKKEEPING_HANDED_OFF, |policy| {
+        &policy.bookkeeping_handed_off
     })
 }
 
@@ -2421,6 +2443,25 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    /// A daemon worker thread serves one compiler request after another:
+    /// rows one request handed to the daemon do not stop the next from
+    /// waiting for the index.
+    #[test]
+    fn bookkeeping_hand_offs_are_noted_per_invocation() {
+        std::thread::spawn(|| {
+            {
+                let _first = InvocationLinkScope::enter();
+                assert!(!bookkeeping_handed_off());
+                note_bookkeeping_handed_off();
+                assert!(bookkeeping_handed_off());
+            }
+            let _second = InvocationLinkScope::enter();
+            assert!(!bookkeeping_handed_off());
+        })
+        .join()
+        .unwrap();
+    }
 
     fn configure_invocation_policy(enabled: bool, marker: &Path) {
         set_windows_hardlink_restore(enabled);

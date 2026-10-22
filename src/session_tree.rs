@@ -203,7 +203,13 @@ pub(crate) fn shared_in(
     }
     crate::phase_trace::decision("session_tree", "walked");
     let computed = compute()?;
-    let staging = path.with_extension(format!("tmp-{}", std::process::id()));
+    // Unique per writer: a daemon runs many units' requests in one process.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staging = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let written = std::fs::File::create(&staging).and_then(|mut file| {
         write!(
             file,
