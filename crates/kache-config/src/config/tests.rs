@@ -2460,6 +2460,57 @@ fn deferred_durability_is_on_unless_switched_off() {
 }
 
 #[test]
+fn out_dir_alias_root_follows_invocation_file_and_ignore_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let load = |vars: Vec<(&str, &str)>, file: &str| {
+        let invocation =
+            InvocationEnv::from_parts(vars, Some(root.to_owned()), None, root.to_owned());
+        Config::load_resolved_for(&invocation, toml::from_str(file).map_err(Into::into))
+    };
+    assert_eq!(load(vec![], "").unwrap().out_dir_alias_root, None);
+    let from_file = root.join("file-alias");
+    let from_env = root.join("env-alias");
+    let file = format!(
+        "[cache]\nout_dir_alias_root = {:?}\n",
+        from_file.to_str().unwrap()
+    );
+    assert_eq!(
+        load(vec![], &file).unwrap().out_dir_alias_root,
+        Some(from_file.clone())
+    );
+    let vars = vec![("KACHE_OUT_DIR_ALIAS_ROOT", from_env.to_str().unwrap())];
+    assert_eq!(
+        load(vars.clone(), &file).unwrap().out_dir_alias_root,
+        Some(from_env.clone())
+    );
+    let ignored = format!("{file}ignore_env = true\n");
+    assert_eq!(
+        load(vars, &ignored).unwrap().out_dir_alias_root,
+        Some(from_file)
+    );
+    assert_eq!(
+        load(vec![("KACHE_OUT_DIR_ALIAS_ROOT", "")], &file)
+            .unwrap()
+            .out_dir_alias_root,
+        None
+    );
+    for file in ["[cache]\nout_dir_alias_root = 'relative'\n", ""] {
+        let vars = if file.is_empty() {
+            vec![("KACHE_OUT_DIR_ALIAS_ROOT", "relative")]
+        } else {
+            vec![]
+        };
+        assert!(
+            load(vars, file)
+                .unwrap_err()
+                .to_string()
+                .contains("out_dir_alias_root must be an absolute path")
+        );
+    }
+}
+
+#[test]
 fn out_dir_alias_setting_is_on_unless_switched_off() {
     assert!(out_dir_alias_setting(None, None));
     assert!(out_dir_alias_setting(None, Some(true)));
@@ -2667,6 +2718,7 @@ fn test_file_config_roundtrip() {
             shared_hardlink_restores: None,
             deferred_discovery: None,
             out_dir_alias: None,
+            out_dir_alias_root: None,
             deferred_durability: None,
             daemon_publish: None,
             daemon_publish_rustc: None,
@@ -3322,6 +3374,7 @@ fn test_config_store_dir() {
         shared_hardlink_restores: false,
         deferred_discovery: true,
         out_dir_alias: true,
+        out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
@@ -3406,6 +3459,7 @@ fn test_config_index_db_path() {
         shared_hardlink_restores: false,
         deferred_discovery: true,
         out_dir_alias: true,
+        out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
@@ -3486,6 +3540,7 @@ fn test_config_event_log_path() {
         shared_hardlink_restores: false,
         deferred_discovery: true,
         out_dir_alias: true,
+        out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
@@ -3585,6 +3640,7 @@ fn test_config_socket_path() {
         shared_hardlink_restores: false,
         deferred_discovery: true,
         out_dir_alias: true,
+        out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
@@ -4321,6 +4377,7 @@ fn test_save_and_load_file_config() {
             shared_hardlink_restores: None,
             deferred_discovery: None,
             out_dir_alias: None,
+            out_dir_alias_root: None,
             deferred_durability: None,
             daemon_publish: None,
             daemon_publish_rustc: None,

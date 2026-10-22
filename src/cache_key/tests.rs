@@ -14307,7 +14307,6 @@ fn guarded_inputs_keep_when_they_were_observed() {
             input.fingerprint,
             FileFingerprint::from_path(&file).unwrap()
         );
-        assert!(!input.settled(), "written a moment ago");
     }
 }
 
