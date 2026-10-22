@@ -12287,6 +12287,34 @@ fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
 }
 
 
+/// A store reads every `.exe` output against the `.pdb` it names: a file
+/// that is no PE refuses the unit, other outputs are not read.
+#[test]
+fn unpaired_executable_debug_info_reads_only_exe_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("app-0a1b");
+    std::fs::write(&elf, b"\x7fELF").unwrap();
+    let not_pe = dir.path().join("app-0a1b.exe");
+    std::fs::write(&not_pe, vec![0u8; 128]).unwrap();
+    let set = |files: Vec<(PathBuf, &str)>| {
+        ArtifactSet::from_output_files(
+            files
+                .into_iter()
+                .map(|(path, name)| (path, name.to_string()))
+                .collect(),
+            classify_by_filename,
+        )
+    };
+    assert_eq!(
+        unpaired_executable_debug_info(&set(vec![(elf, "app-0a1b")])),
+        None
+    );
+    let reason = unpaired_executable_debug_info(&set(vec![(not_pe, "app-0a1b.exe")]))
+        .expect("a .exe that is no PE is refused");
+    assert!(reason.contains("app-0a1b.exe"), "{reason}");
+    assert!(reason.contains("not a PE file"), "{reason}");
+}
+
 #[test]
 fn the_invocation_stamp_of_a_check_unit_is_found_in_both_cargo_layouts() {
     let shared = rustc_args(&[
