@@ -167,7 +167,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
                 .unwrap_or_default(),
             env_var: "KACHE_CACHE_EXECUTABLES",
             env_value: env_val("KACHE_CACHE_EXECUTABLES"),
-            // Platform-dependent (on for Linux only) — see
+            // Platform-dependent (on for Linux, macOS and Windows) — see
             // `config::default_cache_executables`. The editor shows the
             // default that actually applies on this machine, not a constant.
             default_hint: if crate::config::default_cache_executables() {
