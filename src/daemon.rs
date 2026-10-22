@@ -9855,13 +9855,7 @@ fn send_request_with_async_timeout_blocking(
     line: String,
     read_timeout: std::time::Duration,
 ) -> Result<String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .context("creating daemon client runtime")?;
-
-    runtime.block_on(async {
+    daemon_client_runtime()?.block_on(async {
         tokio::time::timeout(
             read_timeout,
             send_request_with_async_transport(socket_path, line, read_timeout),
@@ -9875,6 +9869,28 @@ fn send_request_with_async_timeout_blocking(
             )
         })?
     })
+}
+
+/// The one current-thread runtime this process's daemon requests run on.
+///
+/// Each request used to build and drop a runtime of its own (an I/O
+/// driver, a timer and their threads' bookkeeping), and a wrapper makes
+/// several requests. Tokio lets any number of threads `block_on` one
+/// current-thread runtime: one drives it while the others wait their turn.
+/// It is never dropped, so nothing waits on its blocking threads at exit.
+#[cfg(any(windows, test))]
+fn daemon_client_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .context("creating daemon client runtime")?;
+    // Another thread may have built one meanwhile: keep the first.
+    Ok(RUNTIME.get_or_init(|| runtime))
 }
 
 #[cfg(any(windows, test))]
