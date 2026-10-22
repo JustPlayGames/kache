@@ -362,6 +362,7 @@ pub(super) async fn handle(
     let mut worker = tokio::task::spawn_blocking(move || {
         let _activity = activity;
         let _permit = permit;
+        let _client = crate::invocation::ClientScope::enter(client_pid);
         match entry {
             ExecutionEntry::Compiler => crate::run_compiler_invocation(&args, context),
             ExecutionEntry::Original => {

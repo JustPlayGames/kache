@@ -1386,15 +1386,14 @@ fn probe_is_check_lane(env: &crate::invocation::InvocationEnv) -> bool {
         return true;
     }
     #[cfg(target_os = "linux")]
+    if let Some(ppid) = crate::invocation::cargo_pid()
+        && let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline"))
     {
-        let ppid = std::os::unix::process::parent_id();
-        if let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline")) {
-            let args: Vec<String> = cmdline
-                .split(|byte| *byte == 0)
-                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                .collect();
-            return matches!(cargo_subcommand(&args), Some("check" | "clippy"));
-        }
+        let args: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        return matches!(cargo_subcommand(&args), Some("check" | "clippy"));
     }
     false
 }
@@ -1450,15 +1449,14 @@ fn build_names_a_target(args: &[String], env: &crate::invocation::InvocationEnv)
         return true;
     }
     #[cfg(target_os = "linux")]
+    if let Some(ppid) = crate::invocation::cargo_pid()
+        && let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline"))
     {
-        let ppid = std::os::unix::process::parent_id();
-        if let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline")) {
-            let args: Vec<String> = cmdline
-                .split(|byte| *byte == 0)
-                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                .collect();
-            return names_a_target(&args);
-        }
+        let args: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        return names_a_target(&args);
     }
     false
 }

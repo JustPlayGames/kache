@@ -87,10 +87,7 @@ fn session_from_env(env: &crate::invocation::InvocationEnv) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn parent_session() -> Option<String> {
-    let ppid = std::os::unix::process::parent_id();
-    if ppid <= 1 {
-        return None;
-    }
+    let ppid = crate::invocation::cargo_pid()?;
     let stat = std::fs::read_to_string(format!("/proc/{ppid}/stat")).ok()?;
     cargo_session(ppid, &stat)
 }
