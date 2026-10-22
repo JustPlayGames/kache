@@ -75,27 +75,31 @@ pub async fn previous_identity_keys(lock_path: &Path, identity_key: &str) -> Vec
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())?;
         let name = lock_path.file_name()?.to_str()?;
-        let log = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["log", "--format=%H"])
-            .arg(format!("-n{}", PREVIOUS_LOCKFILES + 1))
-            .args(["--", name])
-            .output()
+        let log = crate::platform::host_output_async(
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["log", "--format=%H"])
+                .arg(format!("-n{}", PREVIOUS_LOCKFILES + 1))
+                .args(["--", name])
+                .kill_on_drop(true),
+        )
+        .await
+        .ok()
+        .filter(|output| output.status.success())?;
+        let mut revisions = Vec::new();
+        for commit in String::from_utf8_lossy(&log.stdout).lines() {
+            let show = crate::platform::host_output_async(
+                tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .arg("show")
+                    .arg(format!("{commit}:./{name}"))
+                    .kill_on_drop(true),
+            )
             .await
             .ok()
             .filter(|output| output.status.success())?;
-        let mut revisions = Vec::new();
-        for commit in String::from_utf8_lossy(&log.stdout).lines() {
-            let show = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .arg("show")
-                .arg(format!("{commit}:./{name}"))
-                .output()
-                .await
-                .ok()
-                .filter(|output| output.status.success())?;
             revisions.push(show.stdout);
         }
         Some(identity_keys_for_revisions(
@@ -151,17 +155,25 @@ pub fn profile_from_rustc_args(args: &RustcArgs) -> String {
     {
         return profile.to_string();
     }
-    if let (Some(out_dir), Some(target_dir)) = (args.out_dir.as_deref(), args.target_dir())
-        && let Some(profile) = profile_between(&target_dir, out_dir, args.target.is_some())
+    if let (Some(out_dir), Some(target_dir)) = (
+        args.out_dir
+            .as_deref()
+            .and_then(|path| args.resolve_invocation_path(path)),
+        args.target_dir(),
+    ) && let Some(profile) = profile_between(&target_dir, &out_dir, args.target.is_some())
     {
         return profile;
     }
-    profile_from_env().unwrap_or_else(|| "unknown".to_string())
+    profile_from_invocation(args.invocation_env()).unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn profile_from_env() -> Option<String> {
+    profile_from_invocation(&crate::invocation::InvocationEnv::capture())
+}
+
+fn profile_from_invocation(env: &crate::invocation::InvocationEnv) -> Option<String> {
     for var in ["KACHE_PROFILE", "PROFILE"] {
-        if let Ok(value) = std::env::var(var) {
+        if let Ok(value) = env.var(var) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
                 return Some(trimmed.to_string());
@@ -656,6 +668,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(profile_from_rustc_args(&args), "release");
+        let relative = crate::args::RustcArgs::parse(&[
+            "rustc".to_string(),
+            "--out-dir".to_string(),
+            "target/release/deps".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(profile_from_rustc_args(&relative), "release");
         let new_layout = crate::args::RustcArgs::parse(&[
             "rustc".to_string(),
             "--out-dir".to_string(),

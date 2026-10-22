@@ -113,7 +113,7 @@ local_max_size = "200GiB"
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
-| none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size |
+| none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size, and moves the dropped lines to `events.jsonl.archive/`, pruned at each rotation to 8 days and 512 MiB |
 | none | `cache.event_log_keep_lines` | `1000` | Minimum lines retained when the event log rotates |
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
@@ -225,7 +225,7 @@ GC skips a shard whose store dir has no `index.db`: a missing directory, an unmo
 
 `kache stats` and `kache stats --full` include every configured store. Entry counts count each cache key once; stored bytes count every copy across stores. JSON includes per-store paths, sizes, budgets and errors. The `stats --json` filesystem `disk` and index measurements still describe the main store; use `stores` for shard measurements.
 
-`kache list` and `kache explain` show the stores that hold each entry. `kache doctor` checks shard availability and accounting, and its link-layout probe uses the shard mapped to the current directory. `doctor --verify` checks every stored copy; `--repair` also repairs shards. Missing shards are reported without creating their directories.
+`kache list` and `kache explain` show the stores that hold each entry. `kache doctor` checks shard availability and accounting. Its link-layout probe resolves the intermediate directory from Cargo configuration and environment variables, falling back to the target directory. It probes that directory, or its nearest existing ancestor, using the shard mapped to the probe path. Configuration that Kache cannot resolve produces a diagnostic instead of a link probe. `doctor --verify` checks every stored copy; `--repair` also repairs shards. Missing shards are reported without creating their directories.
 
 `kache gc --json`, `kache gc --stale-schema` and emptying the cache with `kache clean --cache` still cover only the main store. Automatic prefetch still imports into the main store.
 

@@ -2268,13 +2268,16 @@ dependencies = [
  "dirs",
  "docker_credential",
  "filetime",
- "find-msvc-tools",
  "foldhash 0.2.0",
  "futures",
+ "getrandom 0.4.3",
  "glob",
  "hex",
  "home",
  "interprocess",
+ "jobserver",
+ "kache-client",
+ "kache-config",
  "kache-core",
  "kache-format",
  "kache-fs",
@@ -2314,10 +2317,49 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "unicode-normalization",
  "windows-sys 0.61.2",
  "zstd",
+]
+
+[[package]]
+name = "kache-client"
+version = "1.2.2"
+dependencies = [
+ "anyhow",
+ "heck",
+ "kache-config",
+ "kache-ipc",
+ "kache-protocol",
+ "kache-shims",
+ "libc",
+ "serde_json",
+ "syn 2.0.119",
+ "tempfile",
+ "tracing",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "kache-config"
+version = "1.2.2"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytesize",
+ "dirs",
+ "glob",
+ "kache-core",
+ "kache-fs",
+ "kache-shims",
+ "oci-spec",
+ "serde",
+ "tempfile",
+ "toml",
+ "toml_edit",
+ "tracing",
 ]
 
 [[package]]
@@ -2372,11 +2414,17 @@ version = "1.2.2"
 dependencies = [
  "anyhow",
  "blake3",
+ "find-msvc-tools",
  "interprocess",
+ "kache-protocol",
  "kunobi-daemon",
  "libc",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2387,7 +2435,9 @@ version = "1.2.2"
 name = "kache-protocol"
 version = "1.2.2"
 dependencies = [
+ "chrono",
  "kache-core",
+ "kache-format",
  "serde",
  "serde_json",
 ]
@@ -2437,6 +2487,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "filetime",
+ "kache-core",
  "kache-format",
  "kache-fs",
  "libc",

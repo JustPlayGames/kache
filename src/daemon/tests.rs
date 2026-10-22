@@ -1757,6 +1757,16 @@ fn upload_retry_and_idle_timeout_truth_tables() {
     assert_eq!(daemon_idle_timeout(60), Some(Duration::from_secs(60)));
 }
 
+#[test]
+fn foreground_startup_rejects_a_file_in_place_of_the_runtime_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.runtime_dir = dir.path().join("runtime");
+    fs::write(&config.runtime_dir, b"not a directory").unwrap();
+    let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
+    assert!(run_server(&config, &provenance, None).is_err());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_main_binds_socket_and_handles_shutdown() {
     let dir = tempfile::tempdir().unwrap();
@@ -1776,8 +1786,16 @@ async fn server_main_binds_socket_and_handles_shutdown() {
     let coord = DaemonCoordFile::for_socket(&socket_path);
     let server_config = config.clone();
     let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
-    let server =
-        tokio::spawn(async move { server_main(&server_config, &provenance, coord, None).await });
+    let server = tokio::spawn(async move {
+        server_main(
+            &server_config,
+            &provenance,
+            coord,
+            None,
+            PathBuf::from("Cargo.lock"),
+        )
+        .await
+    });
 
     let ready_socket = socket_path.clone();
     let ready = tokio::task::spawn_blocking(move || {
@@ -3583,6 +3601,28 @@ fn gc_hints_coalesce_while_a_sweep_is_pending() {
         daemon.claim_gc_hint(),
         "a finished sweep releases the claim"
     );
+}
+
+#[test]
+fn delegated_gc_uses_the_invocation_budget_without_changing_daemon_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut startup = test_config(dir.path());
+    startup.auto_gc = false;
+    startup.max_size = 10_000;
+    let mut invocation = startup.clone();
+    invocation.auto_gc = true;
+    invocation.max_size = 1_000;
+    let store = Store::open(&invocation).unwrap();
+    put_upload_evict_entry(&store, dir.path(), "evictable", 1_200, false);
+
+    let daemon = Daemon::new(startup);
+    daemon
+        .sweep_invocation_under_size_pressure(&invocation)
+        .unwrap();
+    assert!(!store.contains("evictable"));
+    assert!(store.physical_size().unwrap() <= 1_000);
+    assert!(!daemon.config.auto_gc);
+    assert_eq!(daemon.config.max_size, 10_000);
 }
 
 #[test]
@@ -10739,7 +10779,7 @@ async fn test_prefetch_disabled_remote_releases_warming_barrier() {
     let daemon = Arc::new(Daemon::new(config));
 
     assert!(
-        start_manifest_warming(&daemon).is_none(),
+        start_manifest_warming(&daemon, PathBuf::from("Cargo.lock")).is_none(),
         "prefetch-disabled startup must not spawn a warming task"
     );
     let start = std::time::Instant::now();
@@ -10748,6 +10788,31 @@ async fn test_prefetch_disabled_remote_releases_warming_barrier() {
         start.elapsed() < Duration::from_millis(500),
         "prefetch-disabled exact checks must not pay the warming grace"
     );
+}
+
+#[tokio::test]
+async fn enabled_manifest_warming_spawns_and_releases_its_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.prefetch_enabled = true;
+    config.remote = Some(crate::config::RemoteConfig {
+        prefix: "artifacts".into(),
+        backend: crate::config::RemoteBackendConfig::Filesystem(
+            crate::config::FilesystemRemoteConfig {
+                root: remote.path().to_owned(),
+                atomic_write_dir: remote.path().join("staging"),
+            },
+        ),
+    });
+    let daemon = Arc::new(Daemon::new(config));
+    let warming = start_manifest_warming(&daemon, dir.path().join("absent/Cargo.lock"))
+        .expect("enabled prefetch must start its warming task");
+    tokio::time::timeout(Duration::from_secs(5), warming)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(daemon.wait_for_warming(Duration::from_millis(100)).await);
 }
 
 #[tokio::test]
@@ -15727,4 +15792,34 @@ fn handed_rows_are_sent_without_waiting_for_the_answer() {
     ));
     assert!(started.elapsed() < std::time::Duration::from_millis(250));
     check();
+}
+
+#[test]
+fn daemon_stats_include_rotated_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let log = config.event_log_path();
+    let mut hit = events::BuildEvent::new_for_test("archived", events::EventResult::LocalHit);
+    hit.ts = chrono::Utc::now() - chrono::Duration::minutes(10);
+    for _ in 0..12 {
+        events::log_event(&log, &hit).unwrap();
+    }
+    let max_size = std::fs::metadata(&log).unwrap().len() / 2;
+    events::rotate_events_if_needed(&log, max_size, 1, &config.cache_dir).unwrap();
+    assert!(events::read_events(&log).unwrap().len() < 12);
+    let miss = events::BuildEvent::new_for_test("live", events::EventResult::Miss);
+    events::log_event(&log, &miss).unwrap();
+    let daemon = Daemon::new(config);
+    let request = StatsRequest {
+        include_entries: false,
+        include_summaries: false,
+        sort_by: None,
+        event_hours: Some(24),
+        event_secs: None,
+        client_epoch: 0,
+        client_version: None,
+    };
+    let snapshot = daemon.handle_stats(&request).stats.unwrap();
+    assert_eq!(snapshot.events.local_hits, 12);
+    assert_eq!(snapshot.events.misses, 1);
 }

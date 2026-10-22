@@ -32,7 +32,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::daemon::{Daemon, Response, UploadJob};
@@ -60,143 +59,80 @@ pub(crate) const PUBLISH_HANDOFF_TIMEOUT: Duration = Duration::from_millis(25);
 pub(crate) const HANDOFF_DIR: &str = "handoff";
 
 /// One output the wrapper snapshotted for the daemon.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct HandoffFile {
-    /// Absolute path of the snapshot, under the store's handoff directory.
-    pub path: String,
-    /// Name the file takes in the entry.
-    pub store_name: String,
-}
+pub(crate) use kache_protocol::HandoffFile;
 
 /// A wrapper's request that the daemon store a cc compile it has finished.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct PublishCcRequest {
-    /// Client executable mtime. Daemons from 1.0.x and earlier drain when it
-    /// is newer than their own; later daemons ignore it.
-    #[serde(default)]
-    pub client_epoch: u64,
-    /// Release requesting an upgrade. Absent from legacy and read-only requests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_version: Option<String>,
-    pub cache_key: String,
-    pub crate_name: String,
-    pub target: String,
-    pub files: Vec<HandoffFile>,
-    pub stdout: String,
-    pub stderr: String,
-    pub compile_time_ms: u64,
-    /// Whether the entry may be uploaded to a writable remote.
-    pub publishes_to_remote: bool,
-    /// The build event the wrapper would have logged, with the store fields
-    /// still empty. The daemon fills them in and writes it.
-    pub event: BuildEvent,
-    /// The read-set memo of a deferred compile, recorded here instead of in
-    /// the wrapper: a hundred-row write transaction the next compile of the
-    /// build script would otherwise wait for.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memo: Option<CcMemoHandoff>,
-    /// What only a rustc compile carries. Present exactly on a
-    /// [`crate::daemon::Request::PublishRustc`] hand-off: a daemon that does
-    /// not know that request refuses it, so a wrapper never has a rustc
-    /// compile stored as a C/C++ object without its digest checks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rustc: Option<RustcPublish>,
-}
+pub(crate) use kache_protocol::PublishCcRequest;
+/// The rest of a rustc compile's store (`PublishCcRequest::rustc`).
+pub(crate) use kache_protocol::{PrestageHint, RustcOutput, RustcPublish, StagedPublish};
 
-/// The rest of a rustc compile's store: what `Store::put_handed_off` and
-/// the bookkeeping after a synchronous rustc put need.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct RustcPublish {
-    pub crate_types: Vec<String>,
-    pub features: Vec<String>,
-    pub profile: String,
-    /// One per [`PublishCcRequest::files`] entry, in the same order.
-    pub outputs: Vec<RustcOutput>,
-    /// Cargo's `-C metadata` unit, recorded with the entry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit: Option<String>,
-    /// Large executables to record for [`crate::prestage`] once stored.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub prestage: Vec<PrestageHint>,
-    /// The wrapper staged and published the entry's blobs itself and only
-    /// the index was too busy to register it: the files are links to those
-    /// blobs, registered in a batch (`Store::register_handed_off_batch`)
-    /// without staging them again. `None`: the files are snapshots of the outputs, stored
-    /// with `Store::put_handed_off`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub staged: Option<StagedPublish>,
-}
-
-/// A rustc entry the wrapper staged ([`RustcPublish::staged`]).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct StagedPublish {
-    /// The entry's files as the wrapper staged them, one per
-    /// [`PublishCcRequest::files`] entry, in the same order.
-    pub files: Vec<crate::store::CachedFile>,
-    /// What the wrapper's staging found (`StorePutResult`).
-    pub output_blobs: u32,
-    pub duplicate_blobs: u32,
-    pub new_blobs: u32,
-}
-
-impl StagedPublish {
-    fn result(&self) -> crate::store::StorePutResult {
-        crate::store::StorePutResult {
-            output_blobs: self.output_blobs,
-            duplicate_blobs: self.duplicate_blobs,
-            new_blobs: self.new_blobs,
-        }
-    }
-
-    /// One file per link, each under the store name and digest the request
-    /// gives it elsewhere.
-    fn matches(&self, request: &PublishCcRequest, rustc: &RustcPublish) -> bool {
-        self.files.len() == request.files.len()
-            && self
-                .files
-                .iter()
-                .zip(&request.files)
-                .zip(&rustc.outputs)
-                .all(|((file, link), output)| {
-                    file.name == link.store_name && file.hash == output.hash
-                })
+/// What the wrapper's staging found (`StorePutResult`), as the request
+/// carries it.
+fn staged_result(staged: &StagedPublish) -> crate::store::StorePutResult {
+    crate::store::StorePutResult {
+        output_blobs: staged.output_blobs,
+        duplicate_blobs: staged.duplicate_blobs,
+        new_blobs: staged.new_blobs,
     }
 }
 
-/// One snapshotted rustc output.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct RustcOutput {
-    /// The digest the wrapper read from the snapshot before it returned to
-    /// Cargo: the bytes the compiler wrote. The put refuses a snapshot that
-    /// no longer hashes to it.
-    pub hash: String,
-    /// The compiler's output the snapshot links, whose file-hash memo is
-    /// seeded once the entry is stored. `None` for a file of the wrapper's
-    /// own (normalized dep-info, a debug bundle).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
-    /// The wrapper re-dated this check unit's `.rmeta` as Cargo is about to.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub redated: bool,
-}
-
-/// A large executable the next build may want staged ahead of its restore.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct PrestageHint {
-    pub target_dir: String,
-    pub dest: String,
-    pub store_name: String,
+/// One file per link, each under the store name and digest the request
+/// gives it elsewhere.
+fn staged_matches(
+    staged: &StagedPublish,
+    request: &PublishCcRequest,
+    rustc: &RustcPublish,
+) -> bool {
+    staged.files.len() == request.files.len()
+        && staged
+            .files
+            .iter()
+            .zip(&request.files)
+            .zip(&rustc.outputs)
+            .all(|((file, link), output)| file.name == link.store_name && file.hash == output.hash)
 }
 
 /// A preprocess memo as the wrapper captured it: the fingerprints and
 /// content hashes of everything the compile read, under the key of its
 /// arguments. Each input carries the time it was observed, and the store
 /// records its stamp only if the stamp had settled by then.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct CcMemoHandoff {
-    pub memo_key: String,
-    pub preprocessed_hash: String,
-    pub inputs: Vec<crate::cache_key::CcPreprocessMemoInput>,
+pub(crate) use kache_protocol::CcMemoHandoff;
+
+/// Convert observed inputs at the application boundary; the wire crate owns no store.
+pub(crate) fn memo_input_for_wire(
+    input: &crate::cache_key::CcPreprocessMemoInput,
+) -> kache_protocol::CcPreprocessMemoInput {
+    kache_protocol::CcPreprocessMemoInput {
+        name: input.name.clone(),
+        fingerprint: kache_protocol::FileFingerprint {
+            path: input.fingerprint.path.clone(),
+            size: input.fingerprint.size,
+            mtime_ns: input.fingerprint.mtime_ns,
+            ctime_ns: input.fingerprint.ctime_ns,
+            inode: input.fingerprint.inode,
+        },
+        content: input.content.clone(),
+        mapped: input.mapped.clone(),
+        observed_ns: input.observed_ns,
+    }
+}
+
+fn memo_input_from_wire(
+    input: &kache_protocol::CcPreprocessMemoInput,
+) -> crate::cache_key::CcPreprocessMemoInput {
+    crate::cache_key::CcPreprocessMemoInput {
+        name: input.name.clone(),
+        fingerprint: crate::store::file_hash::FileFingerprint {
+            path: input.fingerprint.path.clone(),
+            size: input.fingerprint.size,
+            mtime_ns: input.fingerprint.mtime_ns,
+            ctime_ns: input.fingerprint.ctime_ns,
+            inode: input.fingerprint.inode,
+        },
+        content: input.content.clone(),
+        mapped: input.mapped.clone(),
+        observed_ns: input.observed_ns,
+    }
 }
 
 /// A job the handler accepted: the request plus the key lock it holds.
@@ -337,7 +273,7 @@ impl Daemon {
             return refused("a digest is missing for some file");
         }
         if let Some(staged) = &rustc.staged
-            && !staged.matches(&request, rustc)
+            && !staged_matches(staged, &request, rustc)
         {
             return refused("the staged files do not match the request's");
         }
@@ -746,7 +682,7 @@ fn take_staged(
                 &rustc.profile,
                 &links,
                 &staged.files,
-                staged.result(),
+                staged_result(staged),
                 &request.stdout,
                 &request.stderr,
                 request.compile_time_ms,
@@ -783,7 +719,7 @@ fn put_job(store: &Store, request: &PublishCcRequest) -> Result<crate::store::St
                 &rustc.profile,
                 &links,
                 &staged.files,
-                staged.result(),
+                staged_result(staged),
                 &request.stdout,
                 &request.stderr,
                 request.compile_time_ms,
@@ -865,7 +801,11 @@ fn record_put(
                 && let Err(error) = store.file_hash_cache().put_cc_preprocess_memo_inputs(
                     &memo.memo_key,
                     &memo.preprocessed_hash,
-                    &memo.inputs,
+                    &memo
+                        .inputs
+                        .iter()
+                        .map(memo_input_from_wire)
+                        .collect::<Vec<_>>(),
                 )
             {
                 tracing::debug!("daemon could not record the cc memo: {error}");
@@ -1629,7 +1569,10 @@ mod tests {
         let memo = CcMemoHandoff {
             memo_key: "m".repeat(64),
             preprocessed_hash: "p".repeat(64),
-            inputs: vec![settled.clone(), unobserved.clone()],
+            inputs: vec![
+                memo_input_for_wire(&settled),
+                memo_input_for_wire(&unobserved),
+            ],
         };
         request.memo = Some(memo.clone());
         request.event.schema = 26;
@@ -1697,12 +1640,11 @@ mod tests {
         );
     }
 
-    /// Only an entry the wrapper marked for the remote is queued for upload,
-    /// even when a remote is configured.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_an_entry_marked_for_the_remote_is_queued_for_upload() {
-        const CHILD_ROOT: &str = "KACHE_TEST_REMOTE_PUBLISH_ROOT";
-        let Some(root) = std::env::var_os(CHILD_ROOT) else {
+    /// Run blocking publication fixtures in a child that can be killed and
+    /// reaped if persistence outlives an async timeout or runtime teardown.
+    /// Return its root inside the child, or None after checking its result.
+    fn publish_fixture_child_root(test_name: &str, root_env: &str) -> Option<PathBuf> {
+        let Some(root) = std::env::var_os(root_env) else {
             // A stuck publish_one owns a blocking task that runtime teardown
             // cannot cancel. Keep the worker in a process we can kill and reap.
             let dir = tempfile::tempdir().unwrap();
@@ -1719,13 +1661,8 @@ mod tests {
             }
             let mut child = FixtureChild(
                 std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "daemon_publish::tests::only_an_entry_marked_for_the_remote_is_queued_for_upload",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env(CHILD_ROOT, dir.path())
+                    .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+                    .env(root_env, dir.path())
                     .current_dir(dir.path())
                     .stdout(log.try_clone().unwrap())
                     .stderr(log)
@@ -1748,7 +1685,7 @@ mod tests {
                             b"ok",
                             "the child must finish the upload assertions"
                         );
-                        return;
+                        return None;
                     }
                     Ok(None) if std::time::Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(10));
@@ -1766,7 +1703,19 @@ mod tests {
                 }
             }
         };
-        let dir = PathBuf::from(root);
+        Some(PathBuf::from(root))
+    }
+
+    /// Only an entry the wrapper marked for the remote is queued for upload,
+    /// even when a remote is configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_entry_marked_for_the_remote_is_queued_for_upload() {
+        let Some(dir) = publish_fixture_child_root(
+            "daemon_publish::tests::only_an_entry_marked_for_the_remote_is_queued_for_upload",
+            "KACHE_TEST_REMOTE_PUBLISH_ROOT",
+        ) else {
+            return;
+        };
         let mut config = crate::test_support::test_config(dir.join("cache"));
         config.remote = Some(crate::config::RemoteConfig::test_s3("bucket", "artifacts"));
         let daemon = Arc::new(Daemon::new(config.clone()));
@@ -2120,6 +2069,87 @@ mod tests {
         let left = drain_publications(done, &progress, Duration::from_millis(100)).await;
         assert_eq!(left, 2);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A hand-off the shutdown drain stores is still queued for upload: the
+    /// upload queue closes only after the publish worker is done. The worker
+    /// here starts only once shutdown has closed the publish queue, as a busy
+    /// one reaches its last jobs only during the drain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_shutdown_drain_queues_what_it_stores_for_upload() {
+        let Some(dir) = publish_fixture_child_root(
+            "daemon_publish::tests::the_shutdown_drain_queues_what_it_stores_for_upload",
+            "KACHE_TEST_SHUTDOWN_PUBLISH_ROOT",
+        ) else {
+            return;
+        };
+        let mut config = crate::test_support::test_config(dir.join("cache"));
+        config.auto_gc = false;
+        config.remote = Some(crate::config::RemoteConfig {
+            prefix: "artifacts".into(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: dir.join("remote"),
+                    atomic_write_dir: dir.join("remote-staging"),
+                },
+            ),
+        });
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (upload_tx, mut uploads) = tokio::sync::mpsc::unbounded_channel();
+        daemon.set_upload_tx(upload_tx);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        daemon.publish_queue().set_sender(tx);
+        let mut request = handoff_request(&config, &key("drained"), &dir);
+        request.publishes_to_remote = true;
+        let _receipt = HandoffReceipt::new(&request).unwrap();
+        assert!(daemon.handle_publish_cc(request.clone()).await.ok);
+
+        let runtime = tokio::runtime::Handle::current();
+        let (done_tx, done) = tokio::sync::oneshot::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let worker_daemon = Arc::clone(&daemon);
+        let worker = std::thread::spawn(move || {
+            let _runtime = runtime.enter();
+            start_rx.recv().expect("shutdown releases the worker");
+            run_publish_worker(worker_daemon, rx);
+            let _ = done_tx.send(());
+        });
+        let drain = crate::daemon::drain_publications_then_close_uploads(&daemon, done);
+        tokio::pin!(drain);
+        // Let shutdown close publication admission before the worker can
+        // publish. Poll once so the fixture needs no scheduling delay.
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(drain.as_mut(), cx).is_pending(),
+                "the drain waits for the worker"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(
+            daemon.publish_queue().sender().is_none(),
+            "shutdown closes the publish queue"
+        );
+        start_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(30), drain)
+            .await
+            .expect("the drain ends once the worker exits");
+        worker.join().expect("publish worker panicked");
+
+        let store = Store::open(&config).unwrap();
+        assert!(store.get(&request.cache_key).unwrap().is_some(), "stored");
+        let queued = uploads
+            .try_recv()
+            .expect("the entry the drain stored is queued for upload");
+        assert_eq!(queued.key, request.cache_key);
+        assert!(
+            matches!(
+                uploads.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "the upload queue is closed after the drain"
+        );
+        std::fs::write(dir.join("publisher-complete"), b"ok").unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

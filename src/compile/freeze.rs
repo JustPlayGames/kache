@@ -1,8 +1,9 @@
 //! Stopping a compile only when nothing it started can outlive it: see
 //! [`super::stop_compile`].
 
+use crate::invocation::process::Child;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// How long a compiler may take to stop (a thread in uninterruptible

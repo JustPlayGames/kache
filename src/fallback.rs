@@ -1,38 +1,28 @@
 //! Optional compiler wrappers must not turn a working direct compile into a failure.
-use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Outcome {
-    Success,
-    Failed,
-    SpawnFailed,
-    Cancelled,
-    SandboxDenied,
-    DirectRequired,
+pub use kache_protocol::fallback::{Attempt, Outcome};
+
+#[cfg(test)]
+pub fn run(command: Command, name: &str, outputs: &[&Path], args: &[String]) -> Attempt {
+    run_for(
+        Ok(command),
+        name,
+        outputs,
+        args,
+        &crate::invocation::InvocationEnv::capture(),
+    )
 }
 
-/// The final direct compiler status stays in the build event's `exit_code`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Attempt {
-    pub wrapper: String,
-    pub outcome: Outcome,
-    pub exit_code: Option<i32>,
-    pub detail: String,
-}
-
-impl Attempt {
-    pub fn terminal_code(&self) -> Option<i32> {
-        match self.outcome {
-            Outcome::Success | Outcome::Cancelled => self.exit_code,
-            _ => None,
-        }
-    }
-}
-
-pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String]) -> Attempt {
+pub(crate) fn run_for(
+    command: std::io::Result<Command>,
+    name: &str,
+    outputs: &[&Path],
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Attempt {
     let denied = if requires_direct(args) {
         Some((
             Outcome::DirectRequired,
@@ -41,11 +31,11 @@ pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String])
     } else {
         #[cfg(target_os = "macos")]
         {
-            macos::denial(name, outputs).map(|detail| (Outcome::SandboxDenied, detail))
+            macos::denial(name, outputs, env).map(|detail| (Outcome::SandboxDenied, detail))
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = outputs;
+            let _ = (outputs, env);
             None
         }
     };
@@ -56,7 +46,7 @@ pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String])
             exit_code: None,
             detail,
         },
-        None => match command.status() {
+        None => match command.and_then(|mut command| crate::invocation::io::status(&mut command)) {
             Ok(status) => status_attempt(name, status),
             Err(error) => Attempt {
                 wrapper: name.to_owned(),
@@ -69,9 +59,11 @@ pub fn run(mut command: Command, name: &str, outputs: &[&Path], args: &[String])
     if attempt.terminal_code().is_none() {
         // stderr remains inherited for streaming compiler diagnostics (including JSON).
         // Name the failed attempt after its output and before the direct compiler runs.
-        eprintln!(
+        let _ = writeln!(
+            crate::invocation::io::stderr(),
             "kache: warning: fallback `{}`: {}; compiling directly without fallback",
-            name, attempt.detail
+            name,
+            attempt.detail
         );
     }
     attempt
@@ -131,6 +123,11 @@ mod sandbox;
 #[cfg(target_os = "macos")]
 #[path = "fallback/macos.rs"]
 mod macos;
+
+#[cfg(target_os = "macos")]
+pub(crate) fn compiler_peer_unrestricted(token: kache_ipc::PeerAuditToken) -> bool {
+    macos::compiler_peer_unrestricted(token)
+}
 
 #[cfg(test)]
 mod tests {
@@ -204,6 +201,23 @@ mod tests {
             assert_eq!(attempt.terminal_code(), terminal, "{script}");
             assert!(!attempt.detail.is_empty());
         }
+    }
+
+    #[test]
+    fn an_unresolvable_client_wrapper_still_requests_direct_compilation() {
+        let attempt = run_for(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "client wrapper absent",
+            )),
+            "client-wrapper",
+            &[],
+            &[],
+            &crate::invocation::InvocationEnv::default(),
+        );
+        assert_eq!(attempt.outcome, Outcome::SpawnFailed);
+        assert_eq!(attempt.terminal_code(), None);
+        assert!(attempt.detail.contains("client wrapper absent"));
     }
 
     #[cfg(unix)]

@@ -74,6 +74,8 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
             "build",
             "--bin",
             "kache",
+            "--bin",
+            "kache-engine",
             "--target-dir",
             target_dir.to_str().expect("bootstrap target dir is utf-8"),
             "--config",
@@ -145,6 +147,7 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 /// developer dogfooding Kache has `RUSTC_WRAPPER` configured. All of those
 /// are pinned or cleared here, before the caller adds its own wrapper and
 /// overrides; a later `env` call on the same key wins.
+/// Remote selectors are cleared so a cold daemon cannot inherit runner settings.
 ///
 /// `config` pins `KACHE_CONFIG`. `None` unsets it so the child discovers its
 /// configuration the way a real build would.
@@ -170,6 +173,13 @@ pub fn hermetic_command(
         .env_remove("KACHE_ACTIVE")
         .env_remove("KACHE_UNSTABLE")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
+        .env_remove("KACHE_S3_BUCKET")
+        .env_remove("KACHE_S3_ENDPOINT")
+        .env_remove("KACHE_S3_REGION")
+        .env_remove("KACHE_S3_PREFIX")
+        .env_remove("KACHE_S3_PROFILE")
+        .env_remove("KACHE_S3_USER_AGENT")
+        .env_remove("KACHE_LOCAL_ONLY")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
         // Cargo sets kache's own OUT_DIR on the test process (kache has a
@@ -303,6 +313,35 @@ pub fn wait_for_daemon_exit(runtime_dir: &Path, timeout: Duration) -> Result<(),
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+/// Stops a fixture's daemon before its runtime directory is removed.
+/// Declare after the TempDir, or before it in a fixture's field list.
+#[allow(dead_code)]
+pub struct DaemonGuard {
+    program: PathBuf,
+    runtime: PathBuf,
+}
+
+#[allow(dead_code)]
+impl DaemonGuard {
+    pub fn new(program: impl AsRef<Path>, runtime: impl AsRef<Path>) -> Self {
+        Self {
+            program: program.as_ref().to_owned(),
+            runtime: runtime.as_ref().to_owned(),
+        }
+    }
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let mut stop = hermetic_command(
+            &self.program,
+            &self.runtime,
+            Some(&self.runtime.join("daemon-guard-no-config.toml")),
+        );
+        stop_daemon(stop.args(["daemon", "stop"]), &self.runtime);
+    }
 }
 
 /// Stops the daemon that owns `runtime_dir`, for a test fixture's `Drop`.

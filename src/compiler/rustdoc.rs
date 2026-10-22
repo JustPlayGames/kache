@@ -9,21 +9,25 @@
 //! key, so a second checkout restores into its own directories. The key hashes
 //! the crate source, every `mod` and string `include!` it names, and each flag
 //! with its name. Dep-info is not an input: the first `cargo doc` has none,
-//! and hashing it would miss on the next identical run.
+//! and hashing it would miss on the next identical run. Source invocations of
+//! `env!` and `option_env!` pass through until compiler environment dependencies
+//! are tracked. The source scan does not expand macros or resolve aliases.
 
+use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::sync::Mutex;
+use std::process::ExitStatus;
 
 use super::{ArtifactKind, Compiler, CompilerAdapter, CompilerId, KeyCtx, RefuseReason};
+use crate::invocation::InvocationEnv;
 use crate::store::StoreHashExt;
 
 pub const RUSTDOC_ID: CompilerId = CompilerId::new("rustdoc");
-pub const ADAPTER: CompilerAdapter =
-    CompilerAdapter::new(RUSTDOC_ID, "rustdoc", RustdocCompiler::recognizes);
+pub const ADAPTER: CompilerAdapter = CompilerAdapter::new(RUSTDOC_ID, "rustdoc", |args, _| {
+    RustdocCompiler::recognizes(args)
+});
 
 const ARCHIVE_NAME: &str = "docs.tar";
 
@@ -39,6 +43,7 @@ pub enum RustdocMode {
 
 #[derive(Debug, Clone, Default)]
 pub struct RustdocArgs {
+    invocation_env: InvocationEnv,
     pub program: String,
     pub rest: Vec<String>,
     pub mode: RustdocMode,
@@ -57,6 +62,57 @@ pub struct RustdocArgs {
     pub keyed: Vec<String>,
     /// `-L` kinds (`dependency`, `native`, `dir`) without the directory.
     pub library_kinds: Vec<String>,
+}
+
+impl RustdocArgs {
+    fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
+        self.invocation_env
+            .resolve(path)
+            .context("rustdoc path requires the invocation working directory")
+    }
+
+    /// Resolve filesystem selections while retaining the compiler's raw argv.
+    fn rooted_paths(&self) -> Result<Self> {
+        let mut rooted = self.clone();
+        rooted.out_dir = self
+            .out_dir
+            .as_deref()
+            .map(|path| self.resolve_path(path))
+            .transpose()?;
+        rooted.parts_out_dir = self
+            .parts_out_dir
+            .as_deref()
+            .map(|path| self.resolve_path(path))
+            .transpose()?;
+        rooted.dep_info = self
+            .dep_info
+            .as_deref()
+            .map(|path| self.resolve_path(path))
+            .transpose()?;
+        rooted.include_parts_dirs = self
+            .include_parts_dirs
+            .iter()
+            .map(|path| self.resolve_path(path))
+            .collect::<Result<_>>()?;
+        rooted.html_files = self
+            .html_files
+            .iter()
+            .map(|path| self.resolve_path(path))
+            .collect::<Result<_>>()?;
+        rooted.externs = self
+            .externs
+            .iter()
+            .map(|(name, path)| {
+                Ok((
+                    name.clone(),
+                    path.as_deref()
+                        .map(|path| self.resolve_path(path))
+                        .transpose()?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        Ok(rooted)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +153,7 @@ impl Compiler for RustdocCompiler {
     }
 
     fn parse(&self, args: &[String]) -> Result<RustdocArgs> {
-        Ok(parse_args(args))
+        Ok(parse_args_for(args, &InvocationEnv::capture()))
     }
 
     fn refuse_reasons(&self, parsed: &RustdocArgs) -> Vec<RefuseReason> {
@@ -105,14 +161,27 @@ impl Compiler for RustdocCompiler {
     }
 
     fn cache_key(&self, parsed: &RustdocArgs, ctx: &KeyCtx<'_, '_>) -> Result<String> {
-        let version = rustdoc_version(&parsed.program)?;
+        let version = crate::probe::probe_for(
+            ctx.cache_dir,
+            &RustdocProber,
+            &crate::probe::ProbeRequest {
+                compiler: &parsed.program,
+                args: &[],
+                key_args: &[],
+                per_tu_paths: &[],
+                windows_aware: false,
+            },
+            &parsed.invocation_env,
+        )?
+        .version_line;
         let base = cache_key_with(parsed, &version, None)?;
         let label = parsed.crate_name.as_deref().unwrap_or("doc-merge");
-        Ok(finish_rustdoc_key(
+        Ok(finish_rustdoc_key_in(
             base,
             label,
             ctx.key_env_vars,
             ctx.key_salt,
+            ctx.invocation_env,
         ))
     }
 
@@ -177,6 +246,7 @@ pub(crate) fn cache_key_with(
     version: &str,
     salt: Option<&str>,
 ) -> Result<String> {
+    let parsed = &parsed.rooted_paths()?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rustdoc\0");
     hasher.update(version.as_bytes());
@@ -196,7 +266,7 @@ pub(crate) fn cache_key_with(
         hasher.update(kind.as_bytes());
         hasher.update(b"\0");
     }
-    for record in source_records(&parsed.sources)? {
+    for record in source_records(parsed)? {
         if record.relative == "." {
             continue;
         }
@@ -253,13 +323,30 @@ fn hash_file_bytes(hasher: &mut blake3::Hasher, path: &Path) -> Result<()> {
 
 /// Env vars, then the salt. Empty env vars leave the key unchanged. The salt
 /// sees the env fold, matching rustc.
+#[cfg(test)]
 fn finish_rustdoc_key(
     base: String,
     label: &str,
     key_env_vars: &[String],
     salt: Option<&str>,
 ) -> String {
-    let keyed = crate::cache_key::apply_key_env_vars(base, key_env_vars, label);
+    finish_rustdoc_key_in(
+        base,
+        label,
+        key_env_vars,
+        salt,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+fn finish_rustdoc_key_in(
+    base: String,
+    label: &str,
+    key_env_vars: &[String],
+    salt: Option<&str>,
+    env: &crate::invocation::InvocationEnv,
+) -> String {
+    let keyed = crate::cache_key::apply_key_env_vars_in(base, key_env_vars, label, env);
     crate::cache_key::apply_key_salt(keyed, salt, label)
 }
 
@@ -274,25 +361,40 @@ struct SourceRecord {
 /// Crate inputs in a stable order.
 ///
 /// `mod name;` and `#[path = "rel"] mod name;` are followed even when a `cfg`
-/// would drop them. A `mod` inside an inline `mod name { ... }` is resolved
-/// under that name. A missing file is skipped. A file that exists but cannot
+/// would drop them. An implicit `foo.rs` module resolves children under
+/// `foo/`; `mod.rs`, crate roots and explicit paths keep their directory.
+/// A `mod` inside an inline `mod name { ... }` is resolved under that name.
+/// A file loaded in both implicit and explicit roles is scanned in both
+/// contexts but enters the key once. A missing file is skipped. A file that exists but cannot
 /// be read is an error, and the invocation is not cached. `include!`,
 /// `include_str!`, and `include_bytes!` count only with a string literal;
-/// anything else is an error. Dep-info is not read here.
-fn source_records(sources: &[PathBuf]) -> Result<Vec<SourceRecord>> {
+/// anything else is an error. A scanned `env!` or `option_env!` invocation
+/// is also an error because its environment dependency is not tracked.
+/// Dep-info is not read here.
+fn source_records(parsed: &RustdocArgs) -> Result<Vec<SourceRecord>> {
+    let sources = &parsed.sources;
+    let env = &parsed.invocation_env;
+    let c_strings = parsed
+        .keyed
+        .iter()
+        .rev()
+        .find_map(|flag| flag.strip_prefix("--edition="))
+        .is_some_and(|edition| matches!(edition, "2021" | "2024"));
     let Some(primary) = sources.first() else {
         return Ok(Vec::new());
     };
-    let crate_dir = lexical_absolute(primary.parent().unwrap_or(Path::new("")));
+    let crate_dir = lexical_absolute_for(primary.parent().unwrap_or(Path::new("")), env)?;
     let mut seen = BTreeSet::new();
     let mut files = Vec::new();
     for source in sources {
-        collect_source(
-            &lexical_absolute(source),
+        collect_source_for(
+            source,
             &crate_dir,
             true,
-            &mut seen,
-            &mut files,
+            false,
+            (&mut seen, &mut files),
+            c_strings,
+            env,
         )?;
     }
     files.sort_by(|left, right| left.relative.cmp(&right.relative));
@@ -305,15 +407,41 @@ fn source_records(sources: &[PathBuf]) -> Result<Vec<SourceRecord>> {
     Ok(records)
 }
 
+#[cfg(test)]
 fn collect_source(
     path: &Path,
     crate_dir: &Path,
     required: bool,
-    seen: &mut BTreeSet<PathBuf>,
+    module_file: bool,
+    seen: &mut BTreeSet<(PathBuf, bool)>,
     out: &mut Vec<SourceRecord>,
+    c_strings: bool,
 ) -> Result<()> {
-    let absolute = lexical_absolute(path);
-    if !seen.insert(absolute.clone()) {
+    collect_source_for(
+        path,
+        crate_dir,
+        required,
+        module_file,
+        (seen, out),
+        c_strings,
+        &InvocationEnv::capture(),
+    )
+}
+
+fn collect_source_for(
+    path: &Path,
+    crate_dir: &Path,
+    required: bool,
+    module_file: bool,
+    (seen, out): (&mut BTreeSet<(PathBuf, bool)>, &mut Vec<SourceRecord>),
+    c_strings: bool,
+    env: &InvocationEnv,
+) -> Result<()> {
+    let absolute = lexical_absolute_for(path, env)?;
+    // The same file can be both `mod foo;` and `#[path = "foo.rs"] mod alias;`.
+    // Their children have different roots, so cycle detection needs the role.
+    let first_visit = !seen.contains(&(absolute.clone(), !module_file));
+    if !seen.insert((absolute.clone(), module_file)) {
         return Ok(());
     }
     match std::fs::metadata(&absolute) {
@@ -336,20 +464,46 @@ fn collect_source(
     }
     let bytes = std::fs::read(&absolute)
         .with_context(|| format!("reading {} for the rustdoc cache key", absolute.display()))?;
-    let relative = relative_label(crate_dir, &absolute);
-    out.push(SourceRecord {
-        relative,
-        paths: vec![absolute.to_string_lossy().into_owned()],
-    });
+    if first_visit {
+        let relative = relative_label(crate_dir, &absolute);
+        out.push(SourceRecord {
+            relative,
+            paths: vec![absolute.to_string_lossy().into_owned()],
+        });
+    }
     let parent = absolute.parent().unwrap_or(Path::new(""));
-    for found in scan_rust(&bytes)? {
+    // An implicit foo.rs module owns foo/ for children; explicit paths keep the parent.
+    let module_dir = if module_file && absolute.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
+    {
+        absolute.with_extension("")
+    } else {
+        parent.to_path_buf()
+    };
+    for found in scan_rust(&bytes, c_strings)? {
         match found {
             Found::Include(rel) => {
-                collect_source(&parent.join(rel), crate_dir, false, seen, out)?;
+                collect_source_for(
+                    &parent.join(rel),
+                    crate_dir,
+                    false,
+                    false,
+                    (seen, out),
+                    c_strings,
+                    env,
+                )?;
             }
             Found::Module { path, name } => {
-                if let Some(next) = resolve_module(parent, path.as_deref(), &name)? {
-                    collect_source(&next, crate_dir, false, seen, out)?;
+                let dir = if path.is_some() { parent } else { &module_dir };
+                if let Some(next) = resolve_module_for(dir, path.as_deref(), &name, env)? {
+                    collect_source_for(
+                        &next,
+                        crate_dir,
+                        false,
+                        path.is_none(),
+                        (seen, out),
+                        c_strings,
+                        env,
+                    )?;
                 }
             }
         }
@@ -357,7 +511,17 @@ fn collect_source(
     Ok(())
 }
 
+#[cfg(test)]
 fn resolve_module(dir: &Path, path: Option<&str>, name: &str) -> Result<Option<PathBuf>> {
+    resolve_module_for(dir, path, name, &InvocationEnv::capture())
+}
+
+fn resolve_module_for(
+    dir: &Path,
+    path: Option<&str>,
+    name: &str,
+    env: &InvocationEnv,
+) -> Result<Option<PathBuf>> {
     let candidates = if let Some(path) = path {
         vec![dir.join(path)]
     } else {
@@ -367,8 +531,11 @@ fn resolve_module(dir: &Path, path: Option<&str>, name: &str) -> Result<Option<P
         ]
     };
     for candidate in candidates {
+        let candidate = env
+            .resolve(&candidate)
+            .context("resolving rustdoc module path")?;
         match std::fs::metadata(&candidate) {
-            Ok(meta) if meta.is_file() => return Ok(Some(lexical_absolute(&candidate))),
+            Ok(meta) if meta.is_file() => return Ok(Some(lexical_absolute_for(&candidate, env)?)),
             Ok(_) => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
@@ -381,14 +548,13 @@ fn resolve_module(dir: &Path, path: Option<&str>, name: &str) -> Result<Option<P
     Ok(None)
 }
 
+#[cfg(test)]
 fn lexical_absolute(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
+    lexical_absolute_for(path, &InvocationEnv::capture()).unwrap()
+}
+
+fn lexical_absolute_for(path: &Path, env: &InvocationEnv) -> Result<PathBuf> {
+    let absolute = env.resolve(path).context("resolving rustdoc source path")?;
     let mut cleaned = PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -402,9 +568,9 @@ fn lexical_absolute(path: &Path) -> PathBuf {
         }
     }
     if cleaned.as_os_str().is_empty() {
-        PathBuf::from(".")
+        Ok(PathBuf::from("."))
     } else {
-        cleaned
+        Ok(cleaned)
     }
 }
 
@@ -463,8 +629,11 @@ enum Tok {
     Punct(u8),
 }
 
-fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
-    let tokens = rust_tokens(bytes);
+fn scan_rust(bytes: &[u8], c_strings: bool) -> Result<Vec<Found>> {
+    let tokens = rust_tokens(bytes, c_strings);
+    if has_environment_macro(&tokens) {
+        anyhow::bail!("rustdoc environment macros require compiler dependency tracking");
+    }
     let mut found = Vec::new();
     let mut pending_path: Option<String> = None;
     // Inline `mod name { ... }` bodies. A child `mod` is `name/child.rs`,
@@ -561,6 +730,14 @@ fn scan_rust(bytes: &[u8]) -> Result<Vec<Found>> {
     Ok(found)
 }
 
+fn has_environment_macro(tokens: &[Tok]) -> bool {
+    tokens.windows(3).any(|macro_tokens| {
+        matches!(&macro_tokens[0], Tok::Ident(name) if matches!(name.as_str(), "env" | "option_env"))
+            && punct_at(macro_tokens, 1, b'!')
+            && matches!(macro_tokens[2], Tok::Punct(b'(' | b'[' | b'{'))
+    })
+}
+
 fn is_include(name: &str) -> bool {
     matches!(name, "include" | "include_str" | "include_bytes")
 }
@@ -613,7 +790,7 @@ fn close_at(tokens: &[Tok], start: usize, open: u8, close: u8) -> Option<usize> 
     None
 }
 
-fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
+fn rust_tokens(bytes: &[u8], c_strings: bool) -> Vec<Tok> {
     let mut out = Vec::new();
     let mut index = 0;
     for _ in bytes {
@@ -621,12 +798,9 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
             break;
         }
         let byte = bytes[index];
-        if byte.is_ascii_whitespace() {
-            let skip = bytes[index..]
-                .iter()
-                .take_while(|byte| byte.is_ascii_whitespace())
-                .count();
-            index += skip;
+        let whitespace = non_ascii_rust_whitespace_len(bytes, index);
+        if whitespace > 0 {
+            index += whitespace;
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
@@ -639,17 +813,18 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
             continue;
         }
         if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
-            let rest = &bytes[index + 2..];
-            let offset = rest
-                .windows(2)
-                .position(|pair| pair == b"*/")
-                .map(|at| at + 2)
-                .unwrap_or(rest.len());
-            index += 2 + offset;
+            index = skip_block_comment(bytes, index);
             continue;
         }
-        if byte == b'b' && matches!(bytes.get(index + 1), Some(b'"' | b'r' | b'\'')) {
-            index = skip_byte_literal(bytes, index);
+        // A numeric suffix belongs to the number, not a string prefix.
+        if byte.is_ascii_digit() {
+            index = skip_ident_bytes(bytes, index);
+            continue;
+        }
+        if (byte == b'b' || (c_strings && byte == b'c'))
+            && matches!(bytes.get(index + 1), Some(b'"' | b'r' | b'\''))
+        {
+            index = skip_prefixed_literal(bytes, index);
             continue;
         }
         if byte == b'\'' {
@@ -671,11 +846,7 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
         }
         if is_ident_start(byte) {
             let start = index;
-            let len = bytes[index..]
-                .iter()
-                .take_while(|byte| is_ident_continue(**byte))
-                .count();
-            index += len;
+            index = skip_ident_bytes(bytes, index);
             out.push(Tok::Ident(
                 String::from_utf8_lossy(&bytes[start..index]).into_owned(),
             ));
@@ -695,14 +866,64 @@ fn rust_tokens(bytes: &[u8]) -> Vec<Tok> {
 }
 
 fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
+    byte.is_ascii_alphabetic() || byte == b'_' || !byte.is_ascii()
 }
 
 fn is_ident_continue(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+    is_ident_start(byte) || byte.is_ascii_digit()
 }
 
-fn skip_byte_literal(bytes: &[u8], index: usize) -> usize {
+fn skip_ident_bytes(bytes: &[u8], index: usize) -> usize {
+    let mut cursor = index;
+    for _ in index..bytes.len() {
+        let Some(&byte) = bytes.get(cursor) else {
+            break;
+        };
+        if !is_ident_continue(byte) || non_ascii_rust_whitespace_len(bytes, cursor) > 0 {
+            break;
+        }
+        cursor += 1;
+    }
+    cursor
+}
+
+// Non-ASCII Rust whitespace must not join identifier bytes.
+// ASCII whitespace already fails is_ident_continue.
+fn non_ascii_rust_whitespace_len(bytes: &[u8], index: usize) -> usize {
+    match bytes.get(index..).unwrap_or_default() {
+        [0xC2, 0x85, ..] => 2,
+        [0xE2, 0x80, 0x8E | 0x8F | 0xA8 | 0xA9, ..] => 3,
+        [0xEF, 0xBB, 0xBF, ..] => 3,
+        _ => 0,
+    }
+}
+
+fn skip_block_comment(bytes: &[u8], index: usize) -> usize {
+    let mut cursor = index + 2;
+    let mut depth = 1usize;
+    for _ in index..bytes.len() {
+        if cursor + 1 >= bytes.len() {
+            break;
+        }
+        match &bytes[cursor..cursor + 2] {
+            b"/*" => {
+                depth += 1;
+                cursor += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                cursor += 2;
+                if depth == 0 {
+                    return cursor;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    bytes.len()
+}
+
+fn skip_prefixed_literal(bytes: &[u8], index: usize) -> usize {
     match bytes.get(index + 1) {
         Some(b'\'') => skip_char_or_lifetime(bytes, index + 1),
         Some(b'"') => cooked_string(bytes, index + 1).1,
@@ -727,6 +948,8 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
                     .unwrap_or(rest.len());
                 next += offset;
             }
+        } else if bytes.get(next) == Some(&b'x') {
+            next += 3;
         } else {
             next += 1;
         }
@@ -737,6 +960,15 @@ fn skip_char_or_lifetime(bytes: &[u8], index: usize) -> usize {
     }
     if bytes.get(index + 2) == Some(&b'\'') {
         return index + 3;
+    }
+    let width = match bytes.get(index + 1) {
+        Some(0xC2..=0xDF) => 2,
+        Some(0xE0..=0xEF) => 3,
+        Some(0xF0..=0xF4) => 4,
+        _ => return index + 1,
+    };
+    if bytes.get(index + width + 1) == Some(&b'\'') {
+        return index + width + 2;
     }
     index + 1
 }
@@ -866,8 +1098,14 @@ fn collect_files(out: &mut Vec<(String, PathBuf)>, root: &Path, dir: &Path) -> R
     Ok(())
 }
 
+#[cfg(test)]
 fn parse_args(args: &[String]) -> RustdocArgs {
+    RustdocCompiler.parse(args).unwrap()
+}
+
+fn parse_args_for(args: &[String], env: &InvocationEnv) -> RustdocArgs {
     let mut parsed = RustdocArgs {
+        invocation_env: env.clone(),
         program: args.first().cloned().unwrap_or_default(),
         rest: args.get(1..).unwrap_or(&[]).to_vec(),
         ..RustdocArgs::default()
@@ -1151,31 +1389,49 @@ fn remap_to(value: &str) -> Option<&str> {
     value.split_once('=').map(|(_, to)| to)
 }
 
-fn rustdoc_version(program: &str) -> Result<String> {
-    static CACHE: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
-    if let Some(hit) = CACHE
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(program).cloned())
-    {
-        return Ok(hit);
+struct RustdocProber;
+
+impl crate::probe::Prober for RustdocProber {
+    fn id(&self) -> &'static str {
+        "rustdoc"
     }
-    let output = Command::new(program)
-        .arg("-Vv")
-        .output()
-        .with_context(|| format!("running {program} -Vv"))?;
-    if !output.status.success() {
-        anyhow::bail!("{program} -Vv failed");
+
+    fn probe(&self, req: &crate::probe::ProbeRequest<'_>) -> Result<crate::probe::ResolvedConfig> {
+        self.probe_for(req, &InvocationEnv::capture())
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let line = text.lines().next().unwrap_or("").trim().to_string();
-    if line.is_empty() {
-        anyhow::bail!("{program} -Vv produced no version");
+
+    fn probe_for(
+        &self,
+        req: &crate::probe::ProbeRequest<'_>,
+        env: &InvocationEnv,
+    ) -> Result<crate::probe::ResolvedConfig> {
+        let program = req.compiler;
+        let output = env
+            .command(program)?
+            .arg("-Vv")
+            .invocation_output()
+            .with_context(|| format!("running {program} -Vv"))?;
+        if !output.status.success() {
+            anyhow::bail!("{program} -Vv failed");
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let line = text.lines().next().unwrap_or("").trim().to_string();
+        if line.is_empty() {
+            anyhow::bail!("{program} -Vv produced no version");
+        }
+        Ok(crate::probe::ResolvedConfig {
+            schema_version: crate::probe::PROBE_SCHEMA_VERSION,
+            prober: self.id().to_owned(),
+            compiler_name: Path::new(program)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            version_line: line,
+            resolved_tokens: None,
+            host_version_line: None,
+        })
     }
-    if let Ok(mut cache) = CACHE.lock() {
-        cache.insert(program.to_string(), line.clone());
-    }
-    Ok(line)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1276,9 +1532,11 @@ fn strip_root(path: &str, root: &str) -> Option<String> {
 }
 
 fn spawn(parsed: &RustdocArgs) -> Result<std::process::Output> {
-    Command::new(&parsed.program)
+    parsed
+        .invocation_env
+        .command(&parsed.program)?
         .args(&parsed.rest)
-        .output()
+        .invocation_output()
         .with_context(|| format!("running {}", parsed.program))
 }
 
@@ -1407,7 +1665,8 @@ pub(crate) fn rewrite_bytes(input: &[u8], replacements: &[(Vec<u8>, Vec<u8>)]) -
 }
 
 fn restore_bundle(parsed: &RustdocArgs, bundle: &Bundle) -> Result<()> {
-    let current = source_records(&parsed.sources)?;
+    let parsed = &parsed.rooted_paths()?;
+    let current = source_records(parsed)?;
     let rewrites = source_rewrites(&bundle.sources, &current);
     if let Some(out_dir) = &parsed.out_dir {
         for (rel, bytes) in &bundle.out_files {
@@ -1447,13 +1706,22 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(test, unix))]
 pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
-    let parsed = RustdocCompiler.parse(args)?;
+    run_for(config, args, &InvocationEnv::capture())
+}
+
+pub(crate) fn run_for(
+    config: &crate::config::Config,
+    args: &[String],
+    env: &InvocationEnv,
+) -> Result<i32> {
+    let parsed = parse_args_for(args, env);
     let crate_name = parsed
         .crate_name
         .clone()
         .unwrap_or_else(|| "doc-merge".to_string());
-    let root = event_root();
+    let root = event_root_for(env);
     let start = std::time::Instant::now();
     if let Some(reason) = refusal(&parsed) {
         let code = passthrough(&parsed)?;
@@ -1466,7 +1734,10 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
         );
         return Ok(code);
     }
-    let store = match crate::store::Store::open(config) {
+    let store = match crate::store::Store::open_with_options(
+        config,
+        crate::store::StoreOptions::from_env(|name| env.var(name).ok()),
+    ) {
         Ok(store) => store,
         Err(error) => {
             let code = passthrough(&parsed)?;
@@ -1480,9 +1751,10 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
             return Ok(code);
         }
     };
-    let file_hasher = store.file_hasher();
+    let file_hasher = store.file_hasher_for(env);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: env,
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -1518,8 +1790,8 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
         replay(
             &meta.stdout,
             &meta.stderr,
-            std::io::stdout(),
-            std::io::stderr(),
+            crate::invocation::io::stdout(),
+            crate::invocation::io::stderr(),
         );
         log_result(
             config,
@@ -1543,8 +1815,8 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
                 replay(
                     &meta.stdout,
                     &meta.stderr,
-                    std::io::stdout(),
-                    std::io::stderr(),
+                    crate::invocation::io::stdout(),
+                    crate::invocation::io::stderr(),
                 );
                 log_result(
                     config,
@@ -1558,7 +1830,7 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
             }
         }
         crate::store::BuildClaim::Contended => {
-            let waited = match store.wait_for_committed(&cache_key) {
+            let waited = match crate::invocation::wait_for_committed(&store, &cache_key, None) {
                 Ok(waited) => waited,
                 Err(error) => {
                     return pass_store(config, &parsed, &root, &crate_name, start, &error);
@@ -1577,8 +1849,8 @@ pub fn run(config: &crate::config::Config, args: &[String]) -> Result<i32> {
                 replay(
                     &meta.stdout,
                     &meta.stderr,
-                    std::io::stdout(),
-                    std::io::stderr(),
+                    crate::invocation::io::stdout(),
+                    crate::invocation::io::stderr(),
                 );
                 log_result(
                     config,
@@ -1646,7 +1918,12 @@ fn compile_and_store(
     let output = spawn(parsed)?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    replay(&stdout, &stderr, std::io::stdout(), std::io::stderr());
+    replay(
+        &stdout,
+        &stderr,
+        crate::invocation::io::stdout(),
+        crate::invocation::io::stderr(),
+    );
     let code = exit_code(&output.status);
     if code != 0 {
         return Ok(Compiled {
@@ -1663,7 +1940,17 @@ fn compile_and_store(
             });
         }
     };
-    if store_bundle(store, cache_key, crate_name, &bundle, &stdout, &stderr).is_err() {
+    if store_bundle(
+        store,
+        cache_key,
+        crate_name,
+        &bundle,
+        &stdout,
+        &stderr,
+        parsed.invocation_env.temp_dir(),
+    )
+    .is_err()
+    {
         return Ok(Compiled {
             exit_code: 0,
             stored: false,
@@ -1682,6 +1969,7 @@ fn compile_and_store(
 /// stay out: `--merge=none` reads `out/<crate>/` and `out/src/<crate>/`, and
 /// finalize reads only the files in the output root.
 fn files_written(parsed: &RustdocArgs) -> Result<Bundle> {
+    let parsed = &parsed.rooted_paths()?;
     let out_files = match (&parsed.mode, &parsed.out_dir) {
         (RustdocMode::Crate, Some(dir)) => crate_output_files(dir, parsed.crate_name.as_deref())?,
         (RustdocMode::Finalize, Some(dir)) => top_level_files(dir)?,
@@ -1698,7 +1986,7 @@ fn files_written(parsed: &RustdocArgs) -> Result<Bundle> {
             Some(path) if path.is_file() => Some(std::fs::read(path)?),
             _ => None,
         },
-        sources: source_records(&parsed.sources)?,
+        sources: source_records(parsed)?,
     })
 }
 
@@ -1778,9 +2066,10 @@ fn store_bundle(
     bundle: &Bundle,
     stdout: &str,
     stderr: &str,
+    temp_dir: &Path,
 ) -> Result<()> {
     let bytes = pack(bundle)?;
-    let tmp = tempfile::NamedTempFile::new()?;
+    let tmp = tempfile::NamedTempFile::new_in(temp_dir)?;
     std::fs::write(tmp.path(), &bytes)?;
     store.put_with_compile_time_independent(
         cache_key,
@@ -1837,19 +2126,19 @@ fn passthrough(parsed: &RustdocArgs) -> Result<i32> {
     replay(
         &String::from_utf8_lossy(&output.stdout),
         &String::from_utf8_lossy(&output.stderr),
-        std::io::stdout(),
-        std::io::stderr(),
+        crate::invocation::io::stdout(),
+        crate::invocation::io::stderr(),
     );
     Ok(exit_code(&output.status))
 }
 
-fn event_root() -> String {
-    if let Some(root) = std::env::var_os("KACHE_EVENT_ROOT")
+fn event_root_for(env: &InvocationEnv) -> String {
+    if let Some(root) = env.var_os("KACHE_EVENT_ROOT")
         && !root.is_empty()
     {
         return root.to_string_lossy().into_owned();
     }
-    std::env::current_dir()
+    env.cwd()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
@@ -2083,7 +2372,7 @@ mod tests {
     }
 
     fn module_names(source: &str) -> Vec<String> {
-        scan_rust(source.as_bytes())
+        scan_rust(source.as_bytes(), true)
             .unwrap()
             .into_iter()
             .filter_map(|found| match found {
@@ -2094,7 +2383,7 @@ mod tests {
     }
 
     fn module_path(source: &str) -> Option<String> {
-        scan_rust(source.as_bytes())
+        scan_rust(source.as_bytes(), true)
             .unwrap()
             .into_iter()
             .find_map(|found| match found {
@@ -2104,7 +2393,7 @@ mod tests {
     }
 
     fn includes(source: &str) -> Vec<String> {
-        scan_rust(source.as_bytes())
+        scan_rust(source.as_bytes(), true)
             .unwrap()
             .into_iter()
             .filter_map(|found| match found {
@@ -2128,7 +2417,7 @@ mod tests {
             module_names("/* * mod fake;*/mod real;"),
             vec!["real".to_string()]
         );
-        assert!(rust_tokens(b"/*a*").len() < 8);
+        assert!(rust_tokens(b"/*a*", true).len() < 8);
         assert_eq!(
             module_names("// mod fake;\nmod real;"),
             vec!["real".to_string()]
@@ -2164,8 +2453,8 @@ mod tests {
         assert_eq!(skip_char_or_lifetime(b"'\\u{61}'", 0), 8);
         assert_eq!(skip_char_or_lifetime(b"'\\n'", 0), 4);
         assert_eq!(skip_char_or_lifetime(b"'\\u{61;", 0), 1);
-        assert_eq!(skip_byte_literal(b"b'a'", 0), 4);
-        assert_eq!(skip_byte_literal(b"b\"hi\"", 0), 5);
+        assert_eq!(skip_prefixed_literal(b"b'a'", 0), 4);
+        assert_eq!(skip_prefixed_literal(b"b\"hi\"", 0), 5);
         let (text, next) = raw_string(b"r#\"ab\"#", 0).unwrap();
         assert_eq!(text, "ab");
         assert_eq!(next, 7);
@@ -2173,9 +2462,9 @@ mod tests {
         assert_eq!(text, " \" # ");
         assert_eq!(next, 12);
 
-        let nested = rust_tokens(b"(())");
+        let nested = rust_tokens(b"(())", true);
         assert_eq!(close_at(&nested, 1, b'(', b')'), Some(3));
-        let idents: Vec<_> = rust_tokens(b"mod real")
+        let idents: Vec<_> = rust_tokens(b"mod real", true)
             .into_iter()
             .filter_map(|token| match token {
                 Tok::Ident(text) => Some(text),
@@ -2183,8 +2472,219 @@ mod tests {
             })
             .collect();
         assert_eq!(idents, ["mod".to_string(), "real".to_string()]);
-        assert_eq!(skip_byte_literal(b"br", 0), 1);
-        assert_eq!(skip_byte_literal(b"bx", 0), 1);
+        assert_eq!(skip_prefixed_literal(b"br", 0), 1);
+        assert_eq!(skip_prefixed_literal(b"bx", 0), 1);
+    }
+
+    #[test]
+    fn environment_macros_require_compiler_dependency_tracking() {
+        for source in [
+            r#"#![doc = env!("DOC_TEXT")]"#,
+            r#"#[doc = env!("DOC_TEXT")] pub fn thing() {}"#,
+            r#"const TEXT: Option<&str> = option_env!("DOC_TEXT");"#,
+            r#"env!["DOC_TEXT"]"#,
+            r#"env!{"DOC_TEXT"}"#,
+            r#"option_env!["DOC_TEXT"]"#,
+            r#"option_env!{"DOC_TEXT"}"#,
+            r#"std::env!("DOC_TEXT")"#,
+            r#"core::option_env!("DOC_TEXT")"#,
+            r#"r#env /* comment */ ! ("DOC_TEXT")"#,
+            r#"env!(concat!("DOC", "_TEXT"))"#,
+        ] {
+            let error = scan_rust(source.as_bytes(), true)
+                .err()
+                .expect("env macro is uncacheable");
+            assert_eq!(
+                error.to_string(),
+                "rustdoc environment macros require compiler dependency tracking"
+            );
+        }
+        for source in [
+            "// env!(\"DOC_TEXT\")\nmod real;",
+            r#"const TEXT: &str = "env!(DOC_TEXT)"; mod real;"#,
+            "fn env() {} mod real;",
+            "fn test(env: u8) { if env != 0 {} } mod real;",
+            "/* option_env!(\"DOC_TEXT\") */ mod real;",
+            r##"const TEXT: &str = r#"option_env!(DOC_TEXT)"#; mod real;"##,
+            "other_env!(\"DOC_TEXT\"); mod real;",
+            "env(\"DOC_TEXT\"); mod real;",
+            "env!; mod real;",
+        ] {
+            assert_eq!(module_names(source), ["real"]);
+        }
+    }
+
+    #[test]
+    fn environment_macros_in_followed_sources_refuse_the_key() {
+        for declaration in ["mod child;", "include!(\"child.rs\");"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("lib.rs");
+            let child = dir.path().join("child.rs");
+            std::fs::write(&root, declaration).unwrap();
+            std::fs::write(&child, "const TEXT: &str = env!(\"DOC_TEXT\");").unwrap();
+            let parsed = parse(&[
+                "rustdoc",
+                "--merge=none",
+                "--crate-name=demo",
+                &root.to_string_lossy(),
+                "-o",
+                "/out",
+                "--parts-out-dir",
+                "/parts",
+            ]);
+            assert_eq!(
+                cache_key_with(&parsed, "v", None).unwrap_err().to_string(),
+                "rustdoc environment macros require compiler dependency tracking"
+            );
+
+            std::fs::write(&child, "pub fn child() {}").unwrap();
+            assert!(cache_key_with(&parsed, "v", None).is_ok());
+        }
+    }
+
+    #[test]
+    fn character_literals_do_not_hide_environment_macros() {
+        for literal in ["'a'", "'é'", "'中'", "'🦀'", r"'\x22'", r"'\u{22}'"] {
+            for name in ["env", "option_env"] {
+                let source = format!(
+                    "const CHARS: [char; 2] = [{literal},'\"']; fn text() {{ let _ = {name}!(\"DOC_TEXT\"); }}"
+                );
+                assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");
+            }
+            assert_eq!(skip_char_or_lifetime(literal.as_bytes(), 0), literal.len());
+        }
+        for lifetime in ["'a", "'é", "'static"] {
+            assert_eq!(skip_char_or_lifetime(lifetime.as_bytes(), 0), 1);
+        }
+        assert_eq!(skip_char_or_lifetime(b"'", 0), 1);
+    }
+
+    #[test]
+    fn nested_comments_and_c_strings_do_not_hide_environment_macros() {
+        for prefix in [
+            "/* /* */ \" */",
+            "/* padding /* */ */",
+            r###"const DATA: &std::ffi::CStr = cr"\";"###,
+            r###"const DATA: &std::ffi::CStr = cr#"a"b"#;"###,
+            r###"const DATA: &std::ffi::CStr = c"\"";"###,
+            r###"const DATA: &[u8] = br#"a"b"#;"###,
+        ] {
+            for name in ["env", "option_env"] {
+                let source =
+                    format!("{prefix} fn text() {{ let _ = {name}!(\"DOC_TEXT\"); }} // \"");
+                assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");
+            }
+        }
+        for source in [
+            "/* /* */ env!(\"DOC_TEXT\") */ mod real;",
+            r###"const DATA: &std::ffi::CStr = cr#"env!("DOC_TEXT")"#; mod real;"###,
+            r###"const DATA: &std::ffi::CStr = c"env!(\"DOC_TEXT\")"; mod real;"###,
+        ] {
+            assert_eq!(module_names(source), ["real"]);
+        }
+        for (comment, end) in [
+            ("/**/tail", 4),
+            ("/* /* */ */tail", 11),
+            ("/*/", 3),
+            ("/*", 2),
+            ("/* /* */", 8),
+        ] {
+            assert_eq!(skip_block_comment(comment.as_bytes(), 0), end);
+        }
+    }
+
+    #[test]
+    fn source_edition_keeps_legacy_c_prefix_arguments_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        std::fs::write(
+            &source,
+            r###"macro_rules! document {
+                (cr # $a:literal $which:ident !($v:literal), $z:literal) => {
+                    #[doc = $which!($v)] pub fn text() {}
+                };
+            }
+            document! { cr#"a" env!("DOC_TEXT"), "#" }"###,
+        )
+        .unwrap();
+        let source_name = source.to_string_lossy();
+        for (edition, refuses) in [
+            (None, true),
+            (Some("2015"), true),
+            (Some("2018"), true),
+            (Some("2021"), false),
+            (Some("2024"), false),
+        ] {
+            let mut args = vec![
+                "rustdoc",
+                "--merge=none",
+                "--crate-name=demo",
+                source_name.as_ref(),
+                "-o",
+                "/out",
+                "--parts-out-dir",
+                "/parts",
+            ];
+            if let Some(edition) = edition {
+                args.extend(["--edition", edition]);
+            }
+            assert_eq!(
+                cache_key_with(&parse(&args), "v", None).is_err(),
+                refuses,
+                "edition={edition:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_suffixes_do_not_become_literal_prefixes() {
+        let source = r###"macro_rules! document {
+            ($tag:literal # $a:literal $which:ident !($v:literal), $z:literal) => {
+                #[doc = $which!($v)] pub fn text() {}
+            };
+        }
+        document! { 1cr#"a" env!("DOC_TEXT"), "#" }"###;
+        for prefix in [
+            "1cr",
+            "1br",
+            "1r",
+            "12cr",
+            "0x12cr",
+            "1écr",
+            "1a\u{0301}cr",
+            "1ér",
+            "1ébr",
+        ] {
+            let source = source.replace("1cr", prefix);
+            for c_strings in [false, true] {
+                assert!(scan_rust(source.as_bytes(), c_strings).is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_separators_do_not_join_numeric_suffixes_or_identifiers() {
+        for separator in [
+            "\u{0085}", "\u{200E}", "\u{200F}", "\u{2028}", "\u{2029}", "\u{FEFF}",
+        ] {
+            let source = format!("forward!(1{separator}env!(\"DOC_TEXT\"));");
+            for c_strings in [false, true] {
+                assert!(scan_rust(source.as_bytes(), c_strings).is_err(), "{source}");
+            }
+            assert_eq!(module_names(&format!("mod{separator}real;")), ["real"]);
+        }
+        assert!(scan_rust("éenv!(\"DOC_TEXT\");".as_bytes(), true).is_ok());
+        assert!(scan_rust("a\u{0301}env!(\"DOC_TEXT\");".as_bytes(), true).is_ok());
+        assert_eq!(skip_ident_bytes("1écr".as_bytes(), 0), 5);
+        assert_eq!(skip_ident_bytes(b"", 0), 0);
+        assert_eq!(skip_ident_bytes(b";", 0), 0);
+        assert_eq!(non_ascii_rust_whitespace_len(b"\xC2", 0), 0);
+        assert_eq!(non_ascii_rust_whitespace_len(b"\xE2\x80", 0), 0);
+        assert_eq!(non_ascii_rust_whitespace_len(b"x", 1), 0);
+        for separator in [" ", "\t", "\n", "\r", "\x0B", "\x0C"] {
+            let source = format!("forward!(1{separator}env!(\"DOC_TEXT\"));");
+            assert!(scan_rust(source.as_bytes(), true).is_err(), "{source}");
+        }
     }
 
     #[test]
@@ -2270,6 +2770,196 @@ mod tests {
             &source_rewrites(&stored, &current),
         );
         assert_eq!(updated, br"see /new/src\lib.rs");
+    }
+
+    #[test]
+    fn explicit_path_modules_resolve_children_beside_the_module_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("renamed")).unwrap();
+        std::fs::write(root.join("lib.rs"), "#[path = \"renamed.rs\"] mod foo;\n").unwrap();
+        std::fs::write(root.join("renamed.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("child.rs"), "pub fn thing() {}\n").unwrap();
+        std::fs::write(root.join("renamed/child.rs"), "pub fn decoy() {}\n").unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "child.rs", "lib.rs", "renamed.rs"]);
+    }
+
+    #[test]
+    fn mod_rs_children_remain_in_the_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(root.join("foo/mod.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("foo/child.rs"), "pub fn thing() {}\n").unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "foo/child.rs", "foo/mod.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn non_mod_rs_modules_resolve_children_below_their_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("foo/child")).unwrap();
+        std::fs::write(root.join("entry.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            root.join("foo.rs"),
+            "mod child;\ninclude_str!(\"note.txt\");\n#[path = \"renamed.rs\"] mod alias;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("foo/child.rs"), "mod grand;\n").unwrap();
+        std::fs::write(root.join("foo/child/grand.rs"), "pub fn grand() {}\n").unwrap();
+        for file in ["child.rs", "note.txt", "renamed.rs"] {
+            std::fs::write(root.join(file), "pub fn decoy() {}\n").unwrap();
+        }
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("entry.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "entry.rs",
+                "foo.rs",
+                "foo/child.rs",
+                "foo/child/grand.rs",
+                "note.txt",
+                "renamed.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn one_source_in_implicit_and_explicit_modules_keys_both_child_roots() {
+        for root_source in [
+            "mod foo; #[path = \"foo.rs\"] mod alias;\n",
+            "#[path = \"foo.rs\"] mod alias; mod foo;\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            std::fs::create_dir(root.join("foo")).unwrap();
+            let lib = root.join("lib.rs");
+            std::fs::write(&lib, root_source).unwrap();
+            std::fs::write(root.join("foo.rs"), "mod child;\n").unwrap();
+            for child in ["child.rs", "foo/child.rs"] {
+                std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+            }
+            let env = InvocationEnv::from_parts(
+                std::iter::empty::<(&str, &str)>(),
+                Some(root.to_path_buf()),
+                None,
+                root.to_path_buf(),
+            );
+            let parsed = parse_args_for(
+                &argv(&[
+                    "rustdoc",
+                    "--merge=none",
+                    "--crate-name=roles",
+                    "lib.rs",
+                    "-o",
+                    "out",
+                    "--parts-out-dir",
+                    "parts",
+                ]),
+                &env,
+            );
+            let records = source_records(&parsed).unwrap();
+            let names: Vec<_> = records
+                .iter()
+                .map(|record| record.relative.as_str())
+                .collect();
+            assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
+            let original = cache_key_with(&parsed, "v", None).unwrap();
+            for child in ["child.rs", "foo/child.rs"] {
+                std::fs::write(root.join(child), "pub fn changed() {}\n").unwrap();
+                assert_ne!(
+                    original,
+                    cache_key_with(&parsed, "v", None).unwrap(),
+                    "{root_source:?} omitted {child}",
+                );
+                std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+                assert_eq!(original, cache_key_with(&parsed, "v", None).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn role_aware_visits_terminate_alias_cycles_without_duplicate_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(
+            root.join("foo.rs"),
+            "#[path = \"foo.rs\"] mod cycle; mod child;\n",
+        )
+        .unwrap();
+        for child in ["child.rs", "foo/child.rs"] {
+            std::fs::write(root.join(child), "pub fn thing() {}\n").unwrap();
+        }
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(names, [".", "child.rs", "foo.rs", "foo/child.rs", "lib.rs"]);
+    }
+
+    #[test]
+    fn implicit_modules_keep_inline_children_and_mod_rs_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("foo/inline/leaf")).unwrap();
+        std::fs::write(root.join("lib.rs"), "mod foo;\n").unwrap();
+        std::fs::write(root.join("foo.rs"), "mod inline { mod leaf; }\n").unwrap();
+        std::fs::write(root.join("foo/inline/leaf/mod.rs"), "mod child;\n").unwrap();
+        std::fs::write(root.join("foo/inline/leaf/child.rs"), "pub fn thing() {}\n").unwrap();
+        let records = source_records(&parse_args_for(
+            &crate_argv("/out", "/parts", &root.join("lib.rs").to_string_lossy()),
+            &InvocationEnv::capture(),
+        ))
+        .unwrap();
+        let names: Vec<_> = records
+            .iter()
+            .map(|record| record.relative.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "foo.rs",
+                "foo/inline/leaf/child.rs",
+                "foo/inline/leaf/mod.rs",
+                "lib.rs",
+            ],
+        );
     }
 
     #[test]
@@ -3209,6 +3899,182 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn concurrent_rustdoc_clients_keep_sources_outputs_and_archives_in_their_own_directory() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (root, client) in [(first.path(), "first"), (second.path(), "second")] {
+                for dir in ["bin", "src", "deps", "tmp", "doc/demo", "parts"] {
+                    std::fs::create_dir_all(root.join(dir)).unwrap();
+                }
+                std::fs::write(
+                    root.join("src/lib.rs"),
+                    "mod child; pub const V: &str = include_str!(\"data.txt\");\n",
+                )
+                .unwrap();
+                std::fs::write(root.join("src/child.rs"), format!("// {client}\n")).unwrap();
+                std::fs::write(root.join("src/data.txt"), client).unwrap();
+                std::fs::write(root.join("deps/libdep.rlib"), client).unwrap();
+                std::fs::write(root.join("header.html"), client).unwrap();
+                kache_fs::testutil::write_executable(
+                    &root.join("bin/rustdoc"),
+                    "#!/bin/sh\nprintf '%s' \"$CLIENT\" > doc/demo/index.html\nprintf '{}' > parts/demo.json\nprintf 'doc: src/lib.rs\\n' > output.d\nprintf '%s' \"$CLIENT\"\n",
+                );
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let env = InvocationEnv::from_parts(
+                        [("PATH", "bin:/usr/bin:/bin"), ("CLIENT", client)],
+                        Some(root.to_owned()),
+                        None,
+                        root.join("tmp"),
+                    );
+                    let parsed = parse_args_for(
+                        &argv(&[
+                            "rustdoc",
+                            "--crate-name",
+                            "demo",
+                            "src/lib.rs",
+                            "-o",
+                            "doc",
+                            "--parts-out-dir",
+                            "parts",
+                            "--emit=html-non-static-files,dep-info=output.d",
+                            "--merge=none",
+                            "--html-in-header",
+                            "header.html",
+                            "--extern",
+                            "dep=deps/libdep.rlib",
+                        ]),
+                        &env,
+                    );
+                    barrier.wait();
+                    let key = cache_key_with(&parsed, "version", None).unwrap();
+                    let result = RustdocCompiler.execute(&parsed).unwrap();
+                    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+                    assert_eq!(result.stdout, client);
+                    let bundle = files_written(&parsed).unwrap();
+                    assert_eq!(
+                        bundle.out_files,
+                        [("demo/index.html".to_owned(), client.as_bytes().to_vec())]
+                    );
+                    assert!(
+                        bundle
+                            .sources
+                            .iter()
+                            .flat_map(|record| &record.paths)
+                            .all(|path| Path::new(path).starts_with(root))
+                    );
+                    for file in ["doc/demo/index.html", "parts/demo.json", "output.d"] {
+                        std::fs::remove_file(root.join(file)).unwrap();
+                    }
+                    let config = crate::test_support::test_config(root.join("cache"));
+                    let store = crate::store::Store::open_with_options(
+                        &config,
+                        crate::store::StoreOptions::from_env(|_| None),
+                    )
+                    .unwrap();
+                    store_bundle(
+                        &store,
+                        &key,
+                        "demo",
+                        &bundle,
+                        &result.stdout,
+                        &result.stderr,
+                        env.temp_dir(),
+                    )
+                    .unwrap();
+                    let meta = store.get(&key).unwrap().unwrap();
+                    restore_meta(&store, &parsed, &meta).unwrap();
+                    assert_eq!(
+                        std::fs::read_to_string(root.join("doc/demo/index.html")).unwrap(),
+                        client
+                    );
+                    assert_eq!(std::fs::read(root.join("parts/demo.json")).unwrap(), b"{}");
+                    assert_eq!(
+                        std::fs::read(root.join("output.d")).unwrap(),
+                        b"doc: src/lib.rs\n"
+                    );
+                    assert_eq!(cache_key_with(&parsed, "version", None).unwrap(), key);
+                    assert_eq!(std::fs::read_dir(root.join("tmp")).unwrap().count(), 0);
+                });
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustdoc_version_memo_tracks_client_selection_and_rejects_failed_or_empty_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("lib.rs"), "pub fn value() {}\n").unwrap();
+        kache_fs::testutil::write_executable(
+            &root.join("rustdoc"),
+            "#!/bin/sh\nprintf x >> probe-count\nprintf '%s\\n' \"$DOC_VERSION\"\nexit \"${PROBE_EXIT:-0}\"\n",
+        );
+        let mut env = InvocationEnv::from_parts(
+            [("DOC_VERSION", "rustdoc first")],
+            Some(root.to_owned()),
+            None,
+            root.to_owned(),
+        );
+        env.set("PATH", root.as_os_str());
+        let config = crate::test_support::test_config(root.join("cache"));
+        let key = |env: &InvocationEnv| {
+            let parsed = parse_args_for(&argv(&["rustdoc", "--crate-name", "demo", "lib.rs"]), env);
+            let hasher = crate::cache_key::FileHasher::new_for(env);
+            let normalizer = crate::path_normalizer::PathNormalizer::empty();
+            RustdocCompiler.cache_key(
+                &parsed,
+                &KeyCtx {
+                    invocation_env: env,
+                    file_hasher: &hasher,
+                    path_normalizer: &normalizer,
+                    cache_dir: &config.cache_dir,
+                    key_salt: None,
+                    key_env_vars: &[],
+                    extra_inputs_digest: None,
+                    build_script_inputs_digest: None,
+                },
+            )
+        };
+        let first = key(&env).unwrap();
+        assert_eq!(key(&env).unwrap(), first);
+        let resolved = crate::probe::probe_for(
+            &config.cache_dir,
+            &RustdocProber,
+            &crate::probe::ProbeRequest {
+                compiler: "rustdoc",
+                args: &[],
+                key_args: &[],
+                per_tu_paths: &[],
+                windows_aware: false,
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(resolved.prober, "rustdoc");
+        assert_eq!(resolved.version_line, "rustdoc first");
+        assert_eq!(std::fs::read(root.join("probe-count")).unwrap(), b"x");
+        let mut other = env.clone();
+        other.set("DOC_VERSION", "rustdoc second");
+        assert_ne!(key(&other).unwrap(), first);
+        assert_eq!(std::fs::read(root.join("probe-count")).unwrap(), b"xx");
+        assert_eq!(key(&env).unwrap(), first);
+        other.set("DOC_VERSION", "");
+        assert!(
+            key(&other)
+                .unwrap_err()
+                .to_string()
+                .contains("produced no version")
+        );
+        other.set("DOC_VERSION", "rustdoc second");
+        other.set("PROBE_EXIT", "3");
+        assert!(key(&other).unwrap_err().to_string().contains("-Vv failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_refused_run_returns_rustdoc_status_and_records_the_event() {
         let _lock = crate::config::config_path_lock();
         let _root = crate::config::tests::set_env_for_test(
@@ -3267,7 +4133,7 @@ mod tests {
 
     #[test]
     fn a_raw_byte_string_is_one_literal() {
-        assert_eq!(skip_byte_literal(b"br\"abc\"", 0), 7);
+        assert_eq!(skip_prefixed_literal(b"br\"abc\"", 0), 7);
         assert_eq!(skip_char_or_lifetime(b"'a", 0), 1);
         assert!(raw_string(b"r#\"abc", 0).is_none());
         assert_eq!(module_names("mod real; // tail"), vec!["real".to_string()]);
@@ -3298,7 +4164,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        collect_source(dir.path(), dir.path(), true, &mut seen, &mut out).unwrap();
+        collect_source(
+            dir.path(),
+            dir.path(),
+            true,
+            false,
+            &mut seen,
+            &mut out,
+            true,
+        )
+        .unwrap();
         assert!(out.is_empty());
     }
 
@@ -3311,8 +4186,10 @@ mod tests {
             &dir.path().join("missing.rs"),
             dir.path(),
             false,
+            false,
             &mut seen,
             &mut out,
+            true,
         )
         .unwrap();
         assert!(out.is_empty());
@@ -3333,7 +4210,9 @@ mod tests {
         std::os::unix::fs::symlink(&link, &link).unwrap();
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        assert!(collect_source(&link, dir.path(), false, &mut seen, &mut out).is_err());
+        assert!(
+            collect_source(&link, dir.path(), false, false, &mut seen, &mut out, true).is_err()
+        );
         assert!(resolve_module(dir.path(), None, "loop").is_err());
     }
 

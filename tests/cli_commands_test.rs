@@ -242,8 +242,8 @@ fn test_runner_passes_the_exit_code_through() {
         "probe-0123456789abcdef{}",
         std::env::consts::EXE_SUFFIX
     ));
-    std::fs::hard_link(KACHE_BIN, &probe)
-        .or_else(|_| std::fs::copy(KACHE_BIN, &probe).map(drop))
+    std::fs::hard_link(env!("CARGO_BIN_EXE_kache-engine"), &probe)
+        .or_else(|_| std::fs::copy(env!("CARGO_BIN_EXE_kache-engine"), &probe).map(drop))
         .unwrap();
     for scheduler in ["1", "0"] {
         e.cmd()
@@ -1925,6 +1925,11 @@ fn targets_lists_a_tracked_target_and_flags_its_deleted_worktree() {
         String::from_utf8_lossy(&text.stdout)
     );
 
+    // Windows keeps the daemon's working directory open until it exits.
+    stop_daemon(
+        kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache).args(["daemon", "stop"]),
+        &e.cache,
+    );
     std::fs::remove_dir_all(project.path()).unwrap();
     let orphaned = targets();
     assert_eq!(orphaned["targets"][0]["state"], "worktree_deleted");
@@ -2071,6 +2076,64 @@ fn clean_dry_run_collapses_hardlinks_wholly_inside_target() {
 fn doctor_runs_readonly_diagnostics() {
     let e = env();
     e.cmd().arg("doctor").assert().success();
+}
+
+/// The store hardlinks the build tree into its staging area, so the link
+/// layout check has to probe the directory a build writes to, not the
+/// directory the command was run from.
+#[test]
+fn doctor_probes_the_cargo_target_dir_for_the_link_layout() {
+    let e = env();
+    let project = TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join(".cargo")).unwrap();
+    std::fs::create_dir_all(project.path().join("target")).unwrap();
+    // A relative target dir, so the config holds no path to escape.
+    std::fs::write(
+        project.path().join(".cargo/config.toml"),
+        "[build]\ntarget-dir = \"target\"\n",
+    )
+    .unwrap();
+
+    let output = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache)
+        // The environment names the target dir too, and the check has to read
+        // the config this test writes.
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .arg("doctor")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let check = text
+        .lines()
+        .find(|line| line.contains("Link layout"))
+        .unwrap_or_else(|| panic!("the doctor reported no link layout check: {text}"));
+    assert!(
+        check.contains(&project.path().join("target").display().to_string()),
+        "the link layout check probed the wrong directory: {check}"
+    );
+}
+
+#[test]
+fn doctor_reports_an_unresolved_output_directory_without_claiming_link_support() {
+    let e = env();
+    let project = TempDir::new().unwrap();
+    let output = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache)
+        .env("CARGO_TARGET_DIR", "")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .arg("doctor")
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let check = text
+        .lines()
+        .find(|line| line.contains("Link layout"))
+        .unwrap_or_else(|| panic!("missing link-layout result: {text}"));
+    assert!(check.contains("could not be resolved"), "{check}");
+    assert!(check.contains("probe skipped"), "{check}");
 }
 
 #[test]
@@ -2412,7 +2475,7 @@ fn init_rejects_unavailable_daemon_replacement() {
         std::io::BufReader::new(&stream)
             .read_line(&mut request)
             .unwrap();
-        assert!(request.contains("health"), "{request}");
+        assert!(request.contains("health"), "expected a health request");
         // Remove the listener before replying so restart cannot mistake it
         // for the replacement. No coordinator PID means recovery cannot kill
         // this test process, which owns the old daemon's run lock.
@@ -2462,7 +2525,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         std::io::BufReader::new(&stream)
             .read_line(&mut request)
             .unwrap();
-        assert!(request.contains("health"), "{request}");
+        assert!(request.contains("health"), "expected a health request");
         drop(listener);
         writeln!(
             stream,
@@ -3167,6 +3230,10 @@ fn second_kache_binary(link: &Path) {
     if std::fs::hard_link(KACHE_BIN, link).is_err() {
         std::fs::copy(KACHE_BIN, link).unwrap();
     }
+    let engine = link.with_file_name("kache-engine");
+    if std::fs::hard_link(env!("CARGO_BIN_EXE_kache-engine"), &engine).is_err() {
+        std::fs::copy(env!("CARGO_BIN_EXE_kache-engine"), &engine).unwrap();
+    }
 }
 
 /// A PATH layout for shim tests: `dirs` in order, then a directory with a
@@ -3224,6 +3291,25 @@ fn run_shim_command(mut cmd: std::process::Command) -> assert_cmd::assert::Asser
         stderr: std::fs::read(&stderr).unwrap(),
     }
     .assert()
+}
+
+#[cfg(unix)]
+#[test]
+fn a_frontend_installed_as_its_own_engine_fails_without_recursing() {
+    let e = env();
+    let install = tempfile::tempdir().unwrap();
+    let frontend = install.path().join("kache");
+    copy_kache_binary(&frontend);
+    let engine = install.path().join("kache-engine");
+    std::fs::remove_file(&engine).unwrap();
+    std::fs::hard_link(&frontend, &engine).unwrap();
+    let mut command = kache_process_as(&frontend, &e.home, &e.cache);
+    command.arg("--version");
+    run_shim_command(command)
+        .failure()
+        .stderr(predicates::str::contains(
+            "kache-engine points to the client",
+        ));
 }
 
 /// Two kache installs, each with a shim farm on PATH, must both reach the
@@ -5055,21 +5141,30 @@ fn diff_is_quiet_when_the_sessions_match() {
         .stdout(predicates::str::contains("misses 1 -> 1"));
 }
 
-/// A copy of the kache binary at `path`. On Unix a child process writes it,
-/// so no fork on another test thread holds a writable descriptor to it when
-/// it runs (ETXTBSY).
+/// Copy both binaries. A child writes executable files on Unix so another
+/// test thread cannot fork with a writable descriptor and cause ETXTBSY.
 fn copy_kache_binary(path: &Path) {
-    #[cfg(unix)]
-    {
-        let status = std::process::Command::new("/bin/cp")
-            .arg(KACHE_BIN)
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(status.success(), "copying {KACHE_BIN} failed: {status}");
+    let engine = path.with_file_name(if cfg!(windows) {
+        "kache-engine.exe"
+    } else {
+        "kache-engine"
+    });
+    for (source, destination) in [
+        (KACHE_BIN, path),
+        (env!("CARGO_BIN_EXE_kache-engine"), engine.as_path()),
+    ] {
+        #[cfg(unix)]
+        {
+            let status = std::process::Command::new("/bin/cp")
+                .arg(source)
+                .arg(destination)
+                .status()
+                .unwrap();
+            assert!(status.success(), "copying {source} failed: {status}");
+        }
+        #[cfg(not(unix))]
+        std::fs::copy(source, destination).unwrap();
     }
-    #[cfg(not(unix))]
-    std::fs::copy(KACHE_BIN, path).unwrap();
 }
 
 /// Copying a release changes its mtime, not the daemon release it requires.

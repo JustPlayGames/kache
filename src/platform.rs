@@ -9,6 +9,76 @@
 //! On Windows they map to OpenProcess/TerminateProcess and the Windows
 //! console-control events surfaced by tokio::signal::windows.
 
+static FRONTEND_IMAGE: std::sync::OnceLock<kache_shims::FrontendImage> = std::sync::OnceLock::new();
+
+pub(crate) fn set_frontend_image(image: kache_shims::FrontendImage) -> anyhow::Result<()> {
+    FRONTEND_IMAGE
+        .set(image)
+        .map_err(|_| anyhow::anyhow!("frontend image already initialized"))
+}
+
+pub(crate) fn frontend_executable() -> std::io::Result<std::path::PathBuf> {
+    FRONTEND_IMAGE
+        .get()
+        .map(|image| Ok(image.path.clone()))
+        .unwrap_or_else(|| std::env::current_exe().map(|path| kache_shims::frontend_for(&path)))
+}
+
+pub(crate) fn frontend_selection() -> Result<kache_shims::Selection, kache_shims::Error> {
+    let env = kache_shims::Env::from_process().map_err(kache_shims::Error::CurrentExe)?;
+    kache_shims::select_frontend(&env, FRONTEND_IMAGE.get(), &kache_shims::RealFs)
+}
+
+/// Release the build directory after daemon configuration has been resolved.
+#[cfg(windows)]
+pub(crate) fn release_daemon_working_directory(
+    runtime: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
+    let manifest = std::env::current_dir()?.join("Cargo.lock");
+    std::fs::create_dir_all(runtime)?;
+    std::env::set_current_dir(runtime)?;
+    Ok(manifest)
+}
+
+pub(crate) fn host_spawn(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    let _admission = kache_ipc::descriptors::spawn_guard();
+    command.spawn()
+}
+
+/// Run a host utility independently of compiler cancellation and jobserver
+/// state. Descriptor admission is excluded only while creating the process.
+#[cfg(all(unix, test))]
+pub(crate) fn host_output(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = host_spawn(command)?;
+    child.wait_with_output()
+}
+
+pub(crate) async fn host_output_async(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = {
+        #[cfg(unix)]
+        let _admission = kache_ipc::descriptors::spawn_guard();
+        command.spawn()?
+    };
+    child.wait_with_output().await
+}
+
 /// Is `pid` safe to hand to `kill(2)` as a single-process target?
 ///
 /// `kill(2)` overloads the pid argument with broadcast modes, and a bogus or
@@ -50,10 +120,9 @@ fn refuse_unsafe_pid(pid: u32, what: &str) {
 /// or the process is already gone.
 #[cfg(all(unix, test))]
 fn parent_pid(pid: u32) -> Option<u32> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let out =
+        host_output(std::process::Command::new("ps").args(["-o", "ppid=", "-p", &pid.to_string()]))
+            .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -114,7 +183,8 @@ fn assert_test_owns_process(pid: u32, what: &str) -> bool {
     );
 }
 
-/// Forcefully kill a process and all its descendants (process group on Unix, process tree on Windows).
+/// Kill the Unix process group owned by a compiler invocation.
+#[cfg(unix)]
 pub fn kill_process_group(pid: u32) {
     #[cfg(unix)]
     {
@@ -129,12 +199,6 @@ pub fn kill_process_group(pid: u32) {
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
     }
 }
 
@@ -270,25 +334,13 @@ pub fn configure_detached_process(cmd: &mut std::process::Command) {
     }
 }
 
-/// Put a child in its own process group so a timeout kill reaches its whole
-/// tree, WITHOUT detaching it from the console. A .cmd/.bat wrapper runs via
-/// cmd.exe, which needs a console; DETACHED_PROCESS makes it exit 0 with no
-/// output, so the probe must not use it.
+/// Put a Unix compiler child in its own group for invocation cancellation.
+#[cfg(unix)]
 pub fn configure_process_group(cmd: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP = 0x00000200
-        cmd.creation_flags(0x00000200);
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = cmd;
     }
 }
 
@@ -327,6 +379,62 @@ pub fn is_self_spawn(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> b
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_utilities_capture_bytes_without_request_cancellation() {
+        let script = "read ignored; printf '\\377host-out'; printf '\\376host-err' >&2; exit 7";
+        let check = |output: std::process::Output| {
+            assert_eq!(output.status.code(), Some(7));
+            assert_eq!(output.stdout, b"\xffhost-out");
+            assert_eq!(output.stderr, b"\xfehost-err");
+        };
+        {
+            let token = crate::invocation::process::Cancellation::default();
+            token.cancel();
+            let _scope = crate::invocation::process::CancellationScope::enter(Some(token));
+            check(
+                super::host_output(std::process::Command::new("/bin/sh").args(["-c", script]))
+                    .unwrap(),
+            );
+        }
+        check(
+            super::host_output_async(tokio::process::Command::new("/bin/sh").args(["-c", script]))
+                .await
+                .unwrap(),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_utility_wait_does_not_hold_descriptor_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let release = root.path().join("release");
+        std::thread::scope(|threads| {
+            let worker = threads.spawn(|| {
+                super::host_output(std::process::Command::new("/bin/sh")
+                    .args(["-c", "printf ready > \"$READY\"; while [ ! -e \"$RELEASE\" ]; do sleep .01; done"])
+                    .env("PATH", env!("PATH"))
+                    .env("READY", &ready).env("RELEASE", &release)).unwrap()
+            });
+            let started = std::time::Instant::now();
+            while !ready.exists() && started.elapsed() < std::time::Duration::from_secs(3) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                let _admission = kache_ipc::descriptors::spawn_guard();
+                let _ = tx.send(());
+            });
+            let admitted = rx.recv_timeout(std::time::Duration::from_secs(1));
+            // Release before asserting so a regression cannot strand the child.
+            std::fs::write(&release, b"go").unwrap();
+            assert!(worker.join().unwrap().status.success());
+            assert!(ready.exists());
+            admitted.expect("host utility held admission while waiting for its child");
+        });
+    }
+
     /// Is a usable `ps` on PATH? Tests that assert on the parent-chain walk
     /// need to know before asserting — the Nix build sandbox has none, and
     /// there the guard deliberately allows instead of judging.

@@ -3439,7 +3439,8 @@ mod tests {
         );
         let identity = kache_fs::file_identity(&pinned).unwrap();
         assert_ne!(identity, kache_fs::file_identity(&executable).unwrap());
-        let output = Command::new(&pinned).output().unwrap();
+        let output =
+            crate::test_support::output_retrying_etxtbsy(&mut Command::new(&pinned)).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"pinned\n");
         assert_eq!(pin_kache(&executable, &profile).unwrap(), pinned);
@@ -3462,7 +3463,8 @@ mod tests {
         assert_eq!(pin_kache(&executable, &profile).unwrap(), pinned);
         assert_ne!(kache_fs::file_identity(&pinned).unwrap(), original);
         assert_eq!(kache_fs::file_identity(&executable).unwrap(), original);
-        let output = Command::new(&pinned).output().unwrap();
+        let output =
+            crate::test_support::output_retrying_etxtbsy(&mut Command::new(&pinned)).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"pinned\n");
     }
@@ -3510,7 +3512,8 @@ mod tests {
             std::os::unix::fs::symlink(target, &pinned).unwrap();
             assert_eq!(pin_kache(&executable, &profile).unwrap(), pinned);
             assert!(std::fs::symlink_metadata(&pinned).unwrap().is_file());
-            let output = Command::new(&pinned).output().unwrap();
+            let output =
+                crate::test_support::output_retrying_etxtbsy(&mut Command::new(&pinned)).unwrap();
             assert!(output.status.success());
             assert_eq!(output.stdout, b"pinned\n");
         }
@@ -3537,7 +3540,8 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&pinned).unwrap();
         assert!(metadata.is_file());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
-        let output = Command::new(&pinned).output().unwrap();
+        let output =
+            crate::test_support::output_retrying_etxtbsy(&mut Command::new(&pinned)).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"pinned\n");
     }

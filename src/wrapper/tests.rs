@@ -634,6 +634,7 @@ fn volume_route_path_rustc_prefers_out_dir_then_output_parent() {
 #[test]
 fn volume_route_path_cc_uses_output_parent() {
     let mut parsed = crate::compiler::cc::CcArgs {
+        invocation_env: crate::invocation::InvocationEnv::capture(),
         program: "cc".into(),
         rest: Vec::new(),
         sources: vec![PathBuf::from("a.c")],
@@ -2054,6 +2055,69 @@ fn artifact_target_path_keeps_the_exact_output_path() {
     assert_eq!(rustc_output_dir(&args), Some(PathBuf::from("out")));
 }
 
+#[test]
+fn prestaging_relative_outputs_keeps_each_invocations_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let mut expected = Vec::new();
+    std::thread::scope(|threads| {
+        for (client, output_dir, name) in [
+            ("ordinary", "target/debug/deps", "app"),
+            (
+                "build-script",
+                "target/debug/build/unit",
+                "build_script_build",
+            ),
+        ] {
+            let root = dir.path().join(client);
+            std::fs::create_dir(&root).unwrap();
+            let output = format!("{output_dir}/{name}");
+            expected.push(root.join(&output));
+            let config = &config;
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    std::iter::empty::<(String, String)>(),
+                    Some(root.clone()),
+                    None,
+                    root,
+                );
+                let args = RustcArgs::parse_for(
+                    &s(&[
+                        "rustc",
+                        "main.rs",
+                        "--crate-name",
+                        name,
+                        "--crate-type",
+                        "bin",
+                        "--out-dir",
+                        output_dir,
+                        "-o",
+                        &output,
+                    ]),
+                    &env,
+                )
+                .unwrap();
+                let mut file = cached_file(name, &"a".repeat(64));
+                file.size = crate::prestage::MIN_BYTES;
+                file.executable = true;
+                let meta = entry_meta(&"b".repeat(64), vec![file], &["link"]);
+                remember_prestaged_executables(
+                    config,
+                    &RustcCompiler::new(),
+                    &args,
+                    Path::new(output_dir),
+                    None,
+                    &meta,
+                );
+            });
+        }
+    });
+    let mut recorded = crate::prestage::recorded_dests(&config.cache_dir);
+    expected.sort();
+    recorded.sort();
+    assert_eq!(recorded, expected);
+}
+
 /// Prestage records and hints go to the target directory itself, also
 /// for a build script compiled into `<profile>/build/<unit>`, where
 /// `RustcArgs::target_dir` answers the profile directory.
@@ -2076,6 +2140,8 @@ fn only_a_workspace_records_the_target_it_builds_into() {
 
 #[test]
 fn prestage_target_dir_is_the_target_root_for_every_unit() {
+    let dir = tempfile::tempdir().unwrap();
+    let target_root = dir.path().join("target");
     let parse = |out_dir: &str, target: Option<&str>| {
         let mut argv = vec![
             "rustc".to_string(),
@@ -2083,20 +2149,20 @@ fn prestage_target_dir_is_the_target_root_for_every_unit() {
             "build_script_build".to_string(),
             "build.rs".to_string(),
             "--out-dir".to_string(),
-            out_dir.to_string(),
+            target_root.join(out_dir).to_string_lossy().into_owned(),
         ];
         if let Some(target) = target {
             argv.extend(["--target".to_string(), target.to_string()]);
         }
         RustcArgs::parse(&argv).unwrap()
     };
-    let root = Some(PathBuf::from("/w/target"));
+    let root = Some(target_root.clone());
     for (out_dir, target) in [
-        ("/w/target/debug/build/app-0123456789abcdef", None),
-        ("/w/target/debug/build/app/0123456789abcdef/out", None),
-        ("/w/target/debug/deps", None),
+        ("debug/build/app-0123456789abcdef", None),
+        ("debug/build/app/0123456789abcdef/out", None),
+        ("debug/deps", None),
         (
-            "/w/target/x86_64-unknown-linux-gnu/debug/deps",
+            "x86_64-unknown-linux-gnu/debug/deps",
             Some("x86_64-unknown-linux-gnu"),
         ),
     ] {
@@ -2107,8 +2173,8 @@ fn prestage_target_dir_is_the_target_root_for_every_unit() {
         );
     }
     assert_eq!(
-        parse("/w/target/debug/build/app-0123456789abcdef", None).target_dir(),
-        Some(PathBuf::from("/w/target/debug")),
+        parse("debug/build/app-0123456789abcdef", None).target_dir(),
+        Some(target_root.join("debug")),
         "the case prestage_target_dir corrects"
     );
 }
@@ -2211,9 +2277,10 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().canonicalize().unwrap();
     let workspace = base.join("workspace");
+    let cwd = workspace.join("member");
     let target = base.join("shared-target");
     let vendored = base.join("vendored-sources");
-    for path in [&workspace, &target, &vendored] {
+    for path in [&workspace, &cwd, &target, &vendored] {
         std::fs::create_dir_all(path).unwrap();
     }
 
@@ -2221,7 +2288,13 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
         base_dirs: vec![vendored.to_string_lossy().into_owned()],
         ..test_config(base.join("cache"))
     };
-    let roots = configured_rustc_depinfo_roots(&config, Some(&workspace), Some(&target));
+    let env = crate::invocation::InvocationEnv::from_parts(
+        std::iter::empty::<(String, String)>(),
+        Some(cwd.clone()),
+        None,
+        base.clone(),
+    );
+    let roots = configured_rustc_depinfo_roots(&config, Some(&workspace), Some(&target), &env);
 
     let found = |root: &Path, sentinel: &str| {
         roots
@@ -2232,6 +2305,7 @@ fn configured_rustc_depinfo_roots_cover_every_restorable_anchor() {
         found(&workspace, "__kache_workspace__/"),
         "workspace root missing from {roots:?}"
     );
+    assert!(found(&cwd, "__kache_cwd__/"), "cwd missing from {roots:?}");
     assert!(
         found(&target, "__kache_target_rule__/"),
         "external target root missing from {roots:?}"
@@ -3269,17 +3343,21 @@ fn rustc_store_staging_round_trips_depinfo_without_mutating_outputs() {
         },
     ]);
 
-    let prepared = prepare_rustc_store_files(
+    let client_temp = producing_working_dir.join("client-temp");
+    std::fs::create_dir_all(&client_temp).unwrap();
+    let prepared = prepare_rustc_store_files_for(
         &outputs,
         Some(&producing_target),
         &producing_working_dir,
         Some(&producing_workspace),
         &[],
+        &client_temp,
     )
     .unwrap();
     assert_eq!(std::fs::read_to_string(&depfile).unwrap(), original);
     assert_eq!(std::fs::read(&rlib).unwrap(), b"rlib bytes");
     assert_ne!(prepared.files[0].0, depfile);
+    assert_eq!(prepared.files[0].0.parent(), Some(client_temp.as_path()));
     assert_eq!(prepared.files[1].0, rlib);
     assert_eq!(std::fs::read(&prepared.files[1].0).unwrap(), b"rlib bytes");
 
@@ -3950,10 +4028,13 @@ fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
     std::fs::write(&source, b"int x;\n").unwrap();
     let source_mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
 
-    apply_cc_post_publish_actions(&[
-        (object.clone(), ArtifactKind::Object),
-        (depinfo.clone(), ArtifactKind::DepInfo),
-    ])
+    apply_cc_post_publish_actions(
+        &[
+            (object.clone(), ArtifactKind::Object),
+            (depinfo.clone(), ArtifactKind::DepInfo),
+        ],
+        &crate::invocation::InvocationEnv::capture(),
+    )
     .unwrap();
     for path in [&object, &depinfo] {
         assert!(std::fs::metadata(path).unwrap().modified().unwrap() >= source_mtime);
@@ -3961,8 +4042,11 @@ fn cc_post_publish_stamps_old_outputs_as_fresh_writes() {
     assert_eq!(std::fs::read(&object).unwrap(), b"object");
     assert_eq!(std::fs::read(&depinfo).unwrap(), b"unit.o: unit.c\n");
     assert!(
-        apply_cc_post_publish_actions(&[(dir.path().join("missing.o"), ArtifactKind::Object)])
-            .is_err()
+        apply_cc_post_publish_actions(
+            &[(dir.path().join("missing.o"), ArtifactKind::Object)],
+            &crate::invocation::InvocationEnv::capture()
+        )
+        .is_err()
     );
 }
 
@@ -4096,8 +4180,14 @@ fn cc_generated_source_depinfo_rebases_headers_outside_the_build_directory() {
     // distinct ownership sentinels. No live process environment is needed.
     for sentinel in ["__kache_base_dir__/", "__kache_base_dir_0__/"] {
         let roots = vec![(producer.clone(), sentinel.to_string(), 5)];
-        let prepared =
-            prepare_cc_store_files_in(&artifacts, Some(&producer_build), None, &roots).unwrap();
+        let prepared = prepare_cc_store_files_in(
+            &artifacts,
+            Some(&producer_build),
+            None,
+            &roots,
+            producer.as_path(),
+        )
+        .unwrap();
         let stored = std::fs::read_to_string(&prepared.files[1].0).unwrap();
         assert!(stored.contains(sentinel));
         assert!(!stored.contains(producer.to_str().unwrap()));
@@ -4172,6 +4262,51 @@ fn restore_cc_from_cache_replaces_existing_plain_object() {
         std::fs::read(store.blob_path(hash)).unwrap(),
         b"cached object"
     );
+}
+
+#[test]
+fn concurrent_cc_restores_root_objects_and_link_outputs_in_each_client_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let bytes = b"cached bytes";
+    let hash = blake3::hash(bytes).to_hex().to_string();
+    create_blob(&Store::open(&config).unwrap(), &hash, bytes);
+    std::thread::scope(|threads| {
+        for (name, args, cached) in [
+            (
+                "compile",
+                s(&["cc", "-c", "unit.c", "-o", "out/unit.o"]),
+                "unit.o",
+            ),
+            ("link", s(&["cc", "unit.o", "-o", "out/app"]), "app"),
+        ] {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(root.join("out")).unwrap();
+            let config = config.clone();
+            let hash = hash.clone();
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    std::iter::empty::<(String, String)>(),
+                    Some(root.clone()),
+                    None,
+                    root.clone(),
+                );
+                let parsed = crate::compiler::cc::CcArgs::parse_for(&args, &env).unwrap();
+                let meta = entry_meta("cc-client-path", vec![cached_file(cached, &hash)], &[]);
+                restore_cc_from_cache(&Store::open(&config).unwrap(), &parsed, &meta).unwrap();
+                let output = root.join("out").join(cached);
+                assert_eq!(std::fs::read(&output).unwrap(), bytes);
+                #[cfg(unix)]
+                if name == "link" {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_ne!(
+                        std::fs::metadata(output).unwrap().permissions().mode() & 0o100,
+                        0
+                    );
+                }
+            });
+        }
+    });
 }
 
 #[test]
@@ -5613,7 +5748,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
     // Store side: bake + tar the bundle while the `.o` exists.
     use crate::compiler::platform::Platform as _;
     let staging = tempfile::tempdir().unwrap();
-    let tar_path = crate::compiler::platform::MacOsPlatform
+    let tar_path = crate::compiler::platform::MacOsPlatform::default()
         .package_debug_bundle(&binary, staging.path())
         .unwrap()
         .expect("macOS host must package a bundle for a -g binary");
@@ -7198,6 +7333,41 @@ fn nvcc_passthrough_propagates_exit_code_and_reasons() {
     );
 }
 
+#[test]
+fn nvcc_event_root_uses_each_clients_out_dir_before_its_working_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let caller = root.path().join("caller");
+    std::fs::create_dir(&caller).unwrap();
+    for name in ["one", "two"] {
+        tagged_target(&root.path().join(name));
+    }
+    let mut first = crate::invocation::InvocationEnv::from_parts(
+        [("OUT_DIR", "../one/target/debug/build/pkg/out")],
+        Some(caller.clone()),
+        None,
+        root.path().to_owned(),
+    );
+    let mut second = first.clone();
+    second.set("OUT_DIR", "../two/target/debug/build/pkg/out");
+    let expected = |name| {
+        root.path()
+            .join(name)
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(nvcc_event_root_for(&first), expected("one"));
+    assert_eq!(nvcc_event_root_for(&second), expected("two"));
+    first.set("OUT_DIR", "");
+    assert_eq!(
+        nvcc_event_root_for(&first),
+        caller.canonicalize().unwrap().to_string_lossy()
+    );
+    second.set("KACHE_EVENT_ROOT", "../one");
+    assert_eq!(nvcc_event_root_for(&second), expected("one"));
+}
+
 /// Write the fake nvcc toolchain with baked-in paths (no
 /// environment needed, so tests stay parallel): `nvcc` answers
 /// `--version`, `--dryrun` (naming `host`), `-M` (the source plus
@@ -7649,6 +7819,7 @@ fn seed_nvcc_entry(
     let file_hasher = FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -8757,6 +8928,48 @@ fn log_event_persists_same_key_lookup_rejection() {
     );
 }
 
+#[test]
+fn daemon_publications_are_counted_only_for_the_request_that_stored_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let daemon = std::sync::Arc::new(crate::daemon::Daemon::new(config.clone()));
+    let env = crate::invocation::InvocationEnv::from_parts(
+        Vec::<(OsString, OsString)>::new(),
+        Some(dir.path().to_owned()),
+        None,
+        dir.path().to_owned(),
+    );
+    let stored = StorePutResult {
+        output_blobs: 1,
+        duplicate_blobs: 0,
+        new_blobs: 1,
+    };
+    let write = |result, put| {
+        log_event(
+            &config,
+            EventInputs::new("/repo", "foo.c", result, 1).store_put(put),
+        );
+    };
+    let _standalone = InvocationWrapperScope::enter_for(&env, None);
+    write(EventResult::Miss, stored);
+    {
+        let _delegated = InvocationWrapperScope::enter_for(&env, Some(daemon));
+        write(EventResult::Miss, stored);
+        write(EventResult::LocalHit, StorePutResult::default());
+        write(EventResult::Miss, StorePutResult::default());
+    }
+    write(EventResult::Miss, stored);
+    let events = crate::events::read_events(&config.event_log_path()).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.store_handed_off)
+            .collect::<Vec<_>>(),
+        [false, true, false, false, false]
+    );
+    assert!(events.iter().all(|event| event.daemon_store_ms == 0));
+}
+
 /// `verify_compare` (schema 16) is read from the hit-qualification stash.
 /// Empty when verify did not run; the class string when it did.
 #[test]
@@ -9261,6 +9474,75 @@ fn restore_evicts_entry_whose_depinfo_references_missing_paths() {
         !out_dir.join("foo.d").exists(),
         "nothing may be materialized before the gate"
     );
+}
+
+#[test]
+fn concurrent_rustc_restores_validate_relative_depinfo_in_each_client_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let dep = b"out/libfoo.rlib: src/lib.rs\n";
+    let library = b"rlib bytes";
+    let dep_hash = blake3::hash(dep).to_hex().to_string();
+    let lib_hash = blake3::hash(library).to_hex().to_string();
+    let store = Store::open(&config).unwrap();
+    create_blob(&store, &dep_hash, dep);
+    create_blob(&store, &lib_hash, library);
+    std::thread::scope(|threads| {
+        for name in ["left", "right"] {
+            let root = dir.path().join(name);
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/lib.rs"), "pub fn foo() {}\n").unwrap();
+            let config = config.clone();
+            let dep_hash = dep_hash.clone();
+            let lib_hash = lib_hash.clone();
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    std::iter::empty::<(String, String)>(),
+                    Some(root.clone()),
+                    None,
+                    root.clone(),
+                );
+                let args = RustcArgs::parse_for(
+                    &s(&[
+                        "rustc",
+                        "src/lib.rs",
+                        "--crate-name",
+                        "foo",
+                        "--crate-type",
+                        "lib",
+                        "--emit",
+                        "dep-info,link",
+                        "--out-dir",
+                        "out",
+                    ]),
+                    &env,
+                )
+                .unwrap();
+                let meta = entry_meta(
+                    "rustc-client-path",
+                    vec![
+                        cached_file("foo.d", &dep_hash),
+                        cached_file("libfoo.rlib", &lib_hash),
+                    ],
+                    &["dep-info", "link"],
+                );
+                restore_from_cache(
+                    &config,
+                    &RustcCompiler::new(),
+                    &Store::open(&config).unwrap(),
+                    &args,
+                    &meta,
+                    None,
+                )
+                .unwrap();
+                assert!(root.join("out/foo.d").is_file());
+                assert_eq!(
+                    std::fs::read(root.join("out/libfoo.rlib")).unwrap(),
+                    library
+                );
+            });
+        }
+    });
 }
 
 #[test]
@@ -10200,21 +10482,26 @@ fn only_a_cargo_compile_outside_every_layout_is_unrecognized() {
 
 #[test]
 fn the_unknown_layout_notice_shows_once_per_session() {
-    let _lock = crate::test_support::process_state_test_lock();
     let dir = tempfile::TempDir::new().unwrap();
     let config = test_config(dir.path().to_path_buf());
     let root = "/some/workspace";
     let target = tagged_target(&dir.path().join("w"));
-    let mut unknown = RustcArgs::default();
-    unknown.crate_name = Some("demo".into());
+    let env = crate::invocation::InvocationEnv::from_parts(
+        [("CARGO_CRATE_NAME", "demo")],
+        Some(dir.path().to_owned()),
+        None,
+        dir.path().to_owned(),
+    );
+    let mut unknown = RustcArgs::parse_for(
+        &["rustc".into(), "--crate-name".into(), "demo".into()],
+        &env,
+    )
+    .unwrap();
     unknown.out_dir = Some(target.join("debug/units/demo/out"));
     let mut known = unknown.clone();
     known.out_dir = Some(target.join("debug/deps"));
     let mut untagged = unknown.clone();
     untagged.out_dir = Some(dir.path().join("bazel-out/units/demo/out"));
-    let previous = std::env::var_os("CARGO_CRATE_NAME");
-    // SAFETY: the process-state lock serialises environment edits.
-    unsafe { std::env::set_var("CARGO_CRATE_NAME", "demo") };
     // A minted session records the real clock, so the test runs on it.
     let now = now_epoch_secs();
     let shown = [
@@ -10231,10 +10518,6 @@ fn the_unknown_layout_notice_shows_once_per_session() {
     held.lock().unwrap();
     let while_held = maybe_notice_unknown_layout(&config, &unknown, root, later);
     drop(held);
-    match previous {
-        Some(value) => unsafe { std::env::set_var("CARGO_CRATE_NAME", value) },
-        None => unsafe { std::env::remove_var("CARGO_CRATE_NAME") },
-    }
     assert_eq!(shown, [false, false, true, false, true]);
     assert!(!while_held);
 }
@@ -10781,11 +11064,10 @@ fn event_root_string_relative_path_is_joined_to_cwd_and_absolute() {
 fn event_root_override_reads_kache_event_root_env() {
     // KACHE_EVENT_ROOT, when set and non-empty, overrides the event root.
     let _lock = crate::test_support::process_state_test_lock();
-    let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", "/some/forest/root");
-    assert_eq!(
-        event_root_override(),
-        Some(PathBuf::from("/some/forest/root"))
-    );
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("forest/root");
+    let _guard = TestEnvGuard::set("KACHE_EVENT_ROOT", root.to_str().unwrap());
+    assert_eq!(event_root_override(), Some(root));
     // Empty value is treated as unset.
     unsafe {
         std::env::set_var("KACHE_EVENT_ROOT", "");
@@ -12335,6 +12617,69 @@ fn only_a_check_unit_is_redated() {
     assert!(cargo_check_redate_ns(&args("--emit=dep-info,metadata,link")).is_none());
 }
 
+#[test]
+fn reused_workers_discard_unfinished_compile_and_event_state() {
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        for exit in [17, 31] {
+            let barrier = &barrier;
+            threads.spawn(move || {
+                for _ in 0..2 {
+                    let _request = InvocationWrapperScope::enter();
+                    assert_eq!(PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                    assert_eq!(CC_PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                    assert!(crate::demand::take().is_empty());
+                    assert!(crate::verify_compare::take_last_report().is_empty());
+                    PRECOMPILED_EXIT.with(|slot| slot.set(Some(exit)));
+                    CC_PRECOMPILED_EXIT.with(|slot| slot.set(Some(exit + 1)));
+                    PRECOMPILED_REBUILT
+                        .with(|slot| slot.borrow_mut().paths.push("rust-parent".into()));
+                    CC_PRECOMPILED_REBUILT
+                        .with(|slot| slot.borrow_mut().paths.push("cc-parent".into()));
+                    crate::demand::record(&format!("parent-{exit}"));
+                    crate::verify_compare::record_report(format!("parent-{exit}"));
+                    barrier.wait();
+                    let result = std::panic::catch_unwind(|| {
+                        let _nested = InvocationWrapperScope::enter();
+                        assert_eq!(PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                        assert_eq!(CC_PRECOMPILED_EXIT.with(std::cell::Cell::get), None);
+                        assert!(PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.is_empty()));
+                        assert!(CC_PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.is_empty()));
+                        crate::demand::record("unfinished-child");
+                        crate::verify_compare::record_report("unfinished-child".into());
+                        PRECOMPILED_EXIT.with(|slot| slot.set(Some(99)));
+                        CC_PRECOMPILED_EXIT.with(|slot| slot.set(Some(98)));
+                        panic!("request failed before logging its event");
+                    });
+                    assert!(result.is_err());
+                    assert_eq!(PRECOMPILED_EXIT.with(std::cell::Cell::get), Some(exit));
+                    assert_eq!(
+                        CC_PRECOMPILED_EXIT.with(std::cell::Cell::get),
+                        Some(exit + 1)
+                    );
+                    assert_eq!(
+                        PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.clone()),
+                        ["rust-parent"]
+                    );
+                    assert_eq!(
+                        CC_PRECOMPILED_REBUILT.with(|slot| slot.borrow().paths.clone()),
+                        ["cc-parent"]
+                    );
+                    let demands = crate::demand::take();
+                    assert_eq!(demands.len(), 1);
+                    assert_eq!(demands[0].cache_key, format!("parent-{exit}"));
+                    assert_eq!(
+                        crate::verify_compare::take_last_report(),
+                        format!("parent-{exit}")
+                    );
+                    // Leave all provisional compiler state populated. The next
+                    // iteration must still begin as a fresh request.
+                }
+            });
+        }
+    });
+}
+
 #[cfg(unix)]
 #[test]
 fn an_output_is_kept_only_when_it_already_holds_the_entrys_bytes() {
@@ -12477,4 +12822,127 @@ fn a_busy_index_keeps_prediction_rows_for_the_daemon_instead_of_waiting() {
         Some(closure.source_files.clone())
     );
     assert!(hasher.input_prediction("unit-b").is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_passthroughs_and_fallbacks_use_each_clients_environment_and_directory() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        for (root, client, fail_fallback) in
+            [(first.path(), "first", "0"), (second.path(), "second", "1")]
+        {
+            std::fs::create_dir(root.join("bin")).unwrap();
+            for compiler in ["cc", "rustc"] {
+                kache_fs::testutil::write_executable(
+                    &root.join("bin").join(compiler),
+                    "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -o ]; then out=$2; shift 2; else shift; fi; done\nprintf '%s:%s' \"$CLIENT\" \"$CARGO_INCREMENTAL\" > \"$out\"\n",
+                );
+            }
+            kache_fs::testutil::write_executable(
+                &root.join("bin/fallback"),
+                "#!/bin/sh\nprintf '%s' \"$CLIENT\" > fallback-seen\nif [ \"$FAIL_FALLBACK\" = 1 ]; then exit 42; fi\nexec \"$@\"\n",
+            );
+            std::fs::write(root.join("input.c"), "int value;\n").unwrap();
+            std::fs::write(root.join("input.rs"), "pub fn value() {}\n").unwrap();
+            let barrier = &barrier;
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    [
+                        ("PATH", "bin"),
+                        ("CLIENT", client),
+                        ("FAIL_FALLBACK", fail_fallback),
+                        ("CARGO_INCREMENTAL", "1"),
+                    ],
+                    Some(root.to_owned()),
+                    None,
+                    root.to_owned(),
+                );
+                let mut config = test_config(root.join("cache"));
+                config.fallback = Some("fallback".into());
+                let cc = crate::compiler::cc::CcArgs::parse_for(
+                    &[
+                        "cc".into(),
+                        "-c".into(),
+                        "input.c".into(),
+                        "-o".into(),
+                        "output.o".into(),
+                    ],
+                    &env,
+                )
+                .unwrap();
+                let rustc = RustcArgs::parse_for(
+                    &[
+                        "rustc".into(),
+                        "--crate-name".into(),
+                        "demo".into(),
+                        "--crate-type".into(),
+                        "lib".into(),
+                        "input.rs".into(),
+                        "-o".into(),
+                        "output.rlib".into(),
+                    ],
+                    &env,
+                )
+                .unwrap();
+                barrier.wait();
+                let cc_result = cc_passthrough(&config, &cc).unwrap();
+                assert_eq!(cc_result.exit_code, 0);
+                assert_eq!(cc_result.fallback, fail_fallback == "0");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("output.o")).unwrap(),
+                    format!("{client}:1")
+                );
+                let rust_result = passthrough(&rustc, config.fallback.as_deref(), false).unwrap();
+                assert_eq!(rust_result.exit_code, 0);
+                assert_eq!(rust_result.fallback, fail_fallback == "0");
+                assert_eq!(
+                    std::fs::read_to_string(root.join("output.rlib")).unwrap(),
+                    format!("{client}:0")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(root.join("fallback-seen")).unwrap(),
+                    client
+                );
+            });
+        }
+    });
+}
+
+#[test]
+fn concurrent_requests_keep_progress_and_warning_markers_with_the_client() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|threads| {
+        for (root, selector, level) in [(first.path(), "hits", 1), (second.path(), "verbose", 2)] {
+            let barrier = &barrier;
+            threads.spawn(move || {
+                let env = crate::invocation::InvocationEnv::from_parts(
+                    [("KACHE_PROGRESS", selector)],
+                    Some(root.to_owned()),
+                    None,
+                    root.to_owned(),
+                );
+                barrier.wait();
+                for _ in 0..2 {
+                    let _request = InvocationWrapperScope::enter_for(&env, None);
+                    assert_eq!(progress_level(), level);
+                    assert!(warn_marker_path("fault", Path::new("cache")).starts_with(root));
+                    let mut child = env.clone();
+                    child.set("KACHE_PROGRESS", "off");
+                    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _child = InvocationWrapperScope::enter_for(&child, None);
+                        assert_eq!(progress_level(), 0);
+                        panic!("nested request failed");
+                    }));
+                    assert!(failed.is_err());
+                    assert_eq!(progress_level(), level);
+                }
+                assert!(INVOCATION_SETTINGS.with(|slot| slot.borrow().is_none()));
+            });
+        }
+    });
 }

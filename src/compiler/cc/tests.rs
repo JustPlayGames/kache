@@ -1,5 +1,176 @@
 use super::*;
 
+#[test]
+fn header_availability_uses_each_clients_relative_paths_and_include_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let mut clients = Vec::new();
+    for name in ["first", "second"] {
+        let cwd = root.path().join(name);
+        fs::create_dir_all(cwd.join("src")).unwrap();
+        fs::create_dir(cwd.join("include")).unwrap();
+        fs::write(
+            cwd.join("src/unit.c"),
+            "#if __has_include(<optional.h>)\n#endif\nint x;\n",
+        )
+        .unwrap();
+        let env =
+            InvocationEnv::from_parts([("CPATH", "include")], Some(cwd.clone()), None, cwd.clone());
+        let parsed =
+            CcArgs::parse_for(&s(&["cc", "-c", "src/unit.c", "-o", "unit.o"]), &env).unwrap();
+        clients.push((cwd, parsed));
+    }
+    fs::write(clients[0].0.join("include/optional.h"), "/* present */\n").unwrap();
+    let inputs = [PathBuf::from("src/unit.c")];
+    let digests = std::thread::scope(|threads| {
+        clients
+            .iter()
+            .map(|(cwd, parsed)| {
+                let inputs = &inputs;
+                threads.spawn(move || {
+                    let names =
+                        cc_shadowing_names(parsed, inputs, &crate::cache_key::FileHasher::new())
+                            .unwrap();
+                    assert_eq!(names.probes.len(), 1);
+                    assert!(
+                        names.probes[0]
+                            .candidates
+                            .contains(&cwd.join("include/optional.h"))
+                    );
+                    assert!(
+                        names.probes[0]
+                            .candidates
+                            .iter()
+                            .all(|path| path.is_absolute())
+                    );
+                    digest_cc_shadowing_names(parsed, &names).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_ne!(digests[0], digests[1]);
+    fs::write(
+        clients[1].0.join("include/optional.h"),
+        "/* now present */\n",
+    )
+    .unwrap();
+    assert_ne!(
+        digest_cc_include_shadowing(&clients[1].1, &inputs).unwrap(),
+        digests[1]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_clients_preprocess_and_compile_with_their_own_context() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let snapshot = |root: &Path, token: &str, epoch: &str| {
+        let root = root.canonicalize().unwrap();
+        for name in ["bin", "home", "tmp"] {
+            fs::create_dir(root.join(name)).unwrap();
+        }
+        fs::write(root.join("unit.c"), "int x;\n").unwrap();
+        kache_fs::testutil::write_executable(
+            &root.join("bin/client-cc"),
+            r#"#!/bin/sh
+mode=compile
+out=unit.o
+dep=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -E) mode=preprocess ;;
+        -o) out=$2; shift ;;
+        -MF) dep=$2; shift ;;
+    esac
+    shift
+done
+printf '%s\n' "$CLIENT_TOKEN" "$SOURCE_DATE_EPOCH" "$HOME" "$TMPDIR" "$PWD" > "$mode.context"
+if [ -n "$dep" ]; then
+    printf 'unit.o: unit.c\n' > "$dep"
+    printf '%s' "$dep" > "$mode.dep-location"
+fi
+if [ "$mode" = preprocess ]; then
+    test "$KACHE_CC_KEY_PROBE" = 1 || exit 7
+    printf 'int x = %s;\n' "$CLIENT_TOKEN"
+else
+    printf '%s:%s' "$CLIENT_TOKEN" "$SOURCE_DATE_EPOCH" > "$out"
+fi
+"#,
+        );
+        let home = root.join("home");
+        let temp = root.join("tmp");
+        InvocationEnv::from_parts(
+            [
+                ("PATH", "bin".into()),
+                ("CLIENT_TOKEN", token.into()),
+                ("SOURCE_DATE_EPOCH", epoch.into()),
+                ("HOME", home.as_os_str().to_owned()),
+                ("TMPDIR", temp.as_os_str().to_owned()),
+            ],
+            Some(root.to_path_buf()),
+            Some(home),
+            temp,
+        )
+    };
+    let first_env = snapshot(first.path(), "11", "13");
+    let second_env = snapshot(second.path(), "29", "31");
+    let compile = |env: &InvocationEnv| {
+        let compiler = CcCompiler::new().with_invocation_env(env);
+        let argv = s(&["client-cc", "-c", "unit.c", "-o", "unit.o"]);
+        let parsed = compiler.parse(&argv).unwrap();
+        assert_eq!(parsed.program, "client-cc");
+        assert_eq!(parsed.rest, argv[1..]);
+        assert_eq!(parsed.sources, vec![PathBuf::from("unit.c")]);
+        let maps = cc_prefix_maps(&parsed, &[]);
+        let expansion =
+            preprocess_hash(&parsed, &maps, &crate::cache_key::FileHasher::new(), true).unwrap();
+        let token = env.var("CLIENT_TOKEN").unwrap();
+        let epoch = env.var("SOURCE_DATE_EPOCH").unwrap();
+        assert_eq!(
+            expansion.hash,
+            blake3::hash(format!("int x = {token};\n").as_bytes())
+                .to_hex()
+                .to_string()
+        );
+        let root = env.cwd().unwrap();
+        let private_depfile = fs::read_to_string(root.join("preprocess.dep-location")).unwrap();
+        assert!(Path::new(&private_depfile).starts_with(env.temp_dir()));
+        let result = compiler.execute(&parsed).unwrap();
+        assert_eq!(result.exit_code, 0, "{}", result.stderr);
+        assert_eq!(
+            fs::read_to_string(root.join("unit.o")).unwrap(),
+            format!("{token}:{epoch}")
+        );
+        assert_eq!(result.artifacts.outputs().len(), 1);
+        assert_eq!(result.artifacts.outputs()[0].path, root.join("unit.o"));
+        let expected = format!(
+            "{token}\n{epoch}\n{}\n{}\n{}\n",
+            env.home_dir().unwrap().display(),
+            env.temp_dir().display(),
+            root.display()
+        );
+        for stage in ["preprocess", "compile"] {
+            assert_eq!(
+                fs::read_to_string(root.join(format!("{stage}.context"))).unwrap(),
+                expected
+            );
+        }
+        expansion.hash
+    };
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| compile(&first_env));
+        let right = scope.spawn(|| compile(&second_env));
+        (left.join().unwrap(), right.join().unwrap())
+    });
+    assert_ne!(
+        left, right,
+        "the expansion must depend on the requesting client's environment"
+    );
+}
+
 fn s(args: &[&str]) -> Vec<String> {
     args.iter().map(|a| a.to_string()).collect()
 }
@@ -272,6 +443,7 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
             .cache_key(
                 &parse(flags),
                 &KeyCtx {
+                    invocation_env: &crate::invocation::InvocationEnv::capture(),
                     file_hasher: &file_hasher,
                     path_normalizer: &path_normalizer,
                     cache_dir: cache,
@@ -328,6 +500,7 @@ fn a_key_from_before_the_input_race_fixes_is_never_todays() {
         ])
         .unwrap();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &dir.path().join("cache"),
@@ -490,6 +663,43 @@ fn clang_cl_firefox_style_invocation_is_cacheable() {
 }
 
 // ── recognize ────────────────────────────────────────────────
+
+#[test]
+fn unresolved_bare_compilers_follow_each_clients_search_path() {
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    let empty = root.path().join("empty");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&empty).unwrap();
+    let program = "custom-client-compiler";
+    let file = bin.join(if cfg!(windows) {
+        "custom-client-compiler.exe"
+    } else {
+        program
+    });
+    kache_fs::testutil::write_executable(&file, "#!/bin/sh\nexit 0\n");
+    let client = |path: &Path| {
+        InvocationEnv::from_parts(
+            [("PATH", path.as_os_str())],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    let first = client(&bin);
+    let second = client(&empty);
+    assert!(!is_unresolvable_bare_program(program, &first));
+    assert!(is_unresolvable_bare_program(program, &second));
+    assert!(is_unresolvable_bare_program(
+        "missing-client-compiler",
+        &first
+    ));
+    for explicit in ["tools/compiler", r"tools\compiler", file.to_str().unwrap()] {
+        assert!(!is_unresolvable_bare_program(explicit, &first));
+        assert!(!is_unresolvable_bare_program(explicit, &second));
+    }
+    assert!(!is_unresolvable_bare_program(program, &first));
+}
 
 #[test]
 fn recognizes_canonical_command_names() {
@@ -2785,6 +2995,7 @@ fn cache_key_for_link_changes_when_an_object_changes() {
     let file_hasher = crate::cache_key::FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: cache.path(),
@@ -3274,6 +3485,7 @@ fn wa_debug_prefix_map_changes_cache_key_issue_644() {
     let file_hasher = crate::cache_key::FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &cache,
@@ -3863,6 +4075,7 @@ fn cache_key_refuses_probe_captured_flags_without_resolved_invocation() {
         let file_hasher = crate::cache_key::FileHasher::new();
         let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
         let ctx = KeyCtx {
+            invocation_env: &crate::invocation::InvocationEnv::capture(),
             file_hasher: &file_hasher,
             path_normalizer: &path_normalizer,
             cache_dir: cache.path(),
@@ -4555,15 +4768,17 @@ fn apply_cc_prefix_maps_to_bytes_skips_without_missing_a_prefix() {
 
 #[test]
 fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
-    let _lock = crate::test_support::process_state_test_lock();
     let compiler = std::env::current_exe()
         .unwrap()
         .to_string_lossy()
         .into_owned();
     let parsed = CcArgs::parse(&[compiler, "-c".to_string(), "memo-source.c".to_string()]).unwrap();
-    let key = || cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
-
-    let baseline = key();
+    let baseline = cc_preprocess_memo_key(&parsed, &[], "test compiler version").unwrap();
+    let key = |name: &str, value: &str| {
+        let mut invocation = parsed.clone();
+        invocation.invocation_env.set(name, value);
+        cc_preprocess_memo_key(&invocation, &[], "test compiler version").unwrap()
+    };
     for (name, value) in [
         ("_", "/usr/bin/whatever"),
         ("OLDPWD", "/somewhere/else"),
@@ -4584,14 +4799,11 @@ fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
         ("DEP_OPENSSL_INCLUDE", "/usr/include"),
         ("DEP_Z_INCLUDE", "/t/debug/build/libz-sys-1/out/include"),
     ] {
-        // SAFETY: the process-state lock serialises environment edits.
-        unsafe { std::env::set_var(name, value) };
         assert_eq!(
-            key(),
+            key(name, value),
             baseline,
             "{name} cannot change an expansion and must not change the memo key"
         );
-        unsafe { std::env::remove_var(name) };
     }
 
     for (name, value) in [
@@ -4602,10 +4814,7 @@ fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
         ("MY_SYSROOT", "/opt/sysroot"),
         ("CFLAGS", "-DEXTRA"),
     ] {
-        // SAFETY: as above.
-        unsafe { std::env::set_var(name, value) };
-        let changed = key();
-        unsafe { std::env::remove_var(name) };
+        let changed = key(name, value);
         assert_ne!(
             changed, baseline,
             "{name} can change which headers are found or how they expand and must be keyed"
@@ -4899,17 +5108,28 @@ fn cc_prefix_maps_keep_shallow_in_tree_relocated_builds_stable() {
 
 #[test]
 fn cc_prefix_maps_accept_generated_tempdir_common_root() {
-    let root = tempfile::TempDir::new().unwrap();
-    let root = root.path();
-
+    let dir = tempfile::tempdir().unwrap();
+    let temp = dir.path().join("client/deep/temp");
+    let project = temp.join("project");
+    let cwd = project.join("obj");
+    let source_parent = project.join("src");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir(&source_parent).unwrap();
     assert!(
-        stable_cc_common_root(root, &root.join("obj"), &root.join("src")),
+        stable_cc_common_root_for(&project, &cwd, &source_parent, &temp),
         "generated temp project roots should be stable common roots"
     );
     assert!(
-        !stable_cc_common_root(&std::env::temp_dir(), &root.join("obj"), &root.join("src")),
+        !stable_cc_common_root_for(&temp, &cwd, &source_parent, &temp),
         "the temp directory itself is too broad to use as a common root"
     );
+    assert!(stable_cc_common_root_for(
+        &temp,
+        &temp,
+        &source_parent,
+        &temp
+    ));
+    assert!(stable_cc_common_root_for(&temp, &cwd, &temp, &temp));
 }
 
 #[test]
@@ -6432,11 +6652,33 @@ fn resolve_source_date_epoch_honors_build_value_verbatim() {
 }
 
 #[test]
-fn resolve_source_date_epoch_passthrough_disables_default_pin() {
-    // Opt-out with no build value → pin nothing; the unpinned probe yields a
-    // time-dependent key, so a wall-clock object is very unlikely to be
-    // reused.
-    assert_eq!(resolve_source_date_epoch(None, true), None);
+fn source_date_epoch_policy_uses_the_clients_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let default = InvocationEnv::from_parts(
+        [] as [(&str, &str); 0],
+        Some(root.path().to_owned()),
+        None,
+        root.path().to_owned(),
+    );
+    assert_eq!(
+        effective_source_date_epoch_for(&default).as_deref(),
+        Some(OsStr::new("0"))
+    );
+    for policy in ["passthrough", "wallclock", "off", " PASSTHROUGH "] {
+        let mut client = default.clone();
+        client.set("KACHE_CC_SOURCE_DATE_EPOCH", policy);
+        assert_eq!(effective_source_date_epoch_for(&client), None, "{policy}");
+        client.set("SOURCE_DATE_EPOCH", " 1700000000 ");
+        assert_eq!(
+            effective_source_date_epoch_for(&client).as_deref(),
+            Some(OsStr::new(" 1700000000 ")),
+            "the build value takes precedence and remains untrimmed"
+        );
+    }
+    assert_eq!(
+        effective_source_date_epoch_for(&default).as_deref(),
+        Some(OsStr::new("0"))
+    );
 }
 
 #[cfg(unix)]
@@ -6475,7 +6717,7 @@ fn execute_pins_source_date_epoch_on_real_compile() {
     let baked = fs::read_to_string(&obj).unwrap();
     // Robust against an ambient SOURCE_DATE_EPOCH in the test env: the child
     // must see exactly what the resolver computes (and never "UNSET").
-    let expected = effective_source_date_epoch()
+    let expected = effective_source_date_epoch_for(&parsed.invocation_env)
         .map(|v| v.to_string_lossy().into_owned())
         .unwrap_or_default();
     assert_eq!(
@@ -7584,16 +7826,19 @@ fn include_dir_digest_counts_an_empty_subdir_at_exact_cap() {
 
 #[test]
 fn include_dir_digest_ignores_empty_sdkroot() {
-    let _lock = crate::test_support::process_state_test_lock();
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
-    let parsed = CcArgs::parse(&s(&["cc", "-c", source.to_str().unwrap()])).unwrap();
-    unsafe { std::env::remove_var("SDKROOT") };
+    let env = InvocationEnv::from_parts(
+        std::iter::empty::<(String, String)>(),
+        Some(temp.path().to_path_buf()),
+        None,
+        temp.path().to_path_buf(),
+    );
+    let mut parsed = CcArgs::parse_for(&s(&["cc", "-c", source.to_str().unwrap()]), &env).unwrap();
     let unset = digest_cc_include_dir_names(&parsed).unwrap();
-    unsafe { std::env::set_var("SDKROOT", "") };
+    parsed.invocation_env.set("SDKROOT", "");
     let empty = digest_cc_include_dir_names(&parsed).unwrap();
-    unsafe { std::env::remove_var("SDKROOT") };
     assert_eq!(
         unset, empty,
         "empty SDKROOT must not become an include root"
@@ -7776,6 +8021,7 @@ fn shadowing_header_changes_cc_cache_key() {
     let (file_hasher, cache) = include_dir_key_ctx(temp.path());
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let ctx = KeyCtx {
+        invocation_env: &crate::invocation::InvocationEnv::capture(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &cache,
@@ -8029,6 +8275,45 @@ fn direct_keying_applies_to_gnu_object_compiles_with_complete_depfiles() {
         !cc_direct_key_shape_ok(&parse(&["clang-cl", "/c", "a.c", "/Foa.obj"])),
         "the private capture flags are GNU spellings"
     );
+}
+
+#[test]
+fn direct_probe_material_separates_clients_paths_and_include_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let compiler = root.path().join("compiler.exe");
+    fs::write(&compiler, b"compiler image").unwrap();
+    let variables = [
+        ("PATH", root.path().join("first-bin").into_os_string()),
+        ("CPATH", "first-include".into()),
+    ];
+    let client = |vars| {
+        InvocationEnv::from_parts(
+            vars,
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    let first = client(variables.clone().into_iter());
+    let material =
+        |env: &InvocationEnv| cc_direct_probe_material(compiler.to_str().unwrap(), env).unwrap();
+    let expected = material(&first);
+    for (name, value) in [
+        ("PATH", root.path().join("second-bin").into_os_string()),
+        ("CPATH", "second-include".into()),
+    ] {
+        let mut second = first.clone();
+        second.set(name, value);
+        assert_ne!(material(&second), expected, "{name}");
+    }
+    let mut unrelated = first.clone();
+    unrelated.set("CLIENT_NOTE", "unrelated client value");
+    assert_eq!(material(&unrelated), expected);
+    let mut reversed_variables = variables;
+    reversed_variables.reverse();
+    let reversed = client(reversed_variables.into_iter());
+    assert_eq!(material(&reversed), expected);
+    assert_eq!(material(&first), expected);
 }
 
 /// The driver probe vouches for the capture flags once per binary: a
@@ -8566,7 +8851,6 @@ fn dependency_out_dir_maps_drop_the_metadata_hash() {
 /// two build directories share the memo, unmapped they do not.
 #[test]
 fn memo_key_maps_environment_values_like_arguments() {
-    let _lock = crate::test_support::process_state_test_lock();
     let compiler = std::env::current_exe()
         .unwrap()
         .to_string_lossy()
@@ -8579,14 +8863,12 @@ fn memo_key_maps_environment_values_like_arguments() {
         }]
     };
     let key = |job: &str| {
-        // SAFETY: the process-state lock serialises environment edits.
-        unsafe {
-            std::env::set_var(
-                "CPATH",
-                format!("/work/{job}/target/debug/build/kt-sys-1/out/include"),
-            )
-        };
-        cc_preprocess_memo_key(&parsed, &maps_for(job), "test compiler version").unwrap()
+        let mut invocation = parsed.clone();
+        invocation.invocation_env.set(
+            "CPATH",
+            format!("/work/{job}/target/debug/build/kt-sys-1/out/include"),
+        );
+        cc_preprocess_memo_key(&invocation, &maps_for(job), "test compiler version").unwrap()
     };
     let a = key("job-a");
     let b = key("job-b");
@@ -8594,11 +8876,16 @@ fn memo_key_maps_environment_values_like_arguments() {
         a, b,
         "the mapped value is the same in both build directories"
     );
-    // SAFETY: as above.
-    unsafe { std::env::set_var("CPATH", "/elsewhere/include") };
-    let elsewhere =
-        cc_preprocess_memo_key(&parsed, &maps_for("job-a"), "test compiler version").unwrap();
-    unsafe { std::env::remove_var("CPATH") };
+    let mut elsewhere_invocation = parsed.clone();
+    elsewhere_invocation
+        .invocation_env
+        .set("CPATH", "/elsewhere/include");
+    let elsewhere = cc_preprocess_memo_key(
+        &elsewhere_invocation,
+        &maps_for("job-a"),
+        "test compiler version",
+    )
+    .unwrap();
     assert_ne!(
         elsewhere, a,
         "an include directory outside the maps still keys"
@@ -8610,39 +8897,46 @@ fn memo_key_maps_environment_values_like_arguments() {
 /// roots twice leaves one map per root.
 #[test]
 fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
-    let mut lock = crate::test_support::process_state_test_lock();
-    let dir = lock.enter();
-    let out = dir.as_path().join("target/debug/build/pkg-1/out");
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("target/debug/build/pkg-1/out");
     std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(dir.as_path().join("a.c"), "int a;\n").unwrap();
-    let parsed = CcArgs::parse(&s(&["cc", "-c", "a.c", "-o", "a.o"])).unwrap();
+    std::fs::write(dir.path().join("a.c"), "int a;\n").unwrap();
+    let env = InvocationEnv::from_parts(
+        [
+            ("OUT_DIR", out.as_os_str().to_owned()),
+            ("SDKROOT", "".into()),
+            ("KACHE_BASE_DIR", "".into()),
+        ],
+        Some(dir.path().to_path_buf()),
+        None,
+        dir.path().to_path_buf(),
+    );
+    let mut parsed = CcArgs::parse_for(&s(&["cc", "-c", "a.c", "-o", "a.o"]), &env).unwrap();
     let has = |maps: &[CcPrefixMap], to: &str| maps.iter().any(|m| m.to == to);
-    let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
-        "OUT_DIR",
-        "SDKROOT",
-        "KACHE_CC_PATH_NORMALIZE",
-        "KACHE_BASE_DIR",
-    ]
-    .into_iter()
-    .map(|name| (name, std::env::var_os(name)))
-    .collect();
-    // SAFETY: the process-state lock serialises environment edits.
-    unsafe {
-        std::env::remove_var("KACHE_CC_PATH_NORMALIZE");
-        std::env::remove_var("KACHE_BASE_DIR");
-        std::env::set_var("OUT_DIR", &out);
-        std::env::set_var("SDKROOT", "");
-    }
     let maps = cc_prefix_maps(&parsed, &[]);
     assert!(has(&maps, CC_OUT_DIR_SENTINEL), "{maps:?}");
     assert!(has(&maps, CC_TARGET_SENTINEL), "{maps:?}");
     assert!(
+        !has(&maps, CC_BASE_SENTINEL),
+        "an empty base directory is unset"
+    );
+    assert!(
         !has(&maps, CC_SDKROOT_SENTINEL),
         "an empty SDKROOT is unset"
     );
+    let base = dir.path().join("explicit-base");
+    parsed.invocation_env.set("KACHE_BASE_DIR", &base);
+    let with_base = cc_prefix_maps(&parsed, &[]);
+    assert!(
+        with_base
+            .iter()
+            .any(|map| Path::new(&map.from) == base && map.to == "/kache/base-dir"),
+        "the client-supplied base must retain its own map: {with_base:?}",
+    );
+    parsed.invocation_env.set("KACHE_BASE_DIR", "");
 
     let dep_include = dir
-        .as_path()
+        .path()
         .join("target/debug/build/libz-sys-0123456789abcdef/out/include");
     std::fs::create_dir_all(&dep_include).unwrap();
     for include_args in [
@@ -8663,10 +8957,10 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
     let froms: std::collections::HashSet<&str> = maps.iter().map(|m| m.from.as_str()).collect();
     assert_eq!(froms.len(), maps.len(), "one map per root: {maps:?}");
 
-    unsafe { std::env::set_var("SDKROOT", dir.as_path().join("sdk")) };
+    parsed.invocation_env.set("SDKROOT", dir.path().join("sdk"));
     assert!(has(&cc_prefix_maps(&parsed, &[]), CC_SDKROOT_SENTINEL));
 
-    unsafe { std::env::set_var("OUT_DIR", "") };
+    parsed.invocation_env.set("OUT_DIR", "");
     let maps = cc_prefix_maps(&parsed, &[]);
     assert!(
         !has(&maps, CC_OUT_DIR_SENTINEL),
@@ -8674,19 +8968,17 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
     );
     assert!(!has(&maps, CC_TARGET_SENTINEL));
 
-    unsafe {
-        std::env::set_var("OUT_DIR", &out);
-        std::env::set_var("KACHE_CC_PATH_NORMALIZE", "0");
-    }
+    parsed.invocation_env.set("OUT_DIR", out.as_os_str());
+    parsed.invocation_env.set("KACHE_CC_PATH_NORMALIZE", "0");
     assert!(
         cc_prefix_maps(&parsed, &[]).is_empty(),
         "no maps at all when normalization is off, OUT_DIR included"
     );
 
     let mut twice = Vec::new();
-    push_cargo_out_dir_maps(&mut twice, dir.as_path(), &out);
+    push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
     let once = twice.len();
-    push_cargo_out_dir_maps(&mut twice, dir.as_path(), &out);
+    push_cargo_out_dir_maps(&mut twice, dir.path(), &out);
     assert_eq!(
         twice.len(),
         once,
@@ -8703,15 +8995,6 @@ fn out_dir_and_sdk_maps_follow_the_environment_and_the_normalize_switch() {
         (2..=4).contains(&once),
         "each root once per spelling, canonical or not: {twice:?}"
     );
-
-    unsafe {
-        for (name, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
 }
 
 /// The per-process memo of the prefix maps answers only for the same
@@ -8803,7 +9086,10 @@ fn only_a_captured_memo_is_handed_to_the_daemon_and_discarding_forgets_it() {
     let memo = compiler.captured_preprocess_memo().unwrap();
     assert_eq!(memo.memo_key, "k".repeat(64));
     assert_eq!(memo.preprocessed_hash, "p".repeat(64));
-    assert_eq!(memo.inputs, vec![input.clone()]);
+    assert_eq!(
+        memo.inputs,
+        vec![crate::daemon_publish::memo_input_for_wire(&input)]
+    );
     // Handing it over leaves it pending until the daemon has taken it.
     assert!(compiler.pending_preprocess_memo.borrow().is_some());
 
