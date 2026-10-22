@@ -339,7 +339,7 @@ fn prestage_hints(
     };
     let shared = super::shared_inode_loadable(
         args,
-        crate::compiler::platform::current().may_share_restored_loadables(),
+        crate::compiler::platform::current_for(args.invocation_env()).may_share_restored_loadables(),
     );
     files
         .iter()

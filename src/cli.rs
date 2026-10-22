@@ -5290,7 +5290,16 @@ fn command_line(argv: &[String], windows: bool) -> String {
 
 /// The arguments this process was started with, after the program name.
 pub(crate) fn command_args() -> Vec<String> {
-    std::env::args().skip(1).collect()
+    kache_client::engine_entry(std::env::args_os().collect(), crate::VERSION)
+        .map(|entry| {
+            entry
+                .args
+                .into_iter()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The error a command that asks first gives when there is no terminal and
@@ -7592,6 +7601,129 @@ pub(crate) fn doctor_shards(config: &Config) -> Vec<Check> {
         .collect()
 }
 
+/// The directory a build of the current working directory writes its artifacts
+/// to: the target dir Cargo would choose for it, or the build dir when Cargo
+/// splits the two.
+///
+/// `kache doctor` probes this rather than the working directory. What the store
+/// hardlinks into is the build tree, never the source tree, so probing the
+/// working directory reports EXDEV for a project whose `build.target-dir` sits
+/// on the store's mount, and a pass for one whose artifacts get copied.
+fn cargo_output_dir() -> Option<std::path::PathBuf> {
+    cargo_output_dir_from(
+        &std::env::current_dir().ok()?,
+        &CargoEnvironment {
+            target_dir: std::env::var_os("CARGO_TARGET_DIR"),
+            build_target_dir: std::env::var_os("CARGO_BUILD_TARGET_DIR"),
+            build_dir: std::env::var_os("CARGO_BUILD_BUILD_DIR"),
+            cargo_home: std::env::var_os("CARGO_HOME"),
+            home: dirs::home_dir().unwrap_or_default(),
+        },
+    )
+}
+
+/// The environment Cargo resolves the output directory from, passed in so the
+/// search can be tested without mutating the one the suite shares.
+#[derive(Default)]
+struct CargoEnvironment {
+    /// `CARGO_TARGET_DIR`, which names the target dir directly.
+    target_dir: Option<std::ffi::OsString>,
+    /// `CARGO_BUILD_TARGET_DIR`, the environment name of `build.target-dir`.
+    build_target_dir: Option<std::ffi::OsString>,
+    /// `CARGO_BUILD_BUILD_DIR`, the environment name of `build.build-dir`.
+    build_dir: Option<std::ffi::OsString>,
+    /// `CARGO_HOME`.
+    cargo_home: Option<std::ffi::OsString>,
+    /// The platform's home directory, empty when the platform has none.
+    home: std::path::PathBuf,
+}
+
+/// [`cargo_output_dir`] with the environment passed in, so the search can be
+/// tested without mutating the one the suite shares.
+fn cargo_output_dir_from(
+    cwd: &std::path::Path,
+    env: &CargoEnvironment,
+) -> Option<std::path::PathBuf> {
+    let workspace = cargo_workspace_root(cwd)?;
+    let cargo_home = cargo_home_dir_from(env, cwd);
+    let output = crate::target_seed::configured_output_dir(
+        cwd,
+        &workspace,
+        &cargo_home,
+        env.target_dir
+            .as_deref()
+            .or(env.build_target_dir.as_deref()),
+        env.build_dir.as_deref(),
+    )?;
+    closest_existing(output)
+}
+
+/// `$CARGO_HOME`, falling back to the platform's home directory (cargo's
+/// documented default), the way [`cargo_home_dir`] does.
+fn cargo_home_dir_from(env: &CargoEnvironment, cwd: &std::path::Path) -> std::path::PathBuf {
+    match env.cargo_home.as_deref().filter(|value| !value.is_empty()) {
+        Some(cargo_home) => {
+            let cargo_home = std::path::PathBuf::from(cargo_home);
+            if cargo_home.is_absolute() {
+                cargo_home
+            } else {
+                cwd.join(cargo_home)
+            }
+        }
+        None => env.home.join(".cargo"),
+    }
+}
+
+/// The directory Cargo would put the default `target` dir under: the
+/// workspace root, or the package root for a package outside a workspace.
+///
+/// Cargo reads the workspace from the manifest rather than from the lockfile,
+/// so a workspace that has not been built yet still resolves.
+fn cargo_workspace_root(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut package = None;
+    for dir in cwd.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let table = std::fs::read_to_string(&manifest)
+            .ok()?
+            .parse::<toml::Table>()
+            .ok()?;
+        if let Some(workspace) = table
+            .get("package")
+            .and_then(toml::Value::as_table)
+            .and_then(|package| package.get("workspace"))
+        {
+            let root = dir.join(workspace.as_str()?).canonicalize().ok()?;
+            return cargo_manifest_is_workspace(&root.join("Cargo.toml")).then_some(root);
+        }
+        package.get_or_insert(dir);
+        if table.get("workspace").is_some_and(toml::Value::is_table) {
+            return Some(dir.to_path_buf());
+        }
+    }
+    Some(package.map_or_else(|| cwd.to_path_buf(), std::path::Path::to_path_buf))
+}
+
+/// Whether the manifest at `path` declares a workspace.
+fn cargo_manifest_is_workspace(manifest: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(manifest) else {
+        return false;
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    table.get("workspace").is_some_and(toml::Value::is_table)
+}
+
+/// Probe the first existing directory on the output path. An existing file
+/// cannot hold build artifacts, and a missing volume has no directory to probe.
+fn closest_existing(path: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let existing = path.ancestors().find(|candidate| candidate.exists())?;
+    existing.is_dir().then(|| existing.to_path_buf())
+}
+
 fn doctor_link_layout(config: &Config, build_dir: &std::path::Path) -> Check {
     let routed = config.routed_for_path(build_dir);
     let staging = routed.store_dir().join("staging");
@@ -7708,7 +7840,7 @@ pub fn doctor(
     } else {
         (false, "not found".into())
     };
-    let running = std::env::current_exe().ok();
+    let running = crate::platform::frontend_executable().ok();
     checks.push(Check {
         label: "Binary",
         pass: bin_pass,
@@ -7875,8 +8007,18 @@ pub fn doctor(
             });
         }
         checks.extend(doctor_shards(cfg));
-        let build_dir = std::env::current_dir().unwrap_or_else(|_| cfg.cache_dir.clone());
-        checks.push(doctor_link_layout(cfg, &build_dir));
+        checks.push(match cargo_output_dir() {
+            Some(build_dir) => doctor_link_layout(cfg, &build_dir),
+            None => Check {
+                label: "Link layout",
+                pass: false,
+                detail: "Cargo output directory could not be resolved; link probe skipped".into(),
+                fix: Some(
+                    "check Cargo's output-directory settings from an existing project directory"
+                        .into(),
+                ),
+            },
+        });
     }
 
     // 5. Remote cache
@@ -8061,7 +8203,7 @@ pub fn doctor(
 
     // Informational: the path shims and the service record for this binary,
     // and whether it outlives an upgrade.
-    let (pass, detail, hint) = doctor_install_path_check(&kache_shims::detect());
+    let (pass, detail, hint) = doctor_install_path_check(&crate::platform::frontend_selection());
     checks.push(Check {
         label: "Install path",
         pass,
@@ -10292,7 +10434,7 @@ pub(crate) fn rustdoc_shim_path_ok(value: &str) -> bool {
     if path.parent().is_some_and(kache_shims::farm::has_marker) {
         return true;
     }
-    let self_real = std::env::current_exe()
+    let self_real = crate::platform::frontend_executable()
         .ok()
         .and_then(|exe| std::fs::canonicalize(exe).ok());
     kache_shims::farm::resolves_to_kache(path, self_real.as_deref(), &|candidate| {
@@ -11661,7 +11803,7 @@ fn init_test_runner(
 /// an upgrade does not leave the farm dangling.
 #[cfg(unix)]
 fn shim_target() -> Result<kache_shims::Selection> {
-    kache_shims::detect().context("locating the kache binary")
+    crate::platform::frontend_selection().context("locating the kache binary")
 }
 
 /// True when `dir` already links every name an install with `extra_names`

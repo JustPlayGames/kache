@@ -53,7 +53,7 @@ pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 
 /// Environment variable that carries a running test's lease marker to its
 /// children. Its value is the marker's absolute path.
-pub const TEST_LEASE_ENV: &str = "KACHE_TEST_LEASE";
+pub use kache_config::TEST_LEASE_ENV;
 
 pub(crate) const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
 /// How long a test lease waits for its marker, never longer than its wait
@@ -111,6 +111,7 @@ fn acquire_within(path: &Path, timeout: Duration, poll: Duration) -> Result<Opti
     let start = std::time::Instant::now();
     let mut attempt = 0;
     loop {
+        crate::invocation::process::check()?;
         if let Some(lock) = StoreLock::try_acquire(path)? {
             return Ok(Some(lock));
         }
@@ -486,6 +487,7 @@ impl Scheduler {
         let mut attempt = 0;
         let mut waited = false;
         loop {
+            crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
             match try_collect_slots(self, range.clone(), need(waited).max(1) as usize) {
                 Ok(Some(slots)) => return Some(slots),
@@ -802,6 +804,7 @@ fn wait_for_lock(path: &Path, timeout: Duration, poll: Duration) -> Result<bool>
     let start = std::time::Instant::now();
     let mut attempt = 0;
     loop {
+        crate::invocation::process::check()?;
         if let Some(lock) = StoreLock::try_acquire(path)? {
             drop(lock);
             return Ok(true);
@@ -944,7 +947,7 @@ fn write_weight(weights_dir: &Path, crate_name: &str, rss: u64) -> Result<bool> 
 
 /// Interpret `getrusage` output as peak child RSS in bytes.
 #[cfg(unix)]
-fn rss_from_getrusage(rc: i32, ru_maxrss: i64) -> Option<u64> {
+pub(crate) fn rss_from_getrusage(rc: i32, ru_maxrss: i64) -> Option<u64> {
     if rc != 0 {
         return None;
     }
@@ -955,6 +958,9 @@ fn rss_from_getrusage(rc: i32, ru_maxrss: i64) -> Option<u64> {
 }
 
 fn peak_child_rss_bytes() -> Option<u64> {
+    if let Some(peak) = crate::opcounts::invocation_child_rss() {
+        return peak;
+    }
     #[cfg(unix)]
     {
         // SAFETY: `rusage` is a C POD written fully by `getrusage` on success.
@@ -1474,6 +1480,42 @@ mod tests {
     impl Drop for PinnedPressure {
         fn drop(&mut self) {
             pressure::force(None);
+        }
+    }
+
+    #[test]
+    fn request_cancellation_releases_scheduler_waiters() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let path = dir.path().join("blocked");
+        let _owner = StoreLock::try_acquire(&path).unwrap().unwrap();
+        let _slot = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        for kind in 0..3 {
+            let token = crate::invocation::process::Cancellation::default();
+            std::thread::scope(|threads| {
+                let worker = threads.spawn(|| {
+                    let _scope =
+                        crate::invocation::process::CancellationScope::enter(Some(token.clone()));
+                    match kind {
+                        0 => assert!(
+                            acquire_within(&path, Duration::from_secs(5), Duration::from_millis(5))
+                                .is_err()
+                        ),
+                        1 => assert!(
+                            wait_for_lock(&path, Duration::from_secs(5), Duration::from_millis(5))
+                                .is_err()
+                        ),
+                        _ => assert!(scheduler.wait_for_permit(0..1, |_| 1).is_none()),
+                    }
+                });
+                std::thread::sleep(Duration::from_millis(30));
+                let cancelled = std::time::Instant::now();
+                token.cancel();
+                worker.join().unwrap();
+                assert!(cancelled.elapsed() < Duration::from_secs(1));
+            });
         }
     }
 
@@ -2603,6 +2645,28 @@ mod tests {
             assert_eq!(rss_units_to_bytes(1), 1024);
             assert_eq!(rss_units_to_bytes(2), 2048);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invocation_memory_does_not_fall_back_to_other_process_children() {
+        assert!(Command::new("true").status().unwrap().success());
+        assert!(peak_child_rss_bytes().unwrap() > 1024);
+        let _scope = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        assert_eq!(peak_child_rss_bytes(), None);
+        crate::opcounts::child_rss_recorder()
+            .unwrap()
+            .record(123456);
+        assert_eq!(peak_child_rss_bytes(), Some(123456));
+        {
+            let _nested = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+            assert_eq!(peak_child_rss_bytes(), None);
+            crate::opcounts::child_rss_recorder()
+                .unwrap()
+                .record(654321);
+            assert_eq!(peak_child_rss_bytes(), Some(654321));
+        }
+        assert_eq!(peak_child_rss_bytes(), Some(123456));
     }
 
     #[cfg(unix)]

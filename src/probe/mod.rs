@@ -44,6 +44,8 @@
 mod cache;
 mod resolve;
 
+use crate::invocation::InvocationEnv;
+use crate::invocation::process::CommandExt as _;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -121,6 +123,13 @@ pub trait Prober {
     /// Run the probe. This forks the compiler; [`probe`] calls it at
     /// most once per compiler binary per build.
     fn probe(&self, req: &ProbeRequest<'_>) -> Result<ResolvedConfig>;
+
+    /// Probe with the invoking client's environment and working directory.
+    /// Legacy test probers can implement only `probe`; production probers
+    /// override this method to launch commands from the explicit snapshot.
+    fn probe_for(&self, req: &ProbeRequest<'_>, _env: &InvocationEnv) -> Result<ResolvedConfig> {
+        self.probe(req)
+    }
 }
 
 /// Prober for the C-family compilers (`cc`, `gcc`, `clang`, …).
@@ -132,11 +141,16 @@ impl Prober for CcProber {
     }
 
     fn probe(&self, req: &ProbeRequest<'_>) -> Result<ResolvedConfig> {
+        self.probe_for(req, &InvocationEnv::capture())
+    }
+
+    fn probe_for(&self, req: &ProbeRequest<'_>, env: &InvocationEnv) -> Result<ResolvedConfig> {
         // Compiler identity — `cc --version`.
-        let output = Command::new(req.compiler)
+        let output = env
+            .command(req.compiler)?
             .env("LC_ALL", "C")
             .arg("--version")
-            .output()
+            .invocation_output()
             .with_context(|| format!("running `{} --version`", req.compiler))?;
         if !output.status.success() {
             anyhow::bail!("`{} --version` exited {}", req.compiler, output.status);
@@ -157,11 +171,12 @@ impl Prober for CcProber {
             prober: self.id().to_string(),
             compiler_name,
             version_line,
-            resolved_tokens: resolve_invocation(
+            resolved_tokens: resolve_invocation_for(
                 req.compiler,
                 req.args,
                 req.windows_aware,
                 req.per_tu_paths,
+                env,
             ),
             host_version_line: None,
         })
@@ -203,16 +218,21 @@ impl Prober for NvccProber {
     }
 
     fn probe(&self, req: &ProbeRequest<'_>) -> Result<ResolvedConfig> {
-        let version_line = nvcc_version_line(req.compiler)?;
+        self.probe_for(req, &InvocationEnv::capture())
+    }
+
+    fn probe_for(&self, req: &ProbeRequest<'_>, env: &InvocationEnv) -> Result<ResolvedConfig> {
+        let version_line = nvcc_version_line_for(req.compiler, env)?;
         // Mirror the real compile's argv so dispatch resolves exactly as
         // it would for the TU. Nothing from this output is hashed (see
         // above) — only the host binary path is read out of it.
         let mut dryrun_args = vec!["--dryrun".to_string()];
         dryrun_args.extend(req.args.iter().cloned());
-        let dryrun = Command::new(req.compiler)
+        let dryrun = env
+            .command(req.compiler)?
             .env("LC_ALL", "C")
             .args(&dryrun_args)
-            .output()
+            .invocation_output()
             .with_context(|| format!("running `{} --dryrun`", req.compiler))?;
         if !dryrun.status.success() {
             anyhow::bail!("`{} --dryrun` exited {}", req.compiler, dryrun.status);
@@ -239,7 +259,7 @@ impl Prober for NvccProber {
                 req.compiler
             )
         })?;
-        let host_version_line = host_version_line(&host)?;
+        let host_version_line = host_version_line_for(&host, env)?;
         let compiler_name = Path::new(req.compiler)
             .file_name()
             .and_then(|n| n.to_str())
@@ -259,11 +279,17 @@ impl Prober for NvccProber {
 
 /// First line of `nvcc --version` (stdout). Mirrors [`CcProber`]: the
 /// command must succeed and name a version.
+#[cfg(all(test, unix))]
 fn nvcc_version_line(nvcc: &str) -> Result<String> {
-    let output = Command::new(nvcc)
+    nvcc_version_line_for(nvcc, &InvocationEnv::capture())
+}
+
+fn nvcc_version_line_for(nvcc: &str, env: &InvocationEnv) -> Result<String> {
+    let output = env
+        .command(nvcc)?
         .env("LC_ALL", "C")
         .arg("--version")
-        .output()
+        .invocation_output()
         .with_context(|| format!("running `{nvcc} --version`"))?;
     if !output.status.success() {
         anyhow::bail!("`{nvcc} --version` exited {}", output.status);
@@ -344,11 +370,12 @@ fn find_nvcc_host_compiler(dryrun: &str) -> Option<String> {
 /// First non-empty combined-output line of `<host> --version`. Exit
 /// status is ignored: `cl` banners to stderr and exits nonzero, which
 /// still identifies it. Empty output means unidentifiable — bail.
-fn host_version_line(host: &str) -> Result<String> {
-    let output = Command::new(host)
+fn host_version_line_for(host: &str, env: &InvocationEnv) -> Result<String> {
+    let output = env
+        .command(host)?
         .env("LC_ALL", "C")
         .arg("--version")
-        .output()
+        .invocation_output()
         .with_context(|| format!("running `{host} --version`"))?;
     let combined = format!(
         "{}\n{}",
@@ -388,21 +415,47 @@ pub enum ProbedFamily {
 /// Taking the env value verbatim wrote probe records under a literal
 /// `./~/probes/` for values the shell never expanded (systemd Environment=
 /// files, and the tilde-expansion tests' env windows in CI) (#673).
+#[cfg(test)]
 fn family_probe_cache_dir() -> std::path::PathBuf {
-    std::env::var_os("KACHE_CACHE_DIR")
-        .map(|s| crate::config::shellexpand(&s.to_string_lossy()))
-        .unwrap_or_else(crate::config::default_cache_dir)
+    family_probe_cache_dir_for(&InvocationEnv::capture()).expect("client cache directory resolves")
+}
+
+fn family_probe_cache_dir_for(env: &InvocationEnv) -> Option<std::path::PathBuf> {
+    let path = env
+        .var_os("KACHE_CACHE_DIR")
+        .map(|path| crate::config::shellexpand_for(env, &path.to_string_lossy()))
+        .unwrap_or_else(|| {
+            env.cache_dir()
+                .unwrap_or_else(|| Path::new("/tmp"))
+                .join("kache")
+        });
+    env.resolve(&path)
 }
 
 /// Returns `None` if the binary isn't a recognized C compiler.
+#[cfg(test)]
 pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
-    let cache_dir = family_probe_cache_dir();
+    probe_compiler_family_for(program, &InvocationEnv::capture())
+}
 
-    let key = cache::probe_key_isolated("cc-family", program);
+pub(crate) fn probe_compiler_family_for(
+    program: &str,
+    env: &InvocationEnv,
+) -> Option<ProbedFamily> {
+    let cache_dir = family_probe_cache_dir_for(env);
+    let request = ProbeRequest {
+        compiler: program,
+        args: &[],
+        key_args: &[],
+        per_tu_paths: &[],
+        windows_aware: true,
+    };
+    let key = cache::probe_key_for("cc-family", &request, env);
 
     // Cache hit: read family from version_line.
     if let Some(ref k) = key
-        && let Some(hit) = cache::load(&cache_dir, k)
+        && let Some(ref cache_dir) = cache_dir
+        && let Some(hit) = cache::load(cache_dir, k)
     {
         match hit.version_line.as_str() {
             "clang" => return Some(ProbedFamily::Clang),
@@ -413,7 +466,7 @@ pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
     }
 
     // Miss: run the probe.
-    let family = run_family_probe(program);
+    let family = run_family_probe_for(program, env);
     let family_str = match family {
         Ok(Some(ProbedFamily::Clang)) => "clang",
         Ok(Some(ProbedFamily::Gnu)) => "gnu",
@@ -423,9 +476,11 @@ pub fn probe_compiler_family(program: &str) -> Option<ProbedFamily> {
 
     // Store in the existing probe cache. Family (or "none") is encoded in
     // version_line — no ResolvedConfig changes needed.
-    if let Some(ref k) = key {
+    if let Some(ref k) = key
+        && let Some(ref cache_dir) = cache_dir
+    {
         cache::store(
-            &cache_dir,
+            cache_dir,
             k,
             &ResolvedConfig {
                 schema_version: PROBE_SCHEMA_VERSION,
@@ -455,18 +510,23 @@ KACHE_PROBE_CLANG\n\
 KACHE_PROBE_GNU\n\
 #endif\n";
 
+#[cfg(test)]
 fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
+    run_family_probe_for(program, &InvocationEnv::capture())
+}
+
+fn run_family_probe_for(program: &str, env: &InvocationEnv) -> Result<Option<ProbedFamily>, ()> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     // Use a file rather than stdin: Windows batch wrappers pass ordinary
     // arguments through reliably, but stdin is consumed by cmd.exe instead
     // of reaching the compiler invoked by the wrapper.
-    let source_file = tempfile::NamedTempFile::new().map_err(|_| ())?;
+    let source_file = tempfile::NamedTempFile::new_in(env.temp_dir()).map_err(|_| ())?;
     std::fs::write(source_file.path(), FAMILY_PROBE_SOURCE).map_err(|_| ())?;
 
-    let mut child_cmd = Command::new(program);
+    let mut child_cmd = env.command(program).map_err(|_| ())?;
     child_cmd
         .args(["-E", "-P", "-x", "c"])
         .arg(source_file.path())
@@ -476,21 +536,12 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    crate::platform::configure_process_group(&mut child_cmd);
-    let mut child = match child_cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return Err(()),
-    };
-    let pid = child.id();
-
-    let mut stdout_handle = match child.stdout.take() {
-        Some(s) => s,
-        None => return Err(()),
-    };
+    let mut child = child_cmd
+        .invocation_spawn_in_group_with_io(kache_protocol::execution::windows::Stdio::STDOUT)
+        .map_err(|_| ())?;
+    let mut stdout_handle = child.stdout.take().ok_or(())?;
     let (tx, rx) = std::sync::mpsc::channel();
-
-    let tx_read = tx.clone();
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         // Drain the child's stdout to EOF, keeping up to MAX_PROBE_OUTPUT for
         // marker scanning. Draining (rather than stopping at a fixed prefix)
         // matters twofold: the family marker can appear anywhere in the output —
@@ -516,48 +567,36 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
                 Err(_) => break,
             }
         }
-        let _ = tx_read.send(Ok(buf));
+        let _ = tx.send(buf);
     });
-
-    let tx_wait = tx.clone();
-    std::thread::spawn(move || {
-        let status = child.wait().ok();
-        let _ = tx_wait.send(Err(status));
-    });
-
-    let mut output = None;
-    let mut exit_status = None;
-    let start = Instant::now();
-    let timeout = Duration::from_secs(5);
-
-    loop {
-        if matches!((output.is_some(), exit_status.is_some()), (true, true)) {
-            break;
-        }
-        if start.elapsed() >= timeout {
-            break;
-        }
-        let remaining = timeout.saturating_sub(start.elapsed());
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(buf)) => output = Some(buf),
-            Ok(Err(status)) => exit_status = Some(status),
-            Err(_) => break,
-        }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let output = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    if output.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        return Err(());
     }
-
-    let Some(output_buf) = output.as_ref() else {
-        crate::platform::kill_process_group(pid);
-        return Err(());
+    let _ = reader.join();
+    // Keep the leader unreaped until stdout reaches EOF. A timed-out probe
+    // can then terminate descendants that still hold its output pipe.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(());
+            }
+        }
     };
-    let Some(Some(status)) = exit_status.as_ref() else {
-        crate::platform::kill_process_group(pid);
-        return Err(());
-    };
+    let output_buf = output.map_err(|_| ())?;
     if !status.success() {
         return Ok(None);
     }
 
-    let stdout_str = String::from_utf8_lossy(output_buf);
+    let stdout_str = String::from_utf8_lossy(&output_buf);
     let clang = stdout_str.contains("KACHE_PROBE_CLANG");
     let gnu = stdout_str.contains("KACHE_PROBE_GNU");
     match (clang, gnu) {
@@ -575,17 +614,20 @@ fn run_family_probe(program: &str) -> Result<Option<ProbedFamily>, ()> {
 /// non-zero exit (bad flags), or output with no `-cc1` line. The probe
 /// degrades to "no resolved invocation"; it never turns a `-###`
 /// hiccup into a hard error.
-fn resolve_invocation(
+fn resolve_invocation_for(
     compiler: &str,
     args: &[String],
     windows_aware: bool,
     per_tu_paths: &[String],
+    env: &InvocationEnv,
 ) -> Option<Vec<String>> {
-    let output = Command::new(compiler)
+    let output = env
+        .command(compiler)
+        .ok()?
         .env("LC_ALL", "C")
         .arg("-###")
         .args(args)
-        .output()
+        .invocation_output()
         .ok()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     let resolved = resolve::resolved_semantic_tokens(&stderr, windows_aware, per_tu_paths);
@@ -682,7 +724,7 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
     match Command::new(compiler)
         .env("LC_ALL", "C")
         .arg("--version")
-        .output()
+        .invocation_output()
     {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return LiveProbeDiagnostic::NoCompiler;
@@ -744,7 +786,7 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
         .env("LC_ALL", "C")
         .arg("-###")
         .args(&args)
-        .output()
+        .invocation_output()
         .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
         .unwrap_or_default();
     LiveProbeDiagnostic::Unresolved {
@@ -761,14 +803,26 @@ fn live_probe_diagnostic_for(compiler: &str) -> LiveProbeDiagnostic {
 /// other — read the record. Resilient: if the cache cannot be keyed or
 /// read the probe simply runs directly. A probe-cache fault never
 /// fails a compile.
+#[cfg(test)]
 pub fn probe(
     cache_dir: &Path,
     prober: &dyn Prober,
     req: &ProbeRequest<'_>,
 ) -> Result<ResolvedConfig> {
-    let key = cache::probe_key(prober.id(), req);
+    probe_for(cache_dir, prober, req, &InvocationEnv::capture())
+}
+
+pub(crate) fn probe_for(
+    cache_dir: &Path,
+    prober: &dyn Prober,
+    req: &ProbeRequest<'_>,
+    env: &InvocationEnv,
+) -> Result<ResolvedConfig> {
+    let key = cache::probe_key_for(prober.id(), req, env);
+    let cache_dir = env.resolve(cache_dir);
 
     if let Some(key) = &key
+        && let Some(cache_dir) = &cache_dir
         && let Some(hit) = cache::load(cache_dir, key)
     {
         return Ok(hit);
@@ -776,9 +830,11 @@ pub fn probe(
 
     // Miss, or the probe could not be keyed: run the real probe.
     crate::opcounts::record_probe_run();
-    let config = prober.probe(req)?;
+    let config = prober.probe_for(req, env)?;
 
-    if let Some(key) = &key {
+    if let Some(key) = &key
+        && let Some(cache_dir) = &cache_dir
+    {
         cache::store(cache_dir, key, &config);
     }
     Ok(config)
@@ -832,6 +888,181 @@ mod tests {
             per_tu_paths: &[],
             windows_aware: true,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_probes_use_each_clients_paths_env_cwd_temp_and_memo() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let driver = root.path().join("shared-driver");
+        kache_fs::testutil::write_executable(
+            &driver,
+            r#"#!/bin/sh
+[ "$LC_ALL" = C ] || exit 71
+IFS= read -r flavor < compiler-flavor || exit 72
+printf '%s\n' "$1" >> driver-runs
+case "$1" in
+  --version) printf 'driver %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD" ;;
+  '-###') printf '"mock-cc" "-cc1" "-triple" "%s" "unit.c"\n' "$CLIENT_VALUE" >&2 ;;
+  --dryrun) printf '%s\n' '#$ gcc -c unit.c' >&2 ;;
+  -E)
+    [ "$KACHE_FAMILY_PROBE_ACTIVE" = 1 ] || exit 73
+    case "$5" in "$TMPDIR"/*) ;; *) exit 74 ;; esac
+    [ -f "$5" ] || exit 75
+    if [ "$flavor" = clang ]; then printf '%s\n' KACHE_PROBE_CLANG; else printf '%s\n' KACHE_PROBE_GNU; fi ;;
+  *) exit 76 ;;
+esac
+"#,
+        );
+        let host = root.path().join("shared-host");
+        kache_fs::testutil::write_executable(
+            &host,
+            r#"#!/bin/sh
+[ "$LC_ALL" = C ] || exit 71
+IFS= read -r flavor < compiler-flavor || exit 72
+printf '%s\n' "$1" >> host-runs
+printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
+"#,
+        );
+        let cache_dir = root.path().join("shared-cache");
+        let clients: Vec<_> = [("first", "gnu"), ("second", "clang")]
+            .into_iter()
+            .map(|(name, flavor)| {
+                let cwd = root.path().join(name);
+                std::fs::create_dir_all(cwd.join("bin")).unwrap();
+                std::fs::create_dir(cwd.join("tmp")).unwrap();
+                std::fs::write(cwd.join("compiler-flavor"), format!("{flavor}\n")).unwrap();
+                symlink(&driver, cwd.join("bin/mock-cc")).unwrap();
+                symlink(&driver, cwd.join("bin/nvcc")).unwrap();
+                symlink(&host, cwd.join("bin/gcc")).unwrap();
+                let cwd = cwd.canonicalize().unwrap();
+                let env = InvocationEnv::from_parts(
+                    [
+                        ("PATH", std::ffi::OsString::from("bin")),
+                        ("CLIENT_VALUE", name.into()),
+                        ("TMPDIR", cwd.join("tmp").into_os_string()),
+                        ("KACHE_CACHE_DIR", cache_dir.clone().into_os_string()),
+                    ],
+                    Some(cwd.clone()),
+                    Some(cwd.clone()),
+                    cwd.join("tmp"),
+                );
+                (name, flavor, cwd, env)
+            })
+            .collect();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (name, flavor, cwd, env) in &clients {
+                let barrier = &barrier;
+                let cache_dir = &cache_dir;
+                threads.spawn(move || {
+                    barrier.wait();
+                    let cc_request = req("mock-cc");
+                    let cc = probe_for(cache_dir, &CcProber, &cc_request, env).unwrap();
+                    assert_eq!(
+                        cc.version_line,
+                        format!("driver {name} {flavor} {}", cwd.display())
+                    );
+                    assert!(
+                        cc.resolved_tokens
+                            .as_ref()
+                            .unwrap()
+                            .contains(&name.to_string())
+                    );
+                    assert_eq!(
+                        probe_for(cache_dir, &CcProber, &cc_request, env).unwrap(),
+                        cc
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(cwd.join("driver-runs"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        2
+                    );
+                    let nvcc_request = req("nvcc");
+                    let nvcc = probe_for(cache_dir, &NvccProber, &nvcc_request, env).unwrap();
+                    assert_eq!(
+                        nvcc.version_line,
+                        format!("driver {name} {flavor} {}", cwd.display())
+                    );
+                    assert_eq!(
+                        nvcc.host_version_line,
+                        Some(format!("host {name} {flavor} {}", cwd.display()))
+                    );
+                    assert_eq!(
+                        probe_for(cache_dir, &NvccProber, &nvcc_request, env).unwrap(),
+                        nvcc
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(cwd.join("driver-runs"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        4
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(cwd.join("host-runs"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        1
+                    );
+                    let family = parse_family(flavor);
+                    assert_eq!(probe_compiler_family_for("mock-cc", env), family);
+                    assert_eq!(probe_compiler_family_for("mock-cc", env), family);
+                    assert_eq!(
+                        std::fs::read_to_string(cwd.join("driver-runs"))
+                            .unwrap()
+                            .lines()
+                            .count(),
+                        5
+                    );
+                    assert!(
+                        std::fs::read_dir(cwd.join("tmp")).unwrap().next().is_none(),
+                        "probe source must be removed from the client's temp directory"
+                    );
+                });
+            }
+        });
+        assert_eq!(
+            std::fs::read_dir(cache_dir.join("probes")).unwrap().count(),
+            6
+        );
+    }
+
+    #[test]
+    fn family_cache_selection_uses_client_home_and_cwd() {
+        let root = TempDir::new().unwrap();
+        let cwd = root.path().join("project");
+        let home = root.path().join("home");
+        let mut env = InvocationEnv::from_parts(
+            [("KACHE_CACHE_DIR", "~/compiler-cache")],
+            Some(cwd.clone()),
+            Some(home.clone()),
+            root.path().join("temp"),
+        );
+        assert_eq!(
+            family_probe_cache_dir_for(&env),
+            Some(home.join("compiler-cache"))
+        );
+        env.set("KACHE_CACHE_DIR", "relative-cache");
+        assert_eq!(
+            family_probe_cache_dir_for(&env),
+            Some(cwd.join("relative-cache"))
+        );
+        let default_env = InvocationEnv::from_parts(
+            std::iter::empty::<(&str, &str)>(),
+            Some(cwd),
+            Some(home),
+            root.path().join("temp"),
+        );
+        assert_eq!(
+            family_probe_cache_dir_for(&default_env),
+            default_env.cache_dir().map(|path| path.join("kache"))
+        );
     }
 
     #[test]
@@ -1029,7 +1260,7 @@ mod tests {
             ])
             .env("PATH", std::env::join_paths(dirs).unwrap())
             .env("KACHE_DOCTOR_SHIM_TEST_CHILD", version_line)
-            .output()
+            .invocation_output()
             .unwrap();
         assert!(
             output.status.success(),
@@ -1117,7 +1348,7 @@ mod tests {
                 .env("LC_ALL", "C")
                 .arg("-###")
                 .args(&args)
-                .output()
+                .invocation_output()
                 .map(|o| probe_stderr_head(&String::from_utf8_lossy(&o.stderr)))
                 .unwrap_or_else(|e| format!("(could not re-run cc -###: {e})"));
             panic!(
@@ -1192,7 +1423,9 @@ mod tests {
         let bare = family_probe_cache_dir();
         unsafe { std::env::set_var("KACHE_CACHE_DIR", "~/kache-cache") };
         let nested = family_probe_cache_dir();
-        unsafe { std::env::set_var("KACHE_CACHE_DIR", "/abs/kache-cache") };
+        let dir = tempfile::tempdir().unwrap();
+        let expected_absolute = dir.path().join("kache-cache");
+        unsafe { std::env::set_var("KACHE_CACHE_DIR", &expected_absolute) };
         let absolute = family_probe_cache_dir();
 
         unsafe {
@@ -1205,7 +1438,7 @@ mod tests {
 
         assert_eq!(bare, home, "bare tilde must expand to the home dir");
         assert_eq!(nested, home.join("kache-cache"));
-        assert_eq!(absolute, std::path::PathBuf::from("/abs/kache-cache"));
+        assert_eq!(absolute, expected_absolute);
     }
 
     struct TestCacheDirGuard {
@@ -1456,6 +1689,32 @@ mod tests {
             res = run_family_probe(script.to_str().unwrap());
         }
         assert_eq!(res, Ok(Some(ProbedFamily::Gnu)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn family_probe_waits_for_exit_after_stdout_eof_and_enforces_its_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("probe");
+        kache_fs::testutil::write_executable(
+            &program,
+            "#!/bin/sh\nprintf KACHE_PROBE_GNU\nexec 1>&-\nexec sleep \"$PROBE_DELAY\"\n",
+        );
+        let mut env = InvocationEnv::from_parts(
+            [("PATH", env!("PATH")), ("PROBE_DELAY", "1")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        assert_eq!(
+            run_family_probe_for(program.to_str().unwrap(), &env),
+            Ok(Some(ProbedFamily::Gnu))
+        );
+        env.set("PROBE_DELAY", "6");
+        assert_eq!(
+            run_family_probe_for(program.to_str().unwrap(), &env),
+            Err(())
+        );
     }
 
     #[cfg(unix)]

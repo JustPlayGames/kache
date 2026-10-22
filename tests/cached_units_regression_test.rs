@@ -222,10 +222,12 @@ fn results_for<'a>(events: &'a [Value], crate_name: &str) -> Vec<&'a str> {
 }
 
 struct Fixture {
+    _daemon: common::DaemonGuard,
     _dirs: Vec<TempDir>,
     workspace: PathBuf,
     home: PathBuf,
     cache: PathBuf,
+    targets: TempDir,
 }
 
 fn fixture() -> Fixture {
@@ -240,20 +242,32 @@ fn fixture_from(write: fn(&Path)) -> Fixture {
     write(workspace.path());
     std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
     Fixture {
+        _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache.path()),
         workspace: workspace.path().to_path_buf(),
         home: home.path().to_path_buf(),
         cache: cache.path().to_path_buf(),
+        targets: TempDir::new().unwrap(),
         _dirs: vec![workspace, home, cache],
     }
 }
 
 fn target(fixture: &Fixture, name: &str) -> PathBuf {
-    let dir = fixture.cache.parent().unwrap().join(format!(
-        "kache-target-{}-{name}",
-        fixture.cache.file_name().unwrap().to_string_lossy()
-    ));
+    let dir = fixture.targets.path().join(name);
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+#[test]
+fn fixture_target_directories_are_removed_when_the_fixture_drops() {
+    let dir = {
+        let fixture = fixture();
+        let dir = target(&fixture, "cold");
+        assert!(!dir.starts_with(&fixture.workspace));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("artifact"), b"compiled").unwrap();
+        dir
+    };
+    assert!(!dir.exists());
 }
 
 /// Two `cargo check`s of the same workspace at once, each with its own
@@ -923,9 +937,11 @@ fn links_metadata_reaches_dependent_build_scripts_whatever_its_spelling() {
     }
     std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
     let fx = Fixture {
+        _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache.path()),
         workspace: root.to_path_buf(),
         home: home.path().to_path_buf(),
         cache: cache.path().to_path_buf(),
+        targets: TempDir::new().unwrap(),
         _dirs: vec![workspace, home, cache],
     };
 

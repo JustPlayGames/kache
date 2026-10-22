@@ -1,8 +1,209 @@
 use super::*;
 // Config and compiler tests mutate process-wide env, including PATH. Share
 // one lock with cache-key tests that read the same state.
-pub(crate) use crate::test_support::process_state_test_lock as config_path_lock;
+use crate::testing::{TestEnvGuard, config_path_lock, set_env_for_test};
 use std::ffi::OsString;
+
+#[test]
+fn ignored_override_warnings_use_only_client_keys_and_never_their_values() {
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber, span};
+
+    #[derive(Clone)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+    impl Subscriber for Warnings {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == tracing::Level::WARN
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let invocation = |vars: Vec<(&str, &str)>| {
+        InvocationEnv::from_parts(
+            vars,
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    let empty = invocation(Vec::new());
+    let left = invocation(vec![("KACHE_CACHE_DIR", "private-client-cache")]);
+    let right = invocation(vec![("KACHE_PLANNER_TOKEN", "private-planner-token")]);
+    let warnings = Warnings(Arc::new(Mutex::new(Vec::new())));
+    tracing::subscriber::with_default(warnings.clone(), || {
+        warn_ignored_env_overrides_for(&empty);
+        warn_ignored_env_overrides_for(&left);
+        warn_ignored_env_overrides_for(&right);
+    });
+    let messages = warnings.0.lock().unwrap();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(messages[0].contains("KACHE_CACHE_DIR"));
+    assert!(!messages[0].contains("KACHE_PLANNER_TOKEN"));
+    assert!(messages[1].contains("KACHE_PLANNER_TOKEN"));
+    assert!(!messages[1].contains("KACHE_CACHE_DIR"));
+    assert!(messages.iter().all(|message| !message.contains("private-")));
+}
+
+#[test]
+fn invocation_boolean_policies_follow_each_clients_snapshot() {
+    type Policy = fn(&InvocationEnv, &Result<FileConfig>) -> bool;
+    let root = tempfile::tempdir().unwrap();
+    let invocation = |vars: Vec<(&str, &str)>| {
+        InvocationEnv::from_parts(
+            vars,
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+    };
+    let policies: [(&str, &str, Policy, bool); 5] = [
+        (
+            "KACHE_REMOTE_READONLY",
+            "remote_readonly",
+            Config::remote_readonly_enabled_for,
+            false,
+        ),
+        (
+            "KACHE_MODIFIED_INPUT_GUARD",
+            "modified_input_guard",
+            Config::modified_input_guard_enabled_for,
+            false,
+        ),
+        (
+            "KACHE_WINDOWS_HARDLINK",
+            "windows_hardlink",
+            Config::windows_hardlink_enabled_for,
+            false,
+        ),
+        (
+            "KACHE_AUTO_GC",
+            "auto_gc",
+            Config::auto_gc_enabled_for,
+            true,
+        ),
+        (
+            "KACHE_EXPLAIN_MISS",
+            "explain_miss",
+            Config::explain_miss_enabled_for,
+            false,
+        ),
+    ];
+    for (name, key, policy, default) in policies {
+        let absent = Ok(FileConfig::default());
+        assert_eq!(policy(&invocation(vec![]), &absent), default, "{name}");
+        for file_value in [false, true] {
+            let file = Ok(toml::from_str(&format!("[cache]\n{key} = {file_value}\n")).unwrap());
+            assert_eq!(policy(&invocation(vec![]), &file), file_value, "{name}");
+            for (value, expected) in [
+                ("1", true),
+                ("true", true),
+                ("TrUe", true),
+                ("0", false),
+                ("false", false),
+                ("FaLsE", false),
+                ("", default),
+                ("no", default),
+            ] {
+                let client = invocation(vec![(name, value)]);
+                assert_eq!(policy(&client, &file), expected, "{name}={value:?}");
+                let ignored = Ok(toml::from_str(&format!(
+                    "[cache]\n{key} = {file_value}\nignore_env = true\n"
+                ))
+                .unwrap());
+                assert_eq!(
+                    policy(&client, &ignored),
+                    file_value,
+                    "ignored {name}={value:?}"
+                );
+            }
+        }
+        std::thread::scope(|threads| {
+            for value in ["1", "0"] {
+                let client = invocation(vec![(name, value)]);
+                let absent = &absent;
+                threads.spawn(move || assert_eq!(policy(&client, absent), value == "1"));
+            }
+        });
+    }
+}
+
+#[test]
+fn global_config_path_uses_the_clients_home_and_config_override() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("client-home");
+    let mut env = InvocationEnv::from_parts(
+        Vec::<(OsString, OsString)>::new(),
+        Some(root.path().to_owned()),
+        Some(home.clone()),
+        root.path().to_owned(),
+    );
+    assert_eq!(
+        config_file_path_for(&env),
+        home.join(".config/kache/config.toml")
+    );
+    let override_dir = root.path().join("client-config");
+    env.set("XDG_CONFIG_HOME", override_dir.as_os_str());
+    assert_eq!(
+        config_file_path_for(&env),
+        override_dir.join("kache/config.toml")
+    );
+}
+
+#[test]
+fn relative_volume_routing_uses_the_client_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let client = root.path().join("client");
+    let env = InvocationEnv::from_parts(
+        Vec::<(OsString, OsString)>::new(),
+        Some(client.clone()),
+        None,
+        root.path().to_owned(),
+    );
+    let other = InvocationEnv::from_parts(
+        Vec::<(OsString, OsString)>::new(),
+        Some(root.path().join("other")),
+        None,
+        root.path().to_owned(),
+    );
+    let mut config = Config::load_resolved_for(&env, Ok(FileConfig::default())).unwrap();
+    let shard = root.path().join("shard");
+    config.volume_stores = vec![VolumeStore {
+        volume: Config::normalize_volume_root(client.to_str().unwrap()).unwrap(),
+        store: shard.clone(),
+        max_size: None,
+    }];
+    assert_eq!(
+        config.volume_store_for_invocation(Path::new("target/unit.rlib"), &env),
+        Some(shard.as_path())
+    );
+    assert_eq!(
+        config.volume_store_for_invocation(Path::new("target/unit.rlib"), &other),
+        None
+    );
+}
 
 /// kunobi-ninja/kache#319: executables are cached by default only where a
 /// restored binary keeps source-level debugging. Linux embeds DWARF; macOS
@@ -93,33 +294,6 @@ fn cache_cc_links_env_one_and_true_enable_zero_does_not() {
             "{off:?} must not enable cache_cc_links"
         );
     }
-}
-
-pub(crate) struct TestEnvGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl Drop for TestEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match self.previous.as_ref() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
-
-pub(crate) fn set_env_for_test(key: &'static str, value: Option<&std::ffi::OsStr>) -> TestEnvGuard {
-    let previous = std::env::var_os(key);
-    unsafe {
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-    }
-    TestEnvGuard { key, previous }
 }
 
 /// Resolution order for predictions: the environment overrides the
@@ -1039,7 +1213,7 @@ fn load_uses_disk_share_budget_when_max_size_is_unset() {
     let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
     let _max = set_env_for_test("KACHE_MAX_SIZE", None);
     let loaded = Config::load().unwrap();
-    let expected = disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes);
+    let expected = disk_share_budget(kache_fs::volume::probe(&cache_dir).total_bytes);
     assert_eq!(loaded.max_size, expected);
 }
 
@@ -1079,7 +1253,7 @@ fn load_none_max_size_does_not_unbound_the_store() {
     let _cache = set_env_for_test("KACHE_CACHE_DIR", Some(cache_dir.as_os_str()));
     let _max = set_env_for_test("KACHE_MAX_SIZE", None);
     let loaded = Config::load().unwrap();
-    let expected = disk_share_budget(crate::cache_fs::probe(&cache_dir).total_bytes);
+    let expected = disk_share_budget(kache_fs::volume::probe(&cache_dir).total_bytes);
     assert_eq!(loaded.max_size, expected);
     assert_ne!(loaded.max_size, 0);
 }
@@ -1870,7 +2044,7 @@ fn config_provenance_makes_an_explicit_path_absolute_without_resolving_it() {
 
     let (_, provenance) = Config::load_with_provenance().unwrap();
     assert!(provenance.path.is_absolute());
-    assert_eq!(provenance.path, std::path::absolute(&cfg).unwrap());
+    assert_eq!(provenance.path, cfg);
 }
 
 #[test]
@@ -2104,7 +2278,16 @@ fn load_volume_stores_carries_the_explicit_max_size_to_each_shard() {
 fn a_shard_budget_is_the_explicit_max_size_or_its_own_disk_share() {
     const GIB: u64 = 1024 * 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
-    let mut main = crate::test_support::test_config(dir.path().join("main"));
+    let mut main = Config::load_resolved_for(
+        &InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(dir.path().to_owned()),
+            None,
+            dir.path().join("tmp"),
+        ),
+        Ok(FileConfig::default()),
+    )
+    .unwrap();
     main.max_size = 50 * GIB;
     let shard_dir = dir.path().join("shard");
     let mut shard = VolumeStore {
@@ -2135,7 +2318,16 @@ fn a_shard_budget_is_the_explicit_max_size_or_its_own_disk_share() {
 #[test]
 fn for_store_dir_picks_the_shard_budget_only_for_a_shard() {
     let dir = tempfile::tempdir().unwrap();
-    let mut main = crate::test_support::test_config(dir.path().join("main"));
+    let mut main = Config::load_resolved_for(
+        &InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            Some(dir.path().to_owned()),
+            None,
+            dir.path().join("tmp"),
+        ),
+        Ok(FileConfig::default()),
+    )
+    .unwrap();
     main.max_size = 5000;
     let shard_dir = dir.path().join("shard");
     main.volume_stores = vec![VolumeStore {
@@ -2740,21 +2932,22 @@ fn test_incremental_seed_from_is_explicit_and_respects_ignore_env() {
         let _seed = NamedEnvGuard::remove("KACHE_INCREMENTAL_SEED_FROM");
         assert!(Config::load().unwrap().incremental_seed_from.is_none());
     }
-    let _seed = NamedEnvGuard::set("KACHE_INCREMENTAL_SEED_FROM", "/previous/target/debug");
-    assert_eq!(
-        Config::load().unwrap().incremental_seed_from,
-        Some(PathBuf::from("/previous/target/debug"))
-    );
+    let seed = dir.path().join("previous/target/debug");
+    let _seed = NamedEnvGuard::set("KACHE_INCREMENTAL_SEED_FROM", seed.to_str().unwrap());
+    assert_eq!(Config::load().unwrap().incremental_seed_from, Some(seed));
     std::fs::write(&cfg_path, "[cache]\nignore_env = true\n").unwrap();
     assert!(Config::load().unwrap().incremental_seed_from.is_none());
     std::fs::write(
         &cfg_path,
-        "[cache]\nignore_env = true\nincremental_seed_from = '/file/target/debug'\n",
+        format!(
+            "[cache]\nignore_env = true\nincremental_seed_from = '{}'\n",
+            dir.path().join("file/target/debug").display()
+        ),
     )
     .unwrap();
     assert_eq!(
         Config::load().unwrap().incremental_seed_from,
-        Some(PathBuf::from("/file/target/debug"))
+        Some(dir.path().join("file/target/debug"))
     );
 }
 
@@ -4707,10 +4900,11 @@ fn test_lease_comes_from_the_environment_even_with_ignore_env() {
 
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     std::fs::write(&config_path, "[cache]\nignore_env = true\n").unwrap();
-    let _lease = NamedEnvGuard::set("KACHE_TEST_LEASE", "/cache/scheduler/tests/1");
+    let lease = dir.path().join("scheduler/tests/1");
+    let _lease = NamedEnvGuard::set("KACHE_TEST_LEASE", lease.to_str().unwrap());
     assert_eq!(
         Config::load().unwrap().test_lease,
-        Some(PathBuf::from("/cache/scheduler/tests/1")),
+        Some(lease),
         "the lease is operational, so ignore_env does not hide it"
     );
 }

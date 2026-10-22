@@ -2,7 +2,7 @@
 //!
 //! These types retain the existing JSON field names and compatibility defaults.
 //! They perform no I/O and do not depend on the cache store or daemon runtime.
-//! Request envelopes with runtime-owned payloads still live in the binary.
+//! Runtime policy and conversion from live application state stay with callers.
 
 use kache_core::timeline::{PrefetchAccounting, PrefetchOrigin};
 use serde::{Deserialize, Serialize};
@@ -622,3 +622,17 @@ fn default_effective_remote_key_listing() -> bool {
 fn default_effective_remote_key_cache_refresh_secs() -> u64 {
     60
 }
+
+mod envelopes;
+mod events;
+pub mod fallback;
+mod prediction;
+mod publication;
+pub use envelopes::*;
+pub use events::*;
+pub use kache_format::BlobStats;
+pub use prediction::*;
+pub use publication::*;
+
+/// Compiler execution handoff, including native strings and commit states.
+pub mod execution;

@@ -3,11 +3,31 @@ title: Architecture
 description: How the compiler wrapper, local store, and daemon divide the work
 ---
 
-Kache has three parts: a compiler wrapper, a local store, and an optional daemon.
+Kache ships a small `kache` client and a `kache-engine` executable containing the
+CLI, cache pipeline and daemon.
+
+The client sends compiler arguments, environment, working directory and IO to
+the daemon. The daemon runs concurrent cache pipelines, each with its own inputs,
+jobserver, cancellation and accounting. It does not change its process-wide
+environment or working directory to serve a client.
+
+On Unix, the daemon starts native compiler children. On Windows, the client
+starts them at the daemon's request, preserving the client's token, job objects
+and console. The cache pipeline stays in the daemon on both platforms.
+Both Windows peers compare process-token context before committing execution.
+The client opens the pipe with identification-only security, so the server can
+inspect its identity without acting with its token.
+
+The engine starts a missing daemon on the first cache-enabled compile. If
+preparation fails or the client's process restrictions cannot be preserved, the
+client can run the local engine. The first Commit write attempt transfers
+execution responsibility to the daemon. A later disconnect fails the invocation.
+
+CLI commands and build-script launchers run in the engine.
 
 ## Build path
 
-For an eligible compiler invocation, the wrapper:
+For an eligible compiler invocation, the pipeline:
 
 1. parses the compiler arguments and discovers inputs
 2. computes a BLAKE3 cache key
@@ -53,8 +73,9 @@ A miss stores its outputs without waiting for an fsync. The daemon flushes the n
 
 ## Daemon
 
-The daemon owns remote work and periodic maintenance:
+The daemon owns delegated compilation, remote work and periodic maintenance:
 
+- concurrent cache pipelines for delegated compiler invocations
 - exact remote checks and downloads
 - storing finished C/C++ compiles that wrappers hand over, and registering rustc stores the index was too busy for (`cache.daemon_publish`, `cache.daemon_publish_rustc`)
 - background uploads and durable upload replay
@@ -66,7 +87,10 @@ The daemon owns remote work and periodic maintenance:
 - index upkeep, target-directory cleanup and target-file sharing when the machine is quiet
 - monitor statistics that require live transfer state
 
-The wrapper connects through `<runtime_dir>/daemon.sock` on Unix or a named pipe on Windows. A daemon failure does not break compilation: local caching continues and remote work is skipped or deferred.
+The client connects through `<runtime_dir>/daemon.sock` on Unix or a named pipe
+on Windows. Before Commit, an unavailable daemon leaves the local engine
+responsible for compilation and local caching. Remote work is skipped or
+deferred on that path.
 
 See [Daemon overview](/docs/daemon/overview) and [Lifecycle](/docs/daemon/lifecycle).
 

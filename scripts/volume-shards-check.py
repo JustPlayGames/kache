@@ -75,8 +75,15 @@ def check(binary, rustc, root, mounts):
                     for mount, store in zip(mounts, stores)) + "\n"
     )
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("KACHE_") and k not in ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")}
-    env.update(KACHE_CONFIG=str(config), KACHE_HOST_CONFIG="", KACHE_FALLBACK="off")
+           if not k.startswith("KACHE_") and k not in (
+               "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_HOME",
+               "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR")}
+    # Doctor resolves Cargo output placement, so inherited user config must
+    # not redirect this fixture's link probe to another filesystem.
+    cargo_home = root / "cargo-home"
+    cargo_home.mkdir()
+    env.update(KACHE_CONFIG=str(config), KACHE_HOST_CONFIG="", KACHE_FALLBACK="off",
+               CARGO_HOME=str(cargo_home))
 
     def kache(*args, cwd=root):
         return run([binary, *args], env=env, cwd=cwd)
@@ -87,6 +94,12 @@ def check(binary, rustc, root, mounts):
             build.mkdir()
             source = build / "lib.rs"
             source.write_text(f"pub fn value() -> u32 {{ {index + 42} }}\n")
+            # TMPDIR can be inside the checkout. Keep Cargo discovery inside
+            # this fixture instead of inheriting that enclosing workspace.
+            (build / "Cargo.toml").write_text(
+                f'[package]\nname = "shard-{index}"\nversion = "0.1.0"\n'
+                '[lib]\npath = "lib.rs"\n[workspace]\n'
+            )
             output = build / "out"
             output.mkdir()
             args = [rustc, "--crate-name", f"shard_{index}", "--crate-type", "rlib",

@@ -19,6 +19,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+use crate::invocation::InvocationEnv;
 use crate::link::LinkStrategy;
 
 pub mod cc;
@@ -62,14 +63,14 @@ impl std::fmt::Display for CompilerId {
 pub struct CompilerAdapter {
     id: CompilerId,
     display_name: &'static str,
-    recognizes: fn(&[String]) -> bool,
+    recognizes: fn(&[String], &InvocationEnv) -> bool,
 }
 
 impl CompilerAdapter {
-    pub const fn new(
+    pub(crate) const fn new(
         id: CompilerId,
         display_name: &'static str,
-        recognizes: fn(&[String]) -> bool,
+        recognizes: fn(&[String], &InvocationEnv) -> bool,
     ) -> Self {
         Self {
             id,
@@ -86,8 +87,13 @@ impl CompilerAdapter {
         self.display_name
     }
 
+    #[cfg(test)]
     pub fn recognizes(self, args: &[String]) -> bool {
-        (self.recognizes)(args)
+        self.recognizes_for(args, &InvocationEnv::capture())
+    }
+
+    pub(crate) fn recognizes_for(self, args: &[String], env: &InvocationEnv) -> bool {
+        (self.recognizes)(args, env)
     }
 }
 
@@ -157,6 +163,8 @@ impl RefuseReason {
 
 /// Compiler-agnostic context passed to [`Compiler::cache_key`].
 pub struct KeyCtx<'a, 'db> {
+    /// Client environment captured for this compilation, including declared key inputs.
+    pub invocation_env: &'a crate::invocation::InvocationEnv,
     pub file_hasher: &'a crate::cache_key::FileHasher<'db>,
     /// Strips machine-local path prefixes from key inputs so the same
     /// source produces the same key across hosts and worktrees. Lives
@@ -784,27 +792,23 @@ pub const COMPILER_ADAPTERS: &[CompilerAdapter] =
 /// handling via [`cc::CcCompiler::recognizes_family_probe`], which is its own
 /// concern, not an adapter).
 pub fn detect_compiler(args: &[String]) -> Option<&'static CompilerAdapter> {
+    detect_compiler_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn detect_compiler_for(
+    args: &[String],
+    env: &InvocationEnv,
+) -> Option<&'static CompilerAdapter> {
     COMPILER_ADAPTERS
         .iter()
-        .find(|adapter| adapter.recognizes(args))
+        .find(|adapter| adapter.recognizes_for(args, env))
 }
 
 /// Detect a `RUSTC_WRAPPER` + `RUSTC_WORKSPACE_WRAPPER` chain with an
 /// unrecognized workspace wrapper. Cargo passes `<wrapper> rustc <args>`;
 /// the wrapper may be an absolute path or a bare name resolved via PATH.
 /// We match the inner rustc, not the wrapper name.
-#[cfg(unix)]
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &std::path::Path) -> bool {
-    path.is_file()
-}
+use kache_shims::is_executable_file as is_executable;
 
 pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
     if s.starts_with('-') {
@@ -852,56 +856,7 @@ pub(crate) fn resolve_program_on_path(program: &str) -> Option<std::path::PathBu
     resolve_program_on_path_with(program, path.as_deref(), pathext.as_deref())
 }
 
-fn resolve_program_on_path_with(
-    program: &str,
-    path: Option<&std::ffi::OsStr>,
-    pathext: Option<&std::ffi::OsStr>,
-) -> Option<std::path::PathBuf> {
-    if program.contains('/') || program.contains('\\') {
-        return Some(std::path::PathBuf::from(program));
-    }
-    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(path?).collect();
-
-    let extensions: Vec<String> = if cfg!(windows) {
-        if let Some(pathext) = pathext {
-            std::env::split_paths(pathext)
-                .filter_map(|p| p.to_str().map(|s| s.to_string()))
-                .collect()
-        } else {
-            vec![
-                ".exe".to_string(),
-                ".bat".to_string(),
-                ".cmd".to_string(),
-                ".com".to_string(),
-            ]
-        }
-    } else {
-        vec!["".to_string()]
-    };
-
-    for dir in dirs {
-        let p = dir.join(program);
-        if is_executable(&p) {
-            return Some(p);
-        }
-        for ext in &extensions {
-            if ext.is_empty() {
-                continue;
-            }
-            let mut suffixed = p.clone().into_os_string();
-            suffixed.push(ext);
-            let suffixed_path = std::path::PathBuf::from(suffixed);
-            if is_executable(&suffixed_path) {
-                return Some(suffixed_path);
-            }
-        }
-    }
-    None
-}
-
-fn is_program_on_path(program: &str) -> bool {
-    resolve_program_on_path(program).is_some()
-}
+pub(crate) use kache_shims::resolve_program_on_path_with;
 
 /// Detect a real compiler invocation that must run uncached.
 ///
@@ -912,8 +867,13 @@ fn is_program_on_path(program: &str) -> bool {
 /// tool names. (`nvcc` used to live here; since kunobi-ninja/kache#1024 it has
 /// its own adapter and dispatches to `run_nvcc`, which passes through with a
 /// recorded reason until the cache path lands.)
+#[cfg(test)]
 pub(crate) fn is_passthrough_compiler_invocation(args: &[String]) -> bool {
-    let rustc = std::env::var_os("RUSTC");
+    is_passthrough_compiler_invocation_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn is_passthrough_compiler_invocation_for(args: &[String], env: &InvocationEnv) -> bool {
+    let rustc = env.var_os("RUSTC");
     is_passthrough_compiler_invocation_with(args, rustc.as_deref())
 }
 
@@ -937,8 +897,16 @@ pub(crate) fn is_passthrough_compiler_invocation_with(
 /// is rustc plus lints, so its outputs are keyed like rustc's with the Clippy
 /// version, configuration and lint arguments folded in (see
 /// `cache_key::clippy_identity`). Every other driver stays uncached.
+#[cfg(test)]
 pub fn is_cacheable_workspace_wrapper_chain(args: &[String]) -> bool {
-    is_workspace_wrapper_chain(args)
+    is_cacheable_workspace_wrapper_chain_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn is_cacheable_workspace_wrapper_chain_for(
+    args: &[String],
+    env: &InvocationEnv,
+) -> bool {
+    is_workspace_wrapper_chain_for(args, env)
         && args
             .first()
             .is_some_and(|program| is_clippy_driver(program))
@@ -951,8 +919,14 @@ pub(crate) fn is_clippy_driver(program: &str) -> bool {
 }
 
 pub fn is_workspace_wrapper_chain(args: &[String]) -> bool {
-    let workspace_wrapper = std::env::var_os("RUSTC_WORKSPACE_WRAPPER");
-    is_workspace_wrapper_chain_with(args, workspace_wrapper.as_deref(), is_program_on_path)
+    is_workspace_wrapper_chain_for(args, &InvocationEnv::capture())
+}
+
+pub(crate) fn is_workspace_wrapper_chain_for(args: &[String], env: &InvocationEnv) -> bool {
+    let workspace_wrapper = env.var_os("RUSTC_WORKSPACE_WRAPPER");
+    is_workspace_wrapper_chain_with(args, workspace_wrapper.as_deref(), |program| {
+        env.resolve_program(Path::new(program)).is_some()
+    })
 }
 
 fn is_workspace_wrapper_chain_with(
@@ -1001,6 +975,83 @@ pub(crate) fn strip_windows_exe_suffix(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_dispatch_uses_each_clients_compiler_and_wrapper_selection() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for (root, marker, expected) in [
+                (first.path(), "KACHE_PROBE_GNU", Some(cc::CC_ID)),
+                (second.path(), "not-a-compiler", None),
+            ] {
+                std::fs::create_dir(root.join("bin")).unwrap();
+                kache_fs::testutil::write_executable(
+                    &root.join("bin/local-driver"),
+                    format!("#!/bin/sh\nprintf x >> driver-runs\nprintf '%s\\n' '{marker}'\n"),
+                );
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let mut env = InvocationEnv::from_parts(
+                        [
+                            ("PATH", "bin"),
+                            ("RUSTC", "custom-rustc"),
+                            ("RUSTC_WORKSPACE_WRAPPER", "declared-wrapper"),
+                        ],
+                        Some(root.to_owned()),
+                        None,
+                        root.to_owned(),
+                    );
+                    env.set("KACHE_CACHE_DIR", root.join("cache"));
+                    let args = [
+                        "local-driver".to_string(),
+                        "-c".to_string(),
+                        "unit.c".to_string(),
+                    ];
+                    barrier.wait();
+                    assert_eq!(
+                        detect_compiler_for(&args, &env).map(|adapter| adapter.id()),
+                        expected
+                    );
+                    assert_eq!(
+                        detect_compiler_for(&args, &env).map(|adapter| adapter.id()),
+                        expected
+                    );
+                    assert_eq!(
+                        std::fs::read(root.join("driver-runs")).unwrap(),
+                        b"x",
+                        "both positive and negative family results are memoized"
+                    );
+                    let chain = ["local-driver".into(), "rustc".into(), "unit.rs".into()];
+                    assert!(is_workspace_wrapper_chain_for(&chain, &env));
+                    assert!(detect_compiler_for(&chain, &env).is_none());
+                    let declared = ["declared-wrapper".into(), "rustc".into(), "unit.rs".into()];
+                    assert!(is_workspace_wrapper_chain_for(&declared, &env));
+                    let mut other = env.clone();
+                    other.set("PATH", "missing-bin");
+                    other.set("RUSTC_WORKSPACE_WRAPPER", "other-wrapper");
+                    other.set("RUSTC", "other-rustc");
+                    assert!(!is_workspace_wrapper_chain_for(&chain, &other));
+                    assert!(!is_workspace_wrapper_chain_for(&declared, &other));
+                    assert!(detect_compiler_for(&args, &other).is_none());
+                    let custom = ["custom-rustc".into(), "--version".into()];
+                    assert!(is_passthrough_compiler_invocation_for(&custom, &env));
+                    assert!(!is_passthrough_compiler_invocation_for(&custom, &other));
+                    assert!(
+                        detect_compiler_for(&["local-driver".into(), "--version".into()], &env)
+                            .is_none()
+                    );
+                    assert_eq!(
+                        std::fs::read(root.join("driver-runs")).unwrap(),
+                        b"x",
+                        "wrapper chains and info queries must not run detection probes"
+                    );
+                });
+            }
+        });
+    }
 
     #[test]
     fn version_or_info_query_needs_every_arg_to_be_a_query_flag() {
@@ -1997,16 +2048,13 @@ pub(crate) mod shim {
     /// Whether `argv[0]` names a compiler, meaning kache is being invoked
     /// through a shim rather than as itself.
     pub(crate) fn invoked_as_compiler(arg0: &str) -> bool {
-        let argv = [arg0.to_string()];
-        // `rustdoc` is an exact basename. It must not go through the C-family
-        // probe, and a versioned `gcc-13` must still match below.
-        if super::rustdoc::RustdocCompiler::recognizes(&argv) {
-            return true;
-        }
-        // Reuses the full name set (exact, versioned, target-prefixed, MinGW
-        // alternatives), so a hand-made `x86_64-linux-gnu-gcc` shim works
-        // without a second list to keep in sync.
-        super::cc::CcCompiler::recognizes(&argv)
+        invoked_as_compiler_for(arg0, &super::InvocationEnv::capture())
+    }
+
+    fn invoked_as_compiler_for(arg0: &str, env: &super::InvocationEnv) -> bool {
+        let argv = [arg0.to_owned()];
+        super::rustdoc::RustdocCompiler::recognizes(&argv)
+            || super::cc::CcCompiler::recognizes_for(&argv, env)
     }
 
     /// The real compiler behind a shim: the first `name` on `PATH` that is not
@@ -2121,7 +2169,7 @@ pub(crate) mod shim {
     pub(crate) fn resolve_real_compiler_from_env(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         resolve_real_compiler_on(name, &dirs, self_exe.as_deref())
     }
 
@@ -2129,7 +2177,7 @@ pub(crate) mod shim {
     #[cfg(unix)]
     pub(crate) fn real_compiler_on(path: &std::ffi::OsStr, name: &str) -> bool {
         let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         resolve_real_compiler_on(name, &dirs, self_exe.as_deref()).is_some()
     }
 
@@ -2193,7 +2241,7 @@ pub(crate) mod shim {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn names_on_path(path: &std::ffi::OsStr, from_path: bool) -> Vec<String> {
         let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         let wanted: &dyn Fn(&str) -> bool = if from_path {
             &invoked_as_compiler
         } else {
@@ -2214,7 +2262,7 @@ pub(crate) mod shim {
     pub(crate) fn live_shim_status() -> kache_shims::Status {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-        let self_exe = std::env::current_exe().ok();
+        let self_exe = crate::platform::frontend_executable().ok();
         let known: Vec<PathBuf> = default_shim_dir()
             .into_iter()
             .chain([farm::system_dir()])
@@ -2226,12 +2274,28 @@ pub(crate) mod shim {
     /// understands: the resolved real compiler followed by the original
     /// arguments. `None` when this is not a shim invocation.
     pub(crate) fn wrapper_args(argv: &[String]) -> Option<Result<Vec<String>, String>> {
+        wrapper_args_for(
+            argv,
+            &super::InvocationEnv::capture(),
+            crate::platform::frontend_executable().ok().as_deref(),
+        )
+    }
+
+    pub(crate) fn wrapper_args_for(
+        argv: &[String],
+        env: &super::InvocationEnv,
+        executable: Option<&Path>,
+    ) -> Option<Result<Vec<String>, String>> {
         let arg0 = argv.first()?;
-        if !invoked_as_compiler(arg0) {
+        if !invoked_as_compiler_for(arg0, env) {
             return None;
         }
         let name = super::command_basename(arg0)?;
-        let Some(real) = resolve_real_compiler_from_env(name) else {
+        let paths = env.var_os("PATH").unwrap_or_default();
+        let paths = std::env::split_paths(&paths)
+            .filter_map(|path| env.resolve(&path))
+            .collect::<Vec<_>>();
+        let Some(real) = resolve_real_compiler_on(name, &paths, executable) else {
             return Some(Err(format!(
                 "kache was invoked through a compiler shim named `{name}`, but no real `{name}` \
                  was found on PATH behind it. Every `{name}` on PATH resolves to kache itself, \

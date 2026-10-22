@@ -47,9 +47,19 @@ mod rustc_handoff;
 /// - `verbose` / `all` — print hits, dups, misses, and in-flight heartbeats
 /// - anything else / unset — silent
 fn progress_level() -> u8 {
-    match std::env::var("KACHE_PROGRESS").as_deref() {
-        Ok("1" | "hits") => 1,
-        Ok("verbose" | "all") => 2,
+    INVOCATION_SETTINGS
+        .with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|settings| settings.progress_level)
+        })
+        .unwrap_or_else(|| parse_progress_level(std::env::var("KACHE_PROGRESS").ok().as_deref()))
+}
+
+fn parse_progress_level(value: Option<&str>) -> u8 {
+    match value {
+        Some("1" | "hits") => 1,
+        Some("verbose" | "all") => 2,
         _ => 0,
     }
 }
@@ -276,7 +286,17 @@ fn disable_incremental_env(incremental_preserved: bool) -> bool {
 /// two different caches from silencing each other.
 pub(crate) fn warn_marker_path(kind: &str, cache_dir: &Path) -> PathBuf {
     let hash = blake3::hash(cache_dir.as_os_str().as_encoded_bytes()).to_hex();
-    std::env::temp_dir().join(format!("kache-{kind}-warn-{}", &hash[..16]))
+    let temp = INVOCATION_SETTINGS
+        .with(|slot| {
+            slot.borrow().as_ref().map(|settings| {
+                settings
+                    .temp_dir
+                    .clone()
+                    .unwrap_or_else(|| cache_dir.to_owned())
+            })
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    temp.join(format!("kache-{kind}-warn-{}", &hash[..16]))
 }
 
 /// Emit the `store_unavailable_message` to stderr **at most once per build
@@ -645,7 +665,19 @@ pub(crate) fn after_store(config: &Config, store: &Store, failure: Option<&anyho
         config,
         store,
         failure,
-        crate::daemon::send_gc_hint,
+        |config| {
+            let daemon = INVOCATION_SETTINGS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|settings| settings.daemon.clone())
+            });
+            if let Some(daemon) = daemon {
+                daemon.request_gc_for_invocation(config.clone());
+                true
+            } else {
+                crate::daemon::send_gc_hint(config)
+            }
+        },
         spawn_auto_gc_worker,
     );
 }
@@ -929,12 +961,14 @@ fn cc_output_path_requires_passthrough(path: &Path) -> bool {
 /// stdout / stderr inherit so the cc crate reads the preprocessor
 /// output verbatim. Exit code propagates so a real probe failure
 /// (missing compiler, malformed probe file) still surfaces.
-pub fn run_cc_probe(args: &[String]) -> Result<i32> {
-    let program = probe_forward_compiler();
-    let status = std::process::Command::new(&program)
-        .args(args)
-        .status()
-        .with_context(|| {
+pub(crate) fn run_cc_probe_for(
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+    shim_stem: &str,
+) -> Result<i32> {
+    let program = probe_forward_compiler_for(env, shim_stem);
+    let status =
+        crate::invocation::io::status(env.command(&program)?.args(args)).with_context(|| {
             format!("spawning `{program}` to forward cc-crate compiler-family probe")
         })?;
     Ok(status.code().unwrap_or(1))
@@ -942,6 +976,7 @@ pub fn run_cc_probe(args: &[String]) -> Result<i32> {
 
 /// Resolve the compiler a cc-crate family probe should forward to: the
 /// real compiler recovered from `CC`/`CXX`, else the system `cc`.
+#[cfg(test)]
 fn probe_forward_compiler() -> String {
     let self_stem = std::env::current_exe()
         .ok()
@@ -950,17 +985,22 @@ fn probe_forward_compiler() -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "kache".to_string());
 
+    probe_forward_compiler_for(&crate::invocation::InvocationEnv::capture(), &self_stem)
+}
+
+fn probe_forward_compiler_for(env: &crate::invocation::InvocationEnv, shim_stem: &str) -> String {
     // `vars_os` + lossy filter rather than `vars()`, which panics if
     // *any* environment variable holds non-UTF-8 (plausible on Windows).
-    let env_vars = std::env::vars_os()
+    let env_vars = env
+        .vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
 
     // Cargo sets `TARGET` for build scripts — the same triple the cc
     // crate keys its `CC_<target>` lookup on — so kache can resolve the
     // exact variable the cc crate read when several are kache-wrapped.
-    let target = std::env::var("TARGET").ok();
+    let target = env.var("TARGET").ok();
 
-    crate::compiler::cc::resolve_probe_compiler(&self_stem, target.as_deref(), env_vars)
+    crate::compiler::cc::resolve_probe_compiler(shim_stem, target.as_deref(), env_vars)
         .unwrap_or_else(|| "cc".to_string())
 }
 
@@ -989,7 +1029,10 @@ fn volume_route_path_rustc(args: &RustcArgs) -> PathBuf {
         }
         return out.clone();
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    args.invocation_env()
+        .cwd()
+        .unwrap_or(Path::new("."))
+        .to_owned()
 }
 
 /// Directory used to pick a `[cache.volumes]` shard for a cc invocation.
@@ -1000,7 +1043,11 @@ fn volume_route_path_cc(parsed: &crate::compiler::cc::CcArgs) -> PathBuf {
         }
         return out.clone();
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    parsed
+        .invocation_env
+        .cwd()
+        .unwrap_or(Path::new("."))
+        .to_owned()
 }
 
 fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
@@ -1009,15 +1056,25 @@ fn volume_cache_dirs_match(routed: &Path, main: &Path) -> bool {
 
 /// Open the volume shard (or main store) plus the stores read after it: the
 /// main store when the route maps to a shard, then [`Config::readonly_store`].
+#[cfg(test)]
 fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Vec<Store>)> {
-    crate::link::set_mapped_target(config.volume_store_for(route).is_some());
-    let routed = config.routed_for_path(route);
-    let mut primary = Store::open(&routed)?;
+    open_primary_and_fallback_for(config, route, &crate::invocation::InvocationEnv::capture())
+}
+
+fn open_primary_and_fallback_for(
+    config: &Config,
+    route: &Path,
+    env: &crate::invocation::InvocationEnv,
+) -> Result<(Store, Vec<Store>)> {
+    crate::link::set_mapped_target(config.volume_store_for_invocation(route, env).is_some());
+    let routed = config.routed_for_path_for(route, env);
+    let options = crate::store::StoreOptions::from_env(|name| env.var(name).ok());
+    let mut primary = Store::open_with_options(&routed, options.clone())?;
     let mut fallbacks = Vec::new();
     if volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
         send_hit_stamps_to_daemon(config, &mut primary);
     } else {
-        match Store::open(config) {
+        match Store::open_with_options(config, options.clone()) {
             Ok(mut store) => {
                 send_hit_stamps_to_daemon(config, &mut store);
                 fallbacks.push(store);
@@ -1028,7 +1085,7 @@ fn open_primary_and_fallback(config: &Config, route: &Path) -> Result<(Store, Ve
             ),
         }
     }
-    fallbacks.extend(open_readonly_store(config));
+    fallbacks.extend(open_readonly_store(config, options));
     Ok((primary, fallbacks))
 }
 
@@ -1129,14 +1186,14 @@ fn lookup_or_miss_with_clock<T>(
 /// The store named by [`Config::readonly_store`], opened read-only, or `None`
 /// when none is set, when it is this process's own store, or when it cannot be
 /// opened that way (said at warn level).
-fn open_readonly_store(config: &Config) -> Option<Store> {
+fn open_readonly_store(config: &Config, options: crate::store::StoreOptions) -> Option<Store> {
     let dir = config.readonly_store.as_ref()?;
     if *dir == config.cache_dir {
         return None;
     }
     let mut readonly = config.clone();
     readonly.cache_dir = dir.clone();
-    match Store::open_read_only(&readonly) {
+    match Store::open_read_only_with_options(&readonly, options) {
         Ok(store) => Some(store),
         Err(e) => {
             tracing::warn!("read-only store {} unavailable: {e:#}", dir.display());
@@ -1231,9 +1288,22 @@ fn wrapper_entry() -> std::time::Instant {
 /// routing or scheduler admission yet); no fallback wrapper; any
 /// restore failure recompiles via passthrough (nvcc always rewrites
 /// `-o` outputs fresh, so no partial-restore abort).
+#[cfg(all(test, unix))]
 pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
-    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
-    let _trace = crate::phase_trace::start("nvcc", wrapper_args);
+    run_nvcc_for(
+        config,
+        wrapper_args,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn run_nvcc_for(
+    config: &Config,
+    wrapper_args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<i32> {
+    let rebuilt_package = env.var("CARGO_PKG_NAME").ok();
+    let _trace = crate::phase_trace::start_for("nvcc", wrapper_args, env);
     let start = wrapper_entry();
     let invocation_start_ns = crate::cache_key::stamp_clock_ns();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
@@ -1244,13 +1314,12 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     warn_nonlocal_cache_fs_once(config);
     // Shared with the cc knob for now; a dedicated `[nvcc]` knob is a
     // follow-up once the flag set deserves its own namespace (#1024).
-    let compiler =
-        NvccCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
-            .with_base_dirs(config.base_dirs.clone());
+    let compiler = NvccCompiler::for_invocation(config.cc_extra_allowlist_flags.clone(), env)
+        .with_base_dirs(config.base_dirs.clone());
     let parsed = compiler
         .parse(wrapper_args)
         .context("parsing nvcc arguments")?;
-    let event_root = nvcc_event_root();
+    let event_root = nvcc_event_root_for(env);
 
     // The crate-name slot in events / metadata is the source file
     // name — the closest analogue to rustc's crate name.
@@ -1281,9 +1350,10 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // User bypass rules (#222): declared per project, evaluated before any key
     // work, same fail-closed contract as `exclude` below — a match only ever
     // means "do not cache".
-    if let Some(reason) = config
-        .project_rules
-        .user_bypass_reason(&crate_name, &parsed.rest)
+    if let Some(reason) =
+        config
+            .project_rules
+            .user_bypass_reason_for(&crate_name, &parsed.rest, env)
     {
         tracing::debug!("nvcc invocation bypassed by user rule: {reason}");
         return nvcc_passthrough_with_event(
@@ -1296,10 +1366,12 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         );
     }
 
-    let current_dir = std::env::current_dir().ok();
+    let current_dir = env.cwd().map(Path::to_owned);
     let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
     if let Some(source) = parsed.sources.first()
-        && config.project_rules.source_excluded(source, &exclude_roots)
+        && config
+            .project_rules
+            .source_excluded_for(source, &exclude_roots, env)
     {
         tracing::debug!("nvcc source excluded from cache: {}", source.display());
         return nvcc_passthrough_with_event(
@@ -1317,7 +1389,10 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // inode. Bail loudly instead.
     nvcc_legacy_blob_check(config, &parsed)?;
 
-    let store = match Store::open(config) {
+    let store = match Store::open_with_options(
+        config,
+        crate::store::StoreOptions::from_env(|name| env.var(name).ok()),
+    ) {
         Ok(store) => store,
         Err(e) => {
             warn_store_unavailable_once(config, &e);
@@ -1337,12 +1412,13 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // back to passthrough, which runs the real compiler and surfaces
     // the real diagnostic.
     let key_start = std::time::Instant::now();
-    let mut file_hasher = store.file_hasher();
+    let mut file_hasher = store.file_hasher_for(env);
     // Checked after the compile: an input written since this invocation
     // began keeps the object from being stored.
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
+        invocation_env: env,
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -1452,8 +1528,7 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
         Ok(BuildClaim::Committed(meta)) => committed = Some(*meta),
         Ok(BuildClaim::Contended) => {
             tracing::debug!("waiting for nvcc {crate_name} to be built by another process");
-            committed = store
-                .wait_for_committed(&cache_key)
+            committed = crate::invocation::wait_for_committed(&store, &cache_key, None)
                 .unwrap_or(false)
                 .then(|| store.get(&cache_key).ok().flatten())
                 .flatten()
@@ -1521,8 +1596,8 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     replay_diagnostics(
         &result.stdout,
         result.pending_stderr(),
-        std::io::stdout(),
-        std::io::stderr(),
+        crate::invocation::io::stdout(),
+        crate::invocation::io::stderr(),
     );
     // The key hashed every input before nvcc ran; one written since may not
     // be what the object was built from.
@@ -1560,7 +1635,11 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     if store_decision.should_store {
         let depinfo_anchor = nvcc_depinfo_rewrite_root(&parsed);
         let target = crate::compiler::nvcc::nvcc_target_label(&parsed.deferred_flags);
-        match prepare_cc_store_files(&result.artifacts, depinfo_anchor.as_deref()) {
+        match prepare_cc_store_files_for(
+            &result.artifacts,
+            depinfo_anchor.as_deref(),
+            &parsed.invocation_env,
+        ) {
             Ok(prepared) => {
                 let put = store.put_with_compile_time_independent(
                     &cache_key,
@@ -1637,10 +1716,13 @@ pub fn run_nvcc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 /// to the phase-2 cache-miss execution path.
 fn nvcc_passthrough(parsed: &crate::compiler::nvcc::NvccArgs) -> Result<PassthroughOutput> {
     crate::opcounts::record_compiler_run();
-    let status = std::process::Command::new(&parsed.program)
-        .args(&parsed.rest)
-        .status()
-        .with_context(|| format!("executing {}", parsed.program))?;
+    let status = crate::invocation::io::status(
+        parsed
+            .invocation_env
+            .command(&parsed.program)?
+            .args(&parsed.rest),
+    )
+    .with_context(|| format!("executing {}", parsed.program))?;
     Ok(PassthroughOutput {
         exit_code: status.code().unwrap_or(1),
         fallback: false,
@@ -1671,10 +1753,22 @@ fn nvcc_passthrough_with_event<R: Into<String>>(
     Ok(output.exit_code)
 }
 
-fn nvcc_event_root() -> String {
-    nvcc_event_root_in(std::env::var_os("OUT_DIR"))
+fn nvcc_event_root_for(env: &crate::invocation::InvocationEnv) -> String {
+    event_root_string_for(
+        event_root_override_for(env)
+            .or_else(|| {
+                env.var_os("OUT_DIR")
+                    .filter(|dir| !dir.is_empty())
+                    .and_then(|dir| env.resolve(Path::new(&dir)))
+                    .as_deref()
+                    .and_then(cargo_workspace_of)
+            })
+            .or_else(|| env.cwd().map(Path::to_owned)),
+        env,
+    )
 }
 
+#[cfg(test)]
 fn nvcc_event_root_in(out_dir: Option<std::ffi::OsString>) -> String {
     event_root_string(
         event_root_override()
@@ -1697,6 +1791,7 @@ fn nvcc_legacy_blob_check(config: &Config, parsed: &crate::compiler::nvcc::NvccA
         outputs.push(depfile);
     }
     for output in outputs {
+        let output = parsed.resolve_path(&output)?;
         if let Some(blob) = Store::matching_readonly_blob_inode(&store_dir, &output)? {
             anyhow::bail!(
                 "refusing to invoke the compiler because {} still shares the \
@@ -1736,8 +1831,8 @@ fn nvcc_cache_entry_rejection_reason(
 fn nvcc_depinfo_rewrite_root(
     parsed: &crate::compiler::nvcc::NvccArgs,
 ) -> Option<std::path::PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    nvcc_depinfo_rewrite_root_from_cwd(parsed, &cwd)
+    let cwd = parsed.invocation_env.cwd()?;
+    nvcc_depinfo_rewrite_root_from_cwd(parsed, cwd)
 }
 
 fn nvcc_depinfo_rewrite_root_from_cwd(
@@ -1805,6 +1900,7 @@ fn restore_nvcc_from_cache(
             }
         };
 
+        let target = parsed.resolve_path(&target)?;
         // Recheck immediately before the path-based restore: the
         // initial check ran before key computation, and another
         // process may have restored over our outputs since.
@@ -1897,11 +1993,24 @@ fn nvcc_try_remote_hit(
 ///
 /// Local and remote hits share compiler-specific restoration. Miss-path
 /// flights, permits, and per-key build locks match rustc.
+#[cfg(all(test, unix))]
 pub fn run_cc(config: &Config, wrapper_args: &[String]) -> Result<i32> {
-    let _trace = crate::phase_trace::start("cc", wrapper_args);
+    run_cc_for(
+        config,
+        wrapper_args,
+        &crate::invocation::InvocationEnv::capture(),
+    )
+}
+
+pub(crate) fn run_cc_for(
+    config: &Config,
+    wrapper_args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<i32> {
+    let _trace = crate::phase_trace::start_for("cc", wrapper_args, env);
     let start = wrapper_entry();
     let invocation_start_ns = crate::cache_key::stamp_clock_ns();
-    run_cc_inner(config, wrapper_args, start, invocation_start_ns)
+    run_cc_inner(config, wrapper_args, start, invocation_start_ns, env)
 }
 
 /// A C compile that already ran because its key was deferred: the key is
@@ -1928,6 +2037,7 @@ fn run_cc_inner(
     wrapper_args: &[String],
     start: std::time::Instant,
     invocation_start_ns: i64,
+    env: &crate::invocation::InvocationEnv,
 ) -> Result<i32> {
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
@@ -1935,7 +2045,7 @@ fn run_cc_inner(
     crate::link::set_layout_advice_to_log(true);
     crate::link::set_cow_warn_marker(warn_marker_path("cow", &config.cache_dir));
     warn_nonlocal_cache_fs_once(config);
-    let compiler = CcCompiler::with_extra_allowlist_flags(config.cc_extra_allowlist_flags.clone())
+    let compiler = CcCompiler::for_invocation(config.cc_extra_allowlist_flags.clone(), env)
         .with_cache_cc_links(config.cache_cc_links)
         .with_base_dirs(config.base_dirs.clone());
     let trace_parse = crate::phase_trace::phase("cc_parse");
@@ -1943,7 +2053,7 @@ fn run_cc_inner(
         .parse(wrapper_args)
         .context("parsing cc-family arguments")?;
     drop(trace_parse);
-    if crate::compiler::cc::cc_is_internal_key_probe() {
+    if crate::compiler::cc::cc_is_internal_key_probe_for(env) {
         let crate_name = parsed
             .sources
             .first()
@@ -2000,18 +2110,21 @@ fn run_cc_inner(
     // User bypass rules (#222): declared per project, evaluated before any key
     // work, same fail-closed contract as `exclude` below — a match only ever
     // means "do not cache".
-    if let Some(reason) = config
-        .project_rules
-        .user_bypass_reason(&crate_name, &parsed.rest)
+    if let Some(reason) =
+        config
+            .project_rules
+            .user_bypass_reason_for(&crate_name, &parsed.rest, env)
     {
         tracing::debug!("cc invocation bypassed by user rule: {reason}");
         return cc_passthrough_with_event(config, &parsed, &crate_name, &event_root, start, reason);
     }
 
-    let current_dir = std::env::current_dir().ok();
+    let current_dir = env.cwd().map(Path::to_owned);
     let exclude_roots: Vec<_> = current_dir.iter().cloned().collect();
     if let Some(source) = parsed.sources.first()
-        && config.project_rules.source_excluded(source, &exclude_roots)
+        && config
+            .project_rules
+            .source_excluded_for(source, &exclude_roots, env)
     {
         tracing::debug!("cc source excluded from cache: {}", source.display());
         return cc_passthrough_with_event(
@@ -2027,7 +2140,7 @@ fn run_cc_inner(
 
     let trace_store_open = crate::phase_trace::phase("store_open");
     let (store, fallback_stores) =
-        match open_primary_and_fallback(config, &volume_route_path_cc(&parsed)) {
+        match open_primary_and_fallback_for(config, &volume_route_path_cc(&parsed), env) {
             Ok(pair) => {
                 drop(trace_store_open);
                 pair
@@ -2088,13 +2201,13 @@ fn run_cc_with_store(
     } = invocation;
     let start = *start;
     let invocation_start_ns = *invocation_start_ns;
-    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
+    let rebuilt_package = parsed.invocation_env.var("CARGO_PKG_NAME").ok();
     // Compute the cache key (runs `cc -E -P` for the preprocessor
     // hash). On any failure — preprocessor error, missing compiler —
     // fall back to passthrough, which runs the real compiler and
     // surfaces the real diagnostic.
     let key_start = std::time::Instant::now();
-    let mut file_hasher = store.file_hasher();
+    let mut file_hasher = store.file_hasher_for(&parsed.invocation_env);
     // Flag inputs written since this invocation began. A deferred compile
     // fingerprints what it read afterwards and stores neither an entry nor
     // a memo once one is flagged. A key taken first is checked again once
@@ -2102,6 +2215,7 @@ fn run_cc_with_store(
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
     let key_ctx = KeyCtx {
+        invocation_env: &parsed.invocation_env,
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -2330,8 +2444,7 @@ fn run_cc_with_store(
                     "waiting for cc {} to be built by another process",
                     crate_name
                 );
-                committed = store
-                    .wait_for_committed(&cache_key)
+                committed = crate::invocation::wait_for_committed(store, &cache_key, None)
                     .unwrap_or(false)
                     .then(|| store.get(&cache_key).ok().flatten())
                     .flatten()
@@ -2426,8 +2539,8 @@ fn run_cc_with_store(
             replay_diagnostics(
                 &result.stdout,
                 result.pending_stderr(),
-                std::io::stdout(),
-                std::io::stderr(),
+                crate::invocation::io::stdout(),
+                crate::invocation::io::stderr(),
             );
             // The key hashed the read set before the compile ran; an input
             // written since may not hold the bytes the compiler read.
@@ -2500,6 +2613,7 @@ fn run_cc_with_store(
             depinfo_anchor.as_deref(),
             staging_dir.as_deref(),
             &parsed.depinfo_roots,
+            parsed.invocation_env.temp_dir(),
         ) {
             Ok(prepared) => {
                 let stdout = if crate::compiler::cc::cc_expansion_is_stdout(parsed) {
@@ -2692,16 +2806,26 @@ fn cc_passthrough_impl(
         && !force_direct
         && !parsed.requires_compiler_output_semantics()
     {
-        let mut cmd = std::process::Command::new(fb);
-        cmd.arg(&parsed.program);
-        cmd.args(&parsed.rest);
-        let outputs: Vec<&Path> = parsed
+        let mut cmd = parsed.invocation_env.command(fb);
+        if let Ok(cmd) = &mut cmd {
+            cmd.arg(&parsed.program);
+            cmd.args(&parsed.rest);
+        }
+        let outputs: Vec<PathBuf> = parsed
             .output
             .as_deref()
             .map(Path::new)
             .into_iter()
-            .collect();
-        let attempt = crate::fallback::run(cmd, fb, &outputs, &parsed.rest);
+            .map(|path| {
+                parsed
+                    .invocation_env
+                    .resolve(path)
+                    .context("resolving C fallback output path")
+            })
+            .collect::<Result<_>>()?;
+        let outputs: Vec<_> = outputs.iter().map(PathBuf::as_path).collect();
+        let attempt =
+            crate::fallback::run_for(cmd, fb, &outputs, &parsed.rest, &parsed.invocation_env);
         if let Some(exit_code) = attempt.terminal_code() {
             return Ok(PassthroughOutput {
                 exit_code,
@@ -2719,10 +2843,13 @@ fn cc_passthrough_impl(
     // existing output path (#645).
     refuse_legacy_cc_blob_outputs(config, parsed)?;
     crate::opcounts::record_compiler_run();
-    let status = std::process::Command::new(&parsed.program)
-        .args(&parsed.rest)
-        .status()
-        .with_context(|| format!("executing {}", parsed.program))?;
+    let status = crate::invocation::io::status(
+        parsed
+            .invocation_env
+            .command(&parsed.program)?
+            .args(&parsed.rest),
+    )
+    .with_context(|| format!("executing {}", parsed.program))?;
     Ok(PassthroughOutput {
         exit_code: status.code().unwrap_or(1),
         fallback: false,
@@ -2736,6 +2863,10 @@ pub(crate) fn refuse_legacy_cc_blob_outputs(
 ) -> Result<()> {
     let store_dir = config.store_dir();
     for output in parsed.compiler_output_paths() {
+        let output = parsed
+            .invocation_env
+            .resolve(&output)
+            .context("resolving C output path for cache blob check")?;
         if let Some(blob) = Store::matching_readonly_blob_inode(&store_dir, &output)? {
             anyhow::bail!(
                 "refusing to invoke the compiler because {} still shares the \
@@ -2851,8 +2982,7 @@ fn cc_cache_entry_rejection_reason(
 }
 
 fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::path::PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    cc_depinfo_rewrite_root_from_cwd(parsed, &cwd)
+    cc_depinfo_rewrite_root_from_cwd(parsed, parsed.invocation_env.cwd()?)
 }
 
 fn rustc_event_root(args: &RustcArgs) -> String {
@@ -2862,27 +2992,40 @@ fn rustc_event_root(args: &RustcArgs) -> String {
             .and_then(Path::parent)
             .map(Path::to_path_buf)
     });
-    event_root_string(event_root_override().or_else(|| {
-        written_to
-            .as_deref()
-            .and_then(cargo_workspace_of)
-            .or_else(|| args.workspace_root())
-            .or_else(|| std::env::current_dir().ok())
-    }))
+    let env = args.invocation_env();
+    event_root_string_for(
+        event_root_override_for(env).or_else(|| {
+            written_to
+                .as_deref()
+                .and_then(|path| env.resolve(path))
+                .as_deref()
+                .and_then(cargo_workspace_of)
+                .or_else(|| args.workspace_root())
+                .or_else(|| env.cwd().map(Path::to_owned))
+        }),
+        env,
+    )
 }
 
 fn cc_event_root(parsed: &crate::compiler::cc::CcArgs) -> String {
-    cc_event_root_in(parsed, std::env::var_os("OUT_DIR"))
+    cc_event_root_in(parsed, parsed.invocation_env.var_os("OUT_DIR"))
 }
 
 fn cc_event_root_in(
     parsed: &crate::compiler::cc::CcArgs,
     out_dir: Option<std::ffi::OsString>,
 ) -> String {
-    event_root_string(
-        event_root_override()
-            .or_else(|| out_dir_workspace(out_dir))
-            .or_else(|| cc_depinfo_rewrite_root(parsed).or_else(|| std::env::current_dir().ok())),
+    let env = &parsed.invocation_env;
+    event_root_string_for(
+        event_root_override_for(env)
+            .or_else(|| {
+                out_dir
+                    .and_then(|dir| env.resolve(Path::new(&dir)))
+                    .as_deref()
+                    .and_then(cargo_workspace_of)
+            })
+            .or_else(|| cc_depinfo_rewrite_root(parsed).or_else(|| env.cwd().map(Path::to_owned))),
+        env,
     )
 }
 
@@ -2904,27 +3047,29 @@ fn cargo_workspace_of(dir: &Path) -> Option<PathBuf> {
 
 /// The workspace of the build script a compiler runs under, from the
 /// `OUT_DIR` Cargo gives every build script and its child processes.
+#[cfg(test)]
 fn out_dir_workspace(out_dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let out_dir = out_dir.filter(|value| !value.is_empty())?;
     cargo_workspace_of(Path::new(&out_dir))
 }
 
 fn event_root_override() -> Option<PathBuf> {
-    std::env::var_os("KACHE_EVENT_ROOT")
+    event_root_override_for(&crate::invocation::InvocationEnv::capture())
+}
+
+fn event_root_override_for(env: &crate::invocation::InvocationEnv) -> Option<PathBuf> {
+    env.var_os("KACHE_EVENT_ROOT")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .and_then(|path| env.resolve(Path::new(&path)))
 }
 
 fn event_root_string(root: Option<PathBuf>) -> String {
-    let Some(root) = root else {
+    event_root_string_for(root, &crate::invocation::InvocationEnv::capture())
+}
+
+fn event_root_string_for(root: Option<PathBuf>, env: &crate::invocation::InvocationEnv) -> String {
+    let Some(abs) = root.and_then(|root| env.resolve(&root)) else {
         return String::new();
-    };
-    let abs = if root.is_absolute() {
-        root
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(root)
     };
     std::fs::canonicalize(&abs)
         .unwrap_or(abs)
@@ -3062,8 +3207,11 @@ fn prepare_cc_cached_artifact(
         .with_context(|| format!("cc restore: staging transformed {}", target.display()))
 }
 
-fn apply_cc_post_publish_actions(published: &[(PathBuf, ArtifactKind)]) -> Result<()> {
-    let host = platform::current();
+fn apply_cc_post_publish_actions(
+    published: &[(PathBuf, ArtifactKind)],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<()> {
+    let host = platform::current_for(env);
     for (path, kind) in published {
         // Clones retain the donor blob's timestamp. Make must see every hit
         // as a fresh compiler write, including replacement of existing files.
@@ -3088,12 +3236,16 @@ fn finalize_cc_restore(
     parsed: &crate::compiler::cc::CcArgs,
 ) -> Result<()> {
     let finish = || -> Result<()> {
-        apply_cc_post_publish_actions(published)?;
+        apply_cc_post_publish_actions(published, &parsed.invocation_env)?;
         #[cfg(unix)]
         if parsed.mode == crate::compiler::cc::CompileMode::Link
             && let Some(output) = parsed.object_output_path()
         {
             use std::os::unix::fs::PermissionsExt;
+            let output = parsed
+                .invocation_env
+                .resolve(&output)
+                .context("resolving restored C link output")?;
             let mut permissions = std::fs::metadata(&output)
                 .with_context(|| format!("cc restore: stat {}", output.display()))?
                 .permissions();
@@ -3209,7 +3361,7 @@ fn restore_cc_from_cache(
     meta: &crate::store::EntryMeta,
 ) -> Result<()> {
     if crate::compiler::cc::cc_expansion_is_stdout(parsed) {
-        return restore_cc_stdout_from_cache(store, meta, &mut std::io::stdout());
+        return restore_cc_stdout_from_cache(store, meta, &mut crate::invocation::io::stdout());
     }
     if parsed.requires_compiler_output_semantics() {
         anyhow::bail!("cc restore: existing output requires compiler passthrough semantics");
@@ -3278,6 +3430,10 @@ fn restore_cc_from_cache(
         // Recheck immediately before the path-based restore. The initial
         // refusal happens before lookup; this catches ordinary path changes
         // during key computation and narrows the window before restore.
+        let target = parsed
+            .invocation_env
+            .resolve(&target)
+            .context("resolving restored C artifact output")?;
         if cc_output_path_requires_passthrough(&target) {
             anyhow::bail!(
                 "cc restore: output path changed and now requires compiler passthrough semantics"
@@ -3374,8 +3530,12 @@ fn cc_try_remote_hit(
 ///
 /// This is the hot path — called once per crate by cargo.
 /// Flow: parse args → compute cache key → check store → link on hit → compile on miss → store → link
-pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
-    let _trace = crate::phase_trace::start("rustc", wrapper_args);
+pub(crate) fn run_for(
+    config: &Config,
+    wrapper_args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<i32> {
+    let _trace = crate::phase_trace::start_for("rustc", wrapper_args, env);
     let start = wrapper_entry();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
@@ -3391,7 +3551,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // Routed through the Compiler trait — see src/compiler/mod.rs. RustcArgs
     // remains the canonical parsed shape; the trait gives us a stable contract
     // when adding gcc/clang.
-    let compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+    let compiler = RustcCompiler::new_for(env).with_base_dirs(config.base_dirs.clone());
     let args = compiler
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
@@ -3400,7 +3560,7 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
     // config/glob change cannot make those two views disagree.
     let extra_inputs_key_start = std::time::Instant::now();
     let mut extra_inputs_hasher =
-        crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+        crate::cache_key::FileHasher::new_for(env).with_daemon(config.socket_path());
     if config.modified_input_guard {
         extra_inputs_hasher.arm_too_new_guard(invocation_start_ns, 0);
     }
@@ -3475,10 +3635,10 @@ pub fn run(config: &Config, wrapper_args: &[String]) -> Result<i32> {
 /// [`crate::build_script_inputs`]), judged before any route that can hand
 /// the compile to a fallback cache.
 fn build_script_declares_inputs(args: &RustcArgs) -> bool {
-    let cwd = std::env::current_dir().ok();
+    let cwd = args.invocation_env().cwd().map(Path::to_owned);
     crate::build_script_inputs::locate(
         args,
-        &|name: &str| std::env::var_os(name),
+        &|name: &str| args.invocation_env().var_os(name),
         cwd.as_deref(),
         crate::out_dir_alias::active_alias().is_some(),
     )
@@ -3501,7 +3661,8 @@ pub(crate) fn resolve_extra_inputs_for_passthrough(
     args: &RustcArgs,
 ) -> Result<Option<crate::extra_inputs::ExtraInputsSnapshot>> {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    let hasher = crate::cache_key::FileHasher::new_for(args.invocation_env())
+        .with_daemon(config.socket_path());
     let snapshot = crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher)
         .with_context(|| format!("resolving extra_inputs for {crate_name}"))?;
     validate_extra_inputs_freshness_mode(args, snapshot.is_some())?;
@@ -3549,7 +3710,7 @@ pub(crate) fn complete_extra_inputs_dep_info(
         return Ok(());
     };
     snapshot
-        .merge_into_dep_info(&dep_info_path)
+        .merge_into_dep_info_for(&dep_info_path, args.invocation_env())
         .with_context(|| {
             format!(
                 "completing Cargo dep-info {} for extra_inputs",
@@ -3594,13 +3755,15 @@ fn resolve_build_script_inputs(
     let start = std::time::Instant::now();
     let Some(located) = crate::build_script_inputs::locate(
         args,
-        &|name: &str| std::env::var_os(name),
+        &|name: &str| args.invocation_env().var_os(name),
         cwd,
         crate::out_dir_alias::active_alias().is_some(),
     ) else {
         return Ok(BuildScriptInputs::default());
     };
-    let mut file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    let mut file_hasher = store
+        .file_hasher_for(args.invocation_env())
+        .with_daemon(config.socket_path());
     file_hasher.arm_too_new_guard(invocation_start_ns, 0);
     let resolved = resolve_located_build_script_inputs(
         config,
@@ -3648,13 +3811,20 @@ fn resolve_located_build_script_inputs(
     workspace_root: Option<&Path>,
 ) -> Result<crate::build_script_inputs::Resolved> {
     let mut excluded = crate::build_script_inputs::excluded_roots(args.target_dir(), []);
-    excluded.extend(written_while_building(config, Some(store)));
+    excluded.extend(written_while_building(
+        config,
+        Some(store),
+        args.invocation_env(),
+    ));
     let normalizer = std::cell::OnceCell::new();
     let outside = |path: &Path| {
         let normalizer = normalizer.get_or_init(|| {
-            crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-                .with_target_dir(args.target_dir().as_deref())
-                .with_base_dirs(&config.base_dirs)
+            crate::path_normalizer::PathNormalizer::from_invocation(
+                workspace_root,
+                args.invocation_env(),
+            )
+            .with_target_dir(args.target_dir().as_deref())
+            .with_base_dirs(&config.base_dirs)
         });
         crate::cache_key::source_path_identity(path, normalizer)
     };
@@ -3662,7 +3832,7 @@ fn resolve_located_build_script_inputs(
         located,
         &crate::build_script_inputs::Resolver {
             file_hasher,
-            var: &|name: &str| std::env::var_os(name),
+            var: &|name: &str| args.invocation_env().var_os(name),
             cache_dir: &config.cache_dir,
             excluded: &excluded,
             outside: &outside,
@@ -3686,7 +3856,9 @@ fn build_script_inputs_moved(
     };
     let _trace = crate::phase_trace::phase("build_script_inputs_verify");
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let file_hasher = store.file_hasher_with_daemon(config.socket_path());
+    let file_hasher = store
+        .file_hasher_for(args.invocation_env())
+        .with_daemon(config.socket_path());
     match resolve_located_build_script_inputs(
         config,
         args,
@@ -3745,7 +3917,8 @@ fn extra_inputs_changed_during_compile(
     invocation_start_ns: i64,
 ) -> bool {
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
-    let mut hasher = crate::cache_key::FileHasher::new().with_daemon(config.socket_path());
+    let mut hasher = crate::cache_key::FileHasher::new_for(args.invocation_env())
+        .with_daemon(config.socket_path());
     hasher.arm_too_new_guard(invocation_start_ns, 0);
     let after = match crate::extra_inputs::ExtraInputsSnapshot::resolve_for_rustc(args, &hasher) {
         Ok(snapshot) => snapshot,
@@ -3851,7 +4024,7 @@ fn run_parsed_rustc(
     let untrusted_codegen_backend =
         untrusted_codegen_backend(args.codegen_backend_dylib(), config.trust_codegen_backends);
     // The environment and working directory the key reads, taken once.
-    let key_env = KeyEnv::capture();
+    let key_env = KeyEnv::from_invocation(args.invocation_env());
     let current_dir = key_env.cwd().map(Path::to_path_buf);
     let workspace_root = args.path_normalization_root().map(Path::to_path_buf);
     let exclude_roots: Vec<_> = workspace_root
@@ -3859,16 +4032,19 @@ fn run_parsed_rustc(
         .chain(current_dir.iter())
         .cloned()
         .collect();
-    let excluded_source = args
-        .source_file
-        .as_ref()
-        .filter(|source| config.project_rules.source_excluded(source, &exclude_roots));
+    let excluded_source = args.source_file.as_ref().filter(|source| {
+        config
+            .project_rules
+            .source_excluded_for(source, &exclude_roots, args.invocation_env())
+    });
     // User bypass rules (#222). Same fail-closed contract as `exclude`, and
     // gating the incremental fast path on it too: a bypassed unit must not
     // slip back into caching through the managed-incremental route.
-    let user_bypass = config
-        .project_rules
-        .user_bypass_reason(crate_name, &args.all_args);
+    let user_bypass = config.project_rules.user_bypass_reason_for(
+        crate_name,
+        &args.all_args,
+        args.invocation_env(),
+    );
     let skip_user_facing = skips_cache_as_user_facing(args, config.cache_executables);
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
@@ -3934,7 +4110,7 @@ fn run_parsed_rustc(
     let mut fallback_stores = Vec::new();
     let trace_store_open = crate::phase_trace::phase("store_open");
     let store = if args.is_primary || (config.clean_incremental && args.incremental.is_some()) {
-        match open_primary_and_fallback(config, &rustc_route) {
+        match open_primary_and_fallback_for(config, &rustc_route, args.invocation_env()) {
             Ok((primary, fallbacks)) => {
                 fallback_stores = fallbacks;
                 Some(primary)
@@ -4273,7 +4449,8 @@ fn run_parsed_rustc(
         && let Some(workspace_root) = workspace_root.as_deref()
         && owns_its_target(
             workspace_root,
-            crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)).as_deref(),
+            crate::build_script_inputs::cargo_home(&|name| args.invocation_env().var_os(name))
+                .as_deref(),
         )
     {
         register_target_root(
@@ -4281,7 +4458,8 @@ fn run_parsed_rustc(
             &store,
             &target_dir,
             workspace_root,
-            crate::cache_key::rustc_version_text(args.probed_rustc()).as_deref(),
+            crate::cache_key::rustc_version_text_for(args.probed_rustc(), args.invocation_env())
+                .as_deref(),
         );
     }
     drop(trace_remember);
@@ -4555,8 +4733,7 @@ fn run_parsed_rustc(
             Ok(BuildClaim::Contended) => {
                 // Another process is building this key — wait for it
                 tracing::debug!("waiting for {} to be built by another process", crate_name);
-                let committed = store
-                    .wait_for_committed(&cache_key)
+                let committed = crate::invocation::wait_for_committed(&store, &cache_key, None)
                     .unwrap_or(false)
                     .then(|| store.get(&cache_key).ok().flatten())
                     .flatten();
@@ -4642,8 +4819,8 @@ fn run_parsed_rustc(
         replay_diagnostics(
             &result.stdout,
             result.pending_stderr(),
-            std::io::stdout(),
-            std::io::stderr(),
+            crate::invocation::io::stdout(),
+            crate::invocation::io::stderr(),
         );
     }
 
@@ -4869,8 +5046,12 @@ fn run_parsed_rustc(
     let depinfo_anchor = args.target_dir();
     let depinfo_working_dir = current_dir.as_deref().unwrap_or_else(|| Path::new("."));
     let depinfo_workspace_dir = args.path_normalization_root();
-    let depinfo_configured_roots =
-        configured_rustc_depinfo_roots(config, depinfo_workspace_dir, depinfo_anchor.as_deref());
+    let depinfo_configured_roots = configured_rustc_depinfo_roots(
+        config,
+        depinfo_workspace_dir,
+        depinfo_anchor.as_deref(),
+        args.invocation_env(),
+    );
 
     // Validate the compiler's consumer-facing dep-info before Store::put makes
     // an entry observable. The staging transform below cannot alter its input.
@@ -4894,9 +5075,11 @@ fn run_parsed_rustc(
         && let Some((exec_path, exec_name)) =
             find_executable_output(compiler, args, &result.artifacts)
     {
-        match tempfile::tempdir() {
+        match tempfile::tempdir_in(args.invocation_env().temp_dir()) {
             Ok(staging) => {
-                match platform::current().package_debug_bundle(&exec_path, staging.path()) {
+                match platform::current_for(args.invocation_env())
+                    .package_debug_bundle(&exec_path, staging.path())
+                {
                     Ok(Some(tar_path)) => {
                         result.artifacts.push(crate::compiler::Artifact {
                             path: tar_path,
@@ -4927,12 +5110,13 @@ fn run_parsed_rustc(
         }
     }
 
-    let prepared_store = match prepare_rustc_store_files(
+    let prepared_store = match prepare_rustc_store_files_for(
         &result.artifacts,
         depinfo_anchor.as_deref(),
         depinfo_working_dir,
         depinfo_workspace_dir,
         &depinfo_configured_roots,
+        args.invocation_env().temp_dir(),
     ) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -5058,8 +5242,10 @@ fn run_parsed_rustc(
                 && let Some(output_dir) = rustc_output_dir(args)
                 && let Some(meta) = store.stored_meta(&cache_key)
             {
-                let shared =
-                    shared_inode_loadable(args, platform::current().may_share_restored_loadables());
+                let shared = shared_inode_loadable(
+                    args,
+                    platform::current_for(args.invocation_env()).may_share_restored_loadables(),
+                );
                 remember_prestaged_executables(config, compiler, args, &output_dir, shared, &meta);
             }
             redate_stored_check_outputs(&store, args, &prepared_store.files);
@@ -5301,29 +5487,43 @@ fn reclaim_after_declined_handoff(
 ) -> anyhow::Result<BuildClaim> {
     match store.claim_build(cache_key)? {
         BuildClaim::Contended => {
-            store.wait_for_committed_with_timeout(cache_key, wait)?;
+            crate::invocation::wait_for_committed(store, cache_key, Some(wait))?;
             store.claim_build(cache_key)
         }
         claim => Ok(claim),
     }
 }
 
+#[cfg(test)]
 fn prepare_cc_store_files(
     artifacts: &ArtifactSet,
     depinfo_anchor: Option<&Path>,
 ) -> Result<PreparedCcStoreFiles> {
-    prepare_cc_store_files_in(artifacts, depinfo_anchor, None, &[])
+    prepare_cc_store_files_for(
+        artifacts,
+        depinfo_anchor,
+        &crate::invocation::InvocationEnv::capture(),
+    )
 }
 
-/// [`prepare_cc_store_files`] with the snapshots in `staging_dir` when one
+fn prepare_cc_store_files_for(
+    artifacts: &ArtifactSet,
+    depinfo_anchor: Option<&Path>,
+    env: &crate::invocation::InvocationEnv,
+) -> Result<PreparedCcStoreFiles> {
+    prepare_cc_store_files_in(artifacts, depinfo_anchor, None, &[], env.temp_dir())
+}
+
+/// Prepare snapshots in `staging_dir` when one
 /// is given: a hand-off then links them into place instead of copying the
 /// object a second time. An unusable directory falls back to the system
-/// temporary directory.
+/// temporary directory selected by the invocation.
 fn prepare_cc_store_files_in(
     artifacts: &ArtifactSet,
     depinfo_anchor: Option<&Path>,
     staging_dir: Option<&Path>,
     depinfo_roots: &[(PathBuf, String, u8)],
+    temp_dir: &Path,
 ) -> Result<PreparedCcStoreFiles> {
     use std::io::{Read, Write};
 
@@ -5334,8 +5534,10 @@ fn prepare_cc_store_files_in(
         let mut builder = tempfile::Builder::new();
         builder.prefix("kache-cc-artifact-");
         let staged = match staging_dir {
-            Some(dir) => builder.tempfile_in(dir).or_else(|_| builder.tempfile()),
-            None => builder.tempfile(),
+            Some(dir) => builder
+                .tempfile_in(dir)
+                .or_else(|_| builder.tempfile_in(temp_dir)),
+            None => builder.tempfile_in(temp_dir),
         }
         .context("cc store: creating private artifact staging file")?;
         let staged = staged.into_temp_path();
@@ -5407,12 +5609,31 @@ struct PreparedRustcStoreFiles {
 /// Dep-info is normalized while copying it into a private staging file. The
 /// store therefore observes one immutable snapshot and a failed rewrite can
 /// only skip caching; it can never leave Cargo's output partially rewritten.
+#[cfg(test)]
 fn prepare_rustc_store_files(
     artifacts: &ArtifactSet,
     target_dir: Option<&Path>,
     working_dir: &Path,
     workspace_dir: Option<&Path>,
     configured_roots: &[(PathBuf, String, u8)],
+) -> Result<PreparedRustcStoreFiles> {
+    prepare_rustc_store_files_for(
+        artifacts,
+        target_dir,
+        working_dir,
+        workspace_dir,
+        configured_roots,
+        crate::invocation::InvocationEnv::capture().temp_dir(),
+    )
+}
+
+fn prepare_rustc_store_files_for(
+    artifacts: &ArtifactSet,
+    target_dir: Option<&Path>,
+    working_dir: &Path,
+    workspace_dir: Option<&Path>,
+    configured_roots: &[(PathBuf, String, u8)],
+    temp_dir: &Path,
 ) -> Result<PreparedRustcStoreFiles> {
     use std::io::{Read, Write};
 
@@ -5428,7 +5649,7 @@ fn prepare_rustc_store_files(
 
         let mut staged = tempfile::Builder::new()
             .prefix("kache-rustc-artifact-")
-            .tempfile()
+            .tempfile_in(temp_dir)
             .context("rustc store: creating private artifact staging file")?;
         let anchor = target_dir.context("rustc store: missing dep-info rewrite anchor")?;
         let mut content = String::new();
@@ -5467,8 +5688,9 @@ fn configured_rustc_depinfo_roots(
     config: &Config,
     workspace_root: Option<&Path>,
     target_dir: Option<&Path>,
+    env: &crate::invocation::InvocationEnv,
 ) -> Vec<(PathBuf, String, u8)> {
-    crate::path_normalizer::PathNormalizer::from_env(workspace_root)
+    crate::path_normalizer::PathNormalizer::from_invocation(workspace_root, env)
         .with_target_dir(target_dir)
         .with_base_dirs(&config.base_dirs)
         .depinfo_source_roots()
@@ -5500,7 +5722,12 @@ fn validate_extra_inputs_dep_info_before_store(
         let raw = std::fs::read_to_string(&artifact.path)
             .with_context(|| format!("reading producer dep-info {}", artifact.path.display()))?;
         snapshot
-            .merge_dep_info_content(&raw)
+            .merge_dep_info_content_for(
+                &raw,
+                args.invocation_env()
+                    .cwd()
+                    .context("extra_inputs requires the invocation working directory")?,
+            )
             .with_context(|| format!("completing producer dep-info {}", artifact.path.display()))?;
     }
     anyhow::ensure!(
@@ -5581,7 +5808,9 @@ fn prestage_target_dir(args: &RustcArgs) -> Option<PathBuf> {
     if let Some(out_dir) = &args.out_dir
         && let Some(profile) = crate::cargo_layout::build_script_dir_profile(out_dir)
     {
-        return profile.parent().map(Path::to_path_buf);
+        return profile
+            .parent()
+            .and_then(|path| args.resolve_invocation_path(path));
     }
     args.target_dir()
 }
@@ -5629,13 +5858,12 @@ fn remember_prestaged_executables(
             file.executable,
             shared_loadable,
         ) {
-            crate::prestage::remember(
-                &config.cache_dir,
-                &target_dir,
-                &artifact_target_path(args, output_dir, &file.name),
-                &file.hash,
-                file.size,
-            );
+            let Some(dest) =
+                args.resolve_invocation_path(&artifact_target_path(args, output_dir, &file.name))
+            else {
+                continue;
+            };
+            crate::prestage::remember(&config.cache_dir, &target_dir, &dest, &file.hash, file.size);
         }
     }
 }
@@ -5870,7 +6098,7 @@ fn materialize_cached_artifact(
             let text = String::from_utf8(content)
                 .with_context(|| format!("{context}: dep-info is not valid UTF-8"))?;
             content = snapshot
-                .merge_dep_info_content(&text)
+                .merge_dep_info_content_for(&text, depinfo_working_dir)
                 .with_context(|| format!("{context}: completing extra_inputs dep-info"))?
                 .into_bytes();
         }
@@ -6526,7 +6754,7 @@ fn adaptive_compile_before_key(
             Err(_) => true,
         }
     };
-    let portable = RustcCompiler::new()
+    let portable = RustcCompiler::new_for(ctx.args.invocation_env())
         .with_base_dirs(ctx.config.base_dirs.clone())
         .with_incremental_bootstrap(bootstrap.get());
     let mut executed = if !ready {
@@ -6615,8 +6843,8 @@ fn adaptive_compile_before_key(
     replay_diagnostics(
         &result.stdout,
         result.pending_stderr(),
-        std::io::stdout(),
-        std::io::stderr(),
+        crate::invocation::io::stdout(),
+        crate::invocation::io::stderr(),
     );
     after_rustc_exit(result.exit_code, &result.stderr, &ctx.args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
@@ -6753,8 +6981,8 @@ fn compile_before_key(
     replay_diagnostics(
         &result.stdout,
         result.pending_stderr(),
-        std::io::stdout(),
-        std::io::stderr(),
+        crate::invocation::io::stdout(),
+        crate::invocation::io::stderr(),
     );
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     if result.exit_code != 0 {
@@ -6772,7 +7000,9 @@ fn compile_before_key(
     let emitted = args
         .dep_info_path()
         .zip(args.source_file.as_deref())
-        .map(|(path, source)| crate::cache_key::dep_info_from_emitted(&path, source));
+        .map(|(path, source)| {
+            crate::cache_key::dep_info_from_emitted_for(&path, source, args.invocation_env())
+        });
     let dep_info = match emitted {
         Some(Ok(dep_info)) => dep_info,
         other => {
@@ -6851,7 +7081,12 @@ fn stopped_on_hit(executed: &Result<crate::compile::CompileResult>) -> bool {
 /// reported that file complete.
 fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
     let path = args.dep_info_path()?;
-    crate::cache_key::dep_info_from_emitted(&path, args.source_file.as_deref()?).ok()
+    crate::cache_key::dep_info_from_emitted_for(
+        &path,
+        args.source_file.as_deref()?,
+        args.invocation_env(),
+    )
+    .ok()
 }
 
 /// Whether `args` compiles an executable kept out of the cache because
@@ -6934,7 +7169,7 @@ fn record_input_prediction(
     let Some(store) = store else {
         return;
     };
-    let file_hasher = store.file_hasher();
+    let file_hasher = store.file_hasher_for(args.invocation_env());
     if !file_hasher.supports_input_predictions() {
         return;
     }
@@ -6955,7 +7190,8 @@ fn record_input_prediction(
         .and_then(|guard| {
             crate::cache_key::with_closure_dirs(args, dep_info, guard.digest.clone(), guard.taken)
         });
-    let registry = crate::cache_key::registry_src_of(&std::env::vars_os().collect::<Vec<_>>());
+    let registry =
+        crate::cache_key::registry_src_of(&args.invocation_env().vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
     // can use, when the guard was taken before rustc ran (kunobi-ninja/kache#1005).
     let workspace = crate::cache_key::workspace_record(args, dep_info, tree.as_deref());
@@ -7209,8 +7445,13 @@ fn discovery_flight_dir(config: &Config, discovery: &KeyDiscovery) -> Option<Pat
 /// home in the project's `.cargo`, its `config.toml` is the project's. Under
 /// a trust domain the probe directory, which holds the tree memos, stays in
 /// the base cache directory, outside the domain's own cache.
-fn written_while_building(config: &Config, store: Option<&Store>) -> Vec<PathBuf> {
-    let probe_dir = crate::config::probe_memo_dir();
+fn written_while_building(
+    config: &Config,
+    store: Option<&Store>,
+    env: &crate::invocation::InvocationEnv,
+) -> Vec<PathBuf> {
+    let probe_dir =
+        crate::config::probe_memo_dir_for(env).unwrap_or_else(|_| config.cache_dir.join("probes"));
     let mut written = crate::build_script_inputs::excluded_roots(
         None,
         [
@@ -7221,7 +7462,7 @@ fn written_while_building(config: &Config, store: Option<&Store>) -> Vec<PathBuf
         .into_iter()
         .chain(store.map(Store::cache_dir)),
     );
-    if let Some(home) = crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)) {
+    if let Some(home) = crate::build_script_inputs::cargo_home(&|name| env.var_os(name)) {
         written.extend(crate::build_script_inputs::cargo_home_writes(&home));
     }
     written
@@ -7278,14 +7519,17 @@ fn compute_rustc_cache_key(
     if let KeyDiscovery::Emitted(dep_info, tree) = discovery {
         crate::cache_key::provide_dep_info(dep_info, tree);
     }
-    let emitted_sources = crate::cache_key::provided_dep_info_sources();
+    let emitted_sources = crate::cache_key::provided_dep_info_sources_for(args.invocation_env());
     let mut file_hasher = match store {
-        Some(store) => store.file_hasher_with_daemon(config.socket_path()),
-        None => crate::cache_key::FileHasher::new().with_daemon(config.socket_path()),
+        Some(store) => store
+            .file_hasher_for(args.invocation_env())
+            .with_daemon(config.socket_path()),
+        None => crate::cache_key::FileHasher::new_for(args.invocation_env())
+            .with_daemon(config.socket_path()),
     }
     .with_input_predictions(config.input_predictions)
     .with_prediction_flights(flight_dir)
-    .with_own_dirs(written_while_building(config, store));
+    .with_own_dirs(written_while_building(config, store, args.invocation_env()));
     if config.modified_input_guard || emitted {
         // Flag keyed inputs touched at/after this invocation started — their
         // content at hash time may differ from what rustc reads, so we'll look
@@ -7300,15 +7544,19 @@ fn compute_rustc_cache_key(
     // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
     // `RustcCompiler::execute`, or the key would represent one remap rule set
     // and the binary another.
-    let path_normalizer = crate::path_normalizer::PathNormalizer::from_env(workspace_root)
-        .with_target_dir(args.target_dir().as_deref())
-        .with_base_dirs(&config.base_dirs)
-        .with_path_only_env_vars(config.path_only_env_vars.clone())
-        .with_rust_src_rule(
-            crate::cache_key::get_rustc_sysroot(args).as_deref(),
-            crate::cache_key::get_rustc_commit_hash(&args.rustc).as_deref(),
-        );
+    let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+        workspace_root,
+        args.invocation_env(),
+    )
+    .with_target_dir(args.target_dir().as_deref())
+    .with_base_dirs(&config.base_dirs)
+    .with_path_only_env_vars(config.path_only_env_vars.clone())
+    .with_rust_src_rule(
+        crate::cache_key::get_rustc_sysroot_for(args, args.invocation_env()).as_deref(),
+        crate::cache_key::get_rustc_commit_hash_for(&args.rustc, args.invocation_env()).as_deref(),
+    );
     let key_ctx = KeyCtx {
+        invocation_env: args.invocation_env(),
         file_hasher: &file_hasher,
         path_normalizer: &path_normalizer,
         cache_dir: &config.cache_dir,
@@ -7715,7 +7963,7 @@ fn maybe_verify_restored_hit(
     args: &RustcArgs,
     restored: &[(String, PathBuf)],
 ) {
-    if !crate::verify_compare::enabled() {
+    if !crate::verify_compare::enabled_for(args.invocation_env()) {
         return;
     }
     let crate_name = args.crate_name.as_deref().unwrap_or("unknown");
@@ -7766,7 +8014,7 @@ fn run_verify_recompile(
 ) -> Result<crate::verify_compare::CompareReport> {
     let staging = tempfile::Builder::new()
         .prefix("kache-verify-")
-        .tempdir()
+        .tempdir_in(args.invocation_env().temp_dir())
         .context("creating KACHE_VERIFY staging directory")?;
     let staged_args = retarget_rustc_args_for_staging(args, staging.path());
     let result = crate::opcounts::suspend_spawn_counts(|| compiler.execute(&staged_args))
@@ -7975,6 +8223,10 @@ fn restore_from_cache_with_memo_store(
     let Some(output_dir) = rustc_output_dir(args) else {
         anyhow::bail!("no output path (-o) or output directory (--out-dir) in args");
     };
+    let output_dir = args
+        .invocation_env()
+        .resolve(&output_dir)
+        .context("resolving restored Rust output directory")?;
 
     // Ensure the output directory exists before restoring any files.
     // This avoids redundant `create_dir_all` syscalls per file (issue #563)
@@ -7991,13 +8243,20 @@ fn restore_from_cache_with_memo_store(
     let cargo_target_dir = args.target_dir();
     let depinfo_anchor = cargo_target_dir
         .clone()
-        .or_else(|| std::env::current_dir().ok())
+        .or_else(|| args.invocation_env().cwd().map(Path::to_owned))
         .unwrap_or_else(|| Path::new(".").to_path_buf());
-    let depinfo_working_dir =
-        std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+    let depinfo_working_dir = args
+        .invocation_env()
+        .cwd()
+        .context("restoring dep-info requires the invocation working directory")?
+        .to_owned();
     let depinfo_workspace_dir = args.path_normalization_root();
-    let depinfo_configured_roots =
-        configured_rustc_depinfo_roots(config, depinfo_workspace_dir, cargo_target_dir.as_deref());
+    let depinfo_configured_roots = configured_rustc_depinfo_roots(
+        config,
+        depinfo_workspace_dir,
+        cargo_target_dir.as_deref(),
+        args.invocation_env(),
+    );
 
     // Dep-info validation gate (kunobi-ninja/kache#330): a restored `.d`
     // whose paths do not resolve for THIS consumer poisons cargo's
@@ -8044,7 +8303,7 @@ fn restore_from_cache_with_memo_store(
             link::DepInfoMode::Expand,
         );
         let expanded = if let Some(snapshot) = extra_inputs {
-            match snapshot.merge_dep_info_content(&expanded) {
+            match snapshot.merge_dep_info_content_for(&expanded, &depinfo_working_dir) {
                 Ok(completed) => completed,
                 Err(error) => {
                     let _ = store.remove_entry(&meta.cache_key);
@@ -8079,7 +8338,11 @@ fn restore_from_cache_with_memo_store(
             }
         };
         for dep in dependencies {
-            if !dep.exists() {
+            let resolved = args
+                .invocation_env()
+                .resolve(&dep)
+                .context("resolving restored Rust dep-info dependency")?;
+            if !resolved.exists() {
                 let _ = store.remove_entry(&meta.cache_key);
                 anyhow::bail!(
                     "cached dep-info for {} references {} which does not resolve here — \
@@ -8096,7 +8359,7 @@ fn restore_from_cache_with_memo_store(
     // tracing context coherent and lets a future per-restore override
     // (e.g. cross-restore from a Linux cache to a macOS host) plug in
     // at one site.
-    let platform = platform::current();
+    let platform = platform::current_for(args.invocation_env());
     tracing::debug!(
         "restoring {} files via platform={}",
         meta.files.len(),
@@ -8123,7 +8386,10 @@ fn restore_from_cache_with_memo_store(
             );
         }
 
-        let target_path = artifact_target_path(args, &output_dir, &cached_file.name);
+        let target_path = args
+            .invocation_env()
+            .resolve(&artifact_target_path(args, &output_dir, &cached_file.name))
+            .context("resolving restored Rust artifact output")?;
 
         // Per-file dispatch by artifact kind: `classify_output` picks
         // the kind, `plan_post_restore` the actions — no ad-hoc filename
@@ -8276,7 +8542,10 @@ fn passthrough_args(
     // nested `@file` to top-level expansion or exceed the platform argv limit,
     // while raw argv could leak Cargo's non-isolated incremental directory.
     let response_file = if args.has_expanded_argfiles() {
-        match compile::RustcResponseFile::new(compiler_args.iter().map(|arg| arg.as_str())) {
+        match compile::RustcResponseFile::new_in(
+            args.invocation_env().temp_dir(),
+            compiler_args.iter().map(|arg| arg.as_str()),
+        ) {
             Ok(response) => Some(response),
             Err(error) => handle_response_file_error(error, compiler_args_changed)?,
         }
@@ -8295,9 +8564,26 @@ fn passthrough_args(
     // them here too. When the parse couldn't recover crate_name/extra-filename
     // this still can't act, but `pre_clean_outputs` now logs that at debug
     // (rio-build#51 / kache#242).
+    let env = args.invocation_env();
+    let output = args
+        .output
+        .as_deref()
+        .map(|path| {
+            env.resolve(path)
+                .context("resolving rustc passthrough output path")
+        })
+        .transpose()?;
+    let out_dir = args
+        .out_dir
+        .as_deref()
+        .map(|path| {
+            env.resolve(path)
+                .context("resolving rustc passthrough output directory")
+        })
+        .transpose()?;
     compile::pre_clean_outputs(
-        args.output.as_deref(),
-        args.out_dir.as_deref(),
+        output.as_deref(),
+        out_dir.as_deref(),
         args.crate_name.as_deref(),
         args.extra_filename.as_deref(),
         &args.emit,
@@ -8307,27 +8593,27 @@ fn passthrough_args(
     // Configured fallback wrapper: `<fallback> <rustc> [<inner-rustc>]
     // <args>`. Failures fall through to direct compilation.
     if let Some(fb) = fallback {
-        let mut cmd = std::process::Command::new(fb);
-        if disable_incremental_env(incremental_preserved) {
-            cmd.env("CARGO_INCREMENTAL", "0");
+        let mut cmd = env.command(fb);
+        if let Ok(cmd) = &mut cmd {
+            if disable_incremental_env(incremental_preserved) {
+                cmd.env("CARGO_INCREMENTAL", "0");
+            }
+            cmd.arg(&args.rustc);
+            if let Some(inner) = &args.inner_rustc {
+                cmd.arg(inner);
+            }
+            if let Some(response) = &response_file {
+                cmd.arg(response.argument());
+            } else if let Some(direct) = &direct_args {
+                cmd.args(direct);
+            }
         }
-        cmd.arg(&args.rustc);
-        if let Some(inner) = &args.inner_rustc {
-            cmd.arg(inner);
-        }
-        if let Some(response) = &response_file {
-            cmd.arg(response.argument());
-        } else if let Some(direct) = &direct_args {
-            cmd.args(direct);
-        }
-        let outputs: Vec<&Path> = args
-            .output
+        let outputs: Vec<&Path> = output
             .as_deref()
-            .map(Path::new)
             .into_iter()
-            .chain(args.out_dir.as_deref().map(Path::new))
+            .chain(out_dir.as_deref())
             .collect();
-        let attempt = crate::fallback::run(cmd, fb, &outputs, compiler_args);
+        let attempt = crate::fallback::run_for(cmd, fb, &outputs, compiler_args, env);
         if let Some(exit_code) = attempt.terminal_code() {
             return Ok(PassthroughOutput {
                 exit_code,
@@ -8338,8 +8624,8 @@ fn passthrough_args(
         fallback_attempt = Some(attempt);
     }
 
-    let mut cmd = std::process::Command::new(&args.rustc);
-    crate::toolchain_dylib::apply(&mut cmd, &args.rustc);
+    let mut cmd = env.command(&args.rustc)?;
+    crate::toolchain_dylib::apply_for(&mut cmd, &args.rustc, env);
     if disable_incremental_env(incremental_preserved) {
         cmd.env("CARGO_INCREMENTAL", "0");
     }
@@ -8352,8 +8638,7 @@ fn passthrough_args(
     } else if let Some(direct) = &direct_args {
         cmd.args(direct);
     }
-    let status = cmd
-        .status()
+    let status = crate::invocation::io::status(&mut cmd)
         .with_context(|| format!("executing {}", args.rustc.display()))?;
     Ok(PassthroughOutput {
         exit_code: status.code().unwrap_or(1),
@@ -8521,9 +8806,9 @@ fn register_target_root(
 fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
     config.seed_incremental
         && args.inner_rustc.is_none()
-        && crate::cache_key::rustc_version_text(&args.rustc).is_some_and(|version| {
-            crate::incremental_policy::compiler_supports_automatic_seed(&version)
-        })
+        && crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).is_some_and(
+            |version| crate::incremental_policy::compiler_supports_automatic_seed(&version),
+        )
 }
 
 fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> {
@@ -8536,14 +8821,15 @@ fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> 
     let Ok(suffix) = profile.strip_prefix(&target) else {
         return Vec::new();
     };
-    let routed = config.routed_for_path(&volume_route_path_rustc(args));
+    let routed = config.routed_for_path_for(&volume_route_path_rustc(args), args.invocation_env());
     let Ok(store) = Store::open(&routed) else {
         return Vec::new();
     };
     if let Some(workspace) = args.path_normalization_root()
         && owns_its_target(
             workspace,
-            crate::build_script_inputs::cargo_home(&|name| std::env::var_os(name)).as_deref(),
+            crate::build_script_inputs::cargo_home(&|name| args.invocation_env().var_os(name))
+                .as_deref(),
         )
     {
         register_target_root(
@@ -8551,7 +8837,7 @@ fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> 
             &store,
             &target,
             workspace,
-            crate::cache_key::rustc_version_text(&args.rustc).as_deref(),
+            crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).as_deref(),
         );
     }
     let Ok(targets) = store.tracked_target_roots(0) else {
@@ -8607,10 +8893,10 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         )
     });
     let compile_start = std::time::Instant::now();
-    let mut compiler = RustcCompiler::new()
+    let mut compiler = RustcCompiler::new_for(args.invocation_env())
         .with_base_dirs(config.base_dirs.clone())
         .with_incremental_bootstrap(lease.worktree_bootstrap());
-    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
+    let rebuilt_package = args.invocation_env().var("CARGO_PKG_NAME").ok();
     // Only this attempt's dep-info may prove that source read our override.
     if lease.worktree_bootstrap() && !clear_incremental_bootstrap_dep_info(args) {
         if !lease.decline_worktree_bootstrap() {
@@ -8626,7 +8912,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             );
         }
         compiler_args = lease.compiler_args(args);
-        compiler = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+        compiler =
+            RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
     }
     let mut compile =
         if kind == crate::incremental_policy::LeaseKind::Immediate || lease.worktree_portable() {
@@ -8658,7 +8945,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             );
         }
         compiler_args = lease.compiler_args(args);
-        let native = RustcCompiler::new().with_base_dirs(config.base_dirs.clone());
+        let native =
+            RustcCompiler::new_for(args.invocation_env()).with_base_dirs(config.base_dirs.clone());
         compile = if kind == crate::incremental_policy::LeaseKind::Immediate {
             native.execute_passthrough_preserving_incremental(args, &compiler_args)
         } else {
@@ -8690,8 +8978,8 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     replay_diagnostics(
         &result.stdout,
         result.pending_stderr(),
-        std::io::stdout(),
-        std::io::stderr(),
+        crate::invocation::io::stdout(),
+        crate::invocation::io::stderr(),
     );
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
@@ -8730,6 +9018,69 @@ thread_local! {
     /// notifications Cargo pipelines on), so no branch may run it again.
     static PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static PRECOMPILED_REBUILT: std::cell::RefCell<RebuiltArtifacts> = std::cell::RefCell::new(RebuiltArtifacts::default());
+    static INVOCATION_SETTINGS: std::cell::RefCell<Option<InvocationWrapperSettings>> = const { std::cell::RefCell::new(None) };
+}
+
+struct InvocationWrapperSettings {
+    progress_level: u8,
+    temp_dir: Option<PathBuf>,
+    daemon: Option<std::sync::Arc<crate::daemon::Daemon>>,
+}
+
+/// Work left by a compile-before-key path belongs only to that invocation.
+/// Discard unfinished work on error or panic before reusing the worker thread.
+pub(crate) struct InvocationWrapperScope {
+    settings: Option<InvocationWrapperSettings>,
+    rust_exit: Option<i32>,
+    rust_outputs: RebuiltArtifacts,
+    cc_exit: Option<i32>,
+    cc_outputs: RebuiltArtifacts,
+    _demand: crate::demand::InvocationDemandScope,
+    _report: crate::verify_compare::InvocationReportScope,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationWrapperScope {
+    #[cfg(test)]
+    pub(crate) fn enter() -> Self {
+        Self::enter_with_settings(None)
+    }
+
+    pub(crate) fn enter_for(
+        env: &crate::invocation::InvocationEnv,
+        daemon: Option<std::sync::Arc<crate::daemon::Daemon>>,
+    ) -> Self {
+        Self::enter_with_settings(Some(InvocationWrapperSettings {
+            progress_level: parse_progress_level(env.var("KACHE_PROGRESS").ok().as_deref()),
+            temp_dir: env.resolve(env.temp_dir()),
+            daemon,
+        }))
+    }
+
+    fn enter_with_settings(settings: Option<InvocationWrapperSettings>) -> Self {
+        Self {
+            settings: INVOCATION_SETTINGS.with(|slot| slot.replace(settings)),
+            rust_exit: PRECOMPILED_EXIT.with(|slot| slot.replace(None)),
+            rust_outputs: PRECOMPILED_REBUILT
+                .with(|slot| slot.replace(RebuiltArtifacts::default())),
+            cc_exit: CC_PRECOMPILED_EXIT.with(|slot| slot.replace(None)),
+            cc_outputs: CC_PRECOMPILED_REBUILT
+                .with(|slot| slot.replace(RebuiltArtifacts::default())),
+            _demand: crate::demand::InvocationDemandScope::enter(),
+            _report: crate::verify_compare::InvocationReportScope::enter(),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationWrapperScope {
+    fn drop(&mut self) {
+        INVOCATION_SETTINGS.with(|slot| slot.replace(self.settings.take()));
+        PRECOMPILED_EXIT.with(|slot| slot.set(self.rust_exit));
+        PRECOMPILED_REBUILT.with(|slot| slot.replace(std::mem::take(&mut self.rust_outputs)));
+        CC_PRECOMPILED_EXIT.with(|slot| slot.set(self.cc_exit));
+        CC_PRECOMPILED_REBUILT.with(|slot| slot.replace(std::mem::take(&mut self.cc_outputs)));
+    }
 }
 
 /// Category of the passthrough reason for a rustc compile kache could not
@@ -8884,7 +9235,7 @@ fn cc_compile_before_key(
     file_hasher: &crate::cache_key::FileHasher<'_>,
     flight: Option<crate::store::StoreLock>,
 ) -> Result<i32> {
-    let rebuilt_package = KeyEnv::capture().var("CARGO_PKG_NAME");
+    let rebuilt_package = invocation.parsed.invocation_env.var("CARGO_PKG_NAME").ok();
     let CcStoreInvocation {
         compiler,
         parsed,
@@ -8926,8 +9277,8 @@ fn cc_compile_before_key(
     replay_diagnostics(
         &result.stdout,
         result.pending_stderr(),
-        std::io::stdout(),
-        std::io::stderr(),
+        crate::invocation::io::stdout(),
+        crate::invocation::io::stderr(),
     );
     if result.exit_code != 0 {
         let elapsed = start.elapsed().as_millis() as u64;
@@ -9543,7 +9894,12 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         object_output,
         package,
         store_error,
-        store_handed_off: false,
+        store_handed_off: store_put.output_blobs != 0
+            && INVOCATION_SETTINGS.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|settings| settings.daemon.is_some())
+            }),
         daemon_store_ms: 0,
         daemon_store_batch: 0,
         lookup_rejection,
@@ -9777,7 +10133,7 @@ fn unrecognized_cargo_layout<'a>(
 /// system can set Cargo's variables for rustc without using its layout.
 /// Returns whether the line was shown.
 fn maybe_notice_unknown_layout(config: &Config, args: &RustcArgs, root: &str, now: u64) -> bool {
-    let cargo_crate_name = std::env::var_os("CARGO_CRATE_NAME");
+    let cargo_crate_name = args.invocation_env().var_os("CARGO_CRATE_NAME");
     let Some(out_dir) = unrecognized_cargo_layout(args, cargo_crate_name.as_deref()) else {
         return false;
     };
@@ -10005,14 +10361,21 @@ pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &s
         },
         Err(_) => return,
     }
-    let tmp = marker.with_extension(format!("tmp.{}", std::process::id()));
+    let Some(parent) = marker.parent() else {
+        return;
+    };
+    let Ok(tmp) = tempfile::Builder::new()
+        .prefix(".kache-session-")
+        .tempfile_in(parent)
+    else {
+        return;
+    };
+    let tmp = tmp.into_temp_path();
     let record = format!("v1 {} {}", now_epoch_secs(), session_id);
     if std::fs::write(&tmp, record).is_err() {
         return;
     }
-    if std::fs::rename(&tmp, &marker).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let _ = std::fs::rename(&tmp, &marker);
 }
 
 /// Write a `v1 <now> <session_id>` record through the caller's locked handle

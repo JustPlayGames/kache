@@ -20,9 +20,35 @@ fn kache_binary() -> &'static str {
     env!("CARGO_BIN_EXE_kache")
 }
 
+struct FixtureDir(tempfile::TempDir);
+
+impl FixtureDir {
+    fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+    fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+    fn stop_daemon(&self) {
+        let cache = self.path().join("cache");
+        let mut stop = common::hermetic_command(
+            kache_binary(),
+            &cache,
+            Some(&self.path().join("kache.toml")),
+        );
+        common::stop_daemon(stop.args(["daemon", "stop"]), &cache);
+    }
+}
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        self.stop_daemon();
+    }
+}
+
 #[test]
 fn refused_double_dash_invocation_is_exact_passthrough() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
 
     // Fake compiler: dump every argument it receives, one per line, then
     // succeed. A real clang-cl would *fail* on this argv if a flag landed
@@ -91,7 +117,7 @@ fn refused_double_dash_invocation_is_exact_passthrough() {
 /// publication. Exercise the read-set memo, then invalidate it with an edit.
 #[test]
 fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     let cache = root.join("cache");
     let config = root.join("kache.toml");
@@ -156,14 +182,36 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
                 "{phase}: {name}"
             );
         }
-        assert!(
-            !spans.iter().any(|span| matches!(
-                span["name"].as_str(),
-                Some("handoff_snapshot" | "handoff_event")
-            )),
-            "a missing daemon must not add handoff staging work"
-        );
-        assert!(!cache.join("store/staging/handoff").exists());
+        let status = common::hermetic_command(kache_binary(), &cache, Some(&config))
+            .args(["daemon", "status", "--json"])
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["daemon_running"], true, "{status}");
+        let state =
+            std::path::Path::new(status["socket"].as_str().unwrap()).with_extension("state.json");
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(state).unwrap()).unwrap();
+        let daemon_pid = state["pid"].as_u64().unwrap();
+        let pipeline_pid = spans
+            .iter()
+            .find(|span| span["name"] == "cc_parse")
+            .unwrap()["pid"]
+            .as_u64()
+            .unwrap();
+        eprintln!("{phase}: pipeline pid={pipeline_pid}, daemon pid={daemon_pid}");
+        // Sandboxed clients keep compilation local. They may still hand off
+        // publication, while daemon-owned compilation must publish directly.
+        if pipeline_pid == daemon_pid {
+            assert!(
+                !spans.iter().any(|span| matches!(
+                    span["name"].as_str(),
+                    Some("handoff_snapshot" | "handoff_event")
+                )),
+                "execution inside the daemon must not hand publication back to itself"
+            );
+            assert!(!cache.join("store/staging/handoff").exists());
+        }
         if phase == "cold" {
             assert!(
                 spans.iter().any(|span| span["name"] == "cc_capture"),
@@ -192,7 +240,7 @@ fn deferred_cc_reuses_setup_and_still_invalidates_changed_headers() {
 #[test]
 fn exchanged_header_contents_compile_current_output_and_keep_checkout_hits() {
     for discovery in ["0", "1"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = FixtureDir::new();
         let root = dir.path().canonicalize().unwrap();
         let cache = root.join("cache");
         fs::create_dir(root.join("home")).unwrap();
@@ -274,7 +322,7 @@ fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
         "explicit-search-path",
         "default",
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = FixtureDir::new();
         let root = dir.path().canonicalize().unwrap();
         fs::create_dir(root.join("home")).unwrap();
         fs::write(root.join("kache.toml"), "").unwrap();
@@ -702,7 +750,7 @@ fn cacheable_cc_command(root: &std::path::Path) -> Command {
 
 #[test]
 fn cc_admission_reports_a_skip_reason_and_recompiles_until_admitted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::write(root.join("unit.c"), "int value(void) { return 42; }\n").unwrap();
@@ -743,7 +791,7 @@ fn cc_admission_reports_a_skip_reason_and_recompiles_until_admitted() {
 
 #[test]
 fn deferred_cc_does_not_publish_inputs_changed_during_the_compile() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::write(
@@ -818,7 +866,7 @@ exit "$status"
 /// the old header's key, so neither the entry nor the memo may be stored.
 #[test]
 fn key_first_cc_does_not_store_an_input_changed_before_the_compile_read_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::write(
@@ -891,7 +939,7 @@ exec cc "$@"
 /// header it now includes.
 #[test]
 fn key_first_cc_does_not_store_a_header_saved_while_it_was_keyed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::write(
@@ -970,7 +1018,7 @@ exec cc "$@"
 /// key taken before the compile stores the result, and the next run hits.
 #[test]
 fn key_first_cc_caches_a_header_stamped_ahead_of_the_clock() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::write(
@@ -1006,8 +1054,23 @@ fn key_first_cc_caches_a_header_stamped_ahead_of_the_clock() {
 }
 
 fn index_rows(root: &std::path::Path, table: &str) -> i64 {
-    rusqlite::Connection::open(root.join("cache/index.db"))
-        .unwrap()
+    let index = rusqlite::Connection::open_with_flags(
+        root.join("cache/index.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    // Passthrough may open the hash memo without initializing entry tables.
+    let exists: bool = index
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !exists {
+        return 0;
+    }
+    index
         .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
             row.get(0)
         })
@@ -1033,7 +1096,7 @@ fn cc_memo_count(root: &std::path::Path) -> i64 {
 /// (kunobi-ninja/kache#1390).
 #[test]
 fn deferred_cc_records_its_memo_when_the_entry_already_exists() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::write(
@@ -1082,7 +1145,7 @@ fn deferred_cc_records_its_memo_when_the_entry_already_exists() {
 /// spells its own path, so they must not share an entry.
 #[test]
 fn identical_sources_at_different_paths_get_their_own_entries() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     let unit = "const char *unit_file(void) { return __FILE__; }\n";
@@ -1097,6 +1160,7 @@ fn identical_sources_at_different_paths_get_their_own_entries() {
     .unwrap();
 
     for deferred in ["0", "1"] {
+        dir.stop_daemon();
         let _ = fs::remove_dir_all(root.join("cache"));
         let mut keys = Vec::new();
         for copy in ["a", "b", "b"] {

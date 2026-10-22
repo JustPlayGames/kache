@@ -13,10 +13,20 @@ pub use kache_protocol::{
     RecordTargetRootsRequest, RemoteCheckRequest, SeedTargetRequest, StampHitsRequest, StatsEntry,
     StatsRequest, TransferDirection, TransferEvent, UploadJob,
 };
+pub use kache_protocol::{
+    GcBreakdown, GcRequest, GcRequestMode, PredictionPublishRequest, Request, Response,
+    StatsResponse,
+};
 use kunobi_daemon::Lifecycle;
 #[path = "daemon_lifecycle.rs"]
 mod lifecycle_client;
 pub(crate) use lifecycle_client::Ensured;
+#[cfg(unix)]
+#[path = "daemon_execution.rs"]
+mod execution;
+#[cfg(windows)]
+#[path = "daemon_execution_windows.rs"]
+mod execution;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
 use serde::{Deserialize, Serialize};
@@ -452,110 +462,6 @@ fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bo
 
 // ── Protocol types ───────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Request {
-    Upload(UploadJob),
-    /// Legacy GC wire command accepted from older clients.
-    Gc(GcRequest),
-    /// Policy-v2 GC command. Older daemons reject this unknown variant before
-    /// mutation, closing the capability-probe/replacement race.
-    GcV2(GcRequest),
-    /// A wrapper saw the store over the automatic trigger. The daemon
-    /// acknowledges at once and sweeps in the background; hints that arrive
-    /// meanwhile coalesce. Older daemons reject the unknown variant, and the
-    /// wrapper then spawns its own worker.
-    GcHint,
-    RemoteCheck(RemoteCheckRequest),
-    Stats(StatsRequest),
-    Health,
-    BatchRemoteCheck(BatchRemoteCheckRequest),
-    HashFiles(HashFilesRequest),
-    /// A wrapper's hit hands its access stamp to the daemon, which pins the
-    /// entry against its sweeps and writes the stamps in batches
-    /// ([`Daemon::flush_hit_stamps`]). Older daemons reject the unknown
-    /// variant and the wrapper stamps the index itself.
-    StampHits(StampHitsRequest),
-    /// A wrapper hands over the file-hash memo rows its index was too busy
-    /// to take, so the restore that learned them neither waits nor loses
-    /// them ([`Daemon::flush_file_hash_records`]). Older daemons reject the
-    /// unknown variant and the wrapper drops the rows, as it did before.
-    RecordFileHashes(RecordFileHashesRequest),
-    /// A wrapper hands over the target root its index was too busy to
-    /// record ([`Daemon::flush_handed_rows`]). Older daemons reject the
-    /// unknown variant, and the build's next unit records it.
-    RecordTargetRoots(RecordTargetRootsRequest),
-    /// A wrapper hands over the input prediction rows its index was too busy
-    /// to take ([`Daemon::flush_handed_rows`]). Older daemons reject the
-    /// unknown variant, and the rows cost the next build a pre-pass.
-    RecordPredictions(RecordPredictionsRequest),
-    Prefetch(PrefetchRequest),
-    BuildStarted(BuildStartedRequest),
-    CompileStarted(CompileStartedRequest),
-    CompileFinished(CompileFinishedRequest),
-    /// A wrapper hands the daemon a finished cc compile to store.
-    /// Older handlers lack the atomic receipt; reject their protocol instead
-    /// of allowing an ambiguous timeout to publish and log twice.
-    #[serde(rename = "publish_cc_v2")]
-    PublishCc(Box<crate::daemon_publish::PublishCcRequest>),
-    /// A wrapper hands the daemon a finished rustc compile to store: its
-    /// outputs' snapshots and the digests read from them before the
-    /// wrapper returned. Older daemons reject the unknown variant, and the
-    /// wrapper then stores the compile itself.
-    PublishRustc(Box<crate::daemon_publish::PublishCcRequest>),
-    /// A wrapper with no local input prediction row asks for the remote's
-    /// (kunobi-ninja/kache#1011). Older daemons reject the unknown variant,
-    /// which the wrapper reads as no row.
-    PredictionFetch(PredictionFetchRequest),
-    /// A wrapper recorded a portable row; the daemon stores it on a writable
-    /// remote in the background.
-    PredictionPublish(PredictionPublishRequest),
-    /// A build of a target directory started: copy its recorded large
-    /// executables beside their destinations (see [`crate::prestage`]).
-    /// Fire-and-forget; older daemons reject the unknown variant and the
-    /// restore copies as before.
-    Prestage(PrestageRequest),
-    /// Cargo is probing a target directory it has not built: copy another
-    /// checkout's registry units into it before Cargo checks freshness (see
-    /// [`crate::target_seed`]). The wrapper waits for the answer; older
-    /// daemons reject the unknown variant and nothing is copied.
-    SeedTarget(SeedTargetRequest),
-    Shutdown,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PredictionPublishRequest {
-    pub identity: String,
-    pub row: crate::prediction_share::SharedPrediction,
-}
-
-impl Request {
-    /// Whether the request comes from a build. Stats pollers, a TUI and GC
-    /// commands do not keep the machine from counting as quiet.
-    fn is_build_activity(&self) -> bool {
-        !matches!(
-            self,
-            Request::Health
-                | Request::Stats(_)
-                | Request::Gc(_)
-                | Request::GcV2(_)
-                | Request::Shutdown
-        )
-    }
-
-    /// Only a declared newer release may request replacement after admission.
-    fn client_version(&self) -> Option<&str> {
-        match self {
-            Request::Upload(job) => job.client_version.as_deref(),
-            Request::Stats(req) => req.client_version.as_deref(),
-            Request::BuildStarted(req) => req.client_version.as_deref(),
-            Request::CompileStarted(req) => req.client_version.as_deref(),
-            Request::PublishCc(req) | Request::PublishRustc(req) => req.client_version.as_deref(),
-            _ => None,
-        }
-    }
-}
-
 /// How long the daemon spends fetching one prediction row. A row saves one
 /// pre-pass, so waiting longer than a pre-pass takes would be a loss.
 const PREDICTION_FETCH_BUDGET: Duration = Duration::from_secs(2);
@@ -855,31 +761,6 @@ fn load_upload_jobs(config: &Config) -> Result<Vec<UploadJob>> {
     Ok(jobs)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GcRequest {
-    /// Legacy wire field retained so old clients and daemons can still
-    /// exchange an explicit `--max-age` request during rolling upgrades.
-    pub max_age_hours: Option<u64>,
-    #[serde(default)]
-    pub mode: GcRequestMode,
-    /// Effective automatic age policy loaded by the requesting CLI. Old
-    /// daemons ignore this unknown field; new daemons no longer substitute
-    /// their startup config for a manual request.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_max_age_hours: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GcRequestMode {
-    /// A pre-mode client. Resolve `Some` as explicit age and `None` using the
-    /// daemon's configured automatic policy.
-    #[default]
-    Legacy,
-    Automatic,
-    ExplicitAge,
-}
-
 /// Who started a daemon sweep. A requested `kache gc` waits for the lock
 /// and runs its size pass; the timer skips a busy lock and follows the
 /// shared trigger and backoff.
@@ -932,52 +813,25 @@ fn gc_entries_pinned_lower_bound(
     }
 }
 
-impl GcRequest {
-    fn automatic(effective_max_age_hours: u64) -> Self {
-        Self {
-            max_age_hours: None,
-            mode: GcRequestMode::Automatic,
-            effective_max_age_hours: Some(effective_max_age_hours),
-        }
-    }
-
-    fn explicit_age(hours: u64) -> Self {
-        Self {
-            max_age_hours: Some(hours),
-            mode: GcRequestMode::ExplicitAge,
-            effective_max_age_hours: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn legacy(max_age_hours: Option<u64>) -> Self {
-        Self {
-            max_age_hours,
-            mode: GcRequestMode::Legacy,
-            effective_max_age_hours: None,
-        }
-    }
-
-    fn resolve(&self, daemon_max_age_hours: u64) -> Result<GcPolicy> {
-        Ok(match self.mode {
-            GcRequestMode::Automatic => GcPolicy::Automatic {
-                max_age_hours: self.effective_max_age_hours.ok_or_else(|| {
-                    anyhow::anyhow!("automatic GC request is missing effective_max_age_hours")
-                })?,
+fn resolve_gc_request(request: &GcRequest, daemon_max_age_hours: u64) -> Result<GcPolicy> {
+    Ok(match request.mode {
+        GcRequestMode::Automatic => GcPolicy::Automatic {
+            max_age_hours: request.effective_max_age_hours.ok_or_else(|| {
+                anyhow::anyhow!("automatic GC request is missing effective_max_age_hours")
+            })?,
+        },
+        GcRequestMode::ExplicitAge => GcPolicy::ExplicitAge {
+            hours: request.max_age_hours.ok_or_else(|| {
+                anyhow::anyhow!("explicit_age GC request is missing max_age_hours")
+            })?,
+        },
+        GcRequestMode::Legacy => match request.max_age_hours {
+            Some(hours) => GcPolicy::ExplicitAge { hours },
+            None => GcPolicy::Automatic {
+                max_age_hours: daemon_max_age_hours,
             },
-            GcRequestMode::ExplicitAge => GcPolicy::ExplicitAge {
-                hours: self.max_age_hours.ok_or_else(|| {
-                    anyhow::anyhow!("explicit_age GC request is missing max_age_hours")
-                })?,
-            },
-            GcRequestMode::Legacy => match self.max_age_hours {
-                Some(hours) => GcPolicy::ExplicitAge { hours },
-                None => GcPolicy::Automatic {
-                    max_age_hours: daemon_max_age_hours,
-                },
-            },
-        })
-    }
+        },
+    })
 }
 
 /// Cache dir a RemoteCheck should import into.
@@ -1118,98 +972,6 @@ impl PackPrefetchContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StatsResponse {
-    #[serde(default)]
-    pub stores: Vec<crate::store_view::StoreSummary>,
-    pub total_size: u64,
-    pub max_size: u64,
-    pub entry_count: usize,
-    pub entries: Option<Vec<StatsEntry>>,
-    pub events: EventStatsResponse,
-    /// Content-dedup figures for the daemon's store. Defaulted for an old
-    /// daemon so a new client can suppress the section instead of mixing in
-    /// figures from its own differently configured store.
-    #[serde(default)]
-    pub blob_stats: Option<crate::store::BlobStats>,
-    /// Bounded recent session summaries from the daemon's event directory.
-    #[serde(default)]
-    pub recent_summaries: Vec<crate::events::BuildSummaryEvent>,
-    #[serde(default)]
-    pub version: String,
-    /// Daemon executable mtime. Clients from 1.0.x and earlier replace a daemon
-    /// whose executable is older than theirs; later clients only display it.
-    #[serde(default)]
-    pub build_epoch: u64,
-    /// GC request semantics supported by this daemon. Version 2 means the
-    /// daemon applies age before duplicate/size pressure and reports a policy
-    /// breakdown. Missing means an older daemon, so clients must not send a
-    /// mutating GC request.
-    #[serde(default)]
-    pub gc_policy_version: u32,
-    /// Number of keys queued or in-flight for upload.
-    #[serde(default)]
-    pub pending_uploads: usize,
-    /// Number of keys currently being downloaded from S3.
-    #[serde(default)]
-    pub active_downloads: usize,
-    #[serde(default)]
-    pub s3_concurrency_total: usize,
-    #[serde(default)]
-    pub s3_concurrency_used: usize,
-    #[serde(default)]
-    pub upload_queue_capacity: usize,
-    #[serde(default)]
-    pub uploads_completed: u64,
-    #[serde(default)]
-    pub uploads_failed: u64,
-    #[serde(default)]
-    pub uploads_skipped: u64,
-    /// Upload attempts deferred because the remote write breaker was degraded (#327).
-    #[serde(default)]
-    pub uploads_suppressed: u64,
-    #[serde(default)]
-    pub downloads_completed: u64,
-    #[serde(default)]
-    pub downloads_failed: u64,
-    /// Restores answered "miss" because the remote breaker was degraded (#327).
-    #[serde(default)]
-    pub downloads_suppressed: u64,
-    /// RemoteChecks that actually reached S3 (HEAD probes + GETs) — the
-    /// denominator for `negative_hits` (#564).
-    #[serde(default)]
-    pub remote_check_roundtrips: u64,
-    /// Checks answered from the negative-result cache without S3 (#564).
-    #[serde(default)]
-    pub negative_hits: u64,
-    /// Definitive misses currently remembered by the negative cache (#564).
-    #[serde(default)]
-    pub negative_entries: u64,
-    /// Whether the remote breaker is currently degraded (#327).
-    #[serde(default)]
-    pub remote_degraded: bool,
-    #[serde(default)]
-    pub bytes_uploaded: u64,
-    #[serde(default)]
-    pub bytes_downloaded: u64,
-    #[serde(default)]
-    pub recent_transfers: Vec<TransferEvent>,
-    /// Phase-0 prefetch/planning observability (#485). Defaulted so old
-    /// clients reading a new daemon (and vice versa) keep working.
-    #[serde(default)]
-    pub prefetch: PrefetchStatsSnapshot,
-    /// In-flight miss compiles registered by wrapper heartbeat monitors
-    /// (kunobi-ninja/kache#131). Defaulted for old-daemon/new-client mixes.
-    #[serde(default)]
-    pub in_flight: Vec<InFlightEntry>,
-    /// The configuration this daemon actually loaded (kunobi-ninja/kache#689).
-    /// Defaulted to `None` so a daemon that predates the field is
-    /// distinguishable from one that reported it — the CLI then falls back to
-    /// its own config and labels the affected lines as client-derived.
-    #[serde(default)]
-    pub effective_config: Option<EffectiveConfig>,
-}
-
 /// Snapshot the reportable view of `config` plus the exact path/content
 /// provenance parsed by [`Config::load_with_provenance`]. The watcher uses
 /// the same fingerprint as its baseline, so an edit between load and
@@ -1249,211 +1011,6 @@ fn gc_policy_outcome(stats: &crate::store::GcStats) -> GcPolicyOutcome {
         entries_locked: stats.entries_locked,
         evict_write_ms: stats.evict_write_ms,
         bytes_held: stats.bytes_held,
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GcBreakdown {
-    pub mode: GcRequestMode,
-    pub duplicate: GcPolicyOutcome,
-    pub age: GcPolicyOutcome,
-    pub size: GcPolicyOutcome,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct Response {
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evicted: Option<usize>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub skipped: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gc: Option<GcBreakdown>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub found: Option<bool>,
-    /// True when the artifact was downloaded during manifest/shard prefetch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prefetched: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stats: Option<StatsResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health: Option<DaemonHealth>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_results: Option<Vec<Response>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hash_results: Option<Vec<HashFileResult>>,
-    /// Reply payload for `Request::PredictionFetch` (kunobi-ninja/kache#1011).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prediction: Option<crate::prediction_share::SharedPrediction>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
-impl Response {
-    pub(crate) fn ok() -> Self {
-        Self {
-            ok: true,
-            evicted: None,
-            skipped: false,
-            gc: None,
-            found: None,
-            prefetched: None,
-            stats: None,
-            health: None,
-            batch_results: None,
-            hash_results: None,
-            prediction: None,
-            error: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn ok_evicted(n: usize) -> Self {
-        Self {
-            ok: true,
-            evicted: Some(n),
-            skipped: false,
-            gc: None,
-            found: None,
-            prefetched: None,
-            stats: None,
-            health: None,
-            batch_results: None,
-            hash_results: None,
-            prediction: None,
-            error: None,
-        }
-    }
-
-    fn ok_gc(total: usize, breakdown: GcBreakdown) -> Self {
-        Self {
-            evicted: Some(total),
-            gc: Some(breakdown),
-            ..Self::ok()
-        }
-    }
-
-    fn ok_gc_skipped(breakdown: GcBreakdown) -> Self {
-        Self {
-            ok: true,
-            evicted: Some(0),
-            skipped: true,
-            gc: Some(breakdown),
-            found: None,
-            prefetched: None,
-            stats: None,
-            health: None,
-            batch_results: None,
-            hash_results: None,
-            prediction: None,
-            error: None,
-        }
-    }
-
-    fn ok_stats(stats: StatsResponse) -> Self {
-        Self {
-            ok: true,
-            evicted: None,
-            skipped: false,
-            gc: None,
-            found: None,
-            prefetched: None,
-            stats: Some(stats),
-            health: None,
-            batch_results: None,
-            hash_results: None,
-            prediction: None,
-            error: None,
-        }
-    }
-
-    fn ok_batch(results: Vec<Response>) -> Self {
-        Self {
-            ok: true,
-            evicted: None,
-            skipped: false,
-            gc: None,
-            found: None,
-            prefetched: None,
-            stats: None,
-            health: None,
-            batch_results: Some(results),
-            hash_results: None,
-            prediction: None,
-            error: None,
-        }
-    }
-
-    fn ok_hash_results(results: Vec<HashFileResult>) -> Self {
-        Self {
-            ok: true,
-            evicted: None,
-            skipped: false,
-            gc: None,
-            found: None,
-            prefetched: None,
-            stats: None,
-            health: None,
-            batch_results: None,
-            hash_results: Some(results),
-            prediction: None,
-            error: None,
-        }
-    }
-
-    fn found(val: bool) -> Self {
-        Self {
-            ok: true,
-            evicted: None,
-            skipped: false,
-            gc: None,
-            found: Some(val),
-            prefetched: None,
-            stats: None,
-            health: None,
-            batch_results: None,
-            hash_results: None,
-            prediction: None,
-            error: None,
-        }
-    }
-
-    fn found_prefetched(val: bool, prefetched: bool) -> Self {
-        Self {
-            ok: true,
-            evicted: None,
-            skipped: false,
-            gc: None,
-            found: Some(val),
-            prefetched: Some(prefetched),
-            stats: None,
-            health: None,
-            batch_results: None,
-            hash_results: None,
-            prediction: None,
-            error: None,
-        }
-    }
-
-    pub(crate) fn err(msg: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            evicted: None,
-            skipped: false,
-            gc: None,
-            found: None,
-            prefetched: None,
-            stats: None,
-            health: None,
-            batch_results: None,
-            hash_results: None,
-            prediction: None,
-            error: Some(msg.into()),
-        }
     }
 }
 
@@ -2309,6 +1866,10 @@ pub(crate) struct Daemon {
     /// When this read-only daemon last warned that it skipped a writable
     /// build's upload.
     readonly_skip_warned: Mutex<Option<Instant>>,
+    /// Keep compile workers below the connection cap, leaving RPC capacity
+    /// for their own remote checks and publication requests.
+    #[cfg(any(unix, windows))]
+    execution_workers: Arc<tokio::sync::Semaphore>,
 }
 
 /// Whether a rate-limited warning may fire at `now`. Records `now` when it may.
@@ -2456,6 +2017,12 @@ impl Daemon {
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
+            #[cfg(any(unix, windows))]
+            execution_workers: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(32),
+            )),
             config,
         }
     }
@@ -3138,6 +2705,7 @@ impl Daemon {
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
+            | Request::ExecuteV1(_)
             | Request::RemoteCheck(_)
             | Request::BatchRemoteCheck(_)
             | Request::Prefetch(_)
@@ -3891,7 +3459,7 @@ impl Daemon {
 
     /// Handle a GC request — pure logic against the store.
     pub fn handle_gc(&self, req: &GcRequest) -> Response {
-        let policy = match req.resolve(self.config.gc_max_age_hours) {
+        let policy = match resolve_gc_request(req, self.config.gc_max_age_hours) {
             Ok(policy) => policy,
             Err(e) => return Response::err(format!("invalid GC request: {e}")),
         };
@@ -6637,6 +6205,26 @@ impl Daemon {
         Response::ok()
     }
 
+    /// A delegated compiler already resolved its cache policy. Keep that
+    /// snapshot when it requests eviction after a put. The wrapper's shared
+    /// throttle limits requests; each sweep also takes the store's gc.lock.
+    pub(crate) fn request_gc_for_invocation(self: &Arc<Self>, config: Config) {
+        let daemon = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = daemon.sweep_invocation_under_size_pressure(&config) {
+                tracing::warn!("invocation GC sweep failed: {error:#}");
+            }
+        });
+    }
+
+    fn sweep_invocation_under_size_pressure(&self, config: &Config) -> Result<()> {
+        let main = self.sweep_shard_under_size_pressure(config);
+        crate::volume_gc::run_on_volume_shards(config, |shard| {
+            self.sweep_shard_under_size_pressure(shard)
+        });
+        main
+    }
+
     fn run_hinted_sweep(&self) {
         // Released on unwind too, or one panic would swallow every later hint.
         struct Release<'a>(&'a AtomicBool);
@@ -7151,11 +6739,20 @@ pub fn run_server(
         .context("writing daemon coordinator state")?;
     let _coord_guard = DaemonCoordGuard::new(coord.path.clone());
 
+    #[cfg(not(windows))]
+    let manifest_path = PathBuf::from("Cargo.lock");
+    #[cfg(windows)]
+    let manifest_path = crate::platform::release_daemon_working_directory(&config.runtime_dir)
+        .context("releasing the build working directory")?;
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    run_daemon_runtime(rt, server_main(config, provenance, coord, readiness))
+    run_daemon_runtime(
+        rt,
+        server_main(config, provenance, coord, readiness, manifest_path),
+    )
 }
 
 fn run_daemon_runtime(
@@ -7171,14 +6768,16 @@ fn run_daemon_runtime(
     result
 }
 
-fn start_manifest_warming(daemon: &Arc<Daemon>) -> Option<tokio::task::JoinHandle<()>> {
+fn start_manifest_warming(
+    daemon: &Arc<Daemon>,
+    lock_path: PathBuf,
+) -> Option<tokio::task::JoinHandle<()>> {
     if should_start_speculative_prefetch(
         daemon.config.remote.is_some(),
         daemon.config.prefetch_enabled,
     ) {
         let manifest_daemon = daemon.clone();
         let namespace = std::env::var("KACHE_NAMESPACE").ok();
-        let lock_path = PathBuf::from("Cargo.lock");
         Some(tokio::spawn(async move {
             manifest_prefetch(&manifest_daemon, namespace.as_deref(), &lock_path).await;
             manifest_daemon.signal_warming_complete();
@@ -7261,11 +6860,43 @@ fn publish_drain_warning(unpublished: usize) -> Option<String> {
     })
 }
 
+/// Drain accepted publications until the worker finishes or stops making
+/// progress, then close the upload queue.
+///
+/// Accepted hand-offs hold their key locks. The worker keeps going for as long
+/// as it makes progress: a job it never reaches is an entry the next build
+/// compiles again. Keep uploads open during that wait so entries stored by the
+/// drain can be uploaded by this daemon. If the worker stalls, close uploads
+/// anyway; durable intents it records later remain available for restart.
+pub(crate) async fn drain_publications_then_close_uploads(
+    daemon: &Daemon,
+    publish_done: tokio::sync::oneshot::Receiver<()>,
+) {
+    daemon.publish_queue().close();
+    let publish_progress = daemon.publish_queue().progress();
+    let unpublished = crate::daemon_publish::drain_publications(
+        publish_done,
+        &publish_progress,
+        crate::daemon_publish::PUBLISH_DRAIN_STALL,
+    )
+    .await;
+    if let Some(warning) = publish_drain_warning(unpublished) {
+        tracing::warn!("{warning}");
+    }
+    // Graceful shutdown: drop the daemon's sender to close the unbounded buffer.
+    // The caller then gives the entire enqueue + worker drain one shared 30s
+    // budget. The enqueue task itself can block on a full worker channel during
+    // an outage, so awaiting it outside that deadline would make restart
+    // unbounded even though every queued job is already durable on disk.
+    daemon.close_upload_queue();
+}
+
 async fn server_main(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
     mut coord: DaemonCoordFile,
     readiness: Option<kunobi_daemon::readiness::channel::Notifier>,
+    manifest_path: PathBuf,
 ) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -7524,7 +7155,7 @@ async fn server_main(
     // Runs once on startup — subsequent builds update the manifest via `kache save-manifest`.
     // The shared launcher also releases the warming barrier immediately when no
     // remote exists or speculative prefetch is disabled.
-    let manifest_handle = start_manifest_warming(&daemon);
+    let manifest_handle = start_manifest_warming(&daemon, manifest_path);
 
     // Background blob migration: lazily migrate legacy entries on startup
     let migration_config = config.clone();
@@ -7638,28 +7269,7 @@ async fn server_main(
     daemon.flush_hit_stamps();
     daemon.flush_handed_rows();
 
-    // Accepted hand-offs hold their key locks. Let the worker finish them
-    // for as long as it keeps making progress: a job it never reaches is an
-    // entry the next build compiles again. This runs before the upload queue
-    // closes, so an entry stored now is still uploaded by this daemon, as one
-    // the wrapper stored before the shutdown is.
-    daemon.publish_queue().close();
-    let publish_progress = daemon.publish_queue().progress();
-    let unpublished = crate::daemon_publish::drain_publications(
-        publish_done,
-        &publish_progress,
-        crate::daemon_publish::PUBLISH_DRAIN_STALL,
-    )
-    .await;
-    if let Some(warning) = publish_drain_warning(unpublished) {
-        tracing::warn!("{warning}");
-    }
-    // Graceful shutdown: drop the daemon's sender to close the unbounded buffer,
-    // then give the entire enqueue + worker drain one shared 30s budget. The
-    // enqueue task itself can block on a full worker channel during an outage,
-    // so awaiting it outside this deadline would make restart unbounded even
-    // though every queued job is already durable on disk.
-    daemon.close_upload_queue();
+    drain_publications_then_close_uploads(&daemon, publish_done).await;
     drop(daemon);
     if drain_upload_pipeline(enqueue_handle, upload_handles, Duration::from_secs(30)).await {
         tracing::warn!("upload drain timeout, aborting remaining upload tasks");
@@ -7991,7 +7601,11 @@ async fn accept_loop(
             break;
         }
 
-        // Check idle timeout
+        // A compiler can be silent for minutes. Accepted work owns activity
+        // independently of optional progress or heartbeat traffic.
+        if lifecycle.snapshot().active != 0 {
+            last_activity = Instant::now();
+        }
         if let Some(timeout) = idle_timeout
             && last_activity.elapsed() > timeout
         {
@@ -8048,13 +7662,14 @@ async fn accept_loop(
             // Shared drain notification also wakes an otherwise idle listener.
             _ = lifecycle.draining() => {}
             // Wake periodically to check idle timeout (select won't fire otherwise)
-            _ = tokio::time::sleep(ACCEPT_LOOP_IDLE_TICK) => {}
+            _ = tokio::time::sleep(idle_timeout.unwrap_or(ACCEPT_LOOP_IDLE_TICK).min(ACCEPT_LOOP_IDLE_TICK)) => {}
             _ = &mut shutdown_signal => {
                 tracing::info!("shutdown signal received, draining...");
                 break;
             }
             Some(result) = handlers.join_next(), if !handlers.is_empty() => {
                 observe_connection_handler(result);
+                last_activity = Instant::now();
             }
         }
     }
@@ -8667,6 +8282,20 @@ async fn handle_connection_started_at(
         }
 
         let resp = match parsed {
+            Ok(Request::ExecuteV1(req)) => {
+                #[cfg(any(unix, windows))]
+                {
+                    let result =
+                        execution::handle(&stream, &mut reader, *req, daemon, lifecycle).await;
+                    retire_for_newer_client(daemon, lifecycle, client_version.as_deref());
+                    return result;
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let _ = req;
+                    Response::err("compiler execution is unavailable on this platform")
+                }
+            }
             Ok(Request::Upload(ref job)) => {
                 tracing::debug!(
                     crate_name = job.crate_name,
@@ -8733,21 +8362,7 @@ async fn handle_connection_started_at(
         };
         let elapsed = start.elapsed();
 
-        // Accepted work keeps its response and existing drain guarantees.
-        // Legacy epochs are ignored: rebuilding a client is not an upgrade.
-        if client_version
-            .as_deref()
-            .is_some_and(|version| client_version_is_newer(version, &daemon.version))
-            && lifecycle.accepting_calls()
-        {
-            tracing::info!(
-                daemon_version = daemon.version,
-                client_version,
-                "newer client release requested daemon replacement"
-            );
-            lifecycle.start_drain();
-            // Wake the accept loop so the restart starts now (issue #288).
-        }
+        retire_for_newer_client(daemon, lifecycle, client_version.as_deref());
 
         if let Some((error, routine)) = request_failure(&resp) {
             let elapsed_ms = elapsed.as_millis() as u64;
@@ -8768,6 +8383,21 @@ async fn handle_connection_started_at(
     }
 
     Ok(())
+}
+
+fn retire_for_newer_client(daemon: &Daemon, lifecycle: &Lifecycle, client_version: Option<&str>) {
+    // Accepted work keeps its response and existing drain guarantees.
+    // Legacy epochs are ignored: rebuilding a client is not an upgrade.
+    if client_version.is_some_and(|version| client_version_is_newer(version, &daemon.version))
+        && lifecycle.accepting_calls()
+    {
+        tracing::info!(
+            daemon_version = daemon.version,
+            client_version,
+            "newer client release requested daemon replacement"
+        );
+        lifecycle.start_drain();
+    }
 }
 
 /// Returns true for I/O errors that mean the client disconnected, so the
@@ -10117,7 +9747,11 @@ fn spawn_detached_daemon(
     strip_ambient_remote_env(&mut command);
     let mut daemon = detached_command(&command);
     daemon.stderr(stderr_target).readiness_channel();
-    let child = daemon.spawn().context("spawning daemon process")?;
+    let child = {
+        #[cfg(unix)]
+        let _admission = kache_ipc::descriptors::spawn_guard();
+        daemon.spawn().context("spawning daemon process")?
+    };
     if child.in_callers_job() {
         tracing::debug!(
             "the daemon (PID {}) shares the build's job object and stops if the build is \

@@ -54,6 +54,7 @@
 
 mod placement;
 
+use crate::invocation::process::CommandExt as _;
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -138,6 +139,18 @@ pub(crate) fn new_target(
         target_dir,
         workspace_root,
     })
+}
+
+/// Resolve Cargo's intermediate directory for diagnostics as well as seeding.
+/// The shared resolver keeps target and build overrides independent.
+pub(crate) fn configured_output_dir(
+    cwd: &Path,
+    workspace: &Path,
+    cargo_home: &Path,
+    target_env: Option<&std::ffi::OsStr>,
+    build_env: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    placement::resolve(cwd, workspace, cargo_home, target_env, build_env)
 }
 
 fn workspace_root(cwd: &Path) -> Option<&Path> {
@@ -980,23 +993,29 @@ pub(crate) fn seed_for_lane(
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
         let files = FileCounts::default();
+        let cancellation = crate::invocation::process::current();
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
-                scope.spawn(|| {
+                let cancellation = cancellation.clone();
+                let (units, next, copied, from, to, deps, files) =
+                    (&units, &next, &copied, &from, &to, &deps, &files);
+                scope.spawn(move || {
+                    let _cancellation =
+                        crate::invocation::process::CancellationScope::borrow(cancellation);
                     while let Some(unit) = units.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if Instant::now() >= deadline {
+                        if Instant::now() >= deadline
+                            || crate::invocation::process::check().is_err()
+                        {
                             break;
                         }
-                        if marker(&to, layout, unit).exists()
-                            || names_the_donor(&from, layout, unit, donor)
-                            || out_dir_names_the_donor(&from, layout, unit, donor, deadline)
-                            || !artifacts_stored(&from, layout, unit, &deps, cache_dir, deadline)
+                        if marker(to, layout, unit).exists()
+                            || names_the_donor(from, layout, unit, donor)
+                            || out_dir_names_the_donor(from, layout, unit, donor, deadline)
+                            || !artifacts_stored(from, layout, unit, deps, cache_dir, deadline)
                         {
                             continue;
                         }
-                        match copy_unit(
-                            &from, &to, layout, unit, &deps, cache_dir, &files, deadline,
-                        ) {
+                        match copy_unit(from, to, layout, unit, deps, cache_dir, files, deadline) {
                             Ok(()) => {
                                 copied.fetch_add(1, Ordering::Relaxed);
                             }
@@ -1446,34 +1465,46 @@ fn build_names_a_target(args: &[String]) -> bool {
 /// has not built, ask the daemon to seed it and wait for the answer.
 ///
 /// See [`asks_for_seed`] for which invocations qualify.
-pub(crate) fn before_probe(config: &crate::config::Config, args: &[String]) {
+pub(crate) fn before_probe_for(
+    config: &crate::config::Config,
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) {
     if !asks_for_seed(config.seed_new_targets, args) || build_names_a_target(args) {
         return;
     }
-    let Ok(cwd) = std::env::current_dir() else {
+    let Some(cwd) = env.cwd() else {
         return;
     };
-    let Some(workspace) = workspace_root(&cwd) else {
+    let Some(workspace) = workspace_root(cwd) else {
         return;
     };
-    let target_env = placement::override_target()
-        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
-        .or_else(|| std::env::var_os("CARGO_BUILD_TARGET_DIR"));
-    let build_env =
-        placement::override_build().or_else(|| std::env::var_os("CARGO_BUILD_BUILD_DIR"));
+    let target_env = placement::override_target(env)
+        .or_else(|| env.var_os("CARGO_TARGET_DIR"))
+        .or_else(|| env.var_os("CARGO_BUILD_TARGET_DIR"));
+    let build_env = placement::override_build(env).or_else(|| env.var_os("CARGO_BUILD_BUILD_DIR"));
+    let Some(cargo_home) = env
+        .var_os("CARGO_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env.home_dir().map(|home| home.join(".cargo")))
+        .and_then(|path| env.resolve(&path))
+    else {
+        return;
+    };
     let Some(directory) = placement::resolve(
-        &cwd,
+        cwd,
         workspace,
-        &crate::cli::cargo_home_dir(),
+        &cargo_home,
         target_env.as_deref(),
         build_env.as_deref(),
     ) else {
         return;
     };
-    let Some(target) = new_target(&cwd, Some(directory.as_os_str()), false) else {
+    let Some(target) = new_target(cwd, Some(directory.as_os_str()), false) else {
         return;
     };
-    let Some(version) = rustc_version(args.first().map(String::as_str)) else {
+    let Some(version) = rustc_version_for(args.first().map(String::as_str), env) else {
         return;
     };
     let note = std::env::var_os("KACHE_LOG_FILE").is_none();
@@ -1505,12 +1536,22 @@ pub(crate) fn note_in_log(line: &str) {
 }
 
 /// `rustc -vV` from the compiler Cargo is probing.
+#[cfg(test)]
 fn rustc_version(rustc: Option<&str>) -> Option<String> {
-    let output = std::process::Command::new(rustc?)
+    rustc_version_for(rustc, &crate::invocation::InvocationEnv::capture())
+}
+
+fn rustc_version_for(
+    rustc: Option<&str>,
+    env: &crate::invocation::InvocationEnv,
+) -> Option<String> {
+    let output = env
+        .command(rustc?)
+        .ok()?
         .arg("-vV")
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()
+        .invocation_output()
         .ok()?;
     output
         .status
@@ -2015,7 +2056,7 @@ source = "git+https://example.com/gitdep#abc"
                 .join(script.strip_prefix(&profile).unwrap());
             std::fs::remove_dir_all(&donor.target_dir).unwrap();
             std::fs::remove_file(global).unwrap();
-            let output = Command::new(seeded_script).output().unwrap();
+            let output = Command::new(seeded_script).invocation_output().unwrap();
             assert!(output.status.success(), "{layout:?}");
             assert_eq!(output.stdout, b"seeded pin\n", "{layout:?}");
         }
@@ -2138,6 +2179,65 @@ source = "git+https://example.com/gitdep#abc"
         assert!(!to.exists());
         std::fs::create_dir(&record).unwrap();
         assert!(pin_launcher(&from, &to, &record, later()).is_err());
+    }
+
+    #[test]
+    fn a_cancelled_request_does_not_seed_and_another_can_reuse_the_donor() {
+        use crate::invocation::process::{Cancellation, CancellationScope};
+
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "donor", layout);
+            let cache = no_runs();
+            let cancelled_target = checkout(dir.path(), "cancelled");
+            let cancelled = Cancellation::default();
+            cancelled.cancel();
+            {
+                let _scope = CancellationScope::enter(Some(cancelled));
+                assert_eq!(
+                    seed(
+                        &cancelled_target,
+                        VERSION,
+                        std::slice::from_ref(&donor),
+                        cache.path(),
+                        later(),
+                    ),
+                    Seeded::default(),
+                    "{layout:?}"
+                );
+            }
+            assert!(
+                !marker(
+                    &cancelled_target.target_dir.join(PROFILE),
+                    layout,
+                    &unit("dep", HASH)
+                )
+                .exists(),
+                "{layout:?}"
+            );
+            let healthy_target = checkout(dir.path(), "healthy");
+            {
+                let _scope = CancellationScope::enter(Some(Cancellation::default()));
+                let seeded = seed(
+                    &healthy_target,
+                    VERSION,
+                    std::slice::from_ref(&donor),
+                    cache.path(),
+                    later(),
+                );
+                assert_eq!(seeded.units, 1, "{layout:?}");
+                assert_eq!(seeded.donor, Some(donor.workspace_root.clone()));
+            }
+            assert!(
+                marker(
+                    &healthy_target.target_dir.join(PROFILE),
+                    layout,
+                    &unit("dep", HASH)
+                )
+                .is_dir(),
+                "{layout:?}"
+            );
+        }
     }
 
     #[test]
