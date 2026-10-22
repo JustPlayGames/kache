@@ -3537,6 +3537,7 @@ pub(crate) fn run_for(
 ) -> Result<i32> {
     let _trace = crate::phase_trace::start_for("rustc", wrapper_args, env);
     let start = wrapper_entry();
+    crate::cache_key::memoize_tool_fingerprints();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
@@ -3819,12 +3820,14 @@ fn resolve_located_build_script_inputs(
     let normalizer = std::cell::OnceCell::new();
     let outside = |path: &Path| {
         let normalizer = normalizer.get_or_init(|| {
-            crate::path_normalizer::PathNormalizer::from_invocation(
+            crate::path_normalizer::PathNormalizer::for_invocation(
                 workspace_root,
                 args.invocation_env(),
+                args.target_dir().as_deref(),
+                &config.base_dirs,
+                None,
+                None,
             )
-            .with_target_dir(args.target_dir().as_deref())
-            .with_base_dirs(&config.base_dirs)
         });
         crate::cache_key::source_path_identity(path, normalizer)
     };
@@ -4983,7 +4986,10 @@ fn run_parsed_rustc(
     // fault that caused it (kunobi-ninja/kache#1326).
     let degraded = kache_format::reports_debug_info_tool_failure(&result.stderr)
         .then(|| "rustc could not post-process its debug info".to_string());
-    if let Some(reason) = unaudited.or(degraded) {
+    // A Windows executable finds its `.pdb` by the GUID, age and name it
+    // records: it is cached only with that very `.pdb`, named by file name.
+    let unpaired = unpaired_executable_debug_info(&result.artifacts);
+    if let Some(reason) = unaudited.or(degraded).or(unpaired) {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
@@ -5690,13 +5696,18 @@ fn configured_rustc_depinfo_roots(
     target_dir: Option<&Path>,
     env: &crate::invocation::InvocationEnv,
 ) -> Vec<(PathBuf, String, u8)> {
-    crate::path_normalizer::PathNormalizer::from_invocation(workspace_root, env)
-        .with_target_dir(target_dir)
-        .with_base_dirs(&config.base_dirs)
-        .depinfo_source_roots()
-        .into_iter()
-        .map(|root| (root.root, root.depinfo_sentinel, root.priority))
-        .collect()
+    crate::path_normalizer::PathNormalizer::for_invocation(
+        workspace_root,
+        env,
+        target_dir,
+        &config.base_dirs,
+        None,
+        None,
+    )
+    .depinfo_source_roots()
+    .into_iter()
+    .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+    .collect()
 }
 
 fn validate_extra_inputs_dep_info_before_store(
@@ -5760,6 +5771,19 @@ fn find_executable_output(
         .iter()
         .find(|a| compiler.classify_output(args, &a.store_name) == ArtifactKind::Executable)
         .map(|a| (a.path.clone(), a.store_name.clone()))
+}
+
+/// Why a unit's Windows executable must not be cached, `None` when every
+/// `.exe` among its outputs carries no external debug info or is stored with
+/// the `.pdb` it names ([`crate::pe_pdb`]).
+fn unpaired_executable_debug_info(artifacts: &crate::compiler::ArtifactSet) -> Option<String> {
+    let outputs = artifacts
+        .outputs()
+        .iter()
+        .map(|a| (a.path.as_path(), a.store_name.as_str()));
+    crate::pe_pdb::check_outputs(outputs)
+        .err()
+        .map(|error| format!("its executable cannot be cached with its .pdb: {error:#}"))
 }
 
 /// Bundle debug info for cached user binaries unless the invocation opts out
@@ -7090,12 +7114,13 @@ fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
 }
 
 /// Whether `args` compiles an executable kept out of the cache because
-/// `cache_executables` is off (Windows by default: an `.exe` names its
-/// `.pdb`). A Cargo build script built without debug info is cached all the
-/// same: Cargo runs it, nobody debugs it, and rustc names its `.pdb` by file
-/// name alone (`/PDBALTPATH:%_PDB%`), which the store keeps and restores with
-/// it. Kept out, every new target directory compiled each build script again
-/// (92 in a Windows build of five Studio crates, 2026-10-18).
+/// `cache_executables` is off (by configuration: it is on by default where a
+/// restored executable debugs like a linked one). A Cargo build script built
+/// without debug info is cached all the same: Cargo runs it, nobody debugs
+/// it, and rustc names its `.pdb` by file name alone (`/PDBALTPATH:%_PDB%`),
+/// which the store keeps and restores with it. Kept out, every new target
+/// directory compiled each build script again (92 in a Windows build of five
+/// Studio crates, 2026-10-18).
 fn skips_cache_as_user_facing(args: &RustcArgs, cache_executables: bool) -> bool {
     args.is_user_facing_executable()
         && !cache_executables
@@ -7544,17 +7569,15 @@ fn compute_rustc_cache_key(
     // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
     // `RustcCompiler::execute`, or the key would represent one remap rule set
     // and the binary another.
-    let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+    let path_normalizer = crate::path_normalizer::PathNormalizer::for_invocation(
         workspace_root,
         args.invocation_env(),
-    )
-    .with_target_dir(args.target_dir().as_deref())
-    .with_base_dirs(&config.base_dirs)
-    .with_path_only_env_vars(config.path_only_env_vars.clone())
-    .with_rust_src_rule(
+        args.target_dir().as_deref(),
+        &config.base_dirs,
         crate::cache_key::get_rustc_sysroot_for(args, args.invocation_env()).as_deref(),
         crate::cache_key::get_rustc_commit_hash_for(&args.rustc, args.invocation_env()).as_deref(),
-    );
+    )
+    .with_path_only_env_vars(config.path_only_env_vars.clone());
     let key_ctx = KeyCtx {
         invocation_env: args.invocation_env(),
         file_hasher: &file_hasher,

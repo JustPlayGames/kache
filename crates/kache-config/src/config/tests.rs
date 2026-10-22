@@ -208,15 +208,15 @@ fn relative_volume_routing_uses_the_client_directory() {
 /// kunobi-ninja/kache#319: executables are cached by default only where a
 /// restored binary keeps source-level debugging. Linux embeds DWARF; macOS
 /// gets a store-time `.dSYM` cached with the entry (shipped for #319);
-/// Windows `.pdb` paths still point outside the binary, so it stays off
-/// pending the equivalent work. Pinned as a test because this is a
+/// Windows names its `.pdb` by file name and stores it with the `.exe`, the
+/// pair checked at store time (`pe_pdb`). Pinned as a test because this is a
 /// deliberate platform split, not an accident of the code.
 #[test]
-fn cache_executables_defaults_on_for_linux_and_macos() {
+fn cache_executables_defaults_on_for_linux_macos_and_windows() {
     assert_eq!(
         default_cache_executables(),
-        cfg!(target_os = "linux") || cfg!(target_os = "macos"),
-        "executables default on for Linux and macOS, off for Windows (see #319)"
+        cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows"),
+        "executables default on for Linux, macOS and Windows (see #319)"
     );
 }
 

@@ -5094,17 +5094,22 @@ fn compute_key_into(
         cfg!(target_os = "windows"),
         |linker, architecture, host| {
             let search_dirs = windows_native_link_search_dirs(args)?;
-            crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
-                linker,
-                architecture,
-                &rustc_tool_dirs_for(args, host, invocation)?,
-                &search_dirs.rustc,
-                &search_dirs.linker,
-                &args.link_libs,
-                |path| file_hasher.hash_static_lib(path),
-                invocation,
-            )
-            .map(|identity| identity.encode())
+            let mut identity =
+                crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
+                    linker,
+                    architecture,
+                    &rustc_tool_dirs_for(args, host, invocation)?,
+                    &search_dirs.rustc,
+                    &search_dirs.linker,
+                    &args.link_libs,
+                    |path| file_hasher.hash_static_lib(path),
+                    invocation,
+                )?
+                .encode();
+            append_windows_link_argument_files(&mut identity, &search_dirs.files, |path| {
+                file_hasher.hash(path)
+            })?;
+            Ok(identity)
         },
         invocation,
     )?;
@@ -11520,6 +11525,92 @@ fn tool_version_cache_path_for(
     prefix: &str,
     env: &InvocationEnv,
 ) -> Option<PathBuf> {
+    let hash = tool_fingerprint_hash(
+        binary,
+        env,
+        TOOL_FINGERPRINT_MEMO.load(std::sync::atomic::Ordering::Relaxed),
+    )?;
+    Some(crate::config::probe_memo_dir_for(env).ok()?.join(format!("{prefix}-{hash}.txt")))
+}
+
+/// Set at rustc wrapper entry: remember each tool's fingerprint for the rest
+/// of the process. See [`memoize_tool_fingerprints`].
+static TOOL_FINGERPRINT_MEMO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Remember each tool's version-cache fingerprint for the rest of this
+/// process instead of recomputing it on every read and write.
+///
+/// A rustc hit reads the version cache three to five times (`-vV` for the
+/// key and again for the commit hash, the sysroot, the cwd-remap probe),
+/// and each read canonicalized the binary, statted it, tried both
+/// toolchain-file spellings in every directory from the cwd up, read
+/// rustup's `settings.toml`, listed the installed toolchains and statted
+/// each one's rustc. A wrapper lives for one compile, so a toolchain that
+/// changes under it would race the compile anyway. Long-lived processes
+/// (the daemon, CLI commands) never call this and keep noticing a
+/// `rustup update` at once (#1406).
+pub(crate) fn memoize_tool_fingerprints() {
+    TOOL_FINGERPRINT_MEMO.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What a remembered tool fingerprint was computed from.
+#[derive(Clone, PartialEq)]
+struct ToolFingerprintKey {
+    binary: std::path::PathBuf,
+    path_var: Option<std::ffi::OsString>,
+    pathext: Option<std::ffi::OsString>,
+    rustup_toolchain: Option<std::ffi::OsString>,
+    cwd: Option<std::path::PathBuf>,
+    rustup_home: Option<std::path::PathBuf>,
+}
+
+/// The 16-hex-digit hash naming `binary`'s version-cache files, remembered
+/// for the process when `memo` is set (see [`memoize_tool_fingerprints`]).
+fn tool_fingerprint_hash(binary: &Path, env: &InvocationEnv, memo: bool) -> Option<String> {
+    static REMEMBERED: std::sync::Mutex<Vec<(ToolFingerprintKey, String)>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_REMEMBERED: usize = 8;
+    let key = memo.then(|| ToolFingerprintKey {
+        binary: binary.to_path_buf(),
+        path_var: env.var_os("PATH"),
+        pathext: env.var_os("PATHEXT"),
+        rustup_toolchain: env.var_os("RUSTUP_TOOLCHAIN"),
+        cwd: env.cwd().map(Path::to_path_buf),
+        rustup_home: rustup_home_for(env),
+    });
+    if let Some(key) = &key {
+        let remembered = REMEMBERED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, hash)) = remembered.iter().find(|(known, _)| known == key) {
+            return Some(hash.clone());
+        }
+    }
+    let hash = compute_tool_fingerprint_hash(binary, env)?;
+    if let Some(key) = key {
+        let mut remembered = REMEMBERED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if remembered.len() >= MAX_REMEMBERED {
+            remembered.remove(0);
+        }
+        remembered.push((key, hash.clone()));
+    }
+    Some(hash)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread computed a tool fingerprint.
+    pub(crate) static TOOL_FINGERPRINTS_COMPUTED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The fingerprint behind [`tool_version_cache_path_for`], computed afresh.
+fn compute_tool_fingerprint_hash(binary: &Path, env: &InvocationEnv) -> Option<String> {
+    #[cfg(test)]
+    TOOL_FINGERPRINTS_COMPUTED.with(|computed| computed.set(computed.get() + 1));
     let canon = std::fs::canonicalize(env.resolve_program(binary)?).ok()?;
     let mtime = std::fs::metadata(&canon)
         .ok()?
@@ -11549,11 +11640,7 @@ fn tool_version_cache_path_for(
         )
     );
     let hash = blake3::hash(key.as_bytes()).to_hex();
-    Some(crate::config::probe_memo_dir_for(env).ok()?.join(format!(
-        "{}-{}.txt",
-        prefix,
-        &hash[..16]
-    )))
+    Some(hash[..16].to_string())
 }
 
 /// The rustup toolchain-selection state that can redirect an unchanged shim
@@ -11936,6 +12023,9 @@ struct WindowsNativeLinkSearchDirs {
     rustc: Vec<PathBuf>,
     /// Directories emitted to LINK before the LIB environment paths.
     linker: Vec<PathBuf>,
+    /// Files `-C link-arg` hands LINK by absolute path, which the key hashes
+    /// (see `windows_link_argument_input_files`), in argument order.
+    files: Vec<PathBuf>,
 }
 
 fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLinkSearchDirs> {
@@ -11954,6 +12044,7 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
         }
     }
     let mut linker = rustc.clone();
+    let mut files = Vec::new();
     for (key, value) in &args.codegen_opts {
         if !matches!(key.as_str(), "link-arg" | "link-args") {
             continue;
@@ -11962,17 +12053,49 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
             continue;
         };
         if crate::native_link_key::windows_link_argument_has_unmodeled_input(value) {
+            if let Some(inputs) =
+                crate::native_link_key::windows_link_argument_input_files(key, value)
+            {
+                files.extend(inputs);
+                continue;
+            }
             anyhow::bail!(
                 "explicit Windows linker input files (.lib/.a/.obj/.o/.res/.def/.exp/.manifest) \
-                 and file-carrying LINK options (/DEF, /DEFAULTLIB, /MANIFESTINPUT, \
-                 /MANIFESTFILE, /PDBSTRIPPED, ...) are not hashed and are not cacheable"
+                 other than an absolute .res/.obj/.o/.lib/.a or /MANIFESTINPUT path, and \
+                 file-carrying LINK options (/DEF, /DEFAULTLIB, /MANIFESTFILE, /PDBSTRIPPED, \
+                 a side-by-side /MANIFEST, ...) are not hashed and are not cacheable"
             );
         }
         if let Some(path) = windows_libpath_argument(value)? {
             linker.push(PathBuf::from(path));
         }
     }
-    Ok(WindowsNativeLinkSearchDirs { rustc, linker })
+    Ok(WindowsNativeLinkSearchDirs {
+        rustc,
+        linker,
+        files,
+    })
+}
+
+/// Append the digest of each file a native MSVC link reads through `-C
+/// link-arg` to its identity, in argument order. LINK merges these files
+/// into the image (a resource, an object, a manifest), so a file rebuilt in
+/// place under the same name must change the key; a file that is gone
+/// cannot be keyed and fails closed.
+fn append_windows_link_argument_files(
+    identity: &mut String,
+    files: &[PathBuf],
+    hash: impl Fn(&Path) -> Result<String>,
+) -> Result<()> {
+    for (index, file) in files.iter().enumerate() {
+        if !file.is_file() {
+            anyhow::bail!("linker input {} is not a regular file", file.display());
+        }
+        let digest =
+            hash(file).with_context(|| format!("hashing linker input {}", file.display()))?;
+        identity.push_str(&format!("\nlink_arg_input.v1={index}={digest}"));
+    }
+    Ok(())
 }
 
 fn windows_libpath_argument(value: &str) -> Result<Option<String>> {
