@@ -9884,7 +9884,7 @@ async fn send_request_with_async_transport(
     read_timeout: std::time::Duration,
 ) -> Result<String> {
     let name = socket_name(socket_path)?;
-    let mut stream = TokioStream::connect(name)
+    let mut stream = crate::transport::connect_tokio(name, crate::transport::BUSY_PIPE_WAIT)
         .await
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
         .context(DaemonConnectionFailure)?;
