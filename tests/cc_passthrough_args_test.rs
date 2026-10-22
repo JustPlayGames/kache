@@ -30,12 +30,12 @@ impl FixtureDir {
         self.0.path()
     }
     fn stop_daemon(&self) {
-        let cache = self.path().join("cache");
-        let mut stop = common::hermetic_command(
-            kache_binary(),
-            &cache,
-            Some(&self.path().join("kache.toml")),
-        );
+        Self::stop_daemon_at(self.path());
+    }
+    fn stop_daemon_at(root: &std::path::Path) {
+        let cache = root.join("cache");
+        let mut stop =
+            common::hermetic_command(kache_binary(), &cache, Some(&root.join("kache.toml")));
         common::stop_daemon(stop.args(["daemon", "stop"]), &cache);
     }
 }
@@ -419,7 +419,7 @@ fn changed_link_archives_use_current_code_and_explicit_files_keep_cache_hits() {
 fn cc_header_availability_creation_uses_current_compiler_output() {
     for discovery in ["0", "1"] {
         for in_header in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = FixtureDir::new();
             let root = dir.path().canonicalize().unwrap();
             fs::write(root.join("kache.toml"), "").unwrap();
             fs::create_dir(root.join("home")).unwrap();
@@ -540,6 +540,7 @@ fn compile_and_run_unit(root: &std::path::Path, discovery: &str, args: &[&str]) 
 fn assert_probe_follows_optional_header(root: &std::path::Path, args: &[&str], absent: i32) {
     for discovery in ["0", "1"] {
         let _ = fs::remove_file(root.join("inc/optional.h"));
+        FixtureDir::stop_daemon_at(root);
         let _ = fs::remove_dir_all(root.join("cache"));
         let (cold, value) = compile_and_run_unit(root, discovery, args);
         assert!(
@@ -585,7 +586,7 @@ fn assert_probe_follows_optional_header(root: &std::path::Path, args: &[&str], a
 /// user `-I` directory. The key must change and the object must use it.
 #[test]
 fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -604,7 +605,7 @@ fn cc_header_probe_keys_a_header_appearing_in_a_user_include_dir() {
 
 #[test]
 fn absolute_angle_header_probe_follows_its_optional_header() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -629,7 +630,7 @@ fn absolute_angle_header_probe_follows_its_optional_header() {
 /// header appears in a user `-I` directory.
 #[test]
 fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -652,7 +653,7 @@ fn cc_header_probe_outside_user_include_dirs_keys_the_unit() {
 
 #[test]
 fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -667,6 +668,7 @@ fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
     .unwrap();
     for discovery in ["0", "1"] {
         let _ = fs::remove_file(root.join("elsewhere/optional.h"));
+        dir.stop_daemon();
         let _ = fs::remove_dir_all(root.join("cache"));
         assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, 11);
         assert_eq!(compile_and_run_unit(&root, discovery, &[]).1, 11);
@@ -685,7 +687,7 @@ fn quoted_header_probe_outside_user_dirs_follows_its_local_header() {
 
 #[test]
 fn a_header_created_after_preprocessing_cannot_publish_an_incomplete_read_set() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = FixtureDir::new();
     let root = dir.path().canonicalize().unwrap();
     fs::write(root.join("kache.toml"), "").unwrap();
     fs::create_dir(root.join("home")).unwrap();
@@ -773,6 +775,8 @@ fn cc_admission_reports_a_skip_reason_and_recompiles_until_admitted() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(root.join("unit.o").is_file());
+        // Drain asynchronous publication before reading this compile's event.
+        dir.stop_daemon();
         let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
         let event: serde_json::Value =
             serde_json::from_str(events.lines().last().unwrap()).unwrap();
@@ -1078,6 +1082,8 @@ fn index_rows(root: &std::path::Path, table: &str) -> i64 {
 }
 
 fn last_cc_event(root: &std::path::Path) -> serde_json::Value {
+    // Local fallback may return before the daemon publishes its event.
+    FixtureDir::stop_daemon_at(root);
     let events = fs::read_to_string(root.join("cache/events.jsonl")).unwrap();
     serde_json::from_str(events.lines().last().unwrap()).unwrap()
 }

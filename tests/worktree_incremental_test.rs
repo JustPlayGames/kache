@@ -201,6 +201,7 @@ fn default_policy_finds_a_donor_after_an_unchanged_cache_restore() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     let donor = root.join("donor");
     let receiver = root.join("receiver");
     let opted_out = root.join("opted-out");
@@ -275,6 +276,7 @@ fn automatic_bootstrap_retry_preserves_source_observations_and_discards_false_er
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     project(&root, 0);
     for suffix in ["first", "second"] {
         fs::write(root.join("src/main.rs"), format!(
@@ -362,6 +364,7 @@ fn bootstrap_retry_keeps_absolute_include_paths_in_explicit_passthroughs() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), root.join("cache"));
     project(&root, 0);
     fs::write(
         root.join("native_path.rs"),
@@ -393,6 +396,7 @@ fn failed_bootstrap_dep_info_cleanup_keeps_the_native_compile_accounted() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     edited_project(&root, 0);
     let output = automatic_build(&root, &cache, true, true, false);
     assert!(
@@ -442,6 +446,7 @@ fn deferred_compiler_error_does_not_retry_a_stale_bootstrap_observation() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     project(&root, 0);
     let output = std::process::Command::new("rustc")
         .args(["--print", "sysroot"])
@@ -526,6 +531,7 @@ fn deferred_library_seed_retries_bootstrap_before_any_artifact_lookup() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     project(&root, 0);
     let mut last_stderr = String::new();
     for answer in [0, 1] {
@@ -630,6 +636,7 @@ fn deferred_retry_reads_dep_info_when_the_compiler_omits_its_notification() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
     let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     project(&root, 0);
     let output = std::process::Command::new("rustc")
         .args(["--print", "sysroot"])
@@ -714,6 +721,8 @@ fn imports_across_checkout_paths_and_rechecks_sources_and_compile_time_env() {
     let receiver = root.join("deeper/receiver");
     let incompatible = root.join("incompatible");
     let cold = root.join("cold");
+    let _daemons = [&donor, &receiver, &incompatible, &cold]
+        .map(|project| common::DaemonGuard::new(common::kache_binary(), project.join("cache")));
     project(&donor, 1);
     project(&receiver, 2);
     project(&incompatible, 3);
@@ -764,6 +773,7 @@ fn absolute_source_keeps_file_macro_semantics_without_publishing_a_seed() {
     let deps = profile.join("deps");
     fs::create_dir_all(&deps).unwrap();
     let cache = root.join("cache");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     let output = common::hermetic_command(
         env!("CARGO_BIN_EXE_kache"),
         &cache,
@@ -898,6 +908,7 @@ fn automatic_mode_scopes_bootstrap_and_preserves_explicit_selections() {
         ),
     ] {
         let project = root.join(name);
+        let _daemon = common::DaemonGuard::new(common::kache_binary(), project.join("cache"));
         automatic_project(&project);
         let output = automatic_command(&project, unstable, bootstrap)
             .output()
@@ -921,6 +932,7 @@ fn automatic_mode_scopes_bootstrap_and_preserves_explicit_selections() {
         return;
     }
     let project = root.join("scoped");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), project.join("cache"));
     automatic_project(&project);
     let output = automatic_command(&project, "true", None)
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
@@ -938,6 +950,7 @@ fn automatic_mode_scopes_bootstrap_and_preserves_explicit_selections() {
     );
     assert_eq!(marker_count(&project), 0);
     let project = root.join("source-features");
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), project.join("cache"));
     automatic_project(&project);
     fs::write(
         project.join("src/main.rs"),
@@ -958,6 +971,7 @@ fn automatic_mode_scopes_bootstrap_and_preserves_explicit_selections() {
 fn unsupported_compiler_compiles_normally_and_memoizes_negative_probes() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
+    let _daemon = common::DaemonGuard::new(common::kache_binary(), root.join("cache"));
     automatic_project(&root);
     let shim = root.join("rustc-unsupported");
     kache_fs::testutil::write_executable(
