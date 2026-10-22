@@ -61,7 +61,7 @@ pub trait StoreHashExt {
 
 impl StoreHashExt for Store {
     fn file_hasher(&self) -> crate::cache_key::FileHasher<'_> {
-        crate::cache_key::FileHasher::from_cache(self.file_hash_cache())
+        crate::cache_key::FileHasher::from_cache(self.file_hash_cache()).with_memo_handoff(self)
     }
     fn file_hasher_with_daemon(
         &self,

@@ -8364,6 +8364,11 @@ pub struct FileHasher<'db> {
     /// ([`FileHasher::take_busy_predictions`]). Once one write found the
     /// index busy, the process's further rows join it without waiting again.
     busy_predictions: RefCell<Vec<kache_protocol::PredictionRow>>,
+    /// The store whose index `cache` is, when it hands memo rows a busy
+    /// index refuses to the daemon ([`crate::store::Store::hand_busy_memo_rows`]):
+    /// [`FileHasher::flush_memo`] then gives its rows to it instead of
+    /// waiting for the lock.
+    memo_handoff: Option<&'db crate::store::Store>,
     /// The stat walks behind the tree digests computed since the last
     /// [`FileHasher::take_tree_walks`] (see [`tree_guard_of`]).
     tree_walks: RefCell<Vec<GuardWalk>>,
@@ -8481,6 +8486,7 @@ impl FileHasher<'static> {
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
             busy_predictions: RefCell::new(Vec::new()),
+            memo_handoff: None,
             tree_walks: RefCell::new(Vec::new()),
             own_dirs: Vec::new(),
         }
@@ -8503,6 +8509,7 @@ impl FileHasher<'static> {
                 guard_inputs: RefCell::new(Vec::new()),
                 pending_memo: RefCell::new(Vec::new()),
                 busy_predictions: RefCell::new(Vec::new()),
+                memo_handoff: None,
                 tree_walks: RefCell::new(Vec::new()),
                 own_dirs: Vec::new(),
             },
@@ -8520,8 +8527,44 @@ impl FileHasher<'static> {
 /// How long a prediction record waits for the index's write lock
 /// ([`FileHasher::take_busy_predictions`] holds the rows it could not write).
 /// A record saves a later pre-pass; in a burst of misses the full busy
-/// timeout made a unit wait over a second for it after its compile.
+/// timeout made a unit wait over a second for it after its compile. Once
+/// the daemon took bookkeeping rows of this unit, a record does not wait at
+/// all ([`crate::store::bookkeeping_wait`]).
 const PREDICTION_RECORD_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// How long [`FileHasher::flush_memo`] waits for the index's write lock
+/// before it drops its rows, with nowhere to hand them.
+const MEMO_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long [`FileHasher::flush_memo`] waits for the index's write lock
+/// before it hands its rows to the daemon. The flush runs between a unit's
+/// key and its compile: in a burst of misses on an index another process
+/// held 7 s of every 8.5 s, the full [`MEMO_FLUSH_WAIT`] delayed nearly
+/// every compile by 100 ms and lost the rows all the same.
+const MEMO_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Write `rows` in one transaction, waiting at most `wait` for the index's
+/// write lock. A failure writes none.
+fn write_memo_rows(
+    cache: &FileHashCache<'_>,
+    rows: &[(ObservedFingerprint, String)],
+    wait: std::time::Duration,
+) -> rusqlite::Result<()> {
+    let db = cache.db();
+    let _ = db.busy_timeout(wait);
+    let written = (|| -> rusqlite::Result<()> {
+        db.execute_batch("BEGIN IMMEDIATE")?;
+        for (observed, hash) in rows {
+            if let Err(error) = cache.put(&observed.fingerprint, hash) {
+                let _ = db.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        db.execute_batch("COMMIT")
+    })();
+    let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
+    written
+}
 
 /// SQLite's busy or locked answer.
 fn sqlite_busy(error: &rusqlite::Error) -> bool {
@@ -8544,7 +8587,10 @@ impl<'db> FileHasher<'db> {
     /// stamp check could catch. Flushing later does not change that, since
     /// the bytes were read back then. The rows are an optimisation, so a busy
     /// index (another process holds the write lock for longer than the short
-    /// wait here) drops them rather than stalling a hit; the next process
+    /// wait here) does not stall the unit for them: they go to the daemon
+    /// when the store hands memo rows to one ([`Self::with_memo_handoff`]),
+    /// which writes them once the index lets it and only while each still
+    /// describes its file. Otherwise they are dropped, and the next process
     /// hashes those files again.
     pub fn flush_memo(&self) {
         let mut pending = std::mem::take(&mut *self.pending_memo.borrow_mut());
@@ -8561,22 +8607,37 @@ impl<'db> FileHasher<'db> {
             return;
         }
         let _trace = crate::phase_trace::phase("memo_flush");
-        let db = cache.db();
-        let _ = db.busy_timeout(std::time::Duration::from_millis(100));
-        let written = (|| -> rusqlite::Result<()> {
-            db.execute_batch("BEGIN IMMEDIATE")?;
-            for (observed, hash) in &pending {
-                if let Err(error) = cache.put(&observed.fingerprint, hash) {
-                    let _ = db.execute_batch("ROLLBACK");
-                    return Err(error);
+        let wait = match self.memo_handoff {
+            Some(_) => crate::store::bookkeeping_wait(MEMO_HANDOFF_WAIT),
+            None => MEMO_FLUSH_WAIT,
+        };
+        let Err(mut error) = write_memo_rows(cache, &pending, wait) else {
+            return;
+        };
+        if let Some(store) = self.memo_handoff
+            && sqlite_busy(&error)
+        {
+            let rows: Vec<crate::store::MemoRow> = pending
+                .iter()
+                .map(|(observed, hash)| crate::store::MemoRow {
+                    fingerprint: observed.fingerprint.clone(),
+                    hash: hash.clone(),
+                    redated: false,
+                })
+                .collect();
+            if store.hand_busy_memo_rows(&rows) {
+                tracing::debug!(rows = rows.len(), "file hash memo handed off (index busy)");
+                return;
+            }
+            // Nowhere took them: wait as long as a hasher without a daemon.
+            if wait < MEMO_FLUSH_WAIT {
+                match write_memo_rows(cache, &pending, MEMO_FLUSH_WAIT) {
+                    Ok(()) => return,
+                    Err(again) => error = again,
                 }
             }
-            db.execute_batch("COMMIT")
-        })();
-        let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
-        if let Err(error) = written {
-            tracing::debug!(rows = pending.len(), "file hash memo not written: {error}");
         }
+        tracing::debug!(rows = pending.len(), "file hash memo not written: {error}");
     }
 
     /// Flush as if every pending file had been observed one settle window
@@ -8604,9 +8665,20 @@ impl<'db> FileHasher<'db> {
             guard_inputs: RefCell::new(Vec::new()),
             pending_memo: RefCell::new(Vec::new()),
             busy_predictions: RefCell::new(Vec::new()),
+            memo_handoff: None,
             tree_walks: RefCell::new(Vec::new()),
             own_dirs: Vec::new(),
         }
+    }
+
+    /// Give memo rows a busy index refuses to `store`'s hand-off, when it
+    /// has one ([`crate::store::Store::hands_busy_memo_rows`]). `store` must
+    /// be the store whose index this hasher's memo is.
+    pub(crate) fn with_memo_handoff(mut self, store: &'db crate::store::Store) -> Self {
+        if store.hands_busy_memo_rows() {
+            self.memo_handoff = Some(store);
+        }
+        self
     }
 
     pub(crate) fn with_daemon(mut self, socket_path: PathBuf) -> Self {
@@ -8875,7 +8947,7 @@ impl<'db> FileHasher<'db> {
             return;
         }
         let db = cache.db();
-        let _ = db.busy_timeout(PREDICTION_RECORD_WAIT);
+        let _ = db.busy_timeout(crate::store::bookkeeping_wait(PREDICTION_RECORD_WAIT));
         let written = match &row.keep_under {
             Some((prefix, keep)) => cache.put_input_prediction_keeping(
                 prefix,
