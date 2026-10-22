@@ -1381,8 +1381,8 @@ fn hex_le(fingerprint: u64) -> String {
 /// `cargo check` with `CLIPPY_ARGS` set; a `cargo check` is the subcommand of
 /// the parent process. Only narrows what is seeded, so a wrong answer costs
 /// time, never a wrong build.
-fn probe_is_check_lane() -> bool {
-    if std::env::var_os("CLIPPY_ARGS").is_some() {
+fn probe_is_check_lane(env: &crate::invocation::InvocationEnv) -> bool {
+    if env.var_os("CLIPPY_ARGS").is_some() {
         return true;
     }
     #[cfg(target_os = "linux")]
@@ -1441,9 +1441,11 @@ fn names_a_target(args: &[String]) -> bool {
 /// arguments (Cargo probes each platform), `CARGO_BUILD_TARGET` and, on
 /// Linux, the Cargo command line that sent the probe. Only skips a seeding,
 /// so a wrong answer costs time, never a wrong build.
-fn build_names_a_target(args: &[String]) -> bool {
+fn build_names_a_target(args: &[String], env: &crate::invocation::InvocationEnv) -> bool {
     if names_a_target(args)
-        || std::env::var_os("CARGO_BUILD_TARGET").is_some_and(|target| !target.is_empty())
+        || env
+            .var_os("CARGO_BUILD_TARGET")
+            .is_some_and(|target| !target.is_empty())
     {
         return true;
     }
@@ -1470,7 +1472,7 @@ pub(crate) fn before_probe_for(
     args: &[String],
     env: &crate::invocation::InvocationEnv,
 ) {
-    if !asks_for_seed(config.seed_new_targets, args) || build_names_a_target(args) {
+    if !asks_for_seed(config.seed_new_targets, args) || build_names_a_target(args, env) {
         return;
     }
     let Some(cwd) = env.cwd() else {
@@ -1507,9 +1509,9 @@ pub(crate) fn before_probe_for(
     let Some(version) = rustc_version_for(args.first().map(String::as_str), env) else {
         return;
     };
-    let note = std::env::var_os("KACHE_LOG_FILE").is_none();
+    let note = env.var_os("KACHE_LOG_FILE").is_none();
     if let Err(error) =
-        crate::daemon::seed_new_target(config, &target, &version, probe_is_check_lane(), note)
+        crate::daemon::seed_new_target(config, &target, &version, probe_is_check_lane(env), note)
     {
         tracing::debug!("not seeding {}: {error:#}", target.target_dir.display());
     }

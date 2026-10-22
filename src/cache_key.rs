@@ -1328,7 +1328,7 @@ fn tree_digest_memoised(
         return None;
     }
     if let Some(index) = roots.iter().position(|root| root.role == b"workspace")
-        && crate::session_tree::session_id().is_some()
+        && crate::session_tree::session_id(&file_hasher.invocation_env).is_some()
     {
         return shared_workspace_digest(
             index,
@@ -1430,6 +1430,7 @@ fn shared_workspace_digest(
 ) -> Option<String> {
     let workspace = walked[index].clone();
     let shared = crate::session_tree::shared_or(
+        &file_hasher.invocation_env,
         memo_dir,
         &session_root_key(&workspace, max_entries),
         || {
@@ -2840,7 +2841,7 @@ pub(crate) struct WorkspaceRoots {
     /// its guard is the package, not the workspace.
     pub(crate) vendored_package: Option<PathBuf>,
     /// The package directory of a member below the workspace root, when the
-    /// scoped guard is on ([`scoped_workspace_guard`]): its guard is the
+    /// scoped guard is on ([`scoped_guard_mode`]): its guard is the
     /// package, the way to the root and the closure's directories, not the
     /// whole workspace.
     pub(crate) scoped_package: Option<PathBuf>,
@@ -2930,7 +2931,7 @@ fn workspace_roots_in(
             .map(|path| joined_under(Some(current_dir), Path::new(path))),
         vendored_package: vendored_source(args, manifest_dir, current_dir)
             .then(|| manifest_dir.to_path_buf()),
-        scoped_package: (scoped_workspace_guard()
+        scoped_package: (scoped_guard_mode(env_var_in(vars, "KACHE_WORKSPACE_GUARD"))
             && suffix_within(manifest_dir.as_os_str(), &root, 0)
                 .is_some_and(|rest| !rest.is_empty()))
         .then(|| manifest_dir.to_path_buf()),
@@ -3243,19 +3244,21 @@ fn workspace_tree_digest_within(
 ///
 /// `KACHE_WORKSPACE_GUARD=inputs` narrows the package part further
 /// ([`inputs_workspace_guard`]).
-pub(crate) fn scoped_workspace_guard() -> bool {
+///
+/// `mode` is the invocation's `KACHE_WORKSPACE_GUARD`.
+fn scoped_guard_mode(mode: Option<&OsStr>) -> bool {
     #[cfg(test)]
     if let Some(scoped) = SCOPED_GUARD_IN_TEST.with(Cell::get) {
         return scoped;
     }
-    !std::env::var("KACHE_WORKSPACE_GUARD").is_ok_and(|mode| {
+    !mode.and_then(OsStr::to_str).is_some_and(|mode| {
         let mode = mode.trim();
         mode.eq_ignore_ascii_case("workspace") || mode.eq_ignore_ascii_case("off") || mode == "0"
     })
 }
 
 /// Is the inputs guard on (`KACHE_WORKSPACE_GUARD=inputs`, opt-in)? It is
-/// the scoped guard ([`scoped_workspace_guard`]) with the member's package
+/// the scoped guard ([`scoped_guard_mode`]) with the member's package
 /// directory replaced by what can change the closure rustc reports for the
 /// unit:
 ///
@@ -3284,12 +3287,12 @@ pub(crate) fn scoped_workspace_guard() -> bool {
 /// other files (or one deeper than beside the closure's directories), or
 /// probes for a file there. Only a workspace whose macros declare what they
 /// read (`kache.toml` `extra_inputs`) should turn it on.
-pub(crate) fn inputs_workspace_guard() -> bool {
+pub(crate) fn inputs_workspace_guard(env: &InvocationEnv) -> bool {
     #[cfg(test)]
     if let Some(inputs) = INPUTS_GUARD_IN_TEST.with(Cell::get) {
         return inputs;
     }
-    std::env::var("KACHE_WORKSPACE_GUARD")
+    env.var("KACHE_WORKSPACE_GUARD")
         .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("inputs"))
 }
 
@@ -3359,7 +3362,7 @@ pub(crate) const DEFAULT_GUARD_IGNORE: &[&str] = &[
     ".env",
 ];
 
-/// The prefix of a scoped guard's digest ([`scoped_workspace_guard`]).
+/// The prefix of a scoped guard's digest ([`scoped_guard_mode`]).
 const SCOPED_GUARD_TAG: &str = "scoped-v1:";
 
 /// The prefix of an inputs guard's digest ([`inputs_workspace_guard`]): a
@@ -3371,8 +3374,8 @@ const INPUTS_GUARD_TAG: &str = "scoped-v1:inputs-v1:";
 /// [`DEFAULT_GUARD_IGNORE`] (entries separated by `:` or `;`; empty for
 /// none), for example through `[env]` in the workspace's
 /// `.cargo/config.toml`.
-fn scoped_guard_ignored(root: &Path) -> Vec<PathBuf> {
-    guard_ignore_entries(std::env::var("KACHE_GUARD_IGNORE").ok().as_deref())
+fn scoped_guard_ignored(root: &Path, env: &InvocationEnv) -> Vec<PathBuf> {
+    guard_ignore_entries(env.var("KACHE_GUARD_IGNORE").ok().as_deref())
         .into_iter()
         .map(|entry| root.join(entry))
         .collect()
@@ -3394,15 +3397,15 @@ fn guard_ignore_entries(value: Option<&str>) -> Vec<String> {
     }
 }
 
-/// The scoped guard of the member at `package` ([`scoped_workspace_guard`]),
+/// The scoped guard of the member at `package` ([`scoped_guard_mode`]),
 /// before the closure's directories join it ([`expected_tree`]).
 fn scoped_package_digest(
     package: &Path,
     workspace: &WorkspaceRoots,
     file_hasher: &FileHasher<'_>,
 ) -> Option<String> {
-    let ignored = scoped_guard_ignored(&workspace.root);
-    let inputs = inputs_workspace_guard();
+    let ignored = scoped_guard_ignored(&workspace.root, &file_hasher.invocation_env);
+    let inputs = inputs_workspace_guard(&file_hasher.invocation_env);
     let mut hasher = blake3::Hasher::new();
     if inputs {
         // The package's top files and dot-directories; its directories join
@@ -3965,7 +3968,7 @@ fn holds_no_file(directory: &Path, not_after: Option<i64>) -> Option<bool> {
 }
 
 /// The guard a record of `sources` must carry: `guard` itself, or for a
-/// scoped guard ([`scoped_workspace_guard`]) `guard` with the closure's
+/// scoped guard ([`scoped_guard_mode`]) `guard` with the closure's
 /// directories as they are now ([`closure_dirs_digest`]).
 fn expected_tree(
     guard: &str,
@@ -3995,7 +3998,7 @@ pub(crate) fn with_closure_dirs(
     if !tree.starts_with(SCOPED_GUARD_TAG) {
         return Some(tree);
     }
-    let workspace = workspace_roots(args, &std::env::vars_os().collect::<Vec<_>>())?;
+    let workspace = workspace_roots(args, &args.invocation_env().vars_os().collect::<Vec<_>>())?;
     let package = workspace.scoped_package.as_deref()?;
     let in_package = tree.starts_with(INPUTS_GUARD_TAG);
     let dirs = closure_dirs_digest(

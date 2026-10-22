@@ -12571,13 +12571,14 @@ fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
 
 #[test]
 fn the_invocation_stamp_of_a_check_unit_is_found_in_both_cargo_layouts() {
+    let _lock = crate::test_support::process_state_test_lock();
+    // SAFETY: serialised by the process-state lock above. The arguments
+    // capture the invocation's environment when they are parsed.
+    unsafe { std::env::set_var("CARGO_PKG_NAME", "demo-pkg") };
     let shared = rustc_args(&[
         "rustc", "src/lib.rs", "--crate-name", "demo", "--emit=dep-info,metadata",
         "-C", "extra-filename=-0123456789abcdef", "--out-dir", "/t/debug/deps",
     ]);
-    let _lock = crate::test_support::process_state_test_lock();
-    // SAFETY: serialised by the process-state lock above.
-    unsafe { std::env::set_var("CARGO_PKG_NAME", "demo-pkg") };
     assert_eq!(
         cargo_invocation_stamp(&shared),
         Some(PathBuf::from("/t/debug/.fingerprint/demo-pkg-0123456789abcdef/invoked.timestamp"))
