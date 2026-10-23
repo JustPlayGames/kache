@@ -271,6 +271,70 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     );
 }
 
+/// A registry unit's closure is also filed with the Cargo home cut out, so
+/// another home over the same registry finds it: the row names neither home.
+#[test]
+fn a_registry_units_closure_is_filed_for_every_cargo_home() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    // Parsed after the environment is set: the arguments capture it.
+    let unit = |home: &str, checkout: &str| {
+        let package = dir.path().join(home).join("registry/src/index-1/kt-1.0.0");
+        let lib = package.join("src/lib.rs");
+        let deps = dir.path().join(checkout).join("target/debug/deps");
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            lib.to_str().unwrap(),
+            "--out-dir",
+            deps.to_str().unwrap(),
+        ]);
+        (lib, args)
+    };
+    let (_, args_two) = unit("h2", "b");
+    let registry_identity = crate::cache_key::rustc_registry_prediction_identity(&args_two)
+        .expect("a registry unit has a home-free identity");
+    let (lib, args) = unit("h1", "a");
+    assert_eq!(
+        crate::cache_key::rustc_registry_prediction_identity(&args).as_deref(),
+        Some(registry_identity.as_str())
+    );
+    let key = crate::cache_key::KeyOutputs {
+        dep_info: Some(crate::cache_key::DepInfo {
+            source_files: vec![lib],
+            env_deps: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    record_input_prediction(&config, Some(&store), &args, true, &key);
+    let row = store
+        .file_hasher()
+        .input_prediction(&registry_identity)
+        .expect("filed for every home");
+    assert_eq!(row.sources.len(), 1);
+    assert!(
+        !row.sources[0].starts_with(dir.path()),
+        "no home's path in the row: {:?}",
+        row.sources
+    );
+    assert!(row.sources[0].ends_with("index-1/kt-1.0.0/src/lib.rs"));
+}
+
 /// A workspace unit's rows in this checkout, the local one and the shared
 /// one, carry the workspace guard only while it covers the closure: a macro
 /// could list the directory of a file the guard does not see.

@@ -2181,6 +2181,111 @@ fn relocatable_prediction_identity(
     Some(format!("{RELOCATABLE_PREDICTION_PREFIX}{hash}"))
 }
 
+/// Rows of a registry unit filed with its Cargo home cut out of the identity
+/// ([`rustc_registry_prediction_identity`]).
+const REGISTRY_PREDICTION_PREFIX: &str = "shared-registry-v1:";
+
+/// The `<CARGO_HOME>/registry/src` a [`REGISTRY_PREDICTION_PREFIX`] row is
+/// written under. The reader places it under its own ([`registry_row_here`]).
+const REGISTRY_ROW_ROOT: &str = "/kache-cargo-home/registry/src";
+
+/// The identity of a registry unit's shared row with the Cargo home cut out:
+/// the source file, the working directory and `CARGO_MANIFEST_DIR` are
+/// written relative to `<CARGO_HOME>/registry/src`, everything else as the
+/// shared identity has it ([`rustc_shared_prediction_identity`]).
+///
+/// The shared identity folds the home's path, so two Cargo homes over one
+/// registry (a worktree pool gives each member a home of its own, its
+/// `registry` a link to the user's) each paid the dep-info pre-pass for
+/// every registry unit, even on a hit: 757-767 of about 870 hits in a fresh
+/// checkout. A registry package is the same files under every home, and the
+/// row is placed under this home's registry before it is checked on disk.
+///
+/// `None` for any other unit, and when the source is not spelled under the
+/// registry.
+pub(crate) fn rustc_registry_prediction_identity(args: &RustcArgs) -> Option<String> {
+    rustc_registry_prediction_identity_in(args, args.invocation_env().vars_os().collect())
+}
+
+/// [`rustc_registry_prediction_identity`] against an environment snapshot.
+fn rustc_registry_prediction_identity_in(
+    args: &RustcArgs,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
+    let target = args.target_dir_from_args()?;
+    let registry = registry_src_of(&vars)?;
+    if !target.is_absolute() {
+        return None;
+    }
+    // rustc runs a registry unit in its package directory, and the working
+    // directory reads back resolved: through the link, not the home.
+    let resolved = std::fs::canonicalize(&registry).ok();
+    let cut = |value: &OsStr| -> Option<String> {
+        let value = value.to_str()?;
+        std::iter::once(registry.as_path())
+            .chain(resolved.as_deref())
+            .find_map(|root| registry_suffix(value, root))
+            .map(|suffix| format!("kache-registry-relative:{suffix}"))
+    };
+    let source = args.source_file.as_ref()?;
+    let source_cut = cut(source.as_os_str())?;
+    let mut closure_args =
+        shared_prediction_args(&closure_shaping_args(source, &args.all_args), &target);
+    // closure_shaping_args puts the source first, as a literal.
+    *closure_args.first_mut()? =
+        serde_json::to_string(&("registry", "", "", source_cut.as_str())).ok()?;
+    let current_dir = args.invocation_env().cwd().map(|cwd| {
+        cut(cwd.as_os_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cwd.to_path_buf())
+    });
+    let vars = shared_prediction_vars(vars.into_iter(), &target)
+        .into_iter()
+        .map(|(name, value)| {
+            if name == "CARGO_MANIFEST_DIR"
+                && let Some(cut) = cut(&value)
+            {
+                return (name, cut.into());
+            }
+            (name, value)
+        })
+        .collect();
+    let rustc_version = get_rustc_version_for(&args.rustc, args.invocation_env()).ok()?;
+    let identity = prediction_identity_in_env(
+        &PredictionIdentityParts {
+            rustc_version: &rustc_version,
+            inner_rustc: args.inner_rustc.as_deref(),
+            current_dir: current_dir.as_deref(),
+            source_file: Path::new(&source_cut),
+            closure_args: &closure_args,
+            skip_path_remap: args.skip_path_remap(),
+        },
+        vars,
+    );
+    Some(format!("{REGISTRY_PREDICTION_PREFIX}{identity}"))
+}
+
+/// `row`, a registry unit's shared row read under `registry`, as it is filed
+/// under [`rustc_registry_prediction_identity`]: its registry paths under
+/// [`REGISTRY_ROW_ROOT`]. `None` when it names any other absolute path.
+pub(crate) fn registry_row(row: &InputPrediction, registry: &Path) -> Option<InputPrediction> {
+    move_registry_row(row, registry, Path::new(REGISTRY_ROW_ROOT))
+}
+
+/// A [`registry_row`] with its registry paths placed under `registry`.
+fn registry_row_here(row: &InputPrediction, registry: &Path) -> Option<InputPrediction> {
+    move_registry_row(row, Path::new(REGISTRY_ROW_ROOT), registry)
+}
+
+fn move_registry_row(row: &InputPrediction, from: &Path, to: &Path) -> Option<InputPrediction> {
+    match crate::prediction_share::for_remote_plain(row, from)? {
+        crate::prediction_share::SharedPrediction::Plain(row) => {
+            crate::prediction_share::plain_from_remote(&row, to)
+        }
+        crate::prediction_share::SharedPrediction::Portable(_) => None,
+    }
+}
+
 /// The environment a shared record is identified by, with this build's own
 /// `OUT_DIR` written relative to the target directory.
 ///
@@ -2584,6 +2689,12 @@ fn predicted_key_inputs(
             let record = remote_plain_row(shared, &registry_src_of(&vars)?)?;
             from_remote = Some(shared);
             Some(record)
+        })
+        .or_else(|| {
+            // Another Cargo home's row for the same registry unit.
+            let registry = registry_src_of(&vars)?;
+            let identity = rustc_registry_prediction_identity(args)?;
+            registry_row_here(&file_hasher.input_prediction(&identity)?, &registry)
         })
     else {
         let elsewhere = match &workspace {

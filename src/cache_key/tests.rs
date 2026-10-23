@@ -4043,6 +4043,129 @@ fn the_registry_src_root_is_two_levels_above_a_registry_package() {
     assert_eq!(registry_src_root(Path::new("/w/kt")), None);
 }
 
+/// Registry unit `kt` of the Cargo home `home` under `base`, built into the
+/// target directory of checkout `checkout`, as Cargo runs it: in its package
+/// directory, with an absolute source.
+fn home_unit(
+    base: &Path,
+    home: &str,
+    checkout: &str,
+    version: &str,
+) -> (PathBuf, InvocationEnv, RustcArgs) {
+    let package = base.join(home).join(format!("registry/src/index-1/kt-{version}"));
+    write_file(&package.join("src/lib.rs"), "mod m;\n");
+    write_file(&package.join("src/m.rs"), "");
+    let env = client_invocation(
+        &package,
+        &[
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+            ("OUT_DIR", None),
+        ],
+    );
+    let argv = [
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "kt".to_string(),
+        package.join("src/lib.rs").display().to_string(),
+        "--out-dir".to_string(),
+        base.join(checkout).join("target/debug/deps").display().to_string(),
+    ];
+    let args = RustcArgs::parse_for(&argv, &env).unwrap();
+    (package, env, args)
+}
+
+/// A registry unit's row filed with its Cargo home cut out serves another
+/// home over the same registry, placed under that home's registry and
+/// checked on its disk; the plain shared identity stays per home.
+#[test]
+fn a_registry_units_row_serves_another_cargo_home() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path();
+    let (one, env_one, args_one) = home_unit(base, "h1", "a", "1.0.0");
+    let (two, env_two, args_two) = home_unit(base, "h2", "b", "1.0.0");
+    let identity_one = rustc_registry_prediction_identity_in(
+        &args_one,
+        env_one.vars_os().collect(),
+    )
+    .expect("a registry unit has a home-free identity");
+    assert!(identity_one.starts_with("shared-registry-v1:"));
+    assert_eq!(
+        rustc_registry_prediction_identity_in(&args_two, env_two.vars_os().collect()),
+        Some(identity_one.clone())
+    );
+    assert_ne!(
+        rustc_shared_prediction_identity_in(&args_one, env_one.vars_os().collect()),
+        rustc_shared_prediction_identity_in(&args_two, env_two.vars_os().collect()),
+        "the plain shared identity folds the home"
+    );
+    let (_, env_other, other) = home_unit(base, "h1", "a", "1.0.1");
+    let other_vars = env_other.vars_os().collect();
+    assert_ne!(
+        rustc_registry_prediction_identity_in(&other, other_vars),
+        Some(identity_one.clone()),
+        "another package version"
+    );
+    let workspace_vars = vec![("CARGO_MANIFEST_DIR".into(), base.join("w/kt").into_os_string())];
+    assert_eq!(
+        rustc_registry_prediction_identity_in(&args_one, workspace_vars),
+        None
+    );
+
+    // Filed by home one as the wrapper files it, read by home two.
+    let closure = |package: &Path| DepInfo {
+        source_files: vec![package.join("src/lib.rs"), package.join("src/m.rs")],
+        env_deps: vec![(
+            "CARGO_MANIFEST_DIR".to_string(),
+            Some(package.display().to_string()),
+        )],
+    };
+    let registry_one = registry_src_root(&one).unwrap();
+    let row = registry_row(&InputPrediction::from_dep_info(&closure(&one), None), registry_one)
+        .expect("a closure inside the registry can be filed");
+    assert!(
+        row.sources.iter().all(|source| !source.starts_with(base)),
+        "no home's path in the filed row: {:?}",
+        row.sources
+    );
+    let db = base.join("index.db");
+    let hasher = |env: &InvocationEnv| {
+        FileHasher::persistent(&db)
+            .with_invocation_env(env)
+            .with_input_predictions(true)
+    };
+    hasher(&env_one).record_input_prediction(
+        &identity_one,
+        Some("kt"),
+        &DepInfo {
+            source_files: row.sources,
+            env_deps: row.env_deps,
+        },
+        row.tree,
+    );
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None),
+        Ok(closure(&two)),
+        "home two's own spelling of the closure"
+    );
+    std::fs::remove_file(two.join("src/m.rs")).unwrap();
+    assert!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None).is_err(),
+        "a row naming a file missing from this home's package is refused"
+    );
+
+    // A closure reading outside the registry is never filed home-free.
+    let mut outside = closure(&one);
+    outside.source_files.push(base.join("w/kt/src/lib.rs"));
+    assert_eq!(
+        registry_row(&InputPrediction::from_dep_info(&outside, None), registry_one),
+        None
+    );
+}
+
 #[test]
 fn an_out_dir_suffix_is_the_bytes_after_the_directory() {
     let suffix =

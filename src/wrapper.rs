@@ -7405,6 +7405,20 @@ fn record_input_prediction(
                     &identity,
                     crate::prediction_share::for_remote_plain(&row, registry),
                 );
+                // And here, any Cargo home over the same registry.
+                if let Some(identity) = crate::cache_key::rustc_registry_prediction_identity(args)
+                    && let Some(row) = crate::cache_key::registry_row(&row, registry)
+                {
+                    file_hasher.record_input_prediction(
+                        &identity,
+                        args.crate_name.as_deref(),
+                        &crate::cache_key::DepInfo {
+                            source_files: row.sources,
+                            env_deps: row.env_deps,
+                        },
+                        row.tree,
+                    );
+                }
             }
         }
     } else if let Some((identity, record)) =
