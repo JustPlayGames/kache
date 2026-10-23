@@ -303,10 +303,7 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&directory)?;
     let temporary = tempfile::TempDir::new_in(&directory)?;
     let staged = temporary.path().join(PINNED_NAME);
-    if kache_fs::try_reflink(&kache, &staged).is_err() {
-        kache_fs::copy_writable(&kache, &staged, true)?;
-    }
-    kache_fs::set_writable_permissions(&staged, true)?;
+    stage_pin(&kache, &staged, cfg!(windows))?;
     wait_for_no_writers(&staged);
     // Replace old symlink pins atomically. Concurrent installers pin the same bytes.
     if let Err(error) = std::fs::rename(&staged, &pinned) {
@@ -318,6 +315,31 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
         return Err(error.into());
     }
     Ok(pinned)
+}
+
+/// Put the pinned copy of `kache` at `staged`: a hard link when `link`
+/// (Windows), else a copy of its own.
+///
+/// Windows pays a large cost on the first start of a freshly written image:
+/// a fresh 35 MB engine copy took 0.7-2.4 s to start once, four started at
+/// once 4.3 s, against 50-170 ms for a hard link to the installed binary,
+/// an image it has already loaded. Every fresh target directory pinned such
+/// a copy per profile, and the first wave of build scripts queued behind
+/// it. A link is safe there: an image cannot be written while it runs, and
+/// an upgrade replaces the installed file (a new identity, so a new pin)
+/// while the link keeps the old bytes. On Unix a pin stays a file of its
+/// own (see [`pinned_in_place`]). A link that cannot be made (another
+/// volume) falls back to the copy.
+#[cfg(any(unix, windows))]
+fn stage_pin(kache: &Path, staged: &Path, link: bool) -> Result<()> {
+    if link && std::fs::hard_link(kache, staged).is_ok() {
+        return Ok(());
+    }
+    if kache_fs::try_reflink(kache, staged).is_err() {
+        kache_fs::copy_writable(kache, staged, true)?;
+    }
+    kache_fs::set_writable_permissions(staged, true)?;
+    Ok(())
 }
 
 /// The pinned copy's file name: an image on Windows needs its extension to
@@ -3905,6 +3927,48 @@ mod tests {
             0o644
         );
         assert!(set_executable(&dir.path().join("absent"), true).is_err());
+    }
+
+    #[test]
+    fn a_pin_links_the_installed_kache_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let kache = dir.path().join("kache-engine");
+        std::fs::write(&kache, b"engine bytes").unwrap();
+        let source = kache_fs::file_identity(&kache).unwrap();
+
+        let linked = dir.path().join("linked");
+        stage_pin(&kache, &linked, true).unwrap();
+        assert_eq!(kache_fs::file_identity(&linked).unwrap(), source);
+
+        let copied = dir.path().join("copied");
+        stage_pin(&kache, &copied, false).unwrap();
+        assert_ne!(kache_fs::file_identity(&copied).unwrap(), source);
+        assert_eq!(std::fs::read(&copied).unwrap(), b"engine bytes");
+        assert_eq!(std::fs::read(&linked).unwrap(), b"engine bytes");
+
+        // A link that cannot be made (here: the name is taken) copies.
+        let taken = dir.path().join("taken");
+        std::fs::write(&taken, b"older").unwrap();
+        stage_pin(&kache, &taken, true).unwrap();
+        assert_ne!(kache_fs::file_identity(&taken).unwrap(), source);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"engine bytes");
+    }
+
+    /// Windows pins the installed binary itself: a fresh copy of an image
+    /// costs seconds on its first start there.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_pin_is_a_link_to_the_installed_kache() {
+        let dir = tempfile::tempdir().unwrap();
+        let kache = dir.path().join("kache-engine.exe");
+        std::fs::write(&kache, b"engine bytes").unwrap();
+        let profile = dir.path().join("target/debug");
+        let pinned = pin_kache(&kache, &profile).unwrap();
+        assert_eq!(
+            kache_fs::file_identity(&pinned).unwrap(),
+            kache_fs::file_identity(&kache).unwrap()
+        );
+        assert_eq!(pin_kache(&kache, &profile).unwrap(), pinned);
     }
 
     #[cfg(unix)]
