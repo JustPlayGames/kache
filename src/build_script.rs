@@ -3378,9 +3378,10 @@ mod tests {
             None,
             "the binary has to exist before it can be shimmed"
         );
-        let binary = unit.join(crate::args::format_crate_output_stem(
-            "build_script_build",
-            "-1",
+        let binary = unit.join(format!(
+            "{}{}",
+            crate::args::format_crate_output_stem("build_script_build", "-1"),
+            std::env::consts::EXE_SUFFIX
         ));
         std::fs::write(&binary, "elf").unwrap();
         assert_eq!(compiled_build_script(&good), Some(binary));
@@ -3462,7 +3463,10 @@ mod tests {
         ]);
         assert_eq!(
             build_script_output(&args),
-            Some(unit.join("build_script_build-1"))
+            Some(unit.join(format!(
+                "build_script_build-1{}",
+                std::env::consts::EXE_SUFFIX
+            )))
         );
         assert_eq!(compiled_build_script(&args), None);
 
@@ -3480,7 +3484,10 @@ mod tests {
         ]);
         assert_eq!(
             build_script_output_for(&args, false),
-            Some(out.join("build_script_build"))
+            Some(out.join(format!(
+                "build_script_build{}",
+                std::env::consts::EXE_SUFFIX
+            )))
         );
         assert_eq!(
             build_script_output_for(&args, true),
