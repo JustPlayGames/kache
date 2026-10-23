@@ -3677,7 +3677,7 @@ pub(crate) fn run_for(
         )?;
         // Cargo hardlinks and runs the binary after this wrapper returns, so
         // this is the last moment to put the launcher in its place.
-        crate::build_script::install_shim(&args);
+        crate::build_script::install_shim(effective_config, &args);
     }
     Ok(exit)
 }
