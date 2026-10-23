@@ -53,7 +53,7 @@
 
 use std::collections::HashMap;
 
-const DOMAIN: &[u8] = b"kache.native-ar.coff-path-free.v1\0";
+const DOMAIN: &[u8] = b"kache.native-ar.coff-path-free.v2\0";
 const HEADER: usize = 60;
 const IMAGE_SCN_LNK_NRELOC_OVFL: u32 = 0x0100_0000;
 const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x0000_0080;
@@ -98,7 +98,11 @@ impl Hash<'_> {
     }
 }
 
-/// `bytes` split at each occurrence of `dir`, left to right.
+/// `bytes` split at each occurrence of `dir`, left to right. A `/` and a `\`
+/// match each other: Cargo can spell a build script's `OUT_DIR` with both
+/// (`target/cranelift\debug\build\ring/<hash>\out` for a relative
+/// `build.target-dir`, with its per-unit build directories), and `cl.exe`
+/// records the path it was given with backslashes only.
 fn pieces<'a>(bytes: &'a [u8], dir: &[u8]) -> Vec<&'a [u8]> {
     if dir.is_empty() {
         return vec![bytes];
@@ -107,7 +111,7 @@ fn pieces<'a>(bytes: &'a [u8], dir: &[u8]) -> Vec<&'a [u8]> {
     let mut start = 0;
     let mut at = 0;
     while at + dir.len() <= bytes.len() {
-        if &bytes[at..at + dir.len()] == dir {
+        if same_path(&bytes[at..at + dir.len()], dir) {
             pieces.push(&bytes[start..at]);
             at += dir.len();
             start = at;
@@ -117,6 +121,15 @@ fn pieces<'a>(bytes: &'a [u8], dir: &[u8]) -> Vec<&'a [u8]> {
     }
     pieces.push(&bytes[start..]);
     pieces
+}
+
+/// `a` and `b` byte for byte, a `/` and a `\` alike.
+fn same_path(a: &[u8], b: &[u8]) -> bool {
+    let separator = |byte: u8| byte == b'/' || byte == b'\\';
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(&x, &y)| x == y || (separator(x) && separator(y)))
 }
 
 /// Where `offset` falls in `bytes` once the occurrences of `dir` are cut out:

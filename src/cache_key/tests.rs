@@ -8371,7 +8371,7 @@ fn hash_static_lib_memo_rows_are_per_use() {
     let fingerprint = FileFingerprint::from_path(&lib).unwrap();
     let cache = fh.cache.as_ref().expect("persistent cache opens");
     for (namespace, expected) in [
-        ("static-ar-v9-bundled", &bundled),
+        ("static-ar-v10-bundled", &bundled),
         ("static-ar-v9-linked", &linked),
     ] {
         let key = FileFingerprint {
@@ -18396,9 +18396,9 @@ fn a_bundled_or_linked_msvc_archive_keys_without_its_directory() {
     let env = crate::invocation::InvocationEnv::capture();
     let digest = |lib: &Path, usage| compute_static_lib_hash_for(lib, usage, &env).unwrap();
     let bundled = digest(&first, StaticLibUse::Bundled);
-    assert!(bundled.starts_with("bundled-coff-v1:"), "{bundled}");
+    assert!(bundled.starts_with("bundled-coff-v2:"), "{bundled}");
     let linked = digest(&first, StaticLibUse::Linked);
-    assert!(linked.starts_with("linked-coff-v1:"), "{linked}");
+    assert!(linked.starts_with("linked-coff-v2:"), "{linked}");
     assert_eq!(linked, digest(&second, StaticLibUse::Linked));
     assert_ne!(linked, bundled, "the two uses never share a digest");
 
