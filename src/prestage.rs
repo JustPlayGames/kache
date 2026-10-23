@@ -992,18 +992,13 @@ pub(crate) fn prune(cache_dir: &Path, now: SystemTime) -> usize {
                 let _ = lock.unlock();
             }
         }
-        // A borrower's directory holds no records, only which target it is
-        // for; it stays while that target does, so the sweep finds its
-        // copies. Coordination files are unlinked only with their target
-        // gone: a wrapper may have opened a lock but not written its first
-        // state yet, and recreating the same lock path would give two owners
-        // different locked inodes, but no build of a missing target runs.
         if read_records(&path).is_empty() {
-            if target_of(&path).is_none_or(|target| target_is_gone(&target)) {
-                let _ = std::fs::remove_dir_all(&path);
-            } else {
-                let _ = std::fs::remove_dir(&path);
-            }
+            // Never unlink coordination files: a wrapper may have opened a
+            // lock but not written its first state yet. Recreating the same
+            // lock path would give two owners different locked inodes. A
+            // borrower's directory also keeps its `.target`, so the sweep
+            // finds its copies.
+            let _ = std::fs::remove_dir(&path);
         }
     }
     removed
