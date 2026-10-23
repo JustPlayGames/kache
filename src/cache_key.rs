@@ -5662,8 +5662,8 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
-            Self::Bundled => "static-ar-v10-bundled",
-            Self::Linked => "static-ar-v9-linked",
+            Self::Bundled => "static-ar-v11-bundled",
+            Self::Linked => "static-ar-v10-linked",
         }
     }
 }
@@ -7762,9 +7762,14 @@ fn compute_static_lib_hash_for(
     if usage == StaticLibUse::Bundled && bytes.starts_with(b"!<arch>\n") {
         // MSVC objects record the directory they were built in (the build
         // script's `OUT_DIR`, so the target directory): left out, the crate
-        // hits in every target directory (see [`crate::coff_archive`]).
+        // hits in every target directory (see [`crate::coff_archive`]). An
+        // archive kache restored from another target directory names that
+        // one, which is the one left out ([`crate::coff_archive::digest_dir`]).
         if let Some(digest) = path.parent().and_then(|dir| {
-            crate::coff_archive::path_free_digest(&bytes, dir.as_os_str().as_encoded_bytes())
+            crate::coff_archive::path_free_digest(
+                &bytes,
+                crate::coff_archive::digest_dir(&bytes, dir.as_os_str().as_encoded_bytes()),
+            )
         }) {
             return Ok(format!("bundled-coff-v2:{digest}"));
         }
@@ -7786,7 +7791,10 @@ fn compute_static_lib_hash_for(
     if usage == StaticLibUse::Linked
         && bytes.starts_with(b"!<arch>\n")
         && let Some(digest) = path.parent().and_then(|dir| {
-            crate::coff_archive::path_free_digest(&bytes, dir.as_os_str().as_encoded_bytes())
+            crate::coff_archive::path_free_digest(
+                &bytes,
+                crate::coff_archive::digest_dir(&bytes, dir.as_os_str().as_encoded_bytes()),
+            )
         })
     {
         return Ok(format!("linked-coff-v2:{digest}"));
@@ -10497,7 +10505,9 @@ impl<'db> FileHasher<'db> {
         // DWARF-bearing Mach-O members, and v6 predates accepting the blank
         // `//` header GNU `ar` writes (a v5 or v6 row would keep serving the
         // path-bound digest of an unchanged archive). v7 predates accepting
-        // ELF members in BSD archives. None may be served
+        // ELF members in BSD archives, and bundled v10 / linked v9 cut the
+        // archive's own directory out of a COFF archive where v11 / v10 cut
+        // the one its members name. None may be served
         // after the final archive hardening. Bundled and linked uses get
         // separate rows because a DWARF archive hashes differently for each.
         let key = FileFingerprint {

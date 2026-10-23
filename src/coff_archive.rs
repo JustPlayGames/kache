@@ -67,12 +67,81 @@ const DEBUG_S_SYMBOLS: u32 = 0xF1;
 pub(crate) fn path_free_digest(bytes: &[u8], dir: &[u8]) -> Option<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(DOMAIN);
-    archive(&mut Hash(&mut hasher, dir), bytes)?;
+    archive(&mut Hash(&mut hasher, dir, false), bytes)?;
     Some(hasher.finalize().to_hex().to_string())
 }
 
-/// The hasher and the directory cut out of what it hashes.
-struct Hash<'a>(&'a mut blake3::Hasher, &'a [u8]);
+/// The directory to cut out of an archive found in `own_dir`: the one its
+/// members are named under when `lib.exe` named them by absolute paths, else
+/// `own_dir`. The same where the archive was built (`cc` gives `lib.exe` the
+/// objects in `OUT_DIR`, so they agree), and the directory of the target
+/// that built it once kache restored it into another one, so a crate that
+/// bundles or links it keys the same in both.
+pub(crate) fn digest_dir<'a>(bytes: &'a [u8], own_dir: &'a [u8]) -> &'a [u8] {
+    recorded_dir(bytes).unwrap_or(own_dir)
+}
+
+/// The one absolute directory every member of the archive is named under,
+/// as `lib.exe` names each by the path it was given. `None` when a member is
+/// named by a bare name (`llvm-ar`, an import member) or two directories.
+pub(crate) fn recorded_dir(bytes: &[u8]) -> Option<&[u8]> {
+    let (_, members) = parse(bytes)?;
+    let mut dir: Option<&[u8]> = None;
+    for member in &members {
+        let cut = member.name.iter().rposition(|&b| b == b'/' || b == b'\\')?;
+        let parent = &member.name[..cut];
+        if !is_absolute(parent) {
+            return None;
+        }
+        match dir {
+            None => dir = Some(parent),
+            Some(dir) if same_path(dir, parent) => {}
+            Some(_) => return None,
+        }
+    }
+    dir
+}
+
+/// A Unix path below `/`, a drive path below its root, or a UNC path.
+fn is_absolute(path: &[u8]) -> bool {
+    let separator = |byte: u8| byte == b'/' || byte == b'\\';
+    match path {
+        [b'/', rest @ ..] => !rest.is_empty(),
+        [drive, b':', sep, rest @ ..] => {
+            drive.is_ascii_alphabetic() && separator(*sep) && !rest.is_empty()
+        }
+        [b'\\', b'\\', rest @ ..] => !rest.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether `bytes`, a COFF archive or object this reads in full, spells
+/// `dir` only where the tools record where they ran: member names (`lib.exe`)
+/// and the `.debug$S` and `.debug$T` records (`cl.exe`'s `S_OBJNAME`, `-Z7`'s
+/// `LF_BUILDINFO`). Not in section data, a section or symbol name: what the
+/// code itself reads (`__FILE__` of a generated source) names the directory.
+pub(crate) fn spells_dir_only_in_build_records(bytes: &[u8], dir: &[u8]) -> bool {
+    if dir.is_empty() {
+        return false;
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut hash = Hash(&mut hasher, dir, false);
+    let read = if bytes.starts_with(b"!<arch>\n") {
+        archive(&mut hash, bytes)
+    } else {
+        object(&mut hash, bytes)
+    };
+    read.is_some() && !hash.2
+}
+
+/// `bytes` with each occurrence of `dir` cut out, the pieces joined by NUL.
+pub(crate) fn without_dir(bytes: &[u8], dir: &[u8]) -> Vec<u8> {
+    pieces(bytes, dir).join(&0u8)
+}
+
+/// The hasher, the directory cut out of what it hashes, and whether it was
+/// cut out of what the code reads (see [`Hash::code`]).
+struct Hash<'a>(&'a mut blake3::Hasher, &'a [u8], bool);
 
 impl Hash<'_> {
     fn u64(&mut self, value: u64) {
@@ -86,6 +155,15 @@ impl Hash<'_> {
     fn bytes(&mut self, bytes: &[u8]) {
         self.u64(bytes.len() as u64);
         self.0.update(bytes);
+    }
+
+    /// [`Self::text`] for what the code reads (section data, section and
+    /// symbol names): notes whether the directory occurs there.
+    fn code(&mut self, bytes: &[u8]) {
+        if !self.1.is_empty() && pieces(bytes, self.1).len() > 1 {
+            self.2 = true;
+        }
+        self.text(bytes);
     }
 
     /// `bytes` as the pieces between occurrences of the directory.
@@ -186,7 +264,10 @@ struct Member<'a> {
     data: &'a [u8],
 }
 
-fn archive(hash: &mut Hash<'_>, bytes: &[u8]) -> Option<()> {
+/// The archive's linker members and its other members, in order.
+type Parsed<'a> = (Vec<&'a [u8]>, Vec<Member<'a>>);
+
+fn parse(bytes: &[u8]) -> Option<Parsed<'_>> {
     let mut at = bytes.strip_prefix(b"!<arch>\n").map(|_| 8)?;
     let mut linker = Vec::new();
     let mut long_names: &[u8] = &[];
@@ -225,6 +306,11 @@ fn archive(hash: &mut Hash<'_>, bytes: &[u8]) -> Option<()> {
     if members.is_empty() {
         return None;
     }
+    Some((linker, members))
+}
+
+fn archive(hash: &mut Hash<'_>, bytes: &[u8]) -> Option<()> {
+    let (linker, members) = parse(bytes)?;
     let ordinals: HashMap<usize, u64> = members
         .iter()
         .enumerate()
@@ -280,7 +366,7 @@ fn first_linker_member(
     hash.u64(count as u64);
     for (index, name) in names.into_iter().enumerate() {
         let offset = u32_be(table, 4 + 4 * index)? as usize;
-        hash.text(name);
+        hash.code(name);
         hash.u64(*ordinals.get(&offset)?);
     }
     Some(())
@@ -311,7 +397,7 @@ fn second_linker_member(
     hash.u64(symbols as u64);
     for (index, name) in names.into_iter().enumerate() {
         hash.u64(u16_le(table, indices + 2 * index)?.into());
-        hash.text(name);
+        hash.code(name);
     }
     Some(())
 }
@@ -389,13 +475,13 @@ fn object(hash: &mut Hash<'_>, data: &[u8]) -> Option<()> {
             name if name.starts_with(b".debug$") => return None,
             _ => Kind::Plain,
         };
-        hash.text(name);
+        hash.code(name);
         hash.u64(virtual_size.into());
         hash.u64(flags.into());
         hash.u64(relocation_count as u64);
         match kind {
             Kind::Plain => {
-                hash.text(contents);
+                hash.code(contents);
                 hash.bytes(relocations);
             }
             Kind::Symbols => debug_symbols(hash, contents, relocations)?,
@@ -421,7 +507,7 @@ fn object(hash: &mut Hash<'_>, data: &[u8]) -> Option<()> {
         let section = i16::from_le_bytes([record[12], record[13]]);
         let class = record[16];
         let aux = record[17] as usize;
-        hash.text(name);
+        hash.code(name);
         hash.bytes(&record[8..18]);
         let aux_records =
             data.get(symbol_table + 18 * (index + 1)..symbol_table + 18 * (index + 1 + aux))?;
@@ -439,7 +525,7 @@ fn object(hash: &mut Hash<'_>, data: &[u8]) -> Option<()> {
             hash.bytes(&aux_records[4..8]);
             hash.bytes(&aux_records[12..15]);
         } else {
-            hash.text(aux_records);
+            hash.code(aux_records);
         }
         index += 1 + aux;
     }

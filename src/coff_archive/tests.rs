@@ -152,3 +152,35 @@ fn pieces_split_at_each_occurrence() {
     assert_eq!(offset_without(b"aXXbc", b"XX", 4), Some((1, 2)));
     assert_eq!(offset_without(b"aXXbc", b"XX", 1), None);
 }
+
+#[test]
+fn the_directory_lib_exe_named_the_members_under_is_read_back() {
+    assert_eq!(recorded_dir(SHORT), Some(SHORT_DIR.as_bytes()));
+    assert_eq!(recorded_dir(Z7_LONG), Some(Z7_LONG_DIR.as_bytes()));
+    // Where it was built, the archive's own directory is that one.
+    assert_eq!(digest_dir(SHORT, SHORT_DIR.as_bytes()), SHORT_DIR.as_bytes());
+    // Restored into another target directory, the one it names is cut out,
+    // so it digests as it did where it was built.
+    let restored = digest(LONG, std::str::from_utf8(digest_dir(LONG, SHORT_DIR.as_bytes())).unwrap());
+    assert_eq!(restored, digest(SHORT, SHORT_DIR));
+    assert_eq!(restored, digest(LONG, LONG_DIR));
+    // Members by bare names (`llvm-ar`) name no directory.
+    let bare = b"!<arch>\nobj.o/          0           0     0     644     4         `\nabcd";
+    assert_eq!(recorded_dir(bare), None);
+    assert_eq!(digest_dir(bare, b"/own"), b"/own");
+    assert!(!is_absolute(b"/") && !is_absolute(b"C:\\") && !is_absolute(b"rel\\dir"));
+    assert!(is_absolute(b"/t/out") && is_absolute(b"C:\\t") && is_absolute(b"\\\\srv\\share"));
+}
+
+#[test]
+fn a_directory_only_in_build_records_is_told_from_one_the_code_reads() {
+    assert!(spells_dir_only_in_build_records(SHORT, SHORT_DIR.as_bytes()));
+    assert!(spells_dir_only_in_build_records(Z7_LONG, Z7_LONG_DIR.as_bytes()));
+    // `.text$mn`'s bytes stand in for a path the code reads.
+    let code = [0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3];
+    assert!(!spells_dir_only_in_build_records(SHORT, &code));
+    assert!(!spells_dir_only_in_build_records(b"not coff", SHORT_DIR.as_bytes()));
+    assert!(!spells_dir_only_in_build_records(SHORT, b""));
+    let cut = without_dir(SHORT, SHORT_DIR.as_bytes());
+    assert!(!cut.windows(SHORT_DIR.len()).any(|w| w == SHORT_DIR.as_bytes()));
+}
