@@ -1219,6 +1219,55 @@ fn lookup_local_entry<'a>(
     Ok(None)
 }
 
+/// How long a lookup that missed an entry another process is storing right
+/// now ([`Store::store_in_flight`]) waits for its commit. A store holds the
+/// key for milliseconds, and the daemon's hand-off of one until the index's
+/// write lock frees (p99 3.9 s on a shared build machine under a burst);
+/// past this, the unit compiles as it would have without the wait.
+const STORE_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait, bounded, for the entry another process is storing under
+/// `cache_key` right now. `true` once it is committed. Without this, a unit
+/// looked up between a peer's hand-off and the daemon's commit compiled
+/// again: a missed hit (never a wrong one), for every unit of a checkout
+/// built right after another (kache's own out_dir_alias test, about one run
+/// in two under load).
+fn wait_for_store_in_flight(store: &Store, cache_key: &str, crate_name: &str) -> bool {
+    tracing::debug!("{crate_name}: its entry is being stored; waiting for the commit");
+    let waited = std::time::Instant::now();
+    let committed =
+        crate::invocation::wait_for_committed(store, cache_key, Some(STORE_IN_FLIGHT_WAIT))
+            .unwrap_or(false);
+    crate::opcounts::record_flight_wait(waited.elapsed());
+    tracing::debug!(
+        "{crate_name}: the stored entry {} after {} ms",
+        if committed { "was committed" } else { "did not come" },
+        waited.elapsed().as_millis()
+    );
+    committed
+}
+
+/// The entry under `cache_key` when a compile that may stop reaches its
+/// dep-info. One another process is storing right now is waited for, with
+/// a compile that links frozen meanwhile so that the wait never costs the
+/// stop ([`crate::compile::hold_while_deciding`]).
+fn stored_at_dep_info(
+    store: &Store,
+    cache_key: &str,
+    crate_name: &str,
+) -> Result<Option<EntryMeta>> {
+    let stored = store.get(cache_key)?;
+    if stored.is_some() || !store.store_in_flight(cache_key) {
+        return Ok(stored);
+    }
+    crate::compile::hold_while_deciding();
+    if wait_for_store_in_flight(store, cache_key, crate_name) {
+        store.get(cache_key)
+    } else {
+        Ok(None)
+    }
+}
+
 fn admit_scheduler_miss(
     config: &Config,
     store: &Store,
@@ -4405,6 +4454,16 @@ fn run_parsed_rustc(
         // key from what rustc emitted. `discovery_flight` stays held across
         // the recursion so peers wait for this compile.
         tracing::debug!("no closure record for {crate_name}; compiling before keying");
+        // A unit the index has never held may still be in flight: another
+        // checkout's entry for it, handed to the daemon and not committed
+        // yet. Then the miss is no longer certain, and the compile keys at
+        // its dep-info to find (or wait for) that entry.
+        let stop_on_hit = stop_on_hit
+            || (stop_on_hit_allowed(args)
+                && store.unit_in_flight(
+                    crate_name,
+                    args.get_codegen_opt("metadata").unwrap_or(""),
+                ));
         return compile_before_key(
             &compile_first,
             stop_on_hit,
@@ -4496,6 +4555,8 @@ fn run_parsed_rustc(
     let may_defer = deferral_allowed(config, args, false, extra_inputs);
     // `Some(stop_on_hit)` once the miss is to compile before its key.
     let mut compile_then_key = None;
+    // A key another process is storing is waited for once per invocation.
+    let mut waited_for_store = false;
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
@@ -4602,6 +4663,16 @@ fn run_parsed_rustc(
                 &cache_key,
             );
             return Ok(0);
+        }
+
+        // Another process is storing this very key (a compile it just ran,
+        // or the daemon's hand-off of one): its entry is moments away, so
+        // look again once it is committed rather than compile it twice.
+        if !waited_for_store && store.store_in_flight(&cache_key) {
+            waited_for_store = true;
+            if wait_for_store_in_flight(&store, &cache_key, crate_name) {
+                continue;
+            }
         }
 
         // Both lookups missed. Incremental compilation needs no artifact key
@@ -5176,6 +5247,10 @@ fn run_parsed_rustc(
         return Ok(result.exit_code);
     };
 
+    // From here until the entry is committed, a lookup that misses it waits
+    // for it rather than compiling the unit again.
+    let mut lock = lock;
+    lock.mark_storing();
     let mut lock = Some(lock);
     let store_start = std::time::Instant::now();
     let trace_store = crate::phase_trace::phase("store");
@@ -6754,7 +6829,7 @@ fn adaptive_compile_before_key(
             return true;
         };
         let lookup_start = std::time::Instant::now();
-        let stored = ctx.store.get(&keyed.cache_key);
+        let stored = stored_at_dep_info(ctx.store, &keyed.cache_key, ctx.crate_name);
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
         (key_ms, key_hash_stats, _) = combine_key_measurements(
             key_ms,
@@ -6944,13 +7019,26 @@ fn compile_before_key(
     let executed = if stop_on_hit {
         let tree = tree_guard.clone();
         let mut on_dep_info = || {
+            // Another checkout's entry for this unit, still being stored, is
+            // likely this compile's hit. Keying takes long enough for rustc
+            // to start its codegen, after which a compile that links can no
+            // longer be stopped: freeze it first.
+            if ctx
+                .store
+                .unit_in_flight(crate_name, args.get_codegen_opt("metadata").unwrap_or(""))
+            {
+                crate::compile::hold_while_deciding();
+            }
             let Some(dep_info) = emitted_dep_info(args) else {
                 return true;
             };
             let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
-            let stored = keyed
-                .ok()
-                .is_some_and(|keyed| ctx.store.get(&keyed.cache_key).ok().flatten().is_some());
+            let stored = keyed.ok().is_some_and(|keyed| {
+                stored_at_dep_info(ctx.store, &keyed.cache_key, crate_name)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
             if stored {
                 hit_closure = Some((dep_info, tree.clone()));
             }

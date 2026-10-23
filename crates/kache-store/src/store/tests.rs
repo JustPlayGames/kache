@@ -5625,6 +5625,117 @@ fn a_key_claimed_without_the_index_is_the_stores_claim() {
     );
 }
 
+/// Only a held lock marked as storing is a store in flight: a plain claim
+/// (a compile) is not, nor is a mark left in a lock nobody holds, nor a key
+/// that was never locked (whose lock file the check does not create).
+#[test]
+fn only_a_held_lock_marked_storing_is_a_store_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let _store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "store_in_flight";
+
+    assert!(!key_store_in_flight(&store_dir, cache_key));
+    assert!(!store_dir.join(cache_key).with_extension("lock").exists());
+
+    let mut lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    assert!(!key_store_in_flight(&store_dir, cache_key), "a compile");
+    lock.mark_storing();
+    assert!(key_store_in_flight(&store_dir, cache_key));
+    assert!(
+        try_lock_key_in(&store_dir, cache_key).unwrap().is_none(),
+        "the check left the holder's lock alone"
+    );
+    drop(lock);
+    assert!(!key_store_in_flight(&store_dir, cache_key), "a stale mark");
+    assert!(try_lock_key_in(&store_dir, cache_key).unwrap().is_some());
+}
+
+/// A unit's in-flight note lasts as long as its guard, one per key, and
+/// names that could leave the notes' directory are never written.
+#[test]
+fn a_unit_is_in_flight_while_its_note_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    let key = |n: u8| format!("{n:02x}").repeat(32);
+    assert!(!unit_in_flight_in(&store_dir, "serde", "0123abcd"));
+    let first = mark_unit_in_flight_in(&store_dir, "serde", "0123abcd", &key(1)).unwrap();
+    let second = mark_unit_in_flight_in(&store_dir, "serde", "0123abcd", &key(2)).unwrap();
+    assert!(unit_in_flight_in(&store_dir, "serde", "0123abcd"));
+    assert!(!unit_in_flight_in(&store_dir, "serde", "4567"), "another unit");
+    assert!(!unit_in_flight_in(&store_dir, "serde_json", "0123abcd"));
+    drop(first);
+    assert!(unit_in_flight_in(&store_dir, "serde", "0123abcd"), "one key left");
+    drop(second);
+    assert!(!unit_in_flight_in(&store_dir, "serde", "0123abcd"));
+    for (krate, unit, cache_key) in [
+        ("../x", "0123", key(3)),
+        ("serde", "../x", key(3)),
+        ("serde", "", key(3)),
+        ("serde", "0123", "../x".to_string()),
+    ] {
+        assert!(mark_unit_in_flight_in(&store_dir, krate, unit, &cache_key).is_none());
+    }
+    assert!(!dir.path().join("x").exists());
+}
+
+/// A lookup that finds a store in flight and waits gets the entry the
+/// holder commits, and a bounded wait on a holder that never commits ends
+/// with nothing.
+#[test]
+fn a_wait_on_a_store_in_flight_sees_its_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "committed_while_waiting";
+
+    let mut lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    lock.mark_storing();
+    let output = dir.path().join("lib.rlib");
+    fs::write(&output, b"output").unwrap();
+    let holder = {
+        let config = config.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            Store::open(&config)
+                .unwrap()
+                .put(
+                    cache_key,
+                    "c",
+                    &["rlib".to_string()],
+                    &[],
+                    "host",
+                    "dev",
+                    &[(output, "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            drop(lock);
+        })
+    };
+    assert!(store.get(cache_key).unwrap().is_none());
+    assert!(key_store_in_flight(&store_dir, cache_key));
+    assert!(
+        store
+            .wait_for_committed_with_timeout(cache_key, Duration::from_secs(30))
+            .unwrap()
+    );
+    assert!(store.get(cache_key).unwrap().is_some());
+    holder.join().unwrap();
+
+    let mut lock = try_lock_key_in(&store_dir, "never_committed").unwrap().unwrap();
+    lock.mark_storing();
+    assert!(
+        !store
+            .wait_for_committed_with_timeout("never_committed", Duration::from_millis(50))
+            .unwrap()
+    );
+    drop(lock);
+}
+
 #[test]
 fn claim_build_evicts_empty_committed_entry() {
     let dir = tempfile::tempdir().unwrap();

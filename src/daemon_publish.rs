@@ -137,11 +137,13 @@ fn memo_input_from_wire(
     }
 }
 
-/// A job the handler accepted: the request plus the key lock it holds.
+/// A job the handler accepted: the request plus the key lock it holds, and
+/// for a rustc unit the note that its entry is in flight.
 pub(crate) struct PublishJob {
     request: PublishCcRequest,
     owns_event: bool,
     _lock: KeyLock,
+    _unit: Option<crate::store::UnitInFlight>,
 }
 
 /// The daemon's publish queue: a bounded channel drained by one blocking
@@ -344,6 +346,25 @@ impl Daemon {
         // Own separate links before acknowledging. A client may time out
         // after acceptance and remove every path it sent us.
         let claimed = tokio::task::spawn_blocking(move || {
+            // From here until the worker commits, a lookup that misses the
+            // entry waits for it rather than compiling the unit again.
+            let mut lock = lock;
+            lock.mark_storing();
+            // Until then the index does not know the unit either, and a
+            // build asking whether the store ever held it would take its
+            // miss for certain and compile without looking.
+            let unit = request
+                .rustc
+                .as_ref()
+                .and_then(|rustc| rustc.unit.as_deref())
+                .and_then(|unit| {
+                    crate::store::mark_unit_in_flight_in(
+                        &config.store_dir(),
+                        &request.crate_name,
+                        unit,
+                        &request.cache_key,
+                    )
+                });
             if staged {
                 // A staged rustc entry's files are the wrapper's links to
                 // its blobs, which nothing but the daemon writes or removes
@@ -356,6 +377,7 @@ impl Daemon {
                         request,
                         owns_event: true,
                         _lock: lock,
+                        _unit: unit,
                     })),
                     Err(error) if receipt_cancelled(&error) => Ok(None),
                     Err(error) => Err(error),
@@ -390,6 +412,7 @@ impl Daemon {
                 request,
                 owns_event,
                 _lock: lock,
+                _unit: unit,
             }))
         })
         .await;
@@ -1533,6 +1556,7 @@ mod tests {
                     request,
                     owns_event: true,
                     _lock: lock,
+                    _unit: None,
                 },
             );
             assert!(store.get(&cache_key).unwrap().is_some(), "{label}: stored");
@@ -1749,6 +1773,7 @@ mod tests {
                         request,
                         owns_event: true,
                         _lock: lock,
+                        _unit: None,
                     },
                 );
             })

@@ -1592,6 +1592,115 @@ pub fn try_lock_key_in(store_dir: &Path, cache_key: &str) -> Result<Option<KeyLo
     StoreLock::try_acquire(&store_dir.join(cache_key).with_extension("lock"))
 }
 
+/// What a key's lock file says while its holder stores the entry
+/// ([`StoreLock::mark_storing`]), after the holder's process id.
+const STORING_MARK: &str = " storing";
+
+/// Whether a holder of `cache_key`'s lock in `store_dir` is storing its
+/// entry right now: a wrapper registering the compile it just ran, or the
+/// daemon finishing a hand-off it accepted. Such an entry is committed
+/// within moments, so a lookup that missed it is better off waiting for the
+/// commit ([`ArtifactStore::wait_for_committed_with_timeout`]) than
+/// compiling the unit again.
+///
+/// The mark is a hint read from the lock file, never ownership: a lock that
+/// is free (taken here and dropped at once) or says nothing about storing
+/// answers `false`, and a stale mark costs at most one bounded wait. A key
+/// with no lock file yet answers `false` without creating one.
+pub fn key_store_in_flight(store_dir: &Path, cache_key: &str) -> bool {
+    let path = store_dir.join(cache_key).with_extension("lock");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    if !content.ends_with(STORING_MARK) {
+        return false;
+    }
+    matches!(StoreLock::try_acquire(&path), Ok(None))
+}
+
+/// Where the daemon notes the rustc units whose entries it is storing.
+const UNITS_IN_FLIGHT_DIR: &str = "units-in-flight";
+
+/// How old a unit's in-flight note may be and still count: a hand-off is
+/// committed or failed within its batch's patience (seconds), so an older
+/// note is one a daemon that died left behind.
+const UNIT_IN_FLIGHT_FRESH: Duration = Duration::from_secs(600);
+
+/// A note that a rustc unit's entry is being stored under `cache_key`
+/// ([`unit_in_flight_in`]). Dropping it removes the note.
+pub struct UnitInFlight {
+    path: PathBuf,
+}
+
+impl Drop for UnitInFlight {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(unit_dir) = self.path.parent() {
+            // Fails while another key of the unit is in flight, as it should.
+            let _ = fs::remove_dir(unit_dir);
+        }
+    }
+}
+
+/// A unit's directory of in-flight notes, for names Cargo gives a crate and
+/// its `-C metadata` (nothing that could leave the directory).
+fn unit_in_flight_dir(store_dir: &Path, crate_name: &str, unit: &str) -> Option<PathBuf> {
+    let plain = |name: &str| {
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    };
+    (plain(crate_name) && plain(unit)).then(|| {
+        store_dir
+            .join(UNITS_IN_FLIGHT_DIR)
+            .join(format!("{crate_name}@{unit}"))
+    })
+}
+
+/// Note that the entry of `crate_name`'s unit `unit` is being stored under
+/// `cache_key` until the returned guard is dropped. The index learns a unit
+/// only when its entry is committed, so a build that asks meanwhile whether
+/// the store has ever held the unit would hear no, take its miss for
+/// certain and compile without looking for the entry
+/// ([`unit_in_flight_in`]). Best effort: `None` when the note cannot be
+/// written.
+pub fn mark_unit_in_flight_in(
+    store_dir: &Path,
+    crate_name: &str,
+    unit: &str,
+    cache_key: &str,
+) -> Option<UnitInFlight> {
+    let dir = unit_in_flight_dir(store_dir, crate_name, unit)?;
+    if !cache_key.bytes().all(|byte| byte.is_ascii_hexdigit()) || cache_key.is_empty() {
+        return None;
+    }
+    fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(cache_key);
+    fs::write(&path, b"").ok()?;
+    Some(UnitInFlight { path })
+}
+
+/// Whether an entry of `crate_name`'s unit `unit` is being stored right now
+/// ([`mark_unit_in_flight_in`]), by a note younger than
+/// [`UNIT_IN_FLIGHT_FRESH`].
+pub fn unit_in_flight_in(store_dir: &Path, crate_name: &str, unit: &str) -> bool {
+    let Some(dir) = unit_in_flight_dir(store_dir, crate_name, unit) else {
+        return false;
+    };
+    let Ok(notes) = fs::read_dir(dir) else {
+        return false;
+    };
+    notes.filter_map(Result::ok).any(|note| {
+        note.metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < UNIT_IN_FLIGHT_FRESH)
+    })
+}
+
 /// Whether the store directory `store_dir` holds a `meta.json` for
 /// `cache_key`. Without one nothing is committed under the key, whatever
 /// the index says ([`ArtifactStore::contains`]); with one, only the index
@@ -1654,11 +1763,24 @@ impl StoreLock {
 
     fn finish(mut file: fs::File) -> Result<Self> {
         // Diagnostic only: lock ownership is determined exclusively by the OS.
+        Self::write_note(&mut file, "")?;
+        Ok(Self { file })
+    }
+
+    fn write_note(file: &mut fs::File, note: &str) -> Result<()> {
         use std::io::{Seek, SeekFrom, Write};
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        write!(file, "{}", std::process::id())?;
-        Ok(Self { file })
+        write!(file, "{}{note}", std::process::id())?;
+        Ok(())
+    }
+
+    /// Say in the lock file that its holder now stores the key's entry, so
+    /// a lookup that misses the entry meanwhile waits for it instead of
+    /// compiling ([`key_store_in_flight`]). Best effort: a mark that cannot
+    /// be written only costs that wait.
+    pub fn mark_storing(&mut self) {
+        let _ = Self::write_note(&mut self.file, STORING_MARK);
     }
 
     /// Open, lock, then confirm the locked file is the one at `path`.
@@ -3246,6 +3368,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn try_lock(&self, cache_key: &str) -> Result<Option<KeyLock>> {
         self.refuse_write("acquire a build lock")?;
         try_lock_key_in(&self.config.store_dir(), cache_key)
+    }
+
+    /// [`key_store_in_flight`] in this store: another process stores
+    /// `cache_key`'s entry right now. Never for a read-only store, which
+    /// takes no key locks.
+    pub fn store_in_flight(&self, cache_key: &str) -> bool {
+        !self.is_read_only() && key_store_in_flight(&self.config.store_dir(), cache_key)
+    }
+
+    /// [`unit_in_flight_in`] in this store.
+    pub fn unit_in_flight(&self, crate_name: &str, unit: &str) -> bool {
+        unit_in_flight_in(&self.config.store_dir(), crate_name, unit)
     }
 
     /// Claim a cache miss, re-checking the store after acquiring the key lock.

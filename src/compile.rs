@@ -364,8 +364,12 @@ fn capture_rustc_output_with(
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
     let child = std::sync::Mutex::new(child);
     let child_ref = &child;
-    let mut gated = on_dep_info
-        .map(|decide| move || decide() || !stop_compile(&mut child_ref.lock().unwrap(), stop_rule));
+    let mut gated = on_dep_info.map(|decide| {
+        move || {
+            let _deciding = Deciding::enter(&child_ref.lock().unwrap(), stop_rule);
+            decide() || !stop_compile(&mut child_ref.lock().unwrap(), stop_rule)
+        }
+    });
     let on_dep_info = gated
         .as_mut()
         .map(|gated| gated as &mut dyn FnMut() -> bool);
@@ -447,6 +451,74 @@ fn stop_compile(child: &mut Child, rule: StopRule) -> bool {
     {
         false
     }
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// The linking compile whose dep-info `on_dep_info` is deciding about on
+    /// this thread, and whether the decision froze it
+    /// ([`hold_while_deciding`]).
+    static DECIDING: std::cell::Cell<Option<(libc::pid_t, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The span of one `on_dep_info` decision. A compile the decision froze is
+/// resumed when it ends: a stop that killed it leaves nothing to resume, and
+/// one that let it go on resumed it already.
+struct Deciding {
+    #[cfg(target_os = "linux")]
+    previous: Option<(libc::pid_t, bool)>,
+}
+
+impl Deciding {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn enter(child: &Child, rule: StopRule) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let deciding = (rule == StopRule::WhenAlone)
+                .then(|| libc::pid_t::try_from(child.id()).ok())
+                .flatten()
+                .map(|pid| (pid, false));
+            Self {
+                previous: DECIDING.with(|slot| slot.replace(deciding)),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Self {}
+    }
+}
+
+impl Drop for Deciding {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some((pid, true)) = DECIDING.with(|slot| slot.replace(self.previous)) {
+            // SAFETY: the compile is this process's child, not reaped while
+            // its output is read (the reaping waits for the reader that runs
+            // this decision), so `pid` names no other process.
+            unsafe {
+                libc::kill(pid, libc::SIGCONT);
+            }
+        }
+    }
+}
+
+/// Freeze the linking compile that `on_dep_info` is deciding about, until the
+/// decision is taken: the caller is about to wait for an entry, and a compile
+/// left running meanwhile would start its codegen, after which it can no
+/// longer be stopped ([`stop_compile`]). A compile that does not link may be
+/// killed at any point and runs on; so does every compile off Linux, and
+/// outside a decision this does nothing. The kernel resumes a frozen compile
+/// whose wrapper dies ([`freeze::resume_if_orphaned`]).
+pub(crate) fn hold_while_deciding() {
+    #[cfg(target_os = "linux")]
+    DECIDING.with(|slot| {
+        if let Some((pid, false)) = slot.get()
+            // SAFETY: as in `Deciding::drop`.
+            && unsafe { libc::kill(pid, libc::SIGSTOP) } == 0
+        {
+            slot.set(Some((pid, true)));
+        }
+    });
 }
 
 /// Whether a compile that links may be stopped on a hit: only where
@@ -1160,6 +1232,74 @@ fi
             "a compile with a running child must go on"
         );
         assert!(status.success());
+    }
+
+    /// A decision that holds a linking compile freezes it until the decision
+    /// is taken, and the compile then goes on to its end when the decision
+    /// lets it; held and then stopped, it is killed like any stopped compile.
+    /// Outside a decision, and for a compile that does not link, holding does
+    /// nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_linking_compile_is_frozen_until_the_decision() {
+        fn state(pid: u32) -> Option<char> {
+            freeze::parse_state(&fs::read(format!("/proc/{pid}/stat")).ok()?)
+        }
+        hold_while_deciding();
+        let script = "printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; \
+             i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo finished";
+        for (rule, stop) in [
+            (StopRule::WhenAlone, false),
+            (StopRule::WhenAlone, true),
+            (StopRule::Kill, false),
+        ] {
+            let mut child = Command::new("sh")
+                .args(["-c", script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .invocation_spawn()
+                .unwrap();
+            let pid = child.id();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let mut states = Vec::new();
+            let mut decide = || {
+                hold_while_deciding();
+                let started = std::time::Instant::now();
+                while state(pid) != Some('T')
+                    && started.elapsed() < std::time::Duration::from_millis(300)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                states.push(state(pid));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                states.push(state(pid));
+                !stop
+            };
+            let (status, stdout, captured) = capture_rustc_output_with(
+                &mut child,
+                stdout,
+                stderr,
+                None,
+                Some(&mut decide),
+                rule,
+            )
+            .unwrap();
+            let held = rule == StopRule::WhenAlone;
+            assert_eq!(
+                states.iter().all(|state| *state == Some('T')),
+                held,
+                "{rule:?}: {states:?}"
+            );
+            assert_eq!(captured.stopped, stop, "{rule:?}");
+            if stop {
+                assert!(!status.success());
+            } else {
+                assert!(status.success(), "{rule:?}: the compile was not resumed");
+                assert_eq!(stdout, b"finished\n");
+            }
+        }
     }
 
     /// The thread state follows the last ')' of the stat line, whatever the
