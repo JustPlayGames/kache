@@ -5652,6 +5652,73 @@ fn only_a_held_lock_marked_storing_is_a_store_in_flight() {
     assert!(try_lock_key_in(&store_dir, cache_key).unwrap().is_some());
 }
 
+/// The storing mark is a file beside the lock (Windows refuses other
+/// handles a read of a locked file), goes with the lock, and one a killed
+/// holder left behind never reads as a store in flight: not while its
+/// process is gone, and not after the next holder took the lock.
+#[test]
+fn a_storing_mark_goes_with_its_lock_and_a_dead_holders_mark_never_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let _store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "storing_mark";
+    let mark = store_dir.join(cache_key).with_extension("storing");
+
+    let mut lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    lock.mark_storing();
+    assert_eq!(
+        fs::read_to_string(&mark).unwrap(),
+        std::process::id().to_string()
+    );
+    drop(lock);
+    assert!(!mark.exists(), "released with its lock");
+
+    // A holder that was killed while storing: its mark stays, naming a
+    // process that has exited, while someone else holds the key's lock.
+    let mut child = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/C", "exit"]).spawn()
+    } else {
+        std::process::Command::new("true").spawn()
+    }
+    .unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let held = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    fs::write(&mark, dead.to_string()).unwrap();
+    assert!(!key_store_in_flight(&store_dir, cache_key), "a dead holder");
+    fs::write(&mark, std::process::id().to_string()).unwrap();
+    assert!(key_store_in_flight(&store_dir, cache_key), "a live one");
+    fs::write(&mark, "").unwrap();
+    assert!(key_store_in_flight(&store_dir, cache_key), "one being written");
+    drop(held);
+
+    // Nobody holds the lock: the check takes it, which clears the mark.
+    fs::write(&mark, std::process::id().to_string()).unwrap();
+    assert!(!key_store_in_flight(&store_dir, cache_key));
+    assert!(!mark.exists(), "the next holder clears a stale mark");
+}
+
+/// The lock sweep takes a stale storing mark with its lock file.
+#[test]
+fn the_lock_sweep_removes_a_stale_storing_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "ab".repeat(32);
+    drop(try_lock_key_in(&store_dir, &cache_key).unwrap().unwrap());
+    let mark = store_dir.join(&cache_key).with_extension("storing");
+    fs::write(&mark, "1").unwrap();
+    let later = std::time::SystemTime::now() + Duration::from_secs(7200);
+    let stats = store
+        .sweep_stale_key_locks_at(KEY_LOCK_SWEEP_GRACE, KEY_LOCK_SWEEP_CAP, later)
+        .unwrap();
+    assert_eq!(stats.removed, 1);
+    assert!(!mark.exists());
+    assert!(!store_dir.join(&cache_key).with_extension("lock").exists());
+}
+
 /// A unit's in-flight note lasts as long as its guard, one per key, and
 /// names that could leave the notes' directory are never written.
 #[test]
