@@ -2141,6 +2141,18 @@ impl Daemon {
         (result, lock_wait_ms, import_ms)
     }
 
+    fn discard_uncommitted_packed_entries(
+        &self,
+        entries: &[crate::store::VerifiedRestoredEntry],
+    ) -> Result<()> {
+        self.with_store(|store| {
+            for entry in entries {
+                store.discard_uncommitted_restored_entry(&entry.cache_key)?;
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn entry_dir_for(&self, cache_key: &str) -> PathBuf {
         // Defense-in-depth: every caller must validate untrusted keys before
         // reaching here (see `is_valid_cache_key`), so a malformed key getting
@@ -2872,9 +2884,6 @@ impl Daemon {
         Response::ok()
     }
 
-    /// Flush a batch of entries stored without an fsync. Uses its own store
-    /// connection, as GC does, so a sweep of slow writes never holds the
-    /// mutex a lookup needs.
     /// Copy the WAL into the index without waiting for anyone (a passive
     /// checkpoint), on a connection kept for it, every durability tick (2 s).
     /// Every connection of the daemon and of the wrappers defers its own
@@ -2905,9 +2914,23 @@ impl Daemon {
             .ok()
     }
 
+    /// Flush a batch of entries stored without an fsync, in the main store and
+    /// in each `[cache.volumes]` shard. Uses its own store connections, as GC
+    /// does, so a sweep of slow writes never holds the mutex a lookup needs.
     fn flush_pending_durability(&self) {
+        Self::flush_store_durability(&self.config);
+        for shard in &self.config.volume_stores {
+            // Opening a shard without an index would create it on a volume
+            // that may not be mounted.
+            if crate::volume_gc::shard_has_index(&shard.store) {
+                Self::flush_store_durability(&self.config.for_volume_store(shard, |_| None));
+            }
+        }
+    }
+
+    fn flush_store_durability(config: &Config) {
         let flushed = (|| -> Result<usize> {
-            let store = Store::open(&self.config)?;
+            let store = Store::open(config)?;
             if store.pending_durability()? == 0 {
                 return Ok(0);
             }
@@ -4958,11 +4981,14 @@ impl Daemon {
                     self.prefetch_stats
                         .pack_validation_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    for (entry, _, pack_index, entry_index) in &verified {
+                    for (_, _, pack_index, entry_index) in &verified {
                         receipts[*pack_index].accounting().entries[*entry_index].outcome =
                             "import_error".to_owned();
-                        let _ =
-                            std::fs::remove_dir_all(self.entry_dir_for(&entry.restored.cache_key));
+                    }
+                    // Strict flushing can fail after registration commits.
+                    // Preserve those rows' metadata, including existing keys.
+                    if let Err(cleanup_error) = self.discard_uncommitted_packed_entries(&batch) {
+                        tracing::warn!("packed-prefetch residue cleanup failed: {cleanup_error:#}");
                     }
                 }
             }
@@ -7021,7 +7047,8 @@ async fn server_main(
         }
     });
 
-    // Entries a miss stored without an fsync (`cache.deferred_durability`).
+    // Entries a miss or a download stored without an fsync
+    // (`cache.deferred_durability`).
     // Short interval: until an entry is flushed every hit on it re-reads its
     // blobs to verify them, and the wrapper hands the work here precisely so
     // the build does not wait for the disk.
@@ -9465,25 +9492,7 @@ fn send_request_with_async_timeout(
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
 
-    if tokio::runtime::Handle::try_current().is_ok() {
-        let socket_path = socket_path.to_path_buf();
-        std::thread::spawn(move || {
-            send_request_with_async_timeout_blocking(&socket_path, line, read_timeout)
-        })
-        .join()
-        .map_err(|_| anyhow::anyhow!("daemon client timeout thread panicked"))?
-    } else {
-        send_request_with_async_timeout_blocking(socket_path, line, read_timeout)
-    }
-}
-
-#[cfg(windows)]
-fn send_request_with_async_timeout_blocking(
-    socket_path: &Path,
-    line: String,
-    read_timeout: std::time::Duration,
-) -> Result<String> {
-    daemon_client_runtime()?.block_on(async {
+    with_windows_client(|| async {
         tokio::time::timeout(
             read_timeout,
             send_request_with_async_transport(socket_path, line, read_timeout),
@@ -9499,26 +9508,34 @@ fn send_request_with_async_timeout_blocking(
     })
 }
 
-/// The one current-thread runtime this process's daemon requests run on.
-///
-/// Each request used to build and drop a runtime of its own (an I/O
-/// driver, a timer and their threads' bookkeeping), and a wrapper makes
-/// several requests. Tokio lets any number of threads `block_on` one
-/// current-thread runtime: one drives it while the others wait their turn.
-/// It is never dropped, so nothing waits on its blocking threads at exit.
-#[cfg(any(windows, test))]
-fn daemon_client_runtime() -> Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    if let Some(runtime) = RUNTIME.get() {
-        return Ok(runtime);
+/// Run cancelable client I/O in an owned runtime. A caller already inside a
+/// Tokio runtime uses a joined scoped thread, never a detached I/O worker.
+#[cfg(windows)]
+fn with_windows_client<T, F>(exchange: impl FnOnce() -> F + Send) -> Result<T>
+where
+    T: Send,
+    F: std::future::Future<Output = Result<T>>,
+{
+    let run = || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .context("creating daemon client runtime")?;
+        runtime.block_on(exchange())
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("kache-client-runtime".into())
+                .spawn_scoped(scope, run)
+                .context("starting daemon client runtime thread")?
+                .join()
+                .map_err(|_| anyhow::anyhow!("daemon client runtime thread panicked"))?
+        })
+    } else {
+        run()
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .context("creating daemon client runtime")?;
-    // Another thread may have built one meanwhile: keep the first.
-    Ok(RUNTIME.get_or_init(|| runtime))
 }
 
 #[cfg(any(windows, test))]
@@ -9527,13 +9544,15 @@ async fn send_request_with_async_transport(
     line: String,
     read_timeout: std::time::Duration,
 ) -> Result<String> {
-    // The busy-pipe wait ends no later than the caller's own timeout, so the
-    // blocking task it runs in never outlives the request.
+    // Busy-pipe retries are cancelable and share the caller's timeout.
     let busy_wait = crate::transport::BUSY_PIPE_WAIT.min(read_timeout);
-    let mut stream = crate::transport::connect_tokio(socket_path, busy_wait)
+    let stream = crate::transport::connect_tokio(socket_path, busy_wait)
         .await
         .with_context(|| format!("connecting to daemon socket {}", socket_path.display()))
         .context(DaemonConnectionFailure)?;
+    #[cfg(windows)]
+    let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+    let mut stream = &stream;
 
     stream
         .write_all(line.as_bytes())
@@ -9601,29 +9620,32 @@ fn send_line_fire_and_forget(
 
 /// Windows: the same exchange, bounded by `send_wait` as a whole.
 ///
-/// A named pipe has no send timeout, and a write blocks until the daemon
-/// reads whatever does not fit in the pipe's buffer (the daemon's pipe asks
-/// for 512 bytes): a daemon that stopped reading would hold the wrapper for
-/// good. The connect and the write run on a helper thread; past the wait the
-/// request counts as failed, and the thread ends when the daemon reads or the
-/// process exits.
+/// A named pipe has no send timeout. Two reusable I/O workers bound blocked
+/// writes and flushes; queued work expires without starting. A timeout or a
+/// full queue is a best-effort failure. Upload intent is already durable.
+/// A worker flushes before closing so successful delivery does not depend on
+/// interprocess starting another, unbounded background flush.
 #[cfg(windows)]
-fn send_line_fire_and_forget(
+fn send_line_fire_and_forget_windows(
     socket_path: &Path,
     line: String,
     send_wait: std::time::Duration,
 ) -> Result<()> {
     let deadline = std::time::Instant::now() + send_wait;
     let socket = socket_path.to_path_buf();
-    let busy_wait = crate::transport::BUSY_PIPE_WAIT.min(send_wait);
     let sent = crate::transport::finish_by(deadline, move || -> Result<()> {
         use std::io::Write;
-        let mut stream = crate::transport::connect_sync(&socket, busy_wait)
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let busy_wait = crate::transport::BUSY_PIPE_WAIT.min(remaining);
+        let stream = crate::transport::connect_sync(&socket, busy_wait)
             .with_context(|| format!("connecting to daemon socket {}", socket.display()))
             .context(DaemonConnectionFailure)?;
-        stream
+        let _discard = crate::transport::discard_sync_pipe_writes_on_drop(&stream);
+        (&stream)
             .write_all(line.as_bytes())
             .context("writing request to daemon")?;
+        let crate::transport::SyncStream::NamedPipe(pipe) = &stream;
+        pipe.inner().flush().context("flushing request to daemon")?;
         Ok(())
     });
     sent.unwrap_or_else(|| {
@@ -9633,6 +9655,9 @@ fn send_line_fire_and_forget(
         ))
     })
 }
+
+#[cfg(windows)]
+use self::send_line_fire_and_forget_windows as send_line_fire_and_forget;
 
 /// Start the daemon in the background and wait for it to be ready.
 ///
