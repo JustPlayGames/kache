@@ -3669,6 +3669,7 @@ pub(crate) fn run_for(
     )?;
 
     if exit == 0 {
+        retire_prestaged_executables(effective_config, &compiler, &args);
         complete_current_extra_inputs_after_success(
             effective_config,
             &args,
@@ -5059,7 +5060,7 @@ fn run_parsed_rustc(
         .then(|| "rustc could not post-process its debug info".to_string());
     // A Windows executable finds its `.pdb` by the GUID, age and name it
     // records: it is cached only with that very `.pdb`, named by file name.
-    let unpaired = unpaired_executable_debug_info(&result.artifacts);
+    let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
     if let Some(reason) = unaudited.or(degraded).or(unpaired) {
         tracing::warn!("not caching {crate_name}: {reason}");
         let elapsed = start.elapsed().as_millis() as u64;
@@ -5848,15 +5849,33 @@ fn find_executable_output(
         .map(|a| (a.path.clone(), a.store_name.clone()))
 }
 
-/// Why a unit's Windows executable must not be cached, `None` when every
-/// `.exe` among its outputs carries no external debug info or is stored with
-/// the `.pdb` it names ([`crate::pe_pdb`]).
-fn unpaired_executable_debug_info(artifacts: &crate::compiler::ArtifactSet) -> Option<String> {
+/// Why a linked executable must not be cached: its selected output must be
+/// identifiable, and each PE must carry no external CodeView info or be
+/// stored with the PDB it names ([`crate::pe_pdb`]).
+fn unpaired_executable_debug_info(
+    args: &RustcArgs,
+    artifacts: &crate::compiler::ArtifactSet,
+) -> Option<String> {
+    let executable_name = match crate::pe_pdb::executable_output_name(
+        args.is_user_facing_executable() && args.emits_link(),
+        args.output.as_deref(),
+        artifacts
+            .outputs()
+            .iter()
+            .map(|artifact| artifact.store_name.as_str()),
+    ) {
+        Ok(name) => name,
+        Err(error) => {
+            return Some(format!(
+                "its executable output cannot be identified: {error:#}"
+            ));
+        }
+    };
     let outputs = artifacts
         .outputs()
         .iter()
         .map(|a| (a.path.as_path(), a.store_name.as_str()));
-    crate::pe_pdb::check_outputs(outputs)
+    crate::pe_pdb::check_outputs(outputs, executable_name.as_deref())
         .err()
         .map(|error| format!("its executable cannot be cached with its .pdb: {error:#}"))
 }
@@ -5920,6 +5939,43 @@ fn rustc_output_dir(args: &RustcArgs) -> Option<PathBuf> {
         (Some(output), _) => Some(output.parent().unwrap_or(Path::new(".")).to_path_buf()),
         (None, Some(dir)) => Some(dir.clone()),
         (None, None) => None,
+    }
+}
+
+/// A miss, passthrough or differently keyed hit can leave a borrowed staged
+/// prediction unused. Retire it even when this invocation never stored an entry.
+fn retire_prestaged_executables(config: &Config, compiler: &RustcCompiler, args: &RustcArgs) {
+    if !args.emits_link() || !(args.is_executable_output() || args.is_user_facing_executable()) {
+        return;
+    }
+    let Some(target_dir) = prestage_target_dir(args) else {
+        return;
+    };
+    if !crate::prestage::has_predictions(&config.cache_dir, &target_dir) {
+        return;
+    }
+    let generation = crate::prestage::hint_generation(&config.cache_dir, &target_dir);
+    let retire = |path: &Path, name: &str| {
+        let primary = args.is_user_facing_executable()
+            && (args.output.as_deref() == Some(path)
+                || args.output_stem().as_deref() == Some(name));
+        if (compiler.classify_output(args, name).link_strategy() == link::LinkStrategy::Copy
+            || primary)
+            && let Some(dest) = args.resolve_invocation_path(path)
+        {
+            crate::prestage::complete(&config.cache_dir, &target_dir, &dest, &generation);
+        }
+    };
+    if let Some(output) = &args.output {
+        if let Some(name) = output.file_name().and_then(|name| name.to_str()) {
+            retire(output, name);
+        }
+    } else if let (Some(out_dir), Some(crate_name)) = (&args.out_dir, &args.crate_name) {
+        compile::for_each_out_dir_candidate(
+            crate_name,
+            args.extra_filename.as_deref().unwrap_or(""),
+            |name| retire(&out_dir.join(name), name),
+        );
     }
 }
 
@@ -8304,6 +8360,43 @@ fn restore_from_cache_with_memo_store(
              debug info — evicting degraded entry and recompiling",
             meta.crate_name
         );
+    }
+
+    // The key namespace excludes legacy EXE-only producers. Still validate
+    // a cached pair before touching any destination: incomplete metadata or
+    // mismatched blobs must never be published as a hit. Library-only entries
+    // do not allocate paths or open blobs for this audit.
+    let reject_pair = |error: anyhow::Error| {
+        let _ = store.remove_entry(&meta.cache_key);
+        error.context(
+            "cached executable/PDB pair is incomplete or incompatible; evicting and recompiling",
+        )
+    };
+    let executable_name = crate::pe_pdb::executable_output_name(
+        args.is_user_facing_executable() && args.emits_link(),
+        args.output.as_deref(),
+        meta.files.iter().map(|file| file.name.as_str()),
+    )
+    .map_err(reject_pair)?;
+    if executable_name.is_some()
+        || meta
+            .files
+            .iter()
+            .any(|file| crate::pe_pdb::is_windows_executable_name(&file.name))
+    {
+        let cached_outputs: Vec<_> = meta
+            .files
+            .iter()
+            .map(|file| (store.blob_path(&file.hash), file.name.as_str()))
+            .collect();
+        if let Err(error) = crate::pe_pdb::check_cached_outputs(
+            cached_outputs
+                .iter()
+                .map(|(path, name)| (path.as_path(), *name)),
+            executable_name.as_deref(),
+        ) {
+            return Err(reject_pair(error));
+        }
     }
 
     // Legacy entries may predate emit-kind metadata and therefore bypass the
