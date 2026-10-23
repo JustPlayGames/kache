@@ -1237,6 +1237,16 @@ fn put_stores_snapshot_bytes_matching_recorded_digest() {
 }
 
 /// A completed put must leave nothing behind in the staging area.
+/// The files in the store's `staging/` folder. This fork stages a put's
+/// snapshot beside its blob, so the folder may never be made: none then.
+fn staging_paths(store: &Store) -> Vec<PathBuf> {
+    match fs::read_dir(store.staging_dir()) {
+        Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("reading the staging folder: {error}"),
+    }
+}
+
 #[test]
 fn successful_put_leaves_staging_dir_empty() {
     let dir = tempfile::tempdir().unwrap();
@@ -1259,10 +1269,7 @@ fn successful_put_leaves_staging_dir_empty() {
         )
         .unwrap();
 
-    let leftovers = fs::read_dir(store.staging_dir())
-        .unwrap()
-        .collect::<std::io::Result<Vec<_>>>()
-        .unwrap();
+    let leftovers = staging_paths(&store);
     assert!(leftovers.is_empty(), "staging litter: {leftovers:?}");
 }
 
@@ -1318,10 +1325,7 @@ fn zero_byte_refusal_cleans_up_staged_snapshot() {
         "",
     );
     assert!(result.is_err(), "zero-byte rlib must be refused");
-    let leftovers = fs::read_dir(store.staging_dir())
-        .unwrap()
-        .collect::<std::io::Result<Vec<_>>>()
-        .unwrap();
+    let leftovers = staging_paths(&store);
     assert!(leftovers.is_empty(), "refused put left staging litter");
 }
 
@@ -1971,39 +1975,47 @@ fn cas_publication_keeps_a_flushed_winner_after_the_initial_absence_check() {
     assert_eq!(peer.pending_durability().unwrap(), 0);
 }
 
+/// Production's publish never replaces a file at the content address, so a
+/// winner another put published (and maybe flushed) meanwhile keeps its
+/// inode, and the publish needs no index lock (another connection may hold
+/// the writer lock throughout).
+#[cfg(unix)]
 #[test]
-fn cas_publication_holds_the_writer_lock_through_rename() {
+fn cas_publication_never_replaces_a_published_blob_and_takes_no_index_lock() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     let peer = Store::open(&config).unwrap();
-    peer.db.busy_timeout(Duration::ZERO).unwrap();
+    let held = rusqlite::Transaction::new_unchecked(
+        &peer.db,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
     let source = write_temp_file(dir.path(), "locked-publish.rlib", b"published bytes");
     let (staged, _) = store.stage_blob_from_source(&source, false).unwrap();
     let hash = crate::file_hash::hash_file(&staged).unwrap();
     let blob = store.blob_path(&hash);
-    let outcome = store.publish_staged_blob_with(
-        &staged,
-        &blob,
-        || {
-            let competing = rusqlite::Transaction::new_unchecked(
-                &peer.db, rusqlite::TransactionBehavior::Immediate,
-            );
-            assert!(matches!(
-                competing,
-                Err(SqlError::SqliteFailure(code, _)) if code.code == ErrorCode::DatabaseBusy
-            ), "a second connection must not publish between the check and rename");
-            fs::rename(&staged, &blob)
-        },
-        |_| false,
-    ).unwrap();
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::write(&blob, b"published bytes").unwrap();
+    let winner = kache_fs::file_identity(&blob).unwrap();
+    let error = publish_without_replacing(&staged, &blob).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(kache_fs::file_identity(&blob).unwrap(), winner);
+    assert!(staged.exists(), "a refused publish leaves the staged file to its caller");
+
+    fs::remove_file(&blob).unwrap();
+    let outcome = store
+        .publish_staged_blob_with(
+            &staged,
+            &blob,
+            || publish_without_replacing(&staged, &blob),
+            |_| false,
+        )
+        .unwrap();
     assert_eq!(outcome, PublishRename::Published);
+    assert!(!staged.exists());
     assert_eq!(fs::read(&blob).unwrap(), b"published bytes");
-    assert!(
-        rusqlite::Transaction::new_unchecked(&peer.db, rusqlite::TransactionBehavior::Immediate,)
-            .is_ok(),
-        "the publication lock must be released"
-    );
+    drop(held);
 }
 
 /// The grace both sweepers share (daemon GC and `doctor --repair`) must
@@ -14288,9 +14300,8 @@ fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf 
             "",
         )
         .unwrap();
-    let leftovers: Vec<_> = fs::read_dir(store.staging_dir())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let leftovers: Vec<_> = staging_paths(store)
+        .into_iter()
         .filter(|path| !staging_before.contains(path))
         .collect();
     assert!(
