@@ -64,6 +64,35 @@ fn a_path_other_than_the_archives_directory_still_counts() {
     );
 }
 
+/// Cargo spelled a Cranelift build's `OUT_DIR` with both separators
+/// (`<checkout>\target/cranelift\debug\build\ring/<hash>\out`, a relative
+/// `build.target-dir` and the per-unit build directories); `cl.exe` recorded
+/// it with backslashes. Matched only as spelled, nothing was cut out, and
+/// every `-sys` crate missed in each new checkout. A `/` and a `\` now
+/// match each other.
+#[test]
+fn the_directory_is_cut_out_whichever_separators_spell_it() {
+    let mixed = |dir: &str| {
+        let mut spelled = dir.replacen(r"\debug", "/debug", 1);
+        spelled = spelled.replacen(r"\gen-", "/gen-", 1);
+        assert_ne!(spelled, dir);
+        spelled
+    };
+    assert_eq!(digest(SHORT, &mixed(SHORT_DIR)), digest(SHORT, SHORT_DIR));
+    assert_eq!(
+        digest(SHORT, &mixed(SHORT_DIR)),
+        digest(LONG, &mixed(LONG_DIR))
+    );
+    assert_eq!(
+        digest(Z7_SHORT, &mixed(Z7_SHORT_DIR)),
+        digest(Z7_LONG, &Z7_LONG_DIR.replace('\\', "/"))
+    );
+    assert!(same_path(br"a/b\c", br"a\b/c"));
+    assert!(!same_path(br"a/b", br"a/c"));
+    assert!(!same_path(b"a/", b"a/b"));
+    assert_eq!(pieces(br"x C:\o\p y C:/o/p z", br"C:\o/p"), [&b"x "[..], b" y ", b" z"]);
+}
+
 #[test]
 fn a_changed_object_name_changes_the_digest() {
     let renamed = patched(SHORT, b"db3b6bfb95261072-f.o", b"db3b6bfb95261072-g.o");

@@ -5635,7 +5635,7 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
-            Self::Bundled => "static-ar-v9-bundled",
+            Self::Bundled => "static-ar-v10-bundled",
             Self::Linked => "static-ar-v9-linked",
         }
     }
@@ -7739,7 +7739,7 @@ fn compute_static_lib_hash_for(
         if let Some(digest) = path.parent().and_then(|dir| {
             crate::coff_archive::path_free_digest(&bytes, dir.as_os_str().as_encoded_bytes())
         }) {
-            return Ok(format!("bundled-coff-v1:{digest}"));
+            return Ok(format!("bundled-coff-v2:{digest}"));
         }
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"kache.native-ar.bundled-content.v1\0");
@@ -7762,7 +7762,7 @@ fn compute_static_lib_hash_for(
             crate::coff_archive::path_free_digest(&bytes, dir.as_os_str().as_encoded_bytes())
         })
     {
-        return Ok(format!("linked-coff-v1:{digest}"));
+        return Ok(format!("linked-coff-v2:{digest}"));
     }
 
     let encoded_path = absolute.as_os_str().as_encoded_bytes();
