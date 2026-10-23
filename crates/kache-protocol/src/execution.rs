@@ -2,10 +2,13 @@
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 
+pub mod process;
 pub mod unix;
 pub mod windows;
+pub mod workspace;
 
-pub const EXECUTION_VERSION: u32 = 1;
+/// Version 2 requires client-owned restores on every supported platform.
+pub const EXECUTION_VERSION: u32 = 2;
 
 /// Native strings retain Unix bytes or Windows UTF-16, including values that
 /// cannot be represented by a Rust String. A receiver rejects a foreign encoding.
@@ -116,7 +119,7 @@ impl std::fmt::Debug for ExecutionRequest {
 pub enum ExecutionChannels {
     /// Descriptors arrive in stdin/stdout/stderr, optional terminal, jobserver order.
     Unix { terminal: bool, jobserver: Vec<i32> },
-    /// Linux clients retain native process creation. Two private broker
+    /// Unix clients retain native process creation. Two private broker
     /// descriptors follow the standard streams and precede the jobserver.
     UnixClient {
         terminal: bool,
@@ -185,8 +188,34 @@ impl std::fmt::Debug for DescriptorTicket {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionStatus {
+    #[serde(default)]
+    pub protocol_version: u32,
+    pub eligible: bool,
+    pub client_trust_enabled: bool,
+    pub daemon_trust_enabled: bool,
+    pub detail: String,
+}
+
+impl ExecutionStatus {
+    pub fn compatible(&self) -> bool {
+        self.protocol_version == EXECUTION_VERSION
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_diagnostics_reject_legacy_and_foreign_protocols() {
+        let mut status: super::ExecutionStatus = serde_json::from_str(r#"{"eligible":true,"client_trust_enabled":false,"daemon_trust_enabled":false,"detail":"old daemon"}"#).unwrap();
+        assert!(!status.compatible());
+        for (version, compatible) in [(0, false), (1, false), (2, true), (3, false)] {
+            status.protocol_version = version;
+            assert_eq!(status.compatible(), compatible);
+        }
+    }
+
     use super::*;
 
     #[test]

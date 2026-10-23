@@ -2,7 +2,7 @@
 
 #[cfg(all(test, windows))]
 use crate::prelude::*;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use kache_protocol::execution::{
     EXECUTION_VERSION, ExecutionCommand, ExecutionReply, ExecutionRequest,
 };
@@ -28,10 +28,11 @@ mod windows_client;
 use windows::Connection;
 #[cfg(unix)]
 mod unix;
+mod workspace;
 #[cfg(unix)]
 use unix::Connection;
-#[cfg(target_os = "linux")]
-mod linux_client;
+#[cfg(unix)]
+mod unix_client;
 
 /// How long every client runs its compiles locally once a daemon let one
 /// request wait out [`PREPARE_TIMEOUT`] (stopped, swapping, or stuck in IO).
@@ -139,12 +140,12 @@ fn exchange(
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
     committed: &mut bool,
 ) -> Result<i32> {
-    #[cfg(target_os = "linux")]
-    let (mut linux_client, broker_files) = if matches!(
+    #[cfg(unix)]
+    let (mut unix_client, broker_files) = if matches!(
         request.channels,
         kache_protocol::execution::ExecutionChannels::UnixClient { .. }
     ) {
-        let (client, files) = linux_client::Client::prepare(request, descriptors)?;
+        let (client, files) = unix_client::Client::prepare(request, descriptors)?;
         (Some(client), Some(files))
     } else {
         (None, None)
@@ -172,7 +173,7 @@ fn exchange(
         let datagram = std::os::unix::net::UnixDatagram::unbound()?;
         datagram.set_write_timeout(Some(PREPARE_TIMEOUT))?;
         datagram.connect(endpoint)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let files = {
             let mut files = descriptors.to_vec();
             if let Some(broker_files) = &broker_files {
@@ -188,12 +189,11 @@ fn exchange(
             }
             files
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let descriptors = files.as_slice();
         crate::descriptors::send(datagram.as_fd(), &ticket.key, descriptors)?;
     }
-    #[cfg(target_os = "linux")]
-    drop(broker_files);
+
     #[cfg(windows)]
     ensure!(
         matches!(
@@ -210,12 +210,20 @@ fn exchange(
         "compiler execution was not prepared"
     );
 
+    // macOS can drain an in-flight socket when its last sender descriptor
+    // closes. Prepared confirms the daemon has installed its own descriptors.
+    #[cfg(unix)]
+    drop(broker_files);
+
     stream.prepare_commit()?;
-    send_commit(&mut &stream, committed)?;
+    send_commit(&mut &stream, committed).context("sending compiler Commit")?;
     #[cfg(windows)]
     stream.commit_written()?;
     ensure!(
-        matches!(read_reply(&mut reader)?, ExecutionReply::Accepted),
+        matches!(
+            read_reply(&mut reader).context("waiting for compiler acceptance")?,
+            ExecutionReply::Accepted
+        ),
         "daemon did not acknowledge compiler execution"
     );
     #[cfg(windows)]
@@ -224,36 +232,33 @@ fn exchange(
             ExecutionReply::Complete { exit_code } => return Ok(exit_code),
             ExecutionReply::Failed { message } => bail!("{message}"),
             ExecutionReply::WindowsControl { command } => {
-                write_message(&mut &stream, &client.execute(command))?;
+                write_message(&mut &stream, &client.execute_from(command, &stream))?;
             }
             reply => bail!("invalid compiler completion: {reply:?}"),
         }
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     loop {
-        #[cfg(target_os = "linux")]
-        if let Some(client) = &mut linux_client
+        #[cfg(unix)]
+        if let Some(client) = &mut unix_client
             && reader.buffer().is_empty()
             && client.ready(stream.as_fd())?
         {
-            if !client.service()? {
+            if !client
+                .service()
+                .context("servicing client-owned native operations")?
+            {
                 // The worker can release its broker before the async handler
                 // writes Complete. Completion still comes from that handler.
-                linux_client = None;
+                unix_client = None;
             }
             continue;
         }
-        return match read_reply(&mut reader)? {
+        return match read_reply(&mut reader).context("waiting for compiler completion")? {
             ExecutionReply::Complete { exit_code } => Ok(exit_code),
             ExecutionReply::Failed { message } => bail!("{message}"),
             reply => bail!("invalid compiler completion: {reply:?}"),
         };
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    match read_reply(&mut reader)? {
-        ExecutionReply::Complete { exit_code } => Ok(exit_code),
-        ExecutionReply::Failed { message } => bail!("{message}"),
-        reply => bail!("invalid compiler completion: {reply:?}"),
     }
 }
 
@@ -311,12 +316,12 @@ mod tests {
     use std::fs::File;
     use std::os::unix::net::{UnixDatagram, UnixListener};
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn client_process_broker_transfers_live_pipes_and_reaps_the_native_child() {
         use kache_protocol::execution::{
+            process::{Spawn, Stdio as Plan},
             unix::{Command, Reply},
-            windows::{Spawn, Stdio as Plan},
         };
         use std::os::unix::net::UnixStream;
         use std::os::unix::process::ExitStatusExt;
@@ -361,6 +366,10 @@ mod tests {
                     },
                 )
                 .unwrap();
+                // Model a receiver which has sent Ready but has not installed
+                // the in-flight socket descriptors yet. macOS drains a socket
+                // if its sender closes the last installed descriptor here.
+                std::thread::sleep(std::time::Duration::from_millis(20));
                 let mut files =
                     crate::descriptors::receive(datagram.as_fd(), &ticket.key, 8).unwrap();
                 let control = UnixStream::from(files.remove(4));
@@ -812,13 +821,13 @@ mod unresponsive_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use super::*;
-    use anyhow::Context as _;
     use interprocess::local_socket::ListenerNonblockingMode;
     use kache_protocol::execution::{ExecutionChannels, ExecutionEntry, NativeString};
 
     #[derive(Clone, Copy, Debug)]
     enum Peer {
         Complete,
+        Workspace,
         BeforePrepared,
         AfterCommit,
         Legacy,
@@ -857,6 +866,7 @@ mod windows_tests {
             .nonblocking(ListenerNonblockingMode::Both)
             .create_sync()?;
         let request = request(root.path());
+        let restored = root.path().join("restored-output");
         let server = std::thread::spawn(move || -> Result<()> {
             let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
             let inner = retry_until(Some(deadline), || listener.accept())
@@ -904,6 +914,50 @@ mod windows_tests {
                 return Ok(());
             }
             write_message(&mut &connection, &ExecutionReply::Accepted)?;
+            if matches!(peer, Peer::Workspace) {
+                use kache_protocol::execution::{windows, workspace};
+                use std::io::Seek;
+                use std::os::windows::io::AsRawHandle;
+                let mut contents = tempfile::tempfile()?;
+                contents.write_all(b"client-restored\0\xff")?;
+                contents.rewind()?;
+                let mut call = |operation, contents| -> Result<windows::Reply> {
+                    write_message(
+                        &mut &connection,
+                        &ExecutionReply::WindowsControl {
+                            command: windows::Command::Workspace {
+                                request: operation,
+                                contents,
+                            },
+                        },
+                    )?;
+                    line.clear();
+                    reader.read_line(&mut line)?;
+                    Ok(serde_json::from_str(&line)?)
+                };
+                let operation = || workspace::Command::PrepareBytes {
+                    target: NativeString::capture(restored.as_os_str()),
+                };
+                assert!(matches!(
+                    call(operation(), Some(u64::MAX))?,
+                    windows::Reply::Failed { .. }
+                ));
+                let windows::Reply::Workspace {
+                    result: workspace::Reply::PreparedFile { id, .. },
+                } = call(operation(), Some(contents.as_raw_handle() as usize as u64))?
+                else {
+                    bail!("client did not prepare restore contents")
+                };
+                assert!(!restored.exists());
+                assert_eq!(
+                    call(workspace::Command::Publish { id, replace: false }, None)?,
+                    windows::Reply::Workspace {
+                        result: workspace::Reply::Done
+                    }
+                );
+                assert_eq!(std::fs::read(&restored)?, b"client-restored\0\xff");
+            }
+
             write_message(
                 &mut &connection,
                 &ExecutionReply::Complete { exit_code: 19 },
@@ -912,7 +966,7 @@ mod windows_tests {
         });
         // A complete peer must expose preparation errors, rather than letting
         // the availability fallback hide them behind the server's timeout.
-        let result = if matches!(peer, Peer::Complete) {
+        let result = if matches!(peer, Peer::Complete | Peer::Workspace) {
             exchange(&path, &request, &mut false).map(Some)
         } else {
             try_execute(&path, &request)
@@ -932,6 +986,11 @@ mod windows_tests {
         }
         let error = exchange_with(Peer::AfterCommit).unwrap_err();
         assert!(error.to_string().contains("will not be run again locally"));
+    }
+
+    #[test]
+    fn named_pipe_client_restores_transformed_bytes_from_the_authenticated_daemon() {
+        assert_eq!(exchange_with(Peer::Workspace).unwrap(), Some(19));
     }
 
     fn assert_identification_only(connection: &Connection) -> Result<()> {
