@@ -8110,11 +8110,18 @@ fn hash_static_lib_ignores_legacy_namespaces() {
         path: format!("static-ar-v7\0{}", fingerprint.path),
         ..fingerprint.clone()
     };
-    let current_key = FileFingerprint {
+    let legacy_v8_key = FileFingerprint {
         path: format!("static-ar-v8\0{}", fingerprint.path),
+        ..fingerprint.clone()
+    };
+    let current_key = FileFingerprint {
+        path: format!("static-ar-v9-linked\0{}", fingerprint.path),
         ..fingerprint
     };
     let cache = fh.cache.as_ref().expect("persistent cache opens");
+    cache
+        .put(&legacy_v8_key, "legacy-path-bound-coff-sentinel")
+        .unwrap();
     cache
         .put(&legacy_key, "legacy-whole-file-sentinel")
         .unwrap();
@@ -8145,6 +8152,7 @@ fn hash_static_lib_ignores_legacy_namespaces() {
     assert_ne!(computed, "legacy-path-bound-dwarf-sentinel");
     assert_ne!(computed, "legacy-path-bound-blank-longname-sentinel");
     assert_ne!(computed, "legacy-path-bound-bsd-elf-sentinel");
+    assert_ne!(computed, "legacy-path-bound-coff-sentinel");
     fh.flush_memo_as_if_settled();
     assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
     assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
@@ -8364,7 +8372,7 @@ fn hash_static_lib_memo_rows_are_per_use() {
     let cache = fh.cache.as_ref().expect("persistent cache opens");
     for (namespace, expected) in [
         ("static-ar-v9-bundled", &bundled),
-        ("static-ar-v8", &linked),
+        ("static-ar-v9-linked", &linked),
     ] {
         let key = FileFingerprint {
             path: format!("{namespace}\0{}", fingerprint.path),
@@ -8392,7 +8400,7 @@ fn hash_static_lib_memo_threshold_is_exclusive() {
         fh.flush_memo_as_if_settled();
         let fingerprint = FileFingerprint::from_path(&lib).unwrap();
         let key = FileFingerprint {
-            path: format!("static-ar-v8\0{}", fingerprint.path),
+            path: format!("static-ar-v9-linked\0{}", fingerprint.path),
             ..fingerprint
         };
         let expected = memoized.then_some(hash);
@@ -18368,21 +18376,57 @@ fn a_bundled_unportable_archive_keys_by_bytes_and_a_linked_one_by_path_too() {
     assert_ne!(bundled(&first), bundled(&second));
 }
 
-/// An archive of MSVC objects that rustc bundles keys by its content without
-/// the directory the objects record; linked, it still keys by path.
+/// An archive of MSVC objects keys by its content without the directory the
+/// objects record, bundled and linked alike: a COFF link writes no path of
+/// the archive into the image, only into the PDB. Two target directories'
+/// copies of one cc-built library then key alike, so a test or binary that
+/// links it hits in both (a Windows checkout relinked every test binary).
+/// Content still counts.
 #[test]
-fn a_bundled_msvc_archive_keys_without_its_directory() {
+fn a_bundled_or_linked_msvc_archive_keys_without_its_directory() {
     let dir = tempfile::tempdir().unwrap();
-    let lib = dir.path().join("gen.lib");
-    std::fs::write(
-        &lib,
-        include_bytes!("../coff_archive/fixtures/gen-short.lib"),
-    )
-    .unwrap();
-    let bundled = compute_static_lib_hash_for(&lib, StaticLibUse::Bundled, &crate::invocation::InvocationEnv::capture()).unwrap();
+    let fixture = include_bytes!("../coff_archive/fixtures/gen-short.lib");
+    let [first, second] = ["wc", "wd"].map(|name| {
+        let out = dir.path().join(name).join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("gen.lib");
+        std::fs::write(&lib, fixture).unwrap();
+        lib
+    });
+    let env = crate::invocation::InvocationEnv::capture();
+    let digest = |lib: &Path, usage| compute_static_lib_hash_for(lib, usage, &env).unwrap();
+    let bundled = digest(&first, StaticLibUse::Bundled);
     assert!(bundled.starts_with("bundled-coff-v1:"), "{bundled}");
-    let linked = compute_static_lib_hash_for(&lib, StaticLibUse::Linked, &crate::invocation::InvocationEnv::capture()).unwrap();
-    assert!(linked.starts_with("path-ar-v1:"), "{linked}");
+    let linked = digest(&first, StaticLibUse::Linked);
+    assert!(linked.starts_with("linked-coff-v1:"), "{linked}");
+    assert_eq!(linked, digest(&second, StaticLibUse::Linked));
+    assert_ne!(linked, bundled, "the two uses never share a digest");
+
+    // A member's date (lib.exe stamps each member) does not count; what it
+    // defines does.
+    let mut dated = fixture.to_vec();
+    let date = 8 + 16;
+    assert_eq!(&dated[..8], b"!<arch>\n");
+    dated[date..date + 12].copy_from_slice(b"1792744814  ");
+    std::fs::write(&second, &dated).unwrap();
+    assert_eq!(digest(&second, StaticLibUse::Linked), linked);
+    let mut changed = fixture.to_vec();
+    let renamed = changed
+        .windows(9)
+        .enumerate()
+        .filter(|(_, window)| *window == b"gen_value")
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    assert!(!renamed.is_empty());
+    for at in renamed {
+        changed[at + 8] = b'f';
+    }
+    std::fs::write(&second, &changed).unwrap();
+    assert_ne!(
+        compute_static_lib_hash_for(&second, StaticLibUse::Linked, &env)
+            .unwrap_or_default(),
+        linked
+    );
 }
 
 /// The units of one Cargo invocation share the workspace walk
