@@ -1,10 +1,12 @@
 //! Kache identity and endpoint adapter for shared lifecycle control.
 use super::*;
+#[cfg(not(windows))]
+use kunobi_daemon::local::Duplex;
 use kunobi_daemon::{
     ServiceIdentity,
     admission::{Admission, Limits, Pool},
     control::ControlService,
-    local::{Duplex, peer::PeerCredentials},
+    local::peer::PeerCredentials,
     peer::{Policy, SameUser},
     wire::{self, operation},
 };
@@ -147,55 +149,103 @@ pub(super) fn request(
     );
     let expected = kunobi_daemon::ProcessId::new(state.pid)
         .context("lifecycle advertisement has an invalid PID")?;
-    let endpoint = crate::transport::daemon_endpoint(&endpoint(config));
+    let path = endpoint(config);
     let offer = offer(config)?;
     anyhow::ensure!(
         matches!(operation, operation::HEALTH | operation::DRAIN),
         "unsupported lifecycle operation {operation}"
     );
-    let health = by_deadline(deadline, move || {
-        Ok(if operation == operation::HEALTH {
-            kunobi_daemon::client::health(&endpoint, &offer, Some(expected), deadline)?
-        } else {
-            kunobi_daemon::client::drain(&endpoint, &offer, Some(expected), deadline)?
-        })
-    })?;
+    #[cfg(windows)]
+    let health = request_windows(path, offer, expected, operation, deadline)?;
+    #[cfg(not(windows))]
+    let health = {
+        let endpoint = crate::transport::daemon_endpoint(&path);
+        match operation {
+            operation::HEALTH => {
+                kunobi_daemon::client::health(&endpoint, &offer, Some(expected), deadline)
+            }
+            _ => kunobi_daemon::client::drain(&endpoint, &offer, Some(expected), deadline),
+        }?
+    };
     Ok(Some(health))
 }
 
-/// How long past its deadline a lifecycle exchange may still answer on
-/// Windows: an answer read just before the deadline is still on its way back
-/// from the helper thread.
-#[cfg(windows)]
-const LATE_ANSWER_GRACE: Duration = Duration::from_millis(250);
-
-/// Run a lifecycle exchange so that it ends by `deadline`.
-///
-/// On Windows kunobi-daemon's client connects through interprocess's
-/// local-socket layer, which waits for a busy pipe without limit whatever
-/// wait it is given (interprocess 2.4.4 to 2.4.6), so a daemon that stopped
-/// accepting would hold the caller past every deadline. The exchange runs on
-/// a helper thread there; one still running at the deadline fails with the
-/// connect timeout kunobi-daemon reports for a pipe that never freed, which
-/// callers already treat as a daemon that is not there yet. Elsewhere it runs
-/// inline: Unix sockets honour the deadline themselves.
-fn by_deadline<T: Send + 'static>(
-    deadline: Instant,
-    exchange: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    #[cfg(windows)]
-    {
-        crate::transport::finish_by(deadline + LATE_ANSWER_GRACE, exchange).unwrap_or_else(|| {
-            Err(
-                anyhow::Error::new(kunobi_daemon::local::ConnectError::ConnectTimeout)
-                    .context("lifecycle exchange outlived its deadline"),
-            )
-        })
+#[cfg(any(windows, test))]
+fn lifecycle_message(operation: u32) -> wire::Control {
+    wire::Control {
+        operation,
+        ..Default::default()
     }
-    #[cfg(not(windows))]
-    {
-        let _ = deadline;
-        exchange()
+}
+
+/// Use the shared codec, reply validation and peer policies with cancelable
+/// Windows I/O. The synchronous shared adapter cannot accept a bounded stream.
+#[cfg(windows)]
+fn request_windows(
+    path: PathBuf,
+    offer: wire::Hello,
+    expected: kunobi_daemon::ProcessId,
+    operation: u32,
+    deadline: Instant,
+) -> Result<wire::Health> {
+    use kunobi_daemon::client::RequestError as Error;
+    use kunobi_daemon::peer::{ExpectedProcess, Rejected};
+    super::with_windows_client(move || async move {
+        if Instant::now() >= deadline {
+            return Err(
+                Error::Unavailable(kunobi_daemon::local::ConnectError::ConnectTimeout).into(),
+            );
+        }
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+            // One attempt, as PlatformDuplex::connect_once_until specifies.
+            let stream = crate::transport::connect_tokio(&path, Duration::ZERO)
+                .await
+                .map_err(|error| Error::Unavailable(classify_connect_error(&error)))?;
+            let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+            let evidence = stream.credentials().map_err(Error::Credentials)?;
+            ExpectedProcess::new(move || Some(expected))
+                .grant(&evidence)
+                .map_err(Error::Peer)?;
+            let peer = evidence.pid.ok_or(Error::Peer(Rejected::Unreported))?;
+            if Instant::now() >= deadline {
+                return Err(Error::Late);
+            }
+            let mut session = wire::AsyncSession::connect(&stream, &offer)
+                .await
+                .map_err(Error::Protocol)?;
+            if Instant::now() >= deadline {
+                return Err(Error::Late);
+            }
+            let message = lifecycle_message(operation);
+            session.send(&message).await.map_err(Error::Protocol)?;
+            let reply = session.receive().await.map_err(Error::Protocol)?;
+            let health = wire::Health::from_response(&reply, &message).map_err(Error::Protocol)?;
+            if health.process_id != peer.get() {
+                return Err(Error::ProcessMismatch {
+                    peer,
+                    reported: health.process_id,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Late);
+            }
+            Ok(health)
+        })
+        .await
+        .map_err(|_| Error::Protocol(std::io::ErrorKind::TimedOut.into()))?
+        .map_err(anyhow::Error::from)
+    })
+}
+
+#[cfg(windows)]
+fn classify_connect_error(error: &std::io::Error) -> kunobi_daemon::local::ConnectError {
+    use kunobi_daemon::local::ConnectError;
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        ConnectError::PermissionDenied
+    } else if kunobi_daemon::local::is_transient(error) {
+        ConnectError::ConnectTimeout
+    } else {
+        ConnectError::Failed(error.kind())
     }
 }
 
@@ -203,8 +253,10 @@ pub(super) fn health(config: &Config, deadline: Instant) -> Result<Option<wire::
     request(config, operation::HEALTH, deadline)
 }
 
+#[cfg(not(windows))]
 type Local = kunobi_daemon::local::PlatformDuplex;
 
+#[cfg(not(windows))]
 fn connect(path: &Path, deadline: Instant) -> Result<Local> {
     let stream = Local::connect_once_until(&crate::transport::daemon_endpoint(path), deadline)?;
     let credentials = stream
@@ -224,11 +276,17 @@ fn connect(path: &Path, deadline: Instant) -> Result<Local> {
 /// Bounded compatibility exchange on the existing JSON endpoint. Only callers
 /// that found no binary advertisement may use this adapter.
 pub(super) fn legacy_request(path: &Path, request: &Request, deadline: Instant) -> Result<String> {
-    let path = path.to_path_buf();
-    let request = request.clone();
-    by_deadline(deadline, move || legacy_exchange(&path, &request, deadline))
+    #[cfg(not(windows))]
+    {
+        legacy_exchange(path, request, deadline)
+    }
+    #[cfg(windows)]
+    {
+        super::with_windows_client(|| legacy_exchange_windows(path, request, deadline))
+    }
 }
 
+#[cfg(not(windows))]
 fn legacy_exchange(path: &Path, request: &Request, deadline: Instant) -> Result<String> {
     use std::io::{BufRead, Read, Write};
     let stream = connect(path, deadline)?;
@@ -251,9 +309,91 @@ fn legacy_exchange(path: &Path, request: &Request, deadline: Instant) -> Result<
     Ok(response)
 }
 
+#[cfg(windows)]
+async fn legacy_exchange_windows(
+    path: &Path,
+    request: &Request,
+    deadline: Instant,
+) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    if Instant::now() >= deadline {
+        return Err(kunobi_daemon::local::ConnectError::ConnectTimeout.into());
+    }
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        let stream = crate::transport::connect_tokio(path, Duration::ZERO)
+            .await
+            .map_err(|error| classify_connect_error(&error))?;
+        let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+        SameUser
+            .grant(&stream.credentials()?)
+            .context("authenticating lifecycle peer")?;
+        if Instant::now() >= deadline {
+            return Err(kunobi_daemon::local::ConnectError::ConnectTimeout.into());
+        }
+        let mut bytes = serde_json::to_vec(request)?;
+        bytes.push(b'\n');
+        (&stream).write_all(&bytes).await?;
+        let mut response = String::new();
+        tokio::io::BufReader::new((&stream).take(65_536))
+            .read_line(&mut response)
+            .await?;
+        if !response.ends_with('\n') {
+            return Err(std::io::Error::from(if response.len() == 65_536 {
+                std::io::ErrorKind::InvalidData
+            } else {
+                std::io::ErrorKind::UnexpectedEof
+            })
+            .into());
+        }
+        anyhow::ensure!(Instant::now() < deadline, "late legacy lifecycle response");
+        Ok(response)
+    })
+    .await
+    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lifecycle_messages_preserve_health_and_drain_through_the_binary_codec() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let local = offer(&config).unwrap();
+        for operation in [operation::HEALTH, operation::DRAIN] {
+            let (client, server) = tokio::io::duplex(4096);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let client = async {
+                    let mut session = wire::AsyncSession::connect(client, &local).await.unwrap();
+                    let message = lifecycle_message(operation);
+                    session.send(&message).await.unwrap();
+                    let reply = session.receive().await.unwrap();
+                    let health = wire::Health::from_response(&reply, &message).unwrap();
+                    assert_eq!(health.ready, operation == operation::HEALTH);
+                    assert_eq!(health.draining, operation == operation::DRAIN);
+                };
+                let server = async {
+                    let mut session = wire::AsyncSession::accept(server, &local).await.unwrap();
+                    let message = session.receive().await.unwrap();
+                    assert_eq!(message.operation, operation);
+                    let health = wire::Health {
+                        process_id: std::process::id(),
+                        ready: message.operation == operation::HEALTH,
+                        draining: message.operation == operation::DRAIN,
+                        ..Default::default()
+                    };
+                    session
+                        .send(&health.response(&message).unwrap())
+                        .await
+                        .unwrap();
+                };
+                tokio::join!(client, server);
+            })
+            .await
+            .expect("binary lifecycle roundtrip stalled");
+        }
+    }
 
     /// A daemon that stopped accepting: its only pipe instance is taken. The
     /// legacy exchange ends by its deadline with an error callers treat as a
@@ -288,11 +428,296 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn by_deadline_returns_an_exchange_that_finishes_in_time() {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        assert_eq!(by_deadline(deadline, || Ok(5)).unwrap(), 5);
-        assert!(by_deadline::<()>(deadline, || anyhow::bail!("refused")).is_err());
+    fn advertised_binary_health_and_drain_fail_once_when_the_pipe_is_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let control = endpoint(&config);
+        let _listener = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&control).unwrap())
+            .create_sync()
+            .unwrap();
+        let _first = crate::transport::connect_sync(&control, Duration::ZERO).unwrap();
+        let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+        coord.control_version = Some(wire::VERSION);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        for operation in [operation::HEALTH, operation::DRAIN] {
+            let probe = config.clone();
+            let (done, finished) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            std::thread::spawn(move || {
+                let _ = done.send(request(
+                    &probe,
+                    operation,
+                    Instant::now() + Duration::from_secs(2),
+                ));
+            });
+            let failure = finished
+                .recv_timeout(Duration::from_secs(20))
+                .expect("binary lifecycle connect hung")
+                .unwrap_err();
+            assert!(matches!(
+                failure.downcast_ref::<kunobi_daemon::client::RequestError>(),
+                Some(kunobi_daemon::client::RequestError::Unavailable(
+                    kunobi_daemon::local::ConnectError::ConnectTimeout
+                ))
+            ));
+            assert!(super::super::lifecycle_client::transient(&failure));
+            assert!(
+                started.elapsed() < Duration::from_millis(750),
+                "one attempt must not spend the two-second retry budget"
+            );
+        }
+    }
+
+    /// Both adapters must bound a connected peer that leaves its hello or
+    /// request unread, not only the ERROR_PIPE_BUSY connection path.
+    #[cfg(windows)]
+    #[test]
+    fn connected_lifecycle_exchanges_honor_short_deadlines() {
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let control = endpoint(&config);
+        let _binary = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&control).unwrap())
+            .create_sync()
+            .unwrap();
+        let socket = config.socket_path();
+        let _legacy = crate::transport::ListenerOptions::new()
+            .name(crate::transport::socket_name(&socket).unwrap())
+            .create_sync()
+            .unwrap();
+        let mut coord = DaemonCoordFile::for_socket(&socket);
+        coord.control_version = Some(wire::VERSION);
+        coord.write_phase(DaemonPhase::Ready).unwrap();
+        for binary in [true, false] {
+            let config = config.clone();
+            let socket = socket.clone();
+            let (done, finished) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(75);
+                let result = if binary {
+                    request(&config, operation::HEALTH, deadline).map(|_| ())
+                } else {
+                    legacy_request(&socket, &Request::Health, deadline).map(|_| ())
+                };
+                let _ = done.send(result);
+            });
+            let failure = finished
+                .recv_timeout(Duration::from_secs(20))
+                .expect("connected lifecycle exchange hung")
+                .unwrap_err();
+            assert!(started.elapsed() < Duration::from_millis(750));
+            if binary {
+                assert!(matches!(
+                    failure.downcast_ref::<kunobi_daemon::client::RequestError>(),
+                    Some(kunobi_daemon::client::RequestError::Protocol(error))
+                        if error.kind() == std::io::ErrorKind::TimedOut
+                ));
+                assert!(!super::super::lifecycle_client::transient(&failure));
+            } else {
+                assert_eq!(
+                    failure.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::TimedOut
+                );
+                assert!(super::super::lifecycle_client::transient(&failure));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn expired_legacy_deadline_is_transient_and_permission_errors_are_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let error = legacy_request(
+            &root.path().join("absent.sock"),
+            &Request::Health,
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(super::super::lifecycle_client::transient(&error));
+        assert_eq!(
+            classify_connect_error(&std::io::ErrorKind::PermissionDenied.into()),
+            kunobi_daemon::local::ConnectError::PermissionDenied
+        );
+        assert_eq!(
+            classify_connect_error(&std::io::ErrorKind::InvalidData.into()),
+            kunobi_daemon::local::ConnectError::Failed(std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_legacy_replies_preserve_framing_and_the_size_limit() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut limit_with_newline = vec![b'x'; 65_535];
+        limit_with_newline.push(b'\n');
+        for (payload, expected) in [
+            (b"ready\n".to_vec(), None),
+            (limit_with_newline, None),
+            (b"partial".to_vec(), Some(std::io::ErrorKind::UnexpectedEof)),
+            (vec![b'x'; 65_536], Some(std::io::ErrorKind::InvalidData)),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("legacy.sock");
+            let listener = crate::transport::bind_daemon_listener(&socket)
+                .await
+                .unwrap()
+                .unwrap();
+            let answer = payload.clone();
+            let server = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let stream = listener.accept().await.unwrap();
+                    let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+                    let mut line = String::new();
+                    tokio::io::BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        serde_json::from_str::<Request>(&line).unwrap(),
+                        Request::Health
+                    ));
+                    (&stream).write_all(&answer).await.unwrap();
+                    // The reader may close immediately after rejecting the frame.
+                    let _ = (&stream).flush().await;
+                })
+                .await
+                .expect("legacy reply fixture stalled");
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                legacy_request(
+                    &socket,
+                    &Request::Health,
+                    Instant::now() + Duration::from_secs(5),
+                )
+            })
+            .await
+            .unwrap();
+            server.await.unwrap();
+            match expected {
+                None => assert_eq!(result.unwrap().as_bytes(), payload),
+                Some(kind) => assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<std::io::Error>()
+                        .unwrap()
+                        .kind(),
+                    kind
+                ),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_binary_replies_validate_identity_operation_and_refusal() {
+        use kunobi_daemon::client::RequestError;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Reply {
+            Valid,
+            OtherProcess,
+            OtherOperation,
+            OtherRequest,
+            Refused,
+        }
+
+        for case in [
+            Reply::Valid,
+            Reply::OtherProcess,
+            Reply::OtherOperation,
+            Reply::OtherRequest,
+            Reply::Refused,
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let config = super::super::tests::test_config(root.path());
+            let listener = crate::transport::bind_daemon_listener(&endpoint(&config))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut coord = DaemonCoordFile::for_socket(&config.socket_path());
+            coord.control_version = Some(wire::VERSION);
+            coord.write_phase(DaemonPhase::Ready).unwrap();
+            let local = offer(&config).unwrap();
+            let invalid = request(
+                &config,
+                operation::PREPARE,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap_err();
+            assert!(
+                invalid
+                    .to_string()
+                    .contains("unsupported lifecycle operation")
+            );
+
+            let server = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let stream = listener.accept().await.unwrap();
+                    let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+                    if matches!(case, Reply::Refused) {
+                        wire::AsyncSession::refuse(&stream, &local, wire::Refused::PeerRejected)
+                            .await
+                            .unwrap();
+                        return;
+                    }
+                    let mut session = wire::AsyncSession::accept(&stream, &local).await.unwrap();
+                    let message = session.receive().await.unwrap();
+                    assert_eq!(message.operation, operation::HEALTH);
+                    let health = wire::Health {
+                        process_id: if matches!(case, Reply::OtherProcess) {
+                            std::process::id().checked_add(1).unwrap()
+                        } else {
+                            std::process::id()
+                        },
+                        ready: true,
+                        ..Default::default()
+                    };
+                    let mut reply = health.response(&message).unwrap();
+                    match case {
+                        Reply::OtherOperation => reply.operation = operation::DRAIN,
+                        Reply::OtherRequest => reply.request_id = message.request_id + 1,
+                        _ => {}
+                    }
+                    session.send(&reply).await.unwrap();
+                })
+                .await
+                .expect("binary reply fixture stalled");
+            });
+            let result = query(&config, operation::HEALTH).await;
+            server.await.unwrap();
+            if matches!(case, Reply::Valid) {
+                let health = result.unwrap().unwrap();
+                assert_eq!(health.process_id, std::process::id());
+                assert!(health.ready);
+                continue;
+            }
+            let error = result.unwrap_err();
+            match case {
+                Reply::OtherProcess => assert!(matches!(
+                    error.downcast_ref::<RequestError>(),
+                    Some(RequestError::ProcessMismatch { .. })
+                )),
+                Reply::OtherOperation | Reply::OtherRequest => assert!(matches!(
+                    error.downcast_ref::<RequestError>(),
+                    Some(RequestError::Protocol(error))
+                        if error.kind() == std::io::ErrorKind::InvalidData
+                )),
+                Reply::Refused => {
+                    assert!(matches!(
+                        error.downcast_ref::<RequestError>(),
+                        Some(RequestError::Protocol(error))
+                            if wire::Refused::of(error) == Some(wire::Refused::PeerRejected)
+                    ));
+                    assert!(!super::super::lifecycle_client::transient(&error));
+                }
+                Reply::Valid => unreachable!(),
+            }
+        }
     }
 
     /// Both endpoints are Unix sockets in the same directory, so they share one

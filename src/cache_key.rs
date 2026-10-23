@@ -4870,8 +4870,8 @@ fn compute_key_into(
     // or unknown modifier is uncacheable.
     // Direct command-line native Windows MSVC libraries are handled separately
     // below: their import-library bytes affect the executable and are hashed
-    // as part of the host link identity, which refuses files handed to LINK
-    // through `-C link-arg` (`.res`, `.def`, `.obj`, `/DEF:`, ...).
+    // as part of the host link identity. That identity also hashes compiled
+    // resources; other raw files and explicit manifest inputs stay refused.
     // Linker order/section-order/map files and opaque response files require
     // side-input/output handling beyond the archive key. Fail closed instead
     // of caching an invocation whose auxiliary behavior cannot be reproduced.
@@ -5187,9 +5187,9 @@ fn compute_key_into(
         args,
         &rustc_version,
         cfg!(target_os = "windows"),
-        |linker, architecture, host| {
-            let search_dirs = windows_native_link_search_dirs(args)?;
-            let mut identity =
+        file_hasher,
+        |linker, architecture, host, search_dirs| {
+            Ok(
                 crate::native_link_key::probe_windows_msvc_identity_with_library_dirs_for(
                     linker,
                     architecture,
@@ -5200,11 +5200,8 @@ fn compute_key_into(
                     |path| file_hasher.hash_static_lib(path),
                     invocation,
                 )?
-                .encode();
-            append_windows_link_argument_files(&mut identity, &search_dirs.files, |path| {
-                file_hasher.hash(path)
-            })?;
-            Ok(identity)
+                .encode(),
+            )
         },
         invocation,
     )?;
@@ -8751,15 +8748,20 @@ struct RecentHash {
 /// [`hash_file`], for a read that follows a stat of the same file.
 fn read_file_hash(path: &Path) -> Result<String> {
     #[cfg(test)]
+    before_file_read(path);
+    hash_file(path)
+}
+
+#[cfg(test)]
+fn before_file_read(path: &Path) {
     BEFORE_READ.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook(path);
         }
     });
-    hash_file(path)
 }
 
-/// Run by [`read_file_hash`] before it reads, so a test can write to a file
+/// Run before a file read, so a test can write to a file
 /// between a hasher's stat and its read.
 #[cfg(test)]
 pub(crate) type BeforeRead = Box<dyn FnMut(&Path)>;
@@ -10015,6 +10017,50 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: observed.map(|observed| observed.fingerprint),
+                header_scan: None,
+            },
+        );
+        Ok(hash)
+    }
+
+    /// Validate and hash a compiled resource from one open file. Whole-file
+    /// memo rows carry no format proof, so these inputs are streamed on every
+    /// key rather than accepting an archive renamed to `.res`.
+    fn hash_windows_resource(&self, path: &Path) -> Result<String> {
+        use std::io::Read as _;
+
+        let _trace = crate::phase_trace::phase("input_hash");
+        let resolved = self.resolve_path(path)?;
+        let path = resolved.as_path();
+        let before = ObservedFingerprint::from_path(path)?;
+        self.note_too_new(&before.fingerprint);
+        #[cfg(test)]
+        before_file_read(path);
+        let mut file = std::fs::File::open(path)?;
+        // The standard null-resource header starts RC output. Its first 16
+        // bytes are LLVM's WinResMagic; the remaining null fields are zero.
+        const HEADER: [u8; 32] = [
+            0, 0, 0, 0, 32, 0, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+        ];
+        let mut prefix = [0; 32];
+        file.read_exact(&mut prefix)
+            .context("reading the compiled resource header")?;
+        if prefix != HEADER {
+            anyhow::bail!("linker input is not a supported compiled resource");
+        }
+        let mut digest = blake3::Hasher::new();
+        digest.update(&prefix);
+        digest.update_reader(file)?;
+        let hash = digest.finalize().to_hex().to_string();
+        self.record_miss(before.fingerprint.size);
+        let (observed, _) = self.restat_after_read(path, before, true);
+        self.guard_input(&observed);
+        self.recent_hashes.borrow_mut().insert(
+            resolved,
+            RecentHash {
+                hash: hash.clone(),
+                fingerprint: Some(observed.fingerprint),
                 header_scan: None,
             },
         );
@@ -12245,23 +12291,19 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
         let Some(value) = value.as_deref() else {
             continue;
         };
-        if crate::native_link_key::windows_link_argument_has_unmodeled_input(value) {
-            if let Some(inputs) =
-                crate::native_link_key::windows_link_argument_input_files(key, value)
-            {
-                files.extend(inputs);
-                continue;
-            }
-            anyhow::bail!(
-                "explicit Windows linker input files (.lib/.a/.obj/.o/.res/.def/.exp/.manifest) \
-                 other than an absolute .res/.obj/.o/.lib/.a or /MANIFESTINPUT path, and \
-                 file-carrying LINK options (/DEF, /DEFAULTLIB, /MANIFESTFILE, /PDBSTRIPPED, \
-                 a side-by-side /MANIFEST, ...) are not hashed and are not cacheable"
-            );
-        }
+        // A file in this carrier must not hide an accompanying /LIBPATH.
+        // Its existing parser refuses mixed/ambiguous values until both can
+        // be modeled together without changing library search order.
         if let Some(path) = windows_libpath_argument(value)? {
             linker.push(PathBuf::from(path));
         }
+        let Some(inputs) = crate::native_link_key::windows_link_argument_input_files(key, value)
+        else {
+            anyhow::bail!(
+                "Windows linker input files other than absolute compiled resources, and unmodeled file-carrying LINK options, are not cacheable"
+            );
+        };
+        files.extend(inputs);
     }
     Ok(WindowsNativeLinkSearchDirs {
         rustc,
@@ -12270,25 +12312,24 @@ fn windows_native_link_search_dirs(args: &RustcArgs) -> Result<WindowsNativeLink
     })
 }
 
-/// Append the digest of each file a native MSVC link reads through `-C
-/// link-arg` to its identity, in argument order. LINK merges these files
-/// into the image (a resource, an object, a manifest), so a file rebuilt in
-/// place under the same name must change the key; a file that is gone
-/// cannot be keyed and fails closed.
-fn append_windows_link_argument_files(
-    identity: &mut String,
+/// Add compiled-resource digests to the MSVC identity in argument order.
+/// Missing inputs or unsupported formats make the link uncacheable.
+fn windows_link_identity_with_argument_files(
+    mut identity: String,
     files: &[PathBuf],
-    hash: impl Fn(&Path) -> Result<String>,
-) -> Result<()> {
+    file_hasher: &FileHasher<'_>,
+) -> Result<String> {
     for (index, file) in files.iter().enumerate() {
-        if !file.is_file() {
+        let resolved = file_hasher.resolve_path(file)?;
+        if !resolved.is_file() {
             anyhow::bail!("linker input {} is not a regular file", file.display());
         }
-        let digest =
-            hash(file).with_context(|| format!("hashing linker input {}", file.display()))?;
+        let digest = file_hasher
+            .hash_windows_resource(file)
+            .with_context(|| format!("hashing linker input {}", file.display()))?;
         identity.push_str(&format!("\nlink_arg_input.v1={index}={digest}"));
     }
-    Ok(())
+    Ok(identity)
 }
 
 fn windows_libpath_argument(value: &str) -> Result<Option<String>> {
@@ -12371,7 +12412,7 @@ where
 /// Fold the selected native Windows MSVC link identity into a linked-output
 /// key. The probe is injected so the admission gate can be tested without a
 /// Windows toolchain; production supplies the real tool/library discovery.
-/// It gets the selected linker, the MSVC architecture and rustc's host.
+/// Argument admission and resource hashing stay in the shared fold.
 #[cfg(test)]
 fn fold_native_windows_msvc_identity<H, Probe>(
     hasher: &mut H,
@@ -12384,13 +12425,15 @@ where
     H: KeyFold,
     Probe: FnOnce(Option<&Path>, &str, &str) -> Result<String>,
 {
+    let invocation = InvocationEnv::capture();
     fold_native_windows_msvc_identity_for(
         hasher,
         args,
         rustc_version,
         running_on_windows,
-        probe,
-        &InvocationEnv::capture(),
+        &FileHasher::new_for(&invocation),
+        |linker, architecture, host, _| probe(linker, architecture, host),
+        &invocation,
     )
 }
 
@@ -12399,12 +12442,13 @@ fn fold_native_windows_msvc_identity_for<H, Probe>(
     args: &RustcArgs,
     rustc_version: &str,
     running_on_windows: bool,
+    file_hasher: &FileHasher<'_>,
     probe: Probe,
     invocation: &InvocationEnv,
 ) -> Result<()>
 where
     H: KeyFold,
-    Probe: FnOnce(Option<&Path>, &str, &str) -> Result<String>,
+    Probe: FnOnce(Option<&Path>, &str, &str, &WindowsNativeLinkSearchDirs) -> Result<String>,
 {
     if !running_on_windows || !args.is_executable_output() || !args.emits_link() {
         return Ok(());
@@ -12449,8 +12493,11 @@ where
             );
         }
     }
-    let identity = probe(linker, architecture, host)
+    let search_dirs = windows_native_link_search_dirs(args)?;
+    let identity = probe(linker, architecture, host, &search_dirs)
         .context("determining native Windows MSVC link identity")?;
+    let identity =
+        windows_link_identity_with_argument_files(identity, &search_dirs.files, file_hasher)?;
     fold_field(&mut *hasher, b"host_windows_msvc.v1:", identity.as_bytes());
     tracing::trace!(
         "[key:{}] host_windows_msvc={}",

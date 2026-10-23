@@ -2833,6 +2833,55 @@ fn the_daemon_sweep_flushes_entries_pending_durability() {
     assert!(store.try_durability_flush_lock().unwrap().is_some());
 }
 
+/// A busy or missing shard must not prevent the main store and later shards
+/// from flushing. Opening a missing volume would create its store directory.
+#[test]
+fn the_daemon_sweep_flushes_volume_shards_and_skips_busy_or_missing_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    config.deferred_durability = true;
+    config.volume_stores = ["busy", "missing", "ready"]
+        .into_iter()
+        .map(|name| crate::config::VolumeStore {
+            volume: dir.path().join(name).to_string_lossy().into_owned(),
+            store: dir.path().join(name),
+            max_size: None,
+        })
+        .collect();
+    let main = Store::open(&config).unwrap();
+    let busy = Store::open(&config.for_volume_store(&config.volume_stores[0], |_| None)).unwrap();
+    let ready = Store::open(&config.for_volume_store(&config.volume_stores[2], |_| None)).unwrap();
+    for (name, store) in [("main", &main), ("busy", &busy), ("ready", &ready)] {
+        let output = dir.path().join(format!("{name}.rlib"));
+        std::fs::write(&output, name.as_bytes()).unwrap();
+        store
+            .put(
+                "pending",
+                "pending_crate",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output, "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(store.pending_durability().unwrap(), 1);
+    }
+    let held = busy.try_durability_flush_lock().unwrap().unwrap();
+    let missing = config.volume_stores[1].store.clone();
+    let daemon = Daemon::new(config);
+    daemon.flush_pending_durability();
+    assert_eq!(main.pending_durability().unwrap(), 0);
+    assert_eq!(busy.pending_durability().unwrap(), 1);
+    assert_eq!(ready.pending_durability().unwrap(), 0);
+    assert!(!missing.exists(), "an unmounted shard must not be created");
+    drop(held);
+    daemon.flush_pending_durability();
+    assert_eq!(busy.pending_durability().unwrap(), 0);
+}
+
 #[test]
 fn test_handle_gc_reports_lock_skip() {
     let dir = tempfile::tempdir().unwrap();
@@ -8767,6 +8816,118 @@ async fn packed_import_error_marks_the_pack_failed_without_entry_validation_erro
         .unwrap();
     assert_eq!(entry.crate_name, "serde");
     assert_eq!(entry.outcome, "import_error");
+}
+
+#[test]
+fn packed_import_cleanup_preserves_committed_entries_after_a_strict_flush_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.deferred_durability = false;
+    let strict = Store::open(&config).unwrap();
+    let mut deferred_config = config.clone();
+    deferred_config.deferred_durability = true;
+    let deferred = Store::open(&deferred_config).unwrap();
+    let keys = ["healthy-packed", "pending-packed", "new-packed"].map(test_cache_key);
+    let healthy_bytes = b"healthy packed artifact";
+    let pending_bytes = b"pending packed artifact";
+    let seed = |store: &Store, key: &str, bytes: &[u8]| {
+        let source = dir.path().join(format!("{key}.rlib"));
+        std::fs::write(&source, bytes).unwrap();
+        store
+            .put(
+                key,
+                "fixture",
+                &["lib".to_string()],
+                &[],
+                "",
+                "dev",
+                &[(source, "libartifact.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.stored_meta(key).unwrap()
+    };
+    let healthy = seed(&strict, &keys[0], healthy_bytes);
+    let pending = seed(&deferred, &keys[1], pending_bytes);
+    let mut newly_imported = healthy.clone();
+    newly_imported.cache_key = keys[2].clone();
+    let mut batch = vec![
+        crate::store::VerifiedRestoredEntry {
+            cache_key: keys[0].clone(),
+            meta: healthy,
+        },
+        crate::store::VerifiedRestoredEntry {
+            cache_key: keys[2].clone(),
+            meta: newly_imported,
+        },
+        crate::store::VerifiedRestoredEntry {
+            cache_key: keys[1].clone(),
+            meta: pending,
+        },
+    ];
+    let metadata: Vec<_> = batch
+        .iter()
+        .map(|entry| {
+            let entry_dir = strict.entry_dir(&entry.cache_key);
+            std::fs::create_dir_all(&entry_dir).unwrap();
+            let bytes = serde_json::to_vec_pretty(&entry.meta).unwrap();
+            std::fs::write(entry_dir.join("meta.json"), &bytes).unwrap();
+            let artifact = if entry.cache_key == keys[1] {
+                &pending_bytes[..]
+            } else {
+                &healthy_bytes[..]
+            };
+            std::fs::write(entry_dir.join("libartifact.rlib"), artifact).unwrap();
+            bytes
+        })
+        .collect();
+    let blob = strict.blob_path(&batch[2].meta.files[0].hash);
+    let mut permissions = std::fs::metadata(&blob).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(&blob, permissions).unwrap();
+    std::fs::write(&blob, vec![b'x'; pending_bytes.len()]).unwrap();
+    assert!(!strict.contains(&keys[2]));
+    let daemon = Daemon::new(config);
+    assert!(
+        daemon
+            .with_store(|store| store.import_verified_restored_entries(&batch))
+            .is_err()
+    );
+    assert!(
+        keys.iter().all(|key| strict.contains(key)),
+        "the batch committed before strict flushing failed"
+    );
+    assert_eq!(strict.pending_durability().unwrap(), 1);
+
+    // The same cleanup also handles pre-commit residue without deleting a
+    // concurrent publisher's committed metadata.
+    let residue_key = test_cache_key("uncommitted-packed-residue");
+    let mut residue = batch[0].clone();
+    residue.cache_key = residue_key.clone();
+    residue.meta.cache_key = residue_key.clone();
+    let residue_dir = strict.entry_dir(&residue_key);
+    std::fs::create_dir_all(&residue_dir).unwrap();
+    std::fs::write(
+        residue_dir.join("meta.json"),
+        serde_json::to_vec(&residue.meta).unwrap(),
+    )
+    .unwrap();
+    batch.push(residue);
+    daemon.discard_uncommitted_packed_entries(&batch).unwrap();
+    assert!(!residue_dir.exists());
+    for (entry, expected) in batch.iter().zip(metadata) {
+        assert!(strict.contains(&entry.cache_key));
+        assert_eq!(
+            std::fs::read(strict.entry_dir(&entry.cache_key).join("meta.json")).unwrap(),
+            expected
+        );
+    }
+    assert!(strict.get(&keys[0]).unwrap().is_some());
+    assert!(strict.get(&keys[2]).unwrap().is_some());
+    std::fs::write(&blob, pending_bytes).unwrap();
+    assert!(strict.flush_entry_durability(&keys[1]).unwrap());
+    assert_eq!(strict.pending_durability().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -15829,30 +15990,6 @@ fn daemon_stats_include_rotated_events() {
     assert_eq!(snapshot.events.misses, 1);
 }
 
-/// Daemon requests share one client runtime instead of building one each,
-/// and two threads can run on it at once.
-#[test]
-fn daemon_requests_share_one_client_runtime() {
-    let first = daemon_client_runtime().unwrap() as *const tokio::runtime::Runtime;
-    let threads: Vec<_> = (0..2)
-        .map(|_| {
-            std::thread::spawn(|| {
-                let runtime = daemon_client_runtime().unwrap();
-                let value = runtime.block_on(async {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    7
-                });
-                (runtime as *const tokio::runtime::Runtime as usize, value)
-            })
-        })
-        .collect();
-    for thread in threads {
-        let (runtime, value) = thread.join().unwrap();
-        assert_eq!(runtime, first as usize);
-        assert_eq!(value, 7);
-    }
-}
-
 /// Run `work` on a thread and fail the test if it has not finished in 20 s:
 /// the hang these tests guard against must fail them, not stall the run.
 #[cfg(windows)]
@@ -15913,26 +16050,83 @@ fn a_fire_and_forget_request_to_a_daemon_that_never_reads_gives_up_within_its_wa
 }
 
 /// The same hand-off still delivers its line to a daemon that reads it.
-#[test]
-fn a_fire_and_forget_request_reaches_a_daemon_that_reads_it() {
-    use interprocess::local_socket::traits::Listener as _;
-    use std::io::BufRead;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fire_and_forget_request_reaches_a_daemon_that_reads_it() {
+    use tokio::io::AsyncBufReadExt;
+
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("daemon.sock");
-    let listener = ListenerOptions::new()
-        .name(socket_name(&socket).unwrap())
-        .create_sync()
-        .expect("bind listener");
+    let listener = crate::transport::bind_daemon_listener(&socket)
+        .await
+        .unwrap()
+        .unwrap();
     let line = format!("{{\"pad\":\"{}\"}}\n", "y".repeat(256 << 10));
     let expected = line.clone();
-    let reader = std::thread::spawn(move || {
-        let stream = listener.accept().expect("accept");
-        let mut received = String::new();
-        std::io::BufReader::new(stream)
-            .read_line(&mut received)
-            .unwrap();
-        received
+    let (release, held) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let stream = listener.accept().await.expect("accept");
+            #[cfg(windows)]
+            let _discard = crate::transport::discard_pipe_writes_on_drop(&stream);
+            let mut received = String::new();
+            tokio::io::BufReader::new(&stream)
+                .read_line(&mut received)
+                .await
+                .unwrap();
+            held.await.unwrap();
+            received
+        })
+        .await
+        .expect("the fire-and-forget request was never delivered")
     });
-    send_line_fire_and_forget(&socket, line, Duration::from_secs(10)).expect("send");
-    assert_eq!(reader.join().unwrap(), expected);
+    tokio::task::spawn_blocking(move || {
+        send_line_fire_and_forget(&socket, line, Duration::from_secs(10))
+    })
+    .await
+    .unwrap()
+    .expect("send");
+    release.send(()).unwrap();
+    assert_eq!(reader.await.unwrap(), expected);
+}
+
+/// Measure the actual request, including creation and destruction of its
+/// runtime, against a pipe whose only instance remains occupied.
+#[cfg(windows)]
+#[test]
+fn a_busy_windows_request_honors_its_short_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("request-busy.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .unwrap();
+    let _first = crate::transport::connect_sync(&socket, Duration::ZERO).unwrap();
+    let started = Instant::now();
+    let result = within_20s(move || {
+        send_request_with_timeout(&socket, &Request::Health, Duration::from_millis(75))
+    });
+    assert!(result.is_err());
+    assert!(started.elapsed() < Duration::from_millis(750));
+}
+
+/// Even a short write that fits in the kernel buffer must not escape into
+/// interprocess's unbounded background flush when the peer never reads.
+#[cfg(windows)]
+#[test]
+fn a_buffered_fire_and_forget_request_is_bounded_through_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("buffered-write.sock");
+    let _listener = ListenerOptions::new()
+        .name(socket_name(&socket).unwrap())
+        .create_sync()
+        .unwrap();
+    let started = Instant::now();
+    let result = within_20s(move || {
+        send_line_fire_and_forget(&socket, "{}\n".to_owned(), Duration::from_millis(500))
+    });
+    assert!(
+        result.is_err(),
+        "a peer that never reads cannot finish a flush"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
