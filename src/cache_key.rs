@@ -5636,7 +5636,7 @@ impl StaticLibUse {
     fn memo_namespace(self) -> &'static str {
         match self {
             Self::Bundled => "static-ar-v9-bundled",
-            Self::Linked => "static-ar-v8",
+            Self::Linked => "static-ar-v9-linked",
         }
     }
 }
@@ -6307,10 +6307,10 @@ fn native_scan_dirs(
 /// The scan keys a linked output to every archive its scanned `-L` dirs
 /// hold, so an archive a build script rebuilds with different bytes each run
 /// (a build date, say) re-keys every linked unit downstream, as its output
-/// changes too. An archive whose members the portable digest does not admit
-/// (wasm or COFF objects, LTO bitcode) keys with its path, so a linked output
-/// that finds one in a build-tree dir hits only in the checkout that stored
-/// it.
+/// changes too. An archive of COFF objects keys without its directory
+/// ([`crate::coff_archive`]); one whose members neither digest admits (wasm
+/// objects, LTO bitcode) keys with its path, so a linked output that finds
+/// one in a build-tree dir hits only in the checkout that stored it.
 ///
 /// Not keyed: a library a dependency's metadata names and the linker finds
 /// only in its default dirs, which no argv of this unit shows, and the
@@ -7730,8 +7730,8 @@ fn compute_static_lib_hash_for(
     // bundling unit does not link. Archives of COFF objects (every cc-built
     // `-sys` library for `*-windows-msvc`, MSVC `.lib`s a crate ships) fall
     // outside the structural digest, and bound to their path, each such rlib
-    // was rebuilt in every checkout. A link of the archive itself keeps the
-    // fallback.
+    // was rebuilt in every checkout. A link of the archive itself is keyed
+    // without its directory below, when it reads as COFF.
     if usage == StaticLibUse::Bundled && bytes.starts_with(b"!<arch>\n") {
         // MSVC objects record the directory they were built in (the build
         // script's `OUT_DIR`, so the target directory): left out, the crate
@@ -7745,6 +7745,24 @@ fn compute_static_lib_hash_for(
         hasher.update(b"kache.native-ar.bundled-content.v1\0");
         hasher.update(&bytes);
         return Ok(format!("bundled-ar-v1:{}", hasher.finalize().to_hex()));
+    }
+
+    // A link of an archive of COFF objects (lld-link, link.exe) writes no
+    // path of the archive into the image: the archive and member names reach
+    // only the PDB's module records, as the build-script paths in the
+    // objects' own debug records do. Keyed without its directory, as where it
+    // is bundled, a test or binary that links a cc-built `-sys` library hits
+    // in every target directory instead of only the one that stored it (a
+    // second checkout relinked every test binary). What a hit restores is the
+    // image and PDB another target directory linked: the PDB names that
+    // directory's archives, the code is the same.
+    if usage == StaticLibUse::Linked
+        && bytes.starts_with(b"!<arch>\n")
+        && let Some(digest) = path.parent().and_then(|dir| {
+            crate::coff_archive::path_free_digest(&bytes, dir.as_os_str().as_encoded_bytes())
+        })
+    {
+        return Ok(format!("linked-coff-v1:{digest}"));
     }
 
     let encoded_path = absolute.as_os_str().as_encoded_bytes();
