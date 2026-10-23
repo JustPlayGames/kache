@@ -74,12 +74,13 @@ const ACTION_SUFFIX: &str = ".kache-real.action";
 /// up to the profile directory (`../../`, or `../../../../` in Cargo's
 /// per-unit layout), each NUL-terminated. The launcher reads it instead of
 /// listing the directory.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) const LAUNCH_RECORD: &str = ".kache-launch";
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) const SHIM_DIR: &str = ".kache-build-script-shims";
-/// The launcher binary for this target, built from `launcher/build_script.rs`.
-#[cfg(unix)]
+/// The launcher binary for this target, built from `launcher/build_script.rs`
+/// (`launcher/build_script_windows.rs` on Windows).
+#[cfg(any(unix, windows))]
 const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
 // Version 1 could omit whitespace-padded Cargo declarations.
 const PREDICTION_SCHEMA: u32 = 2;
@@ -142,10 +143,13 @@ fn build_script_output_for(args: &RustcArgs, cargo_bin: bool) -> Option<PathBuf>
     if !crate::cargo_layout::is_build_script_dir(out_dir) {
         return None;
     }
-    let stem = crate::args::format_crate_output_stem(
+    let mut stem = crate::args::format_crate_output_stem(
         crate_name,
         args.extra_filename.as_deref().unwrap_or(""),
     );
+    // A build script runs on this host: `build_script_build-<hash>.exe` on
+    // Windows.
+    stem.push_str(std::env::consts::EXE_SUFFIX);
     Some(out_dir.join(stem))
 }
 
@@ -154,7 +158,7 @@ fn build_script_output_for(args: &RustcArgs, cargo_bin: bool) -> Option<PathBuf>
 /// Best-effort: any failure leaves the real binary where Cargo expects it and
 /// the script simply runs uncached.
 pub fn install_shim(args: &RustcArgs) {
-    if !enabled() || !cfg!(unix) {
+    if !enabled() || !launchers_supported() {
         return;
     }
     let Some(executable) = compiled_build_script(args) else {
@@ -165,11 +169,31 @@ pub fn install_shim(args: &RustcArgs) {
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn install(executable: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
+/// Whether this build of kache installs build-script launchers: Unix, and
+/// Windows when built for MSVC (the launcher is built only there).
+fn launchers_supported() -> bool {
+    cfg!(unix) || (cfg!(windows) && !LAUNCHER.is_empty())
+}
 
+/// The bytes of a path in a launch record: the OS's own on Unix, UTF-8 on
+/// Windows (a path that is not valid Unicode is refused).
+#[cfg(any(unix, windows))]
+fn record_bytes(path: &OsStr) -> Result<&[u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(path.as_bytes())
+    }
+    #[cfg(windows)]
+    {
+        path.to_str()
+            .map(str::as_bytes)
+            .context("a launcher path is not valid Unicode")
+    }
+}
+
+#[cfg(any(unix, windows))]
+pub(crate) fn install(executable: &Path) -> Result<()> {
     let metadata = std::fs::metadata(executable)?;
     let modified = metadata.modified()?;
     let real = with_suffix(executable, REAL_SUFFIX);
@@ -203,9 +227,9 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
         std::fs::write(
             &record,
             [
-                real_name.as_bytes(),
+                record_bytes(real_name)?,
                 b"\0",
-                relative.as_os_str().as_bytes(),
+                record_bytes(relative.as_os_str())?,
                 b"\0",
                 to_profile.as_bytes(),
                 b"\0",
@@ -214,7 +238,11 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
         )?;
         let temporary = with_suffix(executable, ".kache-launcher");
         std::fs::write(&temporary, LAUNCHER)?;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+        }
         // Cargo compares this path's mtime with its inputs when deciding
         // whether the compilation is fresh; keep the binary's.
         std::fs::OpenOptions::new()
@@ -234,13 +262,13 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn install(_executable: &Path) -> Result<()> {
-    anyhow::bail!("build-script launchers are only installed on Unix")
+    anyhow::bail!("build-script launchers are only installed on Unix and Windows")
 }
 
 /// `../` once for each level `ancestor` sits above `directory`.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn relative_to_ancestor(directory: &Path, ancestor: &Path) -> Option<String> {
     let depth = directory.strip_prefix(ancestor).ok()?.components().count();
     Some("../".repeat(depth))
@@ -249,10 +277,8 @@ fn relative_to_ancestor(directory: &Path, ancestor: &Path) -> Option<String> {
 /// One independent copy of the running kache per profile directory, addressed
 /// by the binary's identity so an upgrade pins a new copy and old launchers keep
 /// working until the target directory is cleaned.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-
     // macOS current_exe can name a relative symlink. Copy its target.
     let kache = kache
         .canonicalize()
@@ -270,23 +296,52 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
     let directory = profile
         .join(SHIM_DIR)
         .join(&identity.finalize().to_hex()[..32]);
-    let pinned = directory.join("kache");
-    if std::fs::symlink_metadata(&pinned)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
-    {
+    let pinned = directory.join(PINNED_NAME);
+    if pinned_in_place(&pinned) {
         return Ok(pinned);
     }
     std::fs::create_dir_all(&directory)?;
     let temporary = tempfile::TempDir::new_in(&directory)?;
-    let staged = temporary.path().join("kache");
+    let staged = temporary.path().join(PINNED_NAME);
     if kache_fs::try_reflink(&kache, &staged).is_err() {
         kache_fs::copy_writable(&kache, &staged, true)?;
     }
     kache_fs::set_writable_permissions(&staged, true)?;
     wait_for_no_writers(&staged);
     // Replace old symlink pins atomically. Concurrent installers pin the same bytes.
-    std::fs::rename(&staged, &pinned)?;
+    if let Err(error) = std::fs::rename(&staged, &pinned) {
+        // Windows refuses to replace an image that is running: a launcher
+        // another build started runs the copy a concurrent installer pinned.
+        if cfg!(windows) && pinned_in_place(&pinned) {
+            return Ok(pinned);
+        }
+        return Err(error.into());
+    }
     Ok(pinned)
+}
+
+/// The pinned copy's file name: an image on Windows needs its extension to
+/// be started by name.
+#[cfg(unix)]
+const PINNED_NAME: &str = "kache";
+#[cfg(windows)]
+const PINNED_NAME: &str = "kache.exe";
+
+/// Whether a pinned copy is in place as a file of its own (on Unix not a
+/// symlink and not a hard link another pin could rewrite).
+#[cfg(any(unix, windows))]
+fn pinned_in_place(pinned: &Path) -> bool {
+    std::fs::symlink_metadata(pinned).is_ok_and(|metadata| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            metadata.is_file() && metadata.nlink() == 1
+        }
+        #[cfg(windows)]
+        {
+            metadata.is_file()
+        }
+    })
 }
 
 /// Longest [`wait_for_no_writers`] waits for children to drop a file.
@@ -376,9 +431,13 @@ fn wait_for_read_lease(
     }
 }
 
-/// No leases outside Linux; macOS has no ETXTBSY for these files.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn wait_for_no_writers(_path: &Path) {}
+/// No leases outside Linux; macOS has no ETXTBSY for these files, and on
+/// Windows a child inherits only handles made inheritable, which kache's
+/// files are not.
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+fn wait_for_no_writers(_path: &Path) -> bool {
+    false
+}
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -548,6 +607,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
 
     let prediction = run.prediction()?;
     if let Some(prediction) = &prediction
+        && cfg!(unix)
         && run.config.build_script_hermetic
         && let Some(code) = hermetic::run(&run, real, argv, prediction)?
     {
@@ -962,7 +1022,7 @@ impl Environment {
     /// The placeholders of the roots `contents` spells.
     fn spelled_roots(&self, contents: &[u8]) -> BTreeSet<&'static str> {
         self.roots()
-            .filter(|(root, _)| find_bytes(contents, root.as_os_str().as_encoded_bytes()).is_some())
+            .filter(|(root, _)| spells_root(contents, root))
             .map(|(_, placeholder)| placeholder)
             .collect()
     }
@@ -989,7 +1049,7 @@ impl Environment {
         if !self
             .spellings
             .iter()
-            .any(|(root, _)| find_bytes(contents, root.as_os_str().as_encoded_bytes()).is_some())
+            .any(|(root, _)| spells_root(contents, root))
         {
             return None;
         }
@@ -1001,10 +1061,12 @@ impl Environment {
                 placeholder.as_bytes(),
             );
         }
-        // A root that is not a whole path (inside a URL) was not replaced.
-        let unreplaced = self.spellings.iter().any(|(root, _)| {
-            find_bytes(&normalized, root.as_os_str().as_encoded_bytes()).is_some()
-        });
+        // A root that is not a whole path (inside a URL), or one spelled
+        // otherwise than Cargo did, was not replaced.
+        let unreplaced = self
+            .spellings
+            .iter()
+            .any(|(root, _)| spells_root(&normalized, root));
         (normalized != contents && !unreplaced && only_placeholder_paths(&normalized))
             .then_some(normalized)
     }
@@ -1101,6 +1163,52 @@ impl Environment {
         values.sort_unstable();
         values
     }
+}
+
+/// Whether `contents` names `root`. On Windows a tool may spell a root
+/// otherwise than Cargo did: `cl.exe` records an `OUT_DIR` Cargo spelled
+/// `C:\w\target/x\debug\build\ring-1\out` with backslashes only, a
+/// tool may change the drive letter's case, and a PE file or a PDB holds
+/// paths in UTF-16. Any of them names the root as surely, so each counts.
+fn spells_root(contents: &[u8], root: &Path) -> bool {
+    spells_root_with(contents, root.as_os_str().as_encoded_bytes(), cfg!(windows))
+}
+
+/// [`spells_root`], with the Windows spellings when `windows`.
+fn spells_root_with(contents: &[u8], root: &[u8], windows: bool) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    if find_bytes(contents, root).is_some() {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
+    let same = |a: u8, b: u8| {
+        let separator = |c: u8| c == b'/' || c == b'\\';
+        a.eq_ignore_ascii_case(&b) || (separator(a) && separator(b))
+    };
+    // Narrow: one byte per byte of the root.
+    if contents
+        .windows(root.len())
+        .any(|window| window.iter().zip(root).all(|(&a, &b)| same(a, b)))
+    {
+        return true;
+    }
+    // UTF-16LE: each byte of the root (ASCII or not) followed by a zero
+    // byte. A root with non-ASCII characters is matched narrow only.
+    if !root.is_ascii() || contents.len() < root.len() * 2 {
+        return false;
+    }
+    contents.windows(root.len() * 2).any(|window| {
+        window
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(root)
+            .all(|(unit, &b)| unit[1] == 0 && same(unit[0], b))
+    })
 }
 
 const BASE_DIR_PLACEHOLDER: &str = "${KACHE_BASE_DIR}";
@@ -1238,6 +1346,14 @@ fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Ve
 /// reference: each `/` belongs to a word that begins with `${`, or to a web
 /// or Git URL (a pkg-config `URL:` line), which names no local path.
 fn only_placeholder_paths(text: &[u8]) -> bool {
+    only_placeholder_paths_with(text, cfg!(windows))
+}
+
+/// [`only_placeholder_paths`], with `\` a path separator too when
+/// `backslash` (Windows): `C:\w\include` names a path there. A backslash
+/// that is no separator (a C string's `\n`) then keeps the text bound to
+/// its roots, which costs a hit in another checkout, never a wrong one.
+fn only_placeholder_paths_with(text: &[u8], backslash: bool) -> bool {
     let mut word_start = 0;
     let mut url_end = 0;
     for (index, &byte) in text.iter().enumerate() {
@@ -1248,7 +1364,9 @@ fn only_placeholder_paths(text: &[u8]) -> bool {
             word_start = index + 1;
         } else if byte == b'/' && is_url_authority(text, index) {
             url_end = end_of_url(text, index);
-        } else if byte == b'/' && !text[word_start..].starts_with(b"${") {
+        } else if (byte == b'/' || (backslash && byte == b'\\'))
+            && !text[word_start..].starts_with(b"${")
+        {
             return false;
         }
     }
@@ -3478,6 +3596,38 @@ mod tests {
             b"prefix=${KACHE_OUT_DIR}\nlibdir=${prefix}/lib\n"
         ));
         assert!(only_placeholder_paths(b"Cflags: -I${includedir}"));
+        // A root spelled otherwise than Cargo did still names it on Windows:
+        // backslashes only, another drive-letter case, UTF-16.
+        let root: &[u8] = br"C:\w\target/x\debug\build\ring-1\out";
+        let obj: &[u8] = br"..c:\w\target\x\debug\build\ring-1\out\a.obj..";
+        assert!(spells_root_with(obj, root, true));
+        assert!(!spells_root_with(obj, root, false));
+        let wide: Vec<u8> = br"C:\w\target\x\debug\build\ring-1\out\a.pdb"
+            .iter()
+            .flat_map(|&b| [b, 0])
+            .collect();
+        assert!(spells_root_with(&wide, root, true));
+        assert!(!spells_root_with(&wide, root, false));
+        assert!(!spells_root_with(
+            br"C:\w\target\x\debug\build\ring-2\out",
+            root,
+            true
+        ));
+        assert!(spells_root_with(b"/w/out/gen.rs", b"/w/out", false));
+        // Windows spells paths with backslashes; elsewhere one is a byte.
+        assert!(!only_placeholder_paths_with(
+            br"Cflags: -IC:\w\include",
+            true
+        ));
+        assert!(!only_placeholder_paths_with(
+            br"${KACHE_OUT_DIR} D:\opt",
+            true
+        ));
+        assert!(only_placeholder_paths_with(
+            br"${KACHE_OUT_DIR}\gen.rs",
+            true
+        ));
+        assert!(only_placeholder_paths_with(br"a\b", false));
         assert!(!only_placeholder_paths(b"Cflags: -I/usr/include"));
         assert!(!only_placeholder_paths(b"${KACHE_OUT_DIR} /opt"));
     }
