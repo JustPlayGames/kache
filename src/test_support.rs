@@ -97,6 +97,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         deferred_durability: false,
         daemon_publish: true,
         daemon_publish_rustc: true,
+        trust_daemon_execution: false,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,

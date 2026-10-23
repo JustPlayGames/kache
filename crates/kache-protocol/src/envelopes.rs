@@ -18,6 +18,12 @@ pub enum Request {
     /// Compilation uses its own prepare/commit/completion exchange. Older
     /// daemons reject this command before a client sends Commit.
     ExecuteV1(Box<execution::ExecutionRequest>),
+    /// Read-only eligibility probe. It neither reserves a worker nor runs a compiler.
+    ExecutionStatus {
+        client_pid: u32,
+        client_version: String,
+        trusted_pipeline: bool,
+    },
     Upload(UploadJob),
     /// Legacy GC wire command accepted from older clients.
     Gc(GcRequest),
@@ -235,6 +241,8 @@ pub struct Response {
     pub stats: Option<StatsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<DaemonHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_status: Option<execution::unix::ExecutionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_results: Option<Vec<Response>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,6 +262,7 @@ impl Request {
         !matches!(
             self,
             Request::ExecuteV1(_)
+                | Request::ExecutionStatus { .. }
                 | Request::Health
                 | Request::Stats(_)
                 | Request::Gc(_)
@@ -287,6 +296,7 @@ impl Response {
             prefetched: None,
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: None,
             prediction: None,
@@ -305,6 +315,7 @@ impl Response {
             prefetched: None,
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: None,
             prediction: None,
@@ -330,6 +341,7 @@ impl Response {
             prefetched: None,
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: None,
             prediction: None,
@@ -347,6 +359,7 @@ impl Response {
             prefetched: None,
             stats: Some(stats),
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: None,
             prediction: None,
@@ -364,6 +377,7 @@ impl Response {
             prefetched: None,
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: Some(results),
             hash_results: None,
             prediction: None,
@@ -381,6 +395,7 @@ impl Response {
             prefetched: None,
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: Some(results),
             prediction: None,
@@ -398,6 +413,7 @@ impl Response {
             prefetched: None,
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: None,
             prediction: None,
@@ -415,6 +431,7 @@ impl Response {
             prefetched: Some(prefetched),
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: None,
             prediction: None,
@@ -432,6 +449,7 @@ impl Response {
             prefetched: None,
             stats: None,
             health: None,
+            execution_status: None,
             batch_results: None,
             hash_results: None,
             prediction: None,
