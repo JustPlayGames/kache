@@ -2541,6 +2541,11 @@ fn extern_chain_lines(diagnosis: &MissDiagnosis) -> Vec<String> {
                 "  root: {name}{via}, same key in both build trees but its artifact differs \
                  (its output is not reproducible across build trees)"
             ),
+            crate::miss_chain::RootKind::Unreproducible => format!(
+                "  root: {name}{via}, same cache key as before but its artifact differs: its \
+                 compile is not reproducible (e.g. rustc's -Zthreads above 1), so the crates \
+                 above it miss whenever it is compiled again"
+            ),
             crate::miss_chain::RootKind::NothingRecorded => format!(
                 "  root: {name}{via}, dependencies stable and no traced input group changed \
                  (key salt or extra inputs?)"

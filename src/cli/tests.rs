@@ -4419,6 +4419,23 @@ fn explain_crate_cascade_notes_uncached_compiles_and_unresolved_endpoints() {
              miss",
         ]
     );
+    let unreproducible = MissDiagnosis::new(
+        &miss,
+        false,
+        0,
+        false,
+        Some(chain(RootKind::Unreproducible, Vec::new())),
+        true,
+    );
+    assert_eq!(
+        extern_chain_lines(&unreproducible),
+        [
+            "  this miss is downstream of a dependency that changed (leaf)",
+            "  root: leaf, same cache key as before but its artifact differs: its compile is \
+             not reproducible (e.g. rustc's -Zthreads above 1), so the crates above it miss \
+             whenever it is compiled again",
+        ]
+    );
 }
 
 #[test]
