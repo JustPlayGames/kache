@@ -121,6 +121,7 @@ fn test_config() -> Config {
         deferred_durability: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
+        trust_daemon_execution: false,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,

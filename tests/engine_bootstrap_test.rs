@@ -168,27 +168,19 @@ fn cargo_refuses_the_original_frontend_as_its_real_cargo_program() {
 }
 
 #[test]
-fn direct_engine_bootstraps_a_daemon_and_delegates_the_compiler() {
+fn direct_engine_bootstraps_a_daemon_and_keeps_the_platform_process_owner() {
     let fixture = Fixture::new();
     let (engine_pid, status) = fixture.run_compiler(false);
     let parents = fixture.assert_compiler_output(status);
+    // Linux keeps native children in the requesting process on both the
+    // delegated and local paths. macOS still creates them in the daemon.
     #[cfg(target_os = "linux")]
-    let filtered = std::fs::read_to_string("/proc/self/status")
-        .unwrap()
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .any(|(name, value)| matches!(name, "Seccomp" | "NoNewPrivs") && value.trim() != "0");
+    assert_eq!(parents, vec![engine_pid]);
     #[cfg(not(target_os = "linux"))]
-    let filtered = false;
-    if filtered {
-        // Linux filters cannot be compared across processes; execution stays local.
-        assert_eq!(parents, vec![engine_pid]);
-    } else {
-        assert!(
-            parents.iter().all(|parent| *parent != engine_pid),
-            "{parents:?}"
-        );
-    }
+    assert!(
+        parents.iter().all(|parent| *parent != engine_pid),
+        "{parents:?}"
+    );
     assert!(
         parents.iter().all(|parent| *parent == parents[0]),
         "{parents:?}"
@@ -202,4 +194,178 @@ fn disabled_direct_engine_executes_locally_without_starting_a_daemon() {
     let (engine_pid, status) = fixture.run_compiler(true);
     assert_eq!(fixture.assert_compiler_output(status), vec![engine_pid]);
     common::wait_for_daemon_exit(&fixture.runtime, Duration::ZERO).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_linux_frontend_keeps_native_children_and_reports_execution_separately() {
+    let fixture = Fixture::new();
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str("trust_daemon_execution=true\n");
+    std::fs::write(&fixture.config, config).unwrap();
+    let (_, started) = fixture.run(fixture.command(FRONTEND).args(["daemon", "start"]));
+    assert!(started.success());
+    let image = fixture.root.path().join("parent-image");
+    kache_fs::testutil::write_executable(
+        &fixture.compiler,
+        "#!/bin/sh\n/usr/bin/readlink \"/proc/$PPID/exe\" > \"$PARENT_IMAGE\"\nprintf '%s\\n' \"$PPID\" >> \"$PARENT_RECORD\"\nprintf 'compiler-output\\n'\nprintf 'compiler-error\\n' >&2\nexit 17\n",
+    );
+    let (frontend_pid, status) = fixture.run(
+        fixture
+            .command(FRONTEND)
+            .arg(&fixture.compiler)
+            .arg("--version")
+            .env("PARENT_IMAGE", &image),
+    );
+    assert_eq!(fixture.assert_compiler_output(status), vec![frontend_pid]);
+    assert_eq!(
+        std::fs::read_to_string(image).unwrap().trim(),
+        std::fs::canonicalize(FRONTEND).unwrap().to_str().unwrap()
+    );
+    let (_, status) = fixture.run(fixture.command(FRONTEND).args(["doctor", "--json"]));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.root.path().join("stdout")).unwrap())
+            .unwrap();
+    assert!(status.success(), "{report}");
+    let check = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Compiler execution")
+        .unwrap();
+    assert_eq!(check["pass"], true);
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("trusted daemon pipeline")
+    );
+    assert_eq!(check["optional"], true);
+    let (_, status) = fixture.run(fixture.command(FRONTEND).args([
+        "init",
+        "--yes",
+        "--no-shell",
+        "--no-service",
+        "--json",
+    ]));
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.root.path().join("stdout")).unwrap())
+            .unwrap();
+    assert!(status.success(), "{report}");
+    assert_eq!(report["compiler_execution"]["eligible"], true);
+    assert_eq!(report["compiler_execution"]["client_trust_enabled"], true);
+    assert_eq!(report["compiler_execution"]["daemon_trust_enabled"], true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_linux_pipeline_restores_real_rust_outputs_without_recompiling() {
+    let fixture = Fixture::new();
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str("trust_daemon_execution=true\n");
+    std::fs::write(&fixture.config, config).unwrap();
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(sysroot.status.success());
+    let rustc = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim()).join("bin/rustc");
+    let source = fixture.root.path().join("lib.rs");
+    std::fs::write(&source, "pub fn answer() -> u64 { 42 }\n").unwrap();
+    let output = fixture.root.path().join("out");
+    let (_, started) = fixture.run(fixture.command(FRONTEND).args(["daemon", "start"]));
+    assert!(started.success());
+    let compile = || {
+        let (_, status) = fixture.run(
+            fixture
+                .command(FRONTEND)
+                .arg(&rustc)
+                .args([
+                    "--crate-name",
+                    "broker_smoke",
+                    "--crate-type=rlib",
+                    "--emit=link,dep-info",
+                    "--edition=2024",
+                ])
+                .arg(&source)
+                .arg("--out-dir")
+                .arg(&output),
+        );
+        let diagnostics = std::fs::read_to_string(fixture.root.path().join("stderr")).unwrap();
+        assert!(status.success(), "{diagnostics}");
+    };
+    let stats = || {
+        let (_, status) = fixture.run(fixture.command(FRONTEND).args(["stats", "--json"]));
+        assert!(status.success());
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(fixture.root.path().join("stdout")).unwrap(),
+        )
+        .unwrap()
+    };
+    std::fs::create_dir(&output).unwrap();
+    compile();
+    let original = std::fs::read(output.join("libbroker_smoke.rlib")).unwrap();
+    let first = stats();
+    assert_eq!(first["misses"], 1, "{first}");
+    assert_eq!(first["local_hits"], 0, "{first}");
+    std::fs::remove_dir_all(&output).unwrap();
+    std::fs::create_dir(&output).unwrap();
+    compile();
+    assert_eq!(
+        std::fs::read(output.join("libbroker_smoke.rlib")).unwrap(),
+        original
+    );
+    assert!(output.join("broker_smoke.d").exists());
+    let second = stats();
+    assert_eq!(second["misses"], 1, "{second}");
+    assert_eq!(second["local_hits"], 1, "{second}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_linux_pipeline_restores_c_objects_through_client_owned_stages() {
+    let fixture = Fixture::new();
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str("trust_daemon_execution=true\n");
+    std::fs::write(&fixture.config, config).unwrap();
+    let source = fixture.root.path().join("unit.c");
+    let target = fixture.root.path().join("unit.o");
+    std::fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
+    let cc = "cc";
+    let (_, started) = fixture.run(fixture.command(FRONTEND).args(["daemon", "start"]));
+    assert!(started.success());
+    let compile = || {
+        let (_, status) = fixture.run(
+            fixture
+                .command(FRONTEND)
+                .arg(cc)
+                .arg("-c")
+                .arg(&source)
+                .arg("-o")
+                .arg(&target),
+        );
+        let diagnostics = std::fs::read_to_string(fixture.root.path().join("stderr")).unwrap();
+        assert!(status.success(), "{diagnostics}");
+    };
+    compile();
+    let original = std::fs::read(&target).unwrap();
+    std::fs::remove_file(&target).unwrap();
+    compile();
+    assert_eq!(std::fs::read(&target).unwrap(), original);
+    let (_, status) = fixture.run(fixture.command(FRONTEND).args(["stats", "--json"]));
+    assert!(status.success());
+    let stats: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixture.root.path().join("stdout")).unwrap())
+            .unwrap();
+    assert_eq!(stats["misses"], 1, "{stats}");
+    assert_eq!(stats["local_hits"], 1, "{stats}");
+    assert!(
+        !std::fs::read_dir(fixture.root.path())
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kache-restore-"))
+    );
 }
