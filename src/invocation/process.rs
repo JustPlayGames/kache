@@ -1,6 +1,6 @@
 //! Compiler children owned by a cancellable request.
 
-use kache_protocol::execution::windows::{Stdio as ChildIo, Stream as ChildStream};
+use kache_protocol::execution::process::{Stdio as ChildIo, Stream as ChildStream};
 use std::cell::RefCell;
 use std::io::{self, Read};
 use std::process::{ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Output, Stdio};
@@ -102,10 +102,10 @@ pub(crate) fn check() -> io::Result<()> {
 }
 
 struct Running {
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, unix)))]
     child: std::process::Child,
-    #[cfg(target_os = "linux")]
-    child: super::linux_broker::Child,
+    #[cfg(unix)]
+    child: super::unix_broker::Child,
     #[cfg(windows)]
     child: windows::Child,
     controlled: bool,
@@ -121,7 +121,7 @@ impl Running {
         if self.status.is_some() {
             return Ok(());
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if self.child.remote() {
             return self.child.kill();
         }
@@ -141,7 +141,7 @@ impl Running {
         if self.status.is_some() {
             return Ok(self.status);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if self.child.remote() {
             let (status, max_rss) = self.child.try_wait_remote()?;
             self.status = status;
@@ -238,7 +238,7 @@ impl Child {
             .running
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if running.child.remote() {
             drop(running);
             loop {
@@ -421,10 +421,6 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
     if controlled {
         crate::platform::configure_process_group(command);
     }
-    // Cancellation may run a host utility while holding the request lock.
-    // Keep that lock order: request, then descriptor admission.
-    #[cfg(unix)]
-    let descriptor_admission = kache_ipc::descriptors::spawn_guard();
     #[cfg(windows)]
     let (mut child, tree) = if let Some(broker) = crate::invocation::io::current().broker() {
         let (id, pid, handles) = broker.spawn(
@@ -441,8 +437,8 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
     } else {
         (windows::Child::local(command.spawn()?), None)
     };
-    #[cfg(target_os = "linux")]
-    let mut child = if let Some(broker) = crate::invocation::io::current().linux_broker() {
+    #[cfg(unix)]
+    let mut child = if let Some(broker) = crate::invocation::io::current().unix_broker() {
         broker.spawn(
             command,
             io.ok_or_else(|| {
@@ -450,12 +446,13 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
             })?,
         )?
     } else {
-        super::linux_broker::Child::local(command.spawn()?)
+        // A broker receives descriptors during spawn, so admission covers only
+        // local process creation. Keep request -> admission lock ordering.
+        let _admission = kache_ipc::descriptors::spawn_guard();
+        super::unix_broker::Child::local(command.spawn()?)
     };
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, unix)))]
     let mut child = command.spawn()?;
-    #[cfg(unix)]
-    drop(descriptor_admission);
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
