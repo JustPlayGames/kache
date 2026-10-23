@@ -4,6 +4,10 @@ use super::*;
 use std::io;
 
 pub(super) const MARKER: &str = "worktree-seed-v1";
+/// The fixed directory a private compile's cwd is remapped to, the same in
+/// every worktree. It must be an absolute path on the host: on Windows
+/// `/src` has no drive, so no invocation would ever qualify there.
+const REMAP_PREFIX: &str = if cfg!(windows) { r"C:\src" } else { "/src" };
 const MAX_DONORS: usize = 256;
 const MAX_COPY_FILES: usize = 65_536;
 const MAX_COPY_BYTES: u64 = 1 << 30;
@@ -46,9 +50,9 @@ impl Lease {
             .find_map(|flag| flag.strip_prefix("remap-cwd-prefix="));
         let mut candidate = isolated.clone();
         if prefix.is_none() {
-            candidate.push("-Zremap-cwd-prefix=/src".into());
+            candidate.push(format!("-Zremap-cwd-prefix={REMAP_PREFIX}"));
         }
-        let prefix = prefix.unwrap_or("/src");
+        let prefix = prefix.unwrap_or(REMAP_PREFIX);
         let Some(mut normalized) = portable_args(&candidate, args.source_file.as_deref(), &cwd)
         else {
             return isolated;
@@ -319,6 +323,25 @@ fn portable_args(args: &[String], source: Option<&Path>, cwd: &Path) -> Option<V
     (remap_count == 1 && saw_source).then_some(result)
 }
 
+/// Whether `profile` is its own canonical path: no symlinked ancestor. On
+/// Windows `canonicalize` answers the verbatim `\\?\C:\...` spelling of a
+/// plain `C:\...` path, which names the same file.
+fn canonical_spelling(profile: &Path) -> bool {
+    let Ok(canonical) = fs::canonicalize(profile) else {
+        return false;
+    };
+    if canonical == profile {
+        return true;
+    }
+    cfg!(windows)
+        && canonical
+            .to_str()
+            .zip(profile.to_str())
+            .is_some_and(|(canonical, profile)| {
+                kache_fs::paths::strip_verbatim_prefix(canonical) == profile
+            })
+}
+
 pub(super) fn empty_directory(path: &Path) -> bool {
     real_directory(path) && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
@@ -326,7 +349,7 @@ pub(super) fn empty_directory(path: &Path) -> bool {
 fn import(receiver: &AdaptiveUnit, profile: &Path, key: &str) -> bool {
     // Require canonical input to exclude symlinked ancestors in a supplied
     // donor path. No directories or locks are created in the donor tree.
-    if !safe_absolute_path(profile) || fs::canonicalize(profile).ok().as_deref() != Some(profile) {
+    if !safe_absolute_path(profile) || !canonical_spelling(profile) {
         return false;
     }
     let root = profile.join(AUTO_ROOT).join(POLICY_VERSION);
@@ -517,7 +540,35 @@ fn copy_tree(source: &Path, dest: &Path, budget: &mut CopyBudget, depth: usize) 
 mod tests {
     use super::*;
 
-    const VIRTUAL_PREFIX: &str = if cfg!(windows) { r"C:\src" } else { "/src" };
+    const VIRTUAL_PREFIX: &str = REMAP_PREFIX;
+
+    /// The remap target names an absolute path on the host, or no Windows
+    /// invocation qualifies for a seed (`/src` has no drive there).
+    #[test]
+    fn the_remap_prefix_is_absolute_on_this_host() {
+        assert!(Path::new(REMAP_PREFIX).is_absolute(), "{REMAP_PREFIX}");
+    }
+
+    /// A donor profile is accepted under its own canonical spelling; on
+    /// Windows `canonicalize` adds the verbatim prefix, which names the same
+    /// directory.
+    #[test]
+    fn a_canonical_profile_is_accepted_and_a_symlinked_one_is_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = fs::canonicalize(temp.path()).unwrap();
+        let plain = match canonical.to_str() {
+            Some(text) => PathBuf::from(kache_fs::paths::strip_verbatim_prefix(text).into_owned()),
+            None => canonical.clone(),
+        };
+        assert!(canonical_spelling(&plain), "{}", plain.display());
+        assert!(!canonical_spelling(&plain.join("missing")));
+        #[cfg(unix)]
+        {
+            let link = plain.join("link");
+            std::os::unix::fs::symlink(&plain, &link).unwrap();
+            assert!(!canonical_spelling(&link));
+        }
+    }
 
     #[test]
     fn imports_newest_session_by_numeric_name_and_retains_ties() {
