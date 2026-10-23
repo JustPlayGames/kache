@@ -1031,6 +1031,14 @@ impl Environment {
                 stored.push((path, name));
                 continue;
             }
+            if spelled.contains(OUT_DIR_PLACEHOLDER)
+                && let Some(rest) = self.without_recorded_out_dir(&contents)
+            {
+                // Bound only by the roots it spells besides `OUT_DIR`.
+                embedded.extend(self.spelled_roots(&rest));
+                stored.push((path, name));
+                continue;
+            }
             if let Some(normalized) = self.rewrite_text(&contents) {
                 // What the mappings do not cover (a base dir outside them)
                 // still binds the result.
@@ -1052,6 +1060,37 @@ impl Environment {
         })
     }
 
+    /// `contents` without this run's `OUT_DIR`, when it is a COFF archive or
+    /// object (`cl.exe` and `lib.exe` output, through `cc`) that spells it
+    /// only where the tools record where they ran: `lib.exe`'s member names,
+    /// `cl.exe`'s `S_OBJNAME` and `-Z7` build records. Such a file restores
+    /// in another `OUT_DIR` with the same code: what it names there is where
+    /// another target directory built it, as for the debug paths kept out of
+    /// keys before, and a crate that bundles or links the archive keys it
+    /// without that directory ([`crate::coff_archive::digest_dir`]). `None`
+    /// when `OUT_DIR` occurs anywhere else, or the file is anything else.
+    fn without_recorded_out_dir(&self, contents: &[u8]) -> Option<Vec<u8>> {
+        let mut spelled: Vec<&[u8]> = self
+            .root_values(OUT_DIR_PLACEHOLDER)
+            .into_iter()
+            .filter(|value| find_bytes(contents, value).is_some())
+            .collect();
+        if spelled.is_empty()
+            || !spelled
+                .iter()
+                .all(|value| crate::coff_archive::spells_dir_only_in_build_records(contents, value))
+        {
+            return None;
+        }
+        // Longest first, so a spelling inside another is cut after it.
+        spelled.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        let mut rest = contents.to_vec();
+        for value in spelled {
+            rest = crate::coff_archive::without_dir(&rest, value);
+        }
+        Some(rest)
+    }
+
     /// The values of a root, every spelling, in a stable order.
     fn root_values(&self, placeholder: &str) -> Vec<&[u8]> {
         let mut values: Vec<&[u8]> = self
@@ -1065,6 +1104,7 @@ impl Environment {
 }
 
 const BASE_DIR_PLACEHOLDER: &str = "${KACHE_BASE_DIR}";
+const OUT_DIR_PLACEHOLDER: &str = "${KACHE_OUT_DIR}";
 const TARGET_DIR_PLACEHOLDER: &str = "${KACHE_TARGET_DIR}";
 
 /// Every placeholder starts with this.
@@ -3366,6 +3406,38 @@ mod tests {
             .unwrap();
         let stored = std::fs::read(&roots.files[0].0).unwrap();
         (roots, stored)
+    }
+
+    /// `cl.exe` and `lib.exe` record `OUT_DIR` in member names and debug
+    /// records only: such an archive is not bound to it. One that spells it
+    /// where the code reads it stays bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_coff_archive_naming_out_dir_only_in_build_records_is_not_bound_to_it() {
+        const SHORT: &[u8] = include_bytes!("coff_archive/fixtures/gen-short.lib");
+        const Z7: &[u8] = include_bytes!("coff_archive/fixtures/gen-z7-short.lib");
+        let dir = tempfile::tempdir().unwrap();
+        let bound_to = |out_dir: &[u8], contents: &[u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            let mut env = environment(
+                Path::new(std::ffi::OsStr::from_bytes(out_dir)),
+                Path::new("/src/pkg"),
+            );
+            env.out_dir = dir.path().to_path_buf();
+            let (roots, stored) = classify_one(&env, "gen.lib", contents);
+            assert_eq!(stored, contents, "kept as it is");
+            assert!(roots.rewritten.is_empty());
+            roots.embedded
+        };
+        let short = r"C:\Users\User\ko2\tA\debug\build\gen-2f3778baca245d4f\out";
+        let z7 = r"C:\Users\User\ko2\tF\debug\build\gen-2f3778baca245d4f\out";
+        assert!(bound_to(short.as_bytes(), SHORT).is_empty());
+        assert!(bound_to(z7.as_bytes(), Z7).is_empty());
+        // `.text$mn`'s bytes stand in for an `OUT_DIR` the code reads.
+        assert_eq!(
+            bound_to(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3], SHORT),
+            vec!["${KACHE_OUT_DIR}".to_string()]
+        );
     }
 
     /// Older kache reads `portable_out_dir` alone: it must be true only for
