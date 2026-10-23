@@ -2,8 +2,9 @@
 //! bookkeeping writes, when another process holds the index's write lock.
 
 use super::*;
+use crate::cache_key::{BookkeepingWrite, bookkeeping_waits_during};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Above the memo's persistence floor.
 const INPUT_BYTES: usize = 64 * 1024;
@@ -68,20 +69,23 @@ impl Fixture {
 /// A key's memo rows waited 100 ms for a busy index before the compile and
 /// were then dropped, so the build's next unit read the file again. They now
 /// go to the daemon after a short wait, and land once the index lets them.
+///
+/// What the unit may wait is read from the writes themselves, not timed: a
+/// loaded machine stretches any short wall-clock bound.
 #[test]
 fn a_busy_index_hands_a_keys_memo_rows_over_instead_of_waiting() {
+    let _scope = crate::link::InvocationLinkScope::enter();
     let fixture = Fixture::new();
     let hasher = fixture.store.file_hasher();
     let hash = hasher.hash(&fixture.input).unwrap();
 
     let writer = fixture.hold_the_write_lock();
-    let started = Instant::now();
-    hasher.flush_memo_as_if_settled();
-    let waited = started.elapsed();
+    let waits = bookkeeping_waits_during(|| hasher.flush_memo_as_if_settled());
     drop(writer);
-    assert!(
-        waited < Duration::from_millis(50),
-        "the unit waited {waited:?} for its memo rows"
+    assert_eq!(
+        waits,
+        [(BookkeepingWrite::MemoRows, Duration::from_millis(5))],
+        "one short wait, then the rows go to the daemon (no second, full wait)"
     );
     {
         let handed = fixture.handed.lock().unwrap();
@@ -136,6 +140,7 @@ fn a_late_memo_row_for_a_file_changed_since_is_not_written() {
 /// the old wait: the next key reads the file again, nothing else.
 #[test]
 fn without_a_daemon_a_busy_index_drops_a_keys_memo_rows() {
+    let _scope = crate::link::InvocationLinkScope::enter();
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
@@ -146,8 +151,13 @@ fn without_a_daemon_a_busy_index_drops_a_keys_memo_rows() {
 
     let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-    hasher.flush_memo_as_if_settled();
+    let waits = bookkeeping_waits_during(|| hasher.flush_memo_as_if_settled());
     drop(writer);
+    assert_eq!(
+        waits,
+        [(BookkeepingWrite::MemoRows, Duration::from_millis(100))],
+        "with nowhere to hand them, the rows get the old full wait"
+    );
 
     let next = store.file_hasher();
     assert_eq!(next.hash(&input).unwrap(), hash);
@@ -160,8 +170,13 @@ fn without_a_daemon_a_busy_index_drops_a_keys_memo_rows() {
 /// only try the lock. Before, they waited 5 + 25 + 25 ms (100 + 25 + 25 ms
 /// before the memo rows had somewhere to go). The rows still all reach the
 /// daemon.
+///
+/// The waits are read from the writes, not timed: a 40 ms bound on the
+/// whole sequence failed on a loaded machine and on Windows' coarse timer
+/// although no write waited longer than it may.
 #[test]
 fn a_units_bookkeeping_on_a_busy_index_pays_one_short_wait() {
+    let _scope = crate::link::InvocationLinkScope::enter();
     let fixture = Fixture::new();
     let scratch = fixture.input.parent().unwrap();
     let workspace = scratch.join("ws");
@@ -174,26 +189,31 @@ fn a_units_bookkeeping_on_a_busy_index_pays_one_short_wait() {
     };
 
     let writer = fixture.hold_the_write_lock();
-    let started = Instant::now();
-    {
-        let hasher = fixture.store.file_hasher();
-        hasher.hash(&fixture.input).unwrap();
-        hasher.flush_memo_as_if_settled();
-    }
-    register_target_root(
-        &fixture.config,
-        &fixture.store,
-        &target,
-        &workspace,
-        Some("rustc 1"),
-    );
     let predictions = fixture.store.file_hasher().with_input_predictions(true);
-    predictions.record_input_prediction("unit-a", Some("a"), &closure, None);
-    let waited = started.elapsed();
+    let waits = bookkeeping_waits_during(|| {
+        {
+            let hasher = fixture.store.file_hasher();
+            hasher.hash(&fixture.input).unwrap();
+            hasher.flush_memo_as_if_settled();
+        }
+        register_target_root(
+            &fixture.config,
+            &fixture.store,
+            &target,
+            &workspace,
+            Some("rustc 1"),
+        );
+        predictions.record_input_prediction("unit-a", Some("a"), &closure, None);
+    });
     drop(writer);
-    assert!(
-        waited < Duration::from_millis(40),
-        "the unit waited {waited:?} for its bookkeeping"
+    assert_eq!(
+        waits,
+        [
+            (BookkeepingWrite::MemoRows, Duration::from_millis(5)),
+            (BookkeepingWrite::TargetRoot, Duration::ZERO),
+            (BookkeepingWrite::Prediction, Duration::ZERO),
+        ],
+        "only the first write waits; once the daemon took rows the others only try the lock"
     );
     assert_eq!(fixture.handed.lock().unwrap().len(), 1);
     assert_eq!(
