@@ -791,7 +791,12 @@ fn remove_stale_lock_file(
         .metadata()
         .is_ok_and(|meta| metadata_is_stale(&meta, now, min_age));
     // Dropping `file` on any return releases the lock.
-    locked_stale && lock_file_is_at_path(&file, path) && fs::remove_file(path).is_ok()
+    if !(locked_stale && lock_file_is_at_path(&file, path)) {
+        return false;
+    }
+    // Held here, so a storing mark beside it is one a dead holder left.
+    let _ = fs::remove_file(storing_mark_path(path));
+    fs::remove_file(path).is_ok()
 }
 
 fn metadata_is_stale(meta: &fs::Metadata, now: std::time::SystemTime, min_age: Duration) -> bool {
@@ -1581,6 +1586,10 @@ pub fn lock_poll_interval(attempt: u32) -> Duration {
 /// locked, and starts over when it does not.
 pub struct StoreLock {
     file: fs::File,
+    path: PathBuf,
+    /// The storing mark this holder wrote ([`StoreLock::mark_storing`]),
+    /// removed before the lock is released.
+    storing: Option<PathBuf>,
 }
 
 /// Lock guard for a cache key. Dropping it releases the OS lock.
@@ -1592,9 +1601,13 @@ pub fn try_lock_key_in(store_dir: &Path, cache_key: &str) -> Result<Option<KeyLo
     StoreLock::try_acquire(&store_dir.join(cache_key).with_extension("lock"))
 }
 
-/// What a key's lock file says while its holder stores the entry
-/// ([`StoreLock::mark_storing`]), after the holder's process id.
-const STORING_MARK: &str = " storing";
+/// The storing mark beside a lock file: `<key>.storing` beside
+/// `<key>.lock`, holding the process id of the holder that stores the
+/// key's entry ([`StoreLock::mark_storing`]). A file of its own because
+/// Windows refuses other processes a read of a locked file's bytes.
+fn storing_mark_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("storing")
+}
 
 /// Whether a holder of `cache_key`'s lock in `store_dir` is storing its
 /// entry right now: a wrapper registering the compile it just ran, or the
@@ -1603,19 +1616,66 @@ const STORING_MARK: &str = " storing";
 /// commit ([`ArtifactStore::wait_for_committed_with_timeout`]) than
 /// compiling the unit again.
 ///
-/// The mark is a hint read from the lock file, never ownership: a lock that
-/// is free (taken here and dropped at once) or says nothing about storing
-/// answers `false`, and a stale mark costs at most one bounded wait. A key
-/// with no lock file yet answers `false` without creating one.
+/// The mark is a hint, never ownership: no mark, a mark whose process has
+/// exited, or a lock nobody holds (taken here and dropped at once, which
+/// also removes the stale mark) answers `false`, and a mark that outlives
+/// its holder otherwise (a reused process id) costs at most one bounded
+/// wait. A key with no mark answers `false` without creating a lock file.
 pub fn key_store_in_flight(store_dir: &Path, cache_key: &str) -> bool {
     let path = store_dir.join(cache_key).with_extension("lock");
-    let Ok(content) = fs::read_to_string(&path) else {
+    let Ok(content) = fs::read_to_string(storing_mark_path(&path)) else {
         return false;
     };
-    if !content.ends_with(STORING_MARK) {
+    // A mark caught between its creation and its write names nobody yet:
+    // its holder is alive and storing.
+    if let Ok(pid) = content.trim().parse::<u32>()
+        && !process_is_alive(pid)
+    {
         return false;
     }
     matches!(StoreLock::try_acquire(&path), Ok(None))
+}
+
+/// Whether process `pid` still runs, where the platform can tell; `true`
+/// when it cannot (the caller's wait is bounded).
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // Signal 0 checks existence and permission only; EPERM means it runs
+    // under another user.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether process `pid` still runs, where the platform can tell; `true`
+/// when it cannot (the caller's wait is bounded).
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // GetExitCodeProcess's code for a process that has not exited.
+    const STILL_ACTIVE: u32 = 259;
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // No such process; anything else (access denied) means it exists.
+        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+    }
+    let mut code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+    unsafe { CloseHandle(handle) };
+    !queried || code == STILL_ACTIVE
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Where the daemon notes the rustc units whose entries it is storing.
@@ -1761,26 +1821,33 @@ impl StoreLock {
             .open(path)?)
     }
 
-    fn finish(mut file: fs::File) -> Result<Self> {
-        // Diagnostic only: lock ownership is determined exclusively by the OS.
-        Self::write_note(&mut file, "")?;
-        Ok(Self { file })
-    }
-
-    fn write_note(file: &mut fs::File, note: &str) -> Result<()> {
+    fn finish(mut file: fs::File, path: &Path) -> Result<Self> {
         use std::io::{Seek, SeekFrom, Write};
+        // Diagnostic only: lock ownership is determined exclusively by the OS.
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
-        write!(file, "{}{note}", std::process::id())?;
-        Ok(())
+        write!(file, "{}", std::process::id())?;
+        // A storing mark found while holding the lock is one a holder that
+        // died left behind ([`StoreLock::mark_storing`]).
+        let _ = fs::remove_file(storing_mark_path(path));
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            storing: None,
+        })
     }
 
-    /// Say in the lock file that its holder now stores the key's entry, so
-    /// a lookup that misses the entry meanwhile waits for it instead of
-    /// compiling ([`key_store_in_flight`]). Best effort: a mark that cannot
-    /// be written only costs that wait.
+    /// Say beside the lock file that its holder now stores the key's entry,
+    /// so a lookup that misses the entry meanwhile waits for it instead of
+    /// compiling ([`key_store_in_flight`]). The mark goes when the lock is
+    /// released, on every path out of the store, success or failure; a
+    /// holder killed meanwhile leaves one that names an exited process.
+    /// Best effort: a mark that cannot be written only costs that wait.
     pub fn mark_storing(&mut self) {
-        let _ = Self::write_note(&mut self.file, STORING_MARK);
+        let mark = storing_mark_path(&self.path);
+        if fs::write(&mark, std::process::id().to_string()).is_ok() {
+            self.storing = Some(mark);
+        }
     }
 
     /// Open, lock, then confirm the locked file is the one at `path`.
@@ -1803,7 +1870,7 @@ impl StoreLock {
                 kache_fs::handle_identity(&file),
                 kache_fs::file_identity(path),
             ) {
-                return Ok(Some(Self::finish(file)?));
+                return Ok(Some(Self::finish(file, path)?));
             }
             // Closing the handle releases the lock on the unlinked file.
         }
@@ -1865,6 +1932,10 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
+        // Before the unlock: the next holder never sees this holder's mark.
+        if let Some(mark) = self.storing.take() {
+            let _ = fs::remove_file(mark);
+        }
         let _ = self.file.unlock();
     }
 }
