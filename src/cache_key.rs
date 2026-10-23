@@ -8849,6 +8849,52 @@ const MEMO_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_millis(10
 /// every compile by 100 ms and lost the rows all the same.
 const MEMO_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// A unit's bookkeeping write that may wait for the index's write lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BookkeepingWrite {
+    MemoRows,
+    TargetRoot,
+    Prediction,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BOOKKEEPING_WAITS: std::cell::RefCell<Option<Vec<(BookkeepingWrite, std::time::Duration)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The longest `write` may wait for the index's write lock: `wait`, passed
+/// through. Tests read which writes may wait and for how long
+/// ([`bookkeeping_waits_during`]) instead of timing them, which a loaded
+/// machine makes meaningless.
+pub(crate) fn bookkeeping_lock_wait(
+    write: BookkeepingWrite,
+    wait: std::time::Duration,
+) -> std::time::Duration {
+    #[cfg(test)]
+    BOOKKEEPING_WAITS.with(|waits| {
+        if let Some(waits) = waits.borrow_mut().as_mut() {
+            waits.push((write, wait));
+        }
+    });
+    #[cfg(not(test))]
+    let _ = write;
+    wait
+}
+
+/// Run `f` and return the lock waits its bookkeeping writes on this thread
+/// were given ([`bookkeeping_lock_wait`]), in order.
+#[cfg(test)]
+pub(crate) fn bookkeeping_waits_during(
+    f: impl FnOnce(),
+) -> Vec<(BookkeepingWrite, std::time::Duration)> {
+    let previous = BOOKKEEPING_WAITS.with(|waits| waits.replace(Some(Vec::new())));
+    f();
+    BOOKKEEPING_WAITS
+        .with(|waits| waits.replace(previous))
+        .unwrap_or_default()
+}
+
 /// Write `rows` in one transaction, waiting at most `wait` for the index's
 /// write lock. A failure writes none.
 fn write_memo_rows(
@@ -8857,7 +8903,7 @@ fn write_memo_rows(
     wait: std::time::Duration,
 ) -> rusqlite::Result<()> {
     let db = cache.db();
-    let _ = db.busy_timeout(wait);
+    let _ = db.busy_timeout(bookkeeping_lock_wait(BookkeepingWrite::MemoRows, wait));
     let written = (|| -> rusqlite::Result<()> {
         db.execute_batch("BEGIN IMMEDIATE")?;
         for (observed, hash) in rows {
@@ -9275,7 +9321,10 @@ impl<'db> FileHasher<'db> {
             return;
         }
         let db = cache.db();
-        let _ = db.busy_timeout(crate::store::bookkeeping_wait(PREDICTION_RECORD_WAIT));
+        let _ = db.busy_timeout(bookkeeping_lock_wait(
+            BookkeepingWrite::Prediction,
+            crate::store::bookkeeping_wait(PREDICTION_RECORD_WAIT),
+        ));
         let written = match &row.keep_under {
             Some((prefix, keep)) => cache.put_input_prediction_keeping(
                 prefix,

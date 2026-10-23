@@ -8883,7 +8883,10 @@ fn register_target_root(
     workspace_root: &Path,
     rustc: Option<&str>,
 ) {
-    let wait = crate::store::bookkeeping_wait(TARGET_ROOT_WAIT);
+    let wait = crate::cache_key::bookkeeping_lock_wait(
+        crate::cache_key::BookkeepingWrite::TargetRoot,
+        crate::store::bookkeeping_wait(TARGET_ROOT_WAIT),
+    );
     let Err(error) = store.remember_target_root_waiting(target, workspace_root, rustc, wait) else {
         return;
     };
