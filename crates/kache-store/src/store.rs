@@ -890,6 +890,34 @@ enum PublishDest {
     Vacant,
 }
 
+/// Move a staged blob to its content address unless a file is already there.
+///
+/// A plain rename replaces a blob another put published meanwhile, and with
+/// it the inode a durability flush may already have verified and synced
+/// (that entry would then be marked durable over unflushed bytes). On Unix
+/// the staged file is linked to the address, which fails with
+/// `AlreadyExists` when a file is there, and its staging name is removed;
+/// a file system without hard links falls back to the rename. Windows'
+/// rename refuses to replace a published blob, which is read-only.
+fn publish_without_replacing(staged: &Path, blob: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        match fs::hard_link(staged, blob) {
+            Ok(()) => {
+                let _ = fs::remove_file(staged);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(_) => fs::rename(staged, blob),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::rename(staged, blob)
+    }
+}
+
 fn publish_dest_state(blob: &Path) -> PublishDest {
     match fs::metadata(blob) {
         Ok(meta) if meta.is_file() => PublishDest::File,
@@ -5650,7 +5678,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let outcome = self.publish_staged_blob_with(
             staged,
             &blob,
-            || fs::rename(staged, &blob),
+            || publish_without_replacing(staged, &blob),
             crate::atomic::is_transient_rename_error,
         )?;
         if outcome != PublishRename::Published {
@@ -5674,6 +5702,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// The rename half of [`Self::publish_staged_blob`], with the rename and
     /// its transient classifier passed in so a test can stage the Windows
     /// failures. The staged file is gone afterwards unless it became the blob.
+    ///
+    /// Upstream holds SQLite's writer lock from the existence check through
+    /// the rename, so that a plain rename cannot replace a blob another entry
+    /// published (and flushed) meanwhile. This fork publishes outside the
+    /// index lock (a wrapper's put must not wait for a daemon's batch), so
+    /// production's rename never replaces a file instead:
+    /// [`publish_without_replacing`].
     fn publish_staged_blob_with(
         &self,
         staged: &Path,
@@ -5681,27 +5716,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         rename: impl FnMut() -> std::io::Result<()>,
         is_transient: impl Fn(&std::io::Error) -> bool,
     ) -> Result<PublishRename> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
         if blob.is_file() {
             Self::discard_staged_blob(staged);
             return Ok(PublishRename::LostRace);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-        // Keep SQLite's writer lock from this final existence check through
-        // the rename. Plain rename would otherwise overwrite a
-        // newly published inode on Unix and undo another entry's flush.
-        // `publish_rename` still handles Windows sharing/delete-pending states.
         let outcome = publish_rename(rename, || publish_dest_state(blob), is_transient);
         if !matches!(outcome, Ok(PublishRename::Published)) {
             tracing::debug!("{} not published by this put: {outcome:?}", blob.display());
             Self::discard_staged_blob(staged);
         }
-        let outcome = outcome?;
-        tx.commit()?;
-        Ok(outcome)
+        outcome
     }
 
     /// Discard a staging snapshot (best effort; the staging sweep reclaims any
