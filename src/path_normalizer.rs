@@ -292,11 +292,27 @@ impl PathNormalizer {
             .map(PathBuf::from)
             .or_else(|| env.home_dir().map(|home| home.join(".cargo")))
             .and_then(|path| resolve(&path));
+        // A Cargo home whose `registry` and `git` link into another one (a
+        // worktree pool member's own home, sharing `~/.cargo`'s downloads):
+        // rustc runs a dependency in its package directory, `getcwd` spells
+        // that through the link, and the other home's path is not under this
+        // one. It fell to the `<WORKSPACE>` cwd rule (`/proc/self/cwd` in the
+        // debug info), so a registry proc macro compiled there differed from
+        // the one stored from the shared home under the same key, and every
+        // crate that names it as an extern keyed apart (30 misses on a pool
+        // member's first build, 2026-10-23). The other home is this one.
+        let linked_homes = cargo_home
+            .as_deref()
+            .map(linked_cargo_home_roots)
+            .unwrap_or_default();
         push_rule_with_variants(
             &mut rules,
             cargo_home.and_then(|p| canonical_string(&p)),
             "<CARGO_HOME>",
         );
+        for root in linked_homes {
+            push_rule_with_variants(&mut rules, Some(root), "<CARGO_HOME>");
+        }
 
         // Same default-fallback story for RUSTUP_HOME. rustup paths
         // appear in -L flags and toolchain refs — without this rule,
@@ -1359,6 +1375,32 @@ pub(crate) fn canonical_form(canon: &Path) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Where a Cargo home's `registry` and `git` resolve when they link into
+/// another directory of that name: that directory's parent, canonical, once.
+/// Empty when they are the home's own.
+fn linked_cargo_home_roots(home: &Path) -> Vec<String> {
+    let own = home.canonicalize().ok();
+    let mut roots = Vec::new();
+    for sub in ["registry", "git"] {
+        let Ok(target) = home.join(sub).canonicalize() else {
+            continue;
+        };
+        if target.file_name() != Some(std::ffi::OsStr::new(sub)) {
+            continue;
+        }
+        let Some(parent) = target.parent().filter(|parent| Some(*parent) != own.as_deref()) else {
+            continue;
+        };
+        if let Some(root) = canonical_form(parent)
+            && !is_filesystem_root_prefix(&root)
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 /// Drop the Windows extended-length (`\\?\`) verbatim prefix that
 /// [`Path::canonicalize`] returns on Windows.
 ///
@@ -1873,6 +1915,37 @@ mod tests {
     }
     use std::fs;
     use tempfile::TempDir;
+
+    /// A pool member's own Cargo home links `registry` and `git` into the
+    /// shared one; rustc's cwd in a dependency spells the shared path.
+    #[cfg(unix)]
+    #[test]
+    fn a_cargo_home_linking_its_registry_into_another_maps_both_to_cargo_home() {
+        let dir = TempDir::new().unwrap();
+        let root = PathBuf::from(canonical_string(dir.path()).unwrap());
+        let shared = root.join("shared-cargo");
+        let own = root.join("member.cargo");
+        let project = root.join("project");
+        for path in [shared.join("registry/src/idx/dep-1.0.0"), shared.join("git"), own.clone(), project.clone()] {
+            fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(shared.join("registry"), own.join("registry")).unwrap();
+        std::os::unix::fs::symlink(shared.join("git"), own.join("git")).unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("CARGO_HOME", own.as_os_str().to_owned())],
+            Some(project),
+            Some(root.join("home")),
+            root.join("tmp"),
+        );
+        let normalizer = PathNormalizer::from_invocation(None, &env);
+        let through_link = own.join("registry/src/idx/dep-1.0.0");
+        let resolved = shared.join("registry/src/idx/dep-1.0.0");
+        let expected = "<CARGO_HOME>/registry/src/idx/dep-1.0.0";
+        assert_eq!(normalizer.normalize(through_link.to_str().unwrap()), expected);
+        assert_eq!(normalizer.normalize(resolved.to_str().unwrap()), expected);
+        assert_eq!(linked_cargo_home_roots(&own), vec![shared.to_str().unwrap().to_string()]);
+        assert!(linked_cargo_home_roots(&shared).is_empty());
+    }
 
     #[test]
     fn concurrent_invocation_normalizers_use_each_clients_paths() {
