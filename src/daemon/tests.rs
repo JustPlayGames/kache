@@ -16165,6 +16165,27 @@ fn a_buffered_fire_and_forget_request_is_bounded_through_flush() {
 }
 
 #[test]
+fn a_started_daemon_sweeps_when_the_last_sweep_is_due_and_never_at_once() {
+    let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    let ago = |seconds| Some(now - Duration::from_secs(seconds));
+    // A restart in the middle of builds does not sweep while they store.
+    assert_eq!(first_periodic_gc_delay(None, now), STARTUP_GC_DELAY);
+    assert_eq!(first_periodic_gc_delay(ago(7 * 3600), now), STARTUP_GC_DELAY);
+    // A sweep an hour ago: the next is due five hours on, as without the restart.
+    assert_eq!(first_periodic_gc_delay(ago(3600), now), Duration::from_secs(5 * 3600));
+    assert_eq!(
+        first_periodic_gc_delay(ago(6 * 3600 - 60), now),
+        STARTUP_GC_DELAY,
+        "due in a minute still waits for the start delay"
+    );
+    // A record from the future (a clock step) is not trusted to postpone it.
+    assert_eq!(
+        first_periodic_gc_delay(Some(now + Duration::from_secs(3600)), now),
+        STARTUP_GC_DELAY
+    );
+}
+
+#[test]
 fn the_daemon_runs_four_compiler_requests_per_hardware_thread() {
     // A 192-thread build machine starts up to 192 units per build, and
     // concurrent worktree builds several times that; past the limit each unit
