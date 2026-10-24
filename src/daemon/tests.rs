@@ -16163,3 +16163,29 @@ fn a_buffered_fire_and_forget_request_is_bounded_through_flush() {
     );
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+#[test]
+fn the_daemon_runs_four_compiler_requests_per_hardware_thread() {
+    // A 192-thread build machine starts up to 192 units per build, and
+    // concurrent worktree builds several times that; past the limit each unit
+    // pays a whole engine start in its client.
+    assert_eq!(execution_worker_count(192), 768);
+    assert_eq!(execution_worker_count(8), 32);
+    assert_eq!(execution_worker_count(1), 4);
+    assert_eq!(execution_worker_count(0), 1);
+    assert_eq!(execution_worker_count(4096), MAX_EXECUTION_WORKERS);
+}
+
+#[test]
+fn compiler_requests_leave_the_default_blocking_pool_to_offloaded_work() {
+    for workers in [1, 32, 768, MAX_EXECUTION_WORKERS] {
+        assert_eq!(blocking_thread_limit(workers) - workers, OFFLOAD_BLOCKING_THREADS);
+    }
+}
+
+#[test]
+fn running_compiles_leave_the_base_connection_limit_to_other_requests() {
+    for workers in [1, 32, 192, MAX_EXECUTION_WORKERS] {
+        assert_eq!(connection_limit(workers) - workers, BASE_CONNECTION_LIMIT);
+    }
+}
