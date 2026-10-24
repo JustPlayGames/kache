@@ -51,6 +51,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(all(test, windows))]
+type DurabilityOpenHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static DURABILITY_OPEN_HOOK: std::cell::RefCell<Option<DurabilityOpenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn sync_durability_file(file: &fs::File) -> std::io::Result<()> {
     #[cfg(test)]
     DURABILITY_SYNC_OBSERVATIONS.with(|observations| -> std::io::Result<()> {
@@ -72,6 +81,10 @@ fn open_published_file(path: &Path) -> std::io::Result<fs::File> {
     #[cfg(windows)]
     {
         let permissions = fs::metadata(path)?.permissions();
+        #[cfg(test)]
+        if let Some(hook) = DURABILITY_OPEN_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(permissions.readonly());
+        }
         if permissions.readonly() {
             let mut writable = permissions.clone();
             writable.set_readonly(false);
@@ -94,8 +107,9 @@ fn verify_durability_file(
     path: &Path,
     cached: &CachedFile,
     sync_file: &mut impl FnMut(&fs::File) -> std::io::Result<()>,
+    open_file: impl FnOnce(&Path) -> Result<fs::File>,
 ) -> Result<fs::File> {
-    let mut file = open_published_file(path)?;
+    let mut file = open_file(path)?;
     let metadata = file.metadata()?;
     anyhow::ensure!(metadata.is_file(), "pending blob is not a regular file");
     anyhow::ensure!(metadata.len() == cached.size, "pending blob size changed");
@@ -5757,7 +5771,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 record_store_copy_reason(reason, size_bytes);
             }
         }
-        set_blob_readonly(&blob);
         Ok(true)
     }
 
@@ -5783,12 +5796,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return Ok(PublishRename::LostRace);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
+        // Windows flushers clear a published blob's read-only bit for a
+        // moment to open a write handle, serialized under the writer lock
+        // (`open_pending_blob`). Upstream finishes publication under that
+        // lock too; this fork publishes outside it, so on Windows the blob
+        // goes out read-only already and no publisher flips the bit after the
+        // rename, inside a flusher's window. Elsewhere, or if the bit cannot
+        // be set here, the published blob is made read-only as before.
+        #[cfg(windows)]
+        let published_readonly = set_blob_readonly_checked(staged).is_ok();
+        #[cfg(not(windows))]
+        let published_readonly = false;
         let outcome = publish_rename(rename, || publish_dest_state(blob), is_transient);
         if !matches!(outcome, Ok(PublishRename::Published)) {
             tracing::debug!("{} not published by this put: {outcome:?}", blob.display());
             Self::discard_staged_blob(staged);
         }
-        outcome
+        let outcome = outcome?;
+        if outcome == PublishRename::Published && !published_readonly {
+            set_blob_readonly(blob);
+        }
+        Ok(outcome)
     }
 
     /// Discard a staging snapshot (best effort; the staging sweep reclaims any
@@ -6185,7 +6213,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let mut verified = Vec::new();
         if !sequential {
             for cached in unique_files.values() {
-                let Some(blob) = self.verify_pending_blob(cache_key, cached, &mut sync_file) else {
+                let Some(blob) = self.verify_pending_blob(cache_key, cached, &mut sync_file, None)
+                else {
                     return Ok(false);
                 };
                 verified.push(blob);
@@ -6219,7 +6248,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if sequential {
             for cached in unique_files.values() {
                 let Some((blob, file)) =
-                    self.verify_pending_blob(cache_key, cached, &mut sync_file)
+                    self.verify_pending_blob(cache_key, cached, &mut sync_file, Some(&tx))
                 else {
                     return Ok(false);
                 };
@@ -6256,10 +6285,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         cache_key: &str,
         cached: &CachedFile,
         sync_file: &mut impl FnMut(&fs::File) -> std::io::Result<()>,
+        writer_guard: Option<&rusqlite::Transaction<'_>>,
     ) -> Option<(PathBuf, fs::File)> {
         let blob = self.blob_path(&cached.hash);
         let checked = (|| -> Result<fs::File> {
-            let file = verify_durability_file(&blob, cached, sync_file)?;
+            let file = verify_durability_file(&blob, cached, sync_file, |path| {
+                self.open_pending_blob(path, writer_guard)
+            })?;
             crate::atomic::fsync_dir(blob.parent().expect("blob path has a parent"))?;
             Ok(file)
         })();
@@ -6274,6 +6306,29 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 None
             }
         }
+    }
+
+    fn open_pending_blob(
+        &self,
+        path: &Path,
+        writer_guard: Option<&rusqlite::Transaction<'_>>,
+    ) -> Result<fs::File> {
+        // Windows needs a writable handle for FlushFileBuffers. Serialize
+        // only the read-only-bit/open/restore window with other flushers and
+        // publishers; hashing and fsync still run after this guard drops.
+        // Large-entry promotion already holds the writer transaction.
+        #[cfg(windows)]
+        let _writer = if writer_guard.is_none() {
+            Some(rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let _ = writer_guard;
+        Ok(open_published_file(path)?)
     }
 
     pub fn entry_dir(&self, cache_key: &str) -> PathBuf {
@@ -8497,7 +8552,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if artifact.exists() {
                 let blob = self.blob_path(&cached.hash);
                 let selected = if blob.is_file() { &blob } else { &artifact };
-                verify_durability_file(selected, cached, &mut sync_file)?;
+                verify_durability_file(selected, cached, &mut sync_file, |path| {
+                    Ok(open_published_file(path)?)
+                })?;
             }
         }
         after_preflight();
