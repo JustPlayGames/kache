@@ -78,7 +78,7 @@ impl Drop for InvocationScope {
 pub(crate) struct ChildRss(std::sync::Arc<AtomicU64>);
 
 impl ChildRss {
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn record(&self, bytes: u64) {
         self.0.fetch_max(bytes, Ordering::Relaxed);
     }
@@ -91,7 +91,7 @@ impl ChildRss {
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn child_rss_recorder() -> Option<ChildRss> {
     INVOCATION_COUNTS.with(|slot| {
         slot.borrow()

@@ -95,6 +95,27 @@ impl Job {
         Ok(job)
     }
 
+    /// The most memory the processes in this job committed at once, in bytes.
+    /// The kernel keeps it for every job; `None` when it cannot be read.
+    pub fn peak_memory(&self) -> Option<u64> {
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        if unsafe {
+            QueryInformationJobObject(
+                self.0.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return None;
+        }
+        u64::try_from(limits.PeakJobMemoryUsed)
+            .ok()
+            .filter(|bytes| *bytes > 0)
+    }
+
     pub fn kill(&self) -> io::Result<()> {
         if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
             Err(io::Error::last_os_error())

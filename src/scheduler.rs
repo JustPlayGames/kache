@@ -12,9 +12,11 @@
 //! The permit pool size is [`default_pool_size`]:
 //! `std::thread::available_parallelism()`, with a floor of 1. Unmeasured
 //! compiles occupy [`UNMEASURED_COMPILE_WEIGHT`] slots; unmeasured
-//! invocations that run the system linker occupy [`UNMEASURED_LINK_WEIGHT`]. After a real compile, Unix
-//! wrappers record the child's peak RSS by crate name; later invocations of
-//! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
+//! invocations that run the system linker occupy [`UNMEASURED_LINK_WEIGHT`]. After a real compile,
+//! wrappers record the child's peak RSS by crate name (on Windows, the peak
+//! memory of the job holding the compiler); later invocations of that crate
+//! occupy `ceil(rss / slot)` slots, clamped to the pool, a slot being the
+//! machine's memory shared across the pool and never less than 512 MiB.
 //!
 //! Under memory pressure (see [`pressure`]) a compile asks for the whole
 //! pool, so compiles run one after another until pressure eases. Linux
@@ -260,8 +262,9 @@ impl MissGuard {
 
     /// Record the waited-for compiler child's peak RSS under `crate_name`.
     ///
-    /// No-op when the scheduler did not admit this compile, on non-Unix, or
-    /// when the child never ran.
+    /// No-op when the scheduler did not admit this compile, on a platform
+    /// with no child memory sample (neither Unix nor Windows), or when the
+    /// child never ran.
     pub fn record_compile_rss(&self, crate_name: &str) {
         let Some(dir) = self.weights_dir.as_ref() else {
             return;
@@ -670,8 +673,8 @@ pub fn test_floor(cache_dir: &Path, key: &str) -> u32 {
         .map_or(1, |rss| weight_in_slots(rss, u32::MAX, slot))
 }
 
-/// Record the waited-for test child's peak RSS under `key`. No-op on
-/// non-Unix.
+/// Record the waited-for test child's peak RSS under `key`. No-op without
+/// a child memory sample.
 pub fn record_test_rss(cache_dir: &Path, key: &str) {
     if let Some(rss) = peak_child_rss_bytes() {
         let _ = write_weight(&scheduler_root(cache_dir).join("weights"), key, rss);
@@ -879,11 +882,29 @@ fn detected_memory() -> Option<u64> {
         {
             macos_memsize()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            windows_physical_memory()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             None
         }
     }
+}
+
+/// Physical memory on Windows. Without it every slot stood for 512 MiB, so a
+/// measured 1.5 GiB compile took three slots of a 4-slot pool on an 8 GiB
+/// machine instead of one.
+#[cfg(windows)]
+fn windows_physical_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a zeroed MEMORYSTATUSEX with its length set is what the call
+    // expects; it writes the whole structure on success.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0)
+        .then_some(status.ullTotalPhys)
 }
 
 #[cfg(target_os = "macos")]
