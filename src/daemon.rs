@@ -7121,8 +7121,15 @@ async fn server_main(
         }
     });
 
+    let first_gc = first_periodic_gc_delay(
+        crate::report::read_gc_stats(&daemon.config.cache_dir)
+            .and_then(|stats| chrono::DateTime::parse_from_rfc3339(&stats.last_run).ok())
+            .map(std::time::SystemTime::from),
+        std::time::SystemTime::now(),
+    );
     let gc_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + first_gc, PERIODIC_GC_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -7611,6 +7618,31 @@ const BASE_CONNECTION_LIMIT: usize = 128;
 
 /// The most compiler requests one daemon runs at once.
 const MAX_EXECUTION_WORKERS: usize = 1024;
+
+/// How often the daemon sweeps the store (age, housekeeping, size).
+const PERIODIC_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// The soonest a started daemon sweeps. A daemon restarts while builds wait
+/// on it (an update, a crash), and its clients come back storing at once:
+/// a sweep then holds the index's write lock while they store, and their
+/// stores give up as "database is locked".
+const STARTUP_GC_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// When a started daemon first sweeps: when the last sweep, by any daemon on
+/// this store, is [`PERIODIC_GC_INTERVAL`] old, and never sooner than
+/// [`STARTUP_GC_DELAY`]. Without a record (or one from the future, a clock
+/// step) the sweep is due.
+fn first_periodic_gc_delay(
+    last_run: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Duration {
+    let due = last_run
+        .and_then(|last| now.duration_since(last).ok())
+        .map_or(Duration::ZERO, |since| {
+            PERIODIC_GC_INTERVAL.saturating_sub(since)
+        });
+    due.max(STARTUP_GC_DELAY)
+}
 
 /// The fewest: a small machine still runs several builds at once (an
 /// editor's checks beside a build, a few checkouts), each starting as many
