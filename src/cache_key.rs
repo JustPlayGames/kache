@@ -5863,6 +5863,13 @@ pub enum StaticLibUse {
     /// proc-macro). ld64 writes the archive's absolute path into the `N_OSO`
     /// entry of every DWARF-bearing member.
     Linked,
+    /// A [`Self::Linked`] use by a link that strips debug information on an
+    /// ELF target (`-C strip=debuginfo` or `symbols`, which rustc hands the
+    /// linker as `--strip-debug` / `--strip-all`): no debug section of the
+    /// archive's objects reaches the output, so a GNU archive of ELF objects
+    /// is keyed without them
+    /// ([`crate::native_archive::stripped_link_archive_identity`]).
+    StrippedLink,
 }
 
 impl StaticLibUse {
@@ -5872,6 +5879,7 @@ impl StaticLibUse {
         match self {
             Self::Bundled => "static-ar-v11-bundled",
             Self::Linked => "static-ar-v10-linked",
+            Self::StrippedLink => "static-ar-v1-stripped-link",
         }
     }
 }
@@ -5924,9 +5932,27 @@ fn oso_archive_use(
 fn linked_archive_use(args: &RustcArgs, archive: &Path, oso_root: Option<&Path>) -> StaticLibUse {
     if !args.is_executable_output() || oso_root.is_some_and(|root| archive.starts_with(root)) {
         StaticLibUse::Bundled
+    } else if link_strips_elf_debuginfo(args) {
+        StaticLibUse::StrippedLink
     } else {
         StaticLibUse::Linked
     }
+}
+
+/// Whether this link strips debug information from an ELF output: `-C
+/// strip=debuginfo` (Cargo's default for a profile without debug info) or
+/// `strip=symbols`, for a Linux or Android target, where rustc's GNU-flavoured
+/// linker gets `--strip-debug` / `--strip-all`. Apple targets strip in a
+/// separate step after the link, illumos and Solaris links support no
+/// `--strip-debug`, and Windows has no ELF objects: those keep
+/// [`StaticLibUse::Linked`].
+fn link_strips_elf_debuginfo(args: &RustcArgs) -> bool {
+    let strips = matches!(args.get_codegen_opt("strip"), Some("debuginfo" | "symbols"));
+    let linux = match args.target.as_deref() {
+        Some(target) => target.contains("-linux"),
+        None => cfg!(any(target_os = "linux", target_os = "android")),
+    };
+    strips && linux
 }
 
 /// Whether a `static` spec that resolves in none of the unit's dirs refuses
@@ -7940,8 +7966,14 @@ fn compute_static_lib_hash_for(
             path.display()
         );
     }
+    if usage == StaticLibUse::StrippedLink
+        && let Some(digest) = crate::native_archive::stripped_link_archive_identity(&bytes)
+    {
+        return Ok(digest);
+    }
+    let linked = matches!(usage, StaticLibUse::Linked | StaticLibUse::StrippedLink);
     if let Some(identity) = crate::native_archive::portable_static_archive_identity(&bytes)
-        && !(usage == StaticLibUse::Linked && identity.macho_dwarf_members)
+        && !(linked && identity.macho_dwarf_members)
     {
         return Ok(identity.digest);
     }
@@ -7996,7 +8028,7 @@ fn compute_static_lib_hash_for(
     // second checkout relinked every test binary). What a hit restores is the
     // image and PDB another target directory linked: the PDB names that
     // directory's archives, the code is the same.
-    if usage == StaticLibUse::Linked
+    if linked
         && bytes.starts_with(b"!<arch>\n")
         && let Some(digest) = path.parent().and_then(|dir| {
             crate::coff_archive::path_free_digest(

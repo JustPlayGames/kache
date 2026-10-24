@@ -1330,6 +1330,230 @@ fn parse_ar_decimal(field: &[u8]) -> Option<usize> {
     s.parse::<usize>().ok()
 }
 
+/// Domain of [`stripped_link_archive_identity`]: never equal to an exact
+/// digest, a fallback or another key input.
+const GNU_STRIPPED_LINK_DOMAIN: &[u8] = b"kache.native-ar.gnu.stripped-link.v1\0";
+
+/// Identity of a GNU archive of ELF objects for a link that strips debug
+/// information (`-C strip=debuginfo` or `strip=symbols` on an ELF target,
+/// which rustc hands the linker as `--strip-debug` / `--strip-all`), or `None`
+/// for the caller's exact digest.
+///
+/// Such a link drops every debug section of the archive's objects, so their
+/// bytes cannot reach the output. They are the bytes that spell where the
+/// objects were compiled: a `cc` build compiles a registry crate's C under its
+/// Cargo home (`<home>/registry/src/...`), which DWARF records in
+/// `DW_AT_comp_dir` and the line tables. Two Cargo homes (the build machine's
+/// pool members each build with their own) then make archives that differ in
+/// `.debug_line_str` alone, and every test binary or bin linking one (ring's,
+/// under every rustls user) missed in each home although it links the same
+/// bytes.
+///
+/// Hashed: the archive as [`gnu_archive_identity`] proves it (every check of
+/// that arm must pass first), with each member's date and exact name token and
+/// the `//` table as there; the symbol table as its names and the member each
+/// one names (its raw offsets move when a member's debug sections change
+/// size); each object as [`elf_link_identity`]: everything but the content,
+/// size and offset of its debug sections and of the relocations that apply to
+/// them. Any member that is not an ELF relocatable object, or a symbol table
+/// naming no object member, gives `None`.
+pub fn stripped_link_archive_identity(bytes: &[u8]) -> Option<String> {
+    gnu_archive_identity(bytes)?;
+    let mut members = Vec::new();
+    let mut pos = AR_MAGIC.len();
+    while pos < bytes.len() {
+        let header = bytes.get(pos..pos.checked_add(AR_HEADER_LEN)?)?;
+        let name = ar_name(&header[0..16])?;
+        let mtime = parse_ar_timestamp(&header[16..28])?;
+        let size = parse_ar_decimal(&header[48..58])?;
+        let data_start = pos + AR_HEADER_LEN;
+        let data = bytes.get(data_start..data_start.checked_add(size)?)?;
+        members.push((pos, name, mtime, data));
+        pos = data_start.checked_add(size)?.checked_add(size & 1)?;
+    }
+    let object_ordinal = |offset: usize| -> Option<u64> {
+        let index = members.iter().position(|(start, ..)| *start == offset)?;
+        matches!(classify(members[index].1), Member::Object).then_some(index as u64)
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(GNU_STRIPPED_LINK_DOMAIN);
+    for (_, name, mtime, data) in &members {
+        match mtime {
+            ArTimestamp::Decimal(mtime) => {
+                hasher.update(b"mtime\0");
+                hasher.update(&(*mtime as u64).to_le_bytes());
+            }
+            ArTimestamp::Blank => {
+                hasher.update(b"mtime-blank\0");
+            }
+        }
+        match classify(name) {
+            Member::SymbolTable => {
+                let wide = *name == "/SYM64/";
+                hasher.update(if wide { b"symtab64\0" } else { b"symtab32\0" });
+                let word = if wide { 8 } else { 4 };
+                let read = |at: usize| -> Option<usize> {
+                    let raw = data.get(at..at.checked_add(word)?)?;
+                    let value = if wide {
+                        u64::from_be_bytes(raw.try_into().ok()?)
+                    } else {
+                        u64::from(u32::from_be_bytes(raw.try_into().ok()?))
+                    };
+                    usize::try_from(value).ok()
+                };
+                let count = read(0)?;
+                let names_start = word.checked_add(count.checked_mul(word)?)?;
+                let mut names = data.get(names_start..)?;
+                hasher.update(&(count as u64).to_le_bytes());
+                for index in 0..count {
+                    let offset = read(word.checked_add(index.checked_mul(word)?)?)?;
+                    let end = names.iter().position(|byte| *byte == 0)?;
+                    hasher.update(&(end as u64).to_le_bytes());
+                    hasher.update(&names[..end]);
+                    hasher.update(&object_ordinal(offset)?.to_le_bytes());
+                    names = &names[end + 1..];
+                }
+                if names.iter().any(|byte| *byte != 0) {
+                    return None;
+                }
+            }
+            Member::LongNameTable => {
+                hasher.update(b"longnames\0");
+                hasher.update(&(data.len() as u64).to_le_bytes());
+                hasher.update(data);
+            }
+            Member::Object => {
+                hasher.update(b"member\0");
+                hasher.update(&(name.len() as u64).to_le_bytes());
+                hasher.update(name.as_bytes());
+                hasher.update(&elf_link_identity(data)?);
+            }
+        }
+    }
+    Some(format!("gnu-ar-strip-v1:{}", hasher.finalize().to_hex()))
+}
+
+/// Whether an ELF section of this name holds debug information a
+/// `--strip-debug` link drops (DWARF, compressed or not).
+fn is_elf_debug_section_name(name: &[u8]) -> bool {
+    name.starts_with(b".debug") || name.starts_with(b".zdebug")
+}
+
+/// The part of an ELF relocatable object a link that strips debug information
+/// can read: the ELF header but its section-table offset, then per section its
+/// name, type, flags, address, link, info, alignment and entry size, and the
+/// content (or, for `SHT_NOBITS`, the size) of every section that is not
+/// debug information. Debug sections are non-allocated `.debug*` / `.zdebug*`
+/// sections and the `SHT_REL`/`SHT_RELA` sections that apply to them; only
+/// their names and headers' fixed fields are hashed. `None` unless the object
+/// passes [`parse_known_elf_relocatable_object`].
+fn elf_link_identity(bytes: &[u8]) -> Option<[u8; 32]> {
+    parse_known_elf_relocatable_object(bytes)?;
+    let endian = if bytes[5] == 1 { MachEndian::Little } else { MachEndian::Big };
+    let wide = bytes[4] == 2;
+    let (header_len, section_len, shoff_field) = if wide { (64, 64, 40..48) } else { (52, 40, 32..36) };
+    let (section_offset, section_count, names_index) = if wide {
+        (
+            usize::try_from(endian.u64(bytes, 40)?).ok()?,
+            usize::from(endian.u16(bytes, 60)?),
+            usize::from(endian.u16(bytes, 62)?),
+        )
+    } else {
+        (
+            usize::try_from(endian.u32(bytes, 32)?).ok()?,
+            usize::from(endian.u16(bytes, 48)?),
+            usize::from(endian.u16(bytes, 50)?),
+        )
+    };
+    let section = |index: usize| -> Option<&[u8]> {
+        let start = section_offset.checked_add(section_len * index)?;
+        bytes.get(start..start.checked_add(section_len)?)
+    };
+    // (type, flags, addr, offset, size, link, info, addralign, entsize)
+    let fields = |header: &[u8]| -> Option<[u64; 9]> {
+        Some(if wide {
+            [
+                u64::from(endian.u32(header, 4)?),
+                endian.u64(header, 8)?,
+                endian.u64(header, 16)?,
+                endian.u64(header, 24)?,
+                endian.u64(header, 32)?,
+                u64::from(endian.u32(header, 40)?),
+                u64::from(endian.u32(header, 44)?),
+                endian.u64(header, 48)?,
+                endian.u64(header, 56)?,
+            ]
+        } else {
+            [
+                u64::from(endian.u32(header, 4)?),
+                u64::from(endian.u32(header, 8)?),
+                u64::from(endian.u32(header, 12)?),
+                u64::from(endian.u32(header, 16)?),
+                u64::from(endian.u32(header, 20)?),
+                u64::from(endian.u32(header, 24)?),
+                u64::from(endian.u32(header, 28)?),
+                u64::from(endian.u32(header, 32)?),
+                u64::from(endian.u32(header, 36)?),
+            ]
+        })
+    };
+    let names_fields = fields(section(names_index)?)?;
+    let names_start = usize::try_from(names_fields[3]).ok()?;
+    let names = bytes.get(names_start..names_start.checked_add(usize::try_from(names_fields[4]).ok()?)?)?;
+    let name_of = |header: &[u8]| -> Option<&[u8]> {
+        let raw = names.get(usize::try_from(endian.u32(header, 0)?).ok()?..)?;
+        Some(&raw[..raw.iter().position(|byte| *byte == 0)?])
+    };
+    const SHF_ALLOC: u64 = 0x2;
+    const SHT_RELA: u64 = 4;
+    const SHT_NOBITS: u64 = 8;
+    const SHT_REL: u64 = 9;
+    let mut debug = vec![false; section_count];
+    for (index, is_debug) in debug.iter_mut().enumerate() {
+        let header = section(index)?;
+        *is_debug = is_elf_debug_section_name(name_of(header)?) && fields(header)?[1] & SHF_ALLOC == 0;
+    }
+    for index in 0..section_count {
+        let field = fields(section(index)?)?;
+        if matches!(field[0], SHT_REL | SHT_RELA)
+            && field[1] & SHF_ALLOC == 0
+            && usize::try_from(field[6]).ok().and_then(|target| debug.get(target).copied()) == Some(true)
+        {
+            debug[index] = true;
+        }
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"kache.elf.stripped-link.v1\0");
+    let mut header = bytes.get(..header_len)?.to_vec();
+    header[shoff_field].fill(0);
+    hasher.update(&header);
+    for (index, is_debug) in debug.iter().enumerate() {
+        let header = section(index)?;
+        let name = name_of(header)?;
+        let field = fields(header)?;
+        hasher.update(&(name.len() as u64).to_le_bytes());
+        hasher.update(name);
+        for value in [field[0], field[1], field[2], field[5], field[6], field[7], field[8]] {
+            hasher.update(&value.to_le_bytes());
+        }
+        if *is_debug {
+            hasher.update(b"debug\0");
+        } else if field[0] == SHT_NOBITS {
+            hasher.update(b"nobits\0");
+            hasher.update(&field[4].to_le_bytes());
+        } else {
+            let start = usize::try_from(field[3]).ok()?;
+            let content = bytes.get(start..start.checked_add(usize::try_from(field[4]).ok()?)?)?;
+            hasher.update(b"content\0");
+            hasher.update(&(content.len() as u64).to_le_bytes());
+            hasher.update(content);
+        }
+    }
+    Some(*hasher.finalize().as_bytes())
+}
+
 /// A BSD archive with one DWARF-bearing Mach-O member, for `cache_key` tests.
 #[cfg(test)]
 pub(crate) fn dwarf_bsd_archive_for_tests(payload: &[u8]) -> Vec<u8> {
@@ -1345,6 +1569,13 @@ pub(crate) fn dwarf_bsd_archive_for_tests(payload: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) fn gnu_crs_longname_archive_for_tests(payload: &[u8]) -> Vec<u8> {
     tests::gnu_crs_longname_archive("cafca65b3467684e-probe.o", &tests::elf_object(payload))
+}
+
+/// Two GNU archives of the same ELF objects compiled under two Cargo homes:
+/// they differ only in their debug sections, for `cache_key` tests.
+#[cfg(test)]
+pub(crate) fn two_homes_archives_for_tests() -> (Vec<u8>, Vec<u8>) {
+    (tests::ring_like("/w/pool/w03.cargo", b"code"), tests::ring_like("/w/cc-wt/lane.cargo", b"code"))
 }
 
 #[cfg(test)]
@@ -3681,5 +3912,201 @@ mod tests {
             }
             std::fs::write(output.join(name), bytes).unwrap();
         }
+    }
+
+    /// One section of [`elf_with_sections`]: name, type, flags, info, content.
+    type ElfSection<'a> = (&'a str, u32, u64, u32, &'a [u8]);
+
+    /// An x86-64 ELF relocatable object with `sections` after the null
+    /// section and `.shstrtab` last, contents laid out in order.
+    fn elf_with_sections(sections: &[ElfSection<'_>]) -> Vec<u8> {
+        let mut object = vec![0_u8; 64];
+        object[..4].copy_from_slice(b"\x7fELF");
+        object[4] = 2;
+        object[5] = 1;
+        object[6] = 1;
+        object[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        object[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        object[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        object[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        object[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        let count = sections.len() + 2;
+        object[60..62].copy_from_slice(&(count as u16).to_le_bytes());
+        object[62..64].copy_from_slice(&((count - 1) as u16).to_le_bytes());
+        let mut names = vec![0_u8];
+        let mut placed = Vec::new();
+        for (name, _, _, _, content) in sections {
+            placed.push((names.len(), object.len(), content.len()));
+            names.extend_from_slice(name.as_bytes());
+            names.push(0);
+            object.extend_from_slice(content);
+        }
+        let table_name = names.len();
+        names.extend_from_slice(b".shstrtab\0");
+        let names_offset = object.len();
+        object.extend_from_slice(&names);
+        while !object.len().is_multiple_of(8) {
+            object.push(0);
+        }
+        let table = object.len();
+        object[40..48].copy_from_slice(&(table as u64).to_le_bytes());
+        object.resize(table + count * 64, 0);
+        let mut put = |index: usize, name: usize, kind: u32, flags: u64, info: u32, at: usize, len: usize| {
+            let h = table + index * 64;
+            object[h..h + 4].copy_from_slice(&(name as u32).to_le_bytes());
+            object[h + 4..h + 8].copy_from_slice(&kind.to_le_bytes());
+            object[h + 8..h + 16].copy_from_slice(&flags.to_le_bytes());
+            object[h + 24..h + 32].copy_from_slice(&(at as u64).to_le_bytes());
+            object[h + 32..h + 40].copy_from_slice(&(len as u64).to_le_bytes());
+            object[h + 44..h + 48].copy_from_slice(&info.to_le_bytes());
+            object[h + 48..h + 56].copy_from_slice(&1_u64.to_le_bytes());
+        };
+        for (index, ((_, kind, flags, info, _), (name, at, len))) in sections.iter().zip(placed).enumerate() {
+            put(index + 1, name, *kind, *flags, *info, at, len);
+        }
+        put(count - 1, table_name, 3, 0, 0, names_offset, names.len());
+        object
+    }
+
+    /// An object compiled under `home`: code, data, and DWARF that spells
+    /// the home (with a relocation section applying to `.debug_info`).
+    fn object_built_in(home: &str, code: &[u8]) -> Vec<u8> {
+        let line_str = format!("{home}/registry/src/ring-0.17.14/crypto\0montgomery.c\0");
+        elf_with_sections(&[
+            (".text", 1, 0x6, 0, code),
+            (".data", 1, 0x3, 0, b"data"),
+            (".debug_info", 1, 0, 0, b"info"),
+            (".rela.debug_info", 4, 0x40, 3, &[7_u8; 24]),
+            (".debug_line_str", 1, 0x30, 0, line_str.as_bytes()),
+            (".comment", 1, 0x30, 0, b"GCC: 15\0"),
+        ])
+    }
+
+    /// A GNU archive of `members` (short names) behind a `/` symbol table
+    /// whose entries name members by index, at their real offsets.
+    fn archive_with_symbols(members: &[(&str, Vec<u8>)], symbols: &[(&str, usize)]) -> Vec<u8> {
+        let names_len: usize = symbols.iter().map(|(name, _)| name.len() + 1).sum();
+        let table_len = 4 + 4 * symbols.len() + names_len;
+        let mut offsets = Vec::new();
+        let mut at = AR_MAGIC.len() + AR_HEADER_LEN + table_len + (table_len & 1);
+        for (_, data) in members {
+            offsets.push(at);
+            at += AR_HEADER_LEN + data.len() + (data.len() & 1);
+        }
+        let mut table = (symbols.len() as u32).to_be_bytes().to_vec();
+        for (_, member) in symbols {
+            table.extend_from_slice(&(offsets[*member] as u32).to_be_bytes());
+        }
+        for (name, _) in symbols {
+            table.extend_from_slice(name.as_bytes());
+            table.push(0);
+        }
+        let mut out = AR_MAGIC.to_vec();
+        out.extend_from_slice(&member("/", &table));
+        for (name, data) in members {
+            out.extend_from_slice(&member(name, data));
+        }
+        out
+    }
+
+    pub(super) fn ring_like(home: &str, code: &[u8]) -> Vec<u8> {
+        archive_with_symbols(
+            &[("a-montgomery.o/", object_built_in(home, code)), ("b-mem.o/", object_built_in(home, b"mem"))],
+            &[("bn_from_montgomery", 0), ("CRYPTO_memcmp", 1)],
+        )
+    }
+
+    /// Two Cargo homes compile the same C into objects whose DWARF spells
+    /// each home (paths of other lengths move every later offset and the
+    /// symbol table's member offsets). A link that strips debug information
+    /// links the same bytes from both, so its digest is one; every other
+    /// reading still tells them apart.
+    #[test]
+    fn a_stripped_link_reads_no_debug_section_bytes() {
+        let a = ring_like("/w/pool/w03.cargo", b"code");
+        let b = ring_like("/w/cc-wt/lane-fresh-worktrees.cargo", b"code");
+        assert_ne!(a, b);
+        assert_ne!(portable_static_archive_hash(&a), portable_static_archive_hash(&b));
+        let digest = stripped_link_archive_identity(&a).expect("ELF archive");
+        assert!(digest.starts_with("gnu-ar-strip-v1:"));
+        assert_eq!(Some(digest.clone()), stripped_link_archive_identity(&b));
+        assert_ne!(Some(digest), portable_static_archive_hash(&a));
+    }
+
+    /// What a stripped link reads stays in the digest: code, the symbol
+    /// table's names and the member each names, member names, relocations
+    /// against code, and an allocated section whatever its name.
+    #[test]
+    fn a_stripped_link_still_reads_code_symbols_and_names() {
+        let base = stripped_link_archive_identity(&ring_like("/h", b"code")).unwrap();
+        let differs = |bytes: Vec<u8>, what: &str| {
+            assert_ne!(stripped_link_archive_identity(&bytes), Some(base.clone()), "{what}");
+        };
+        differs(ring_like("/h", b"edoc"), "code");
+        differs(
+            archive_with_symbols(
+                &[("a-montgomery.o/", object_built_in("/h", b"code")), ("b-mem.o/", object_built_in("/h", b"mem"))],
+                &[("bn_from_montgomery", 1), ("CRYPTO_memcmp", 0)],
+            ),
+            "the member a symbol names",
+        );
+        differs(
+            archive_with_symbols(
+                &[("a-montgomery.o/", object_built_in("/h", b"code")), ("b-mem.o/", object_built_in("/h", b"mem"))],
+                &[("bn_from_montgomery", 0), ("CRYPTO_memcpy", 1)],
+            ),
+            "a symbol's name",
+        );
+        differs(
+            archive_with_symbols(
+                &[("a-montgomery.o/", object_built_in("/h", b"code")), ("c-mem.o/", object_built_in("/h", b"mem"))],
+                &[("bn_from_montgomery", 0), ("CRYPTO_memcmp", 1)],
+            ),
+            "a member's name",
+        );
+        let with = |sections: &[ElfSection<'_>]| {
+            archive_with_symbols(&[("a.o/", elf_with_sections(sections))], &[("f", 0)])
+        };
+        let rela = |payload: &'static [u8]| {
+            with(&[(".text", 1, 0x6, 0, b"code"), (".rela.text", 4, 0x40, 1, payload)])
+        };
+        assert_ne!(
+            stripped_link_archive_identity(&rela(&[1; 24])),
+            stripped_link_archive_identity(&rela(&[2; 24])),
+            "a relocation against code"
+        );
+        let allocated = |payload: &'static [u8]| with(&[(".debug_kept", 1, 0x2, 0, payload)]);
+        assert_ne!(
+            stripped_link_archive_identity(&allocated(b"one")),
+            stripped_link_archive_identity(&allocated(b"two")),
+            "an allocated section named like debug information"
+        );
+        let debug = |payload: &'static [u8]| with(&[(".text", 1, 0x6, 0, b"code"), (".zdebug_str", 1, 0, 0, payload)]);
+        assert_eq!(
+            stripped_link_archive_identity(&debug(b"one")),
+            stripped_link_archive_identity(&debug(b"other")),
+            "compressed DWARF is debug information too"
+        );
+    }
+
+    /// Anything the stripped reading cannot prove falls back to the exact one.
+    #[test]
+    fn a_stripped_link_falls_back_on_what_it_cannot_prove() {
+        let object = object_built_in("/h", b"code");
+        let mut stray = archive_with_symbols(&[("a.o/", object.clone())], &[("f", 0)]);
+        // The symbol's offset points into the middle of the member.
+        let at = AR_MAGIC.len() + AR_HEADER_LEN + 4;
+        let offset = u32::from_be_bytes(stray[at..at + 4].try_into().unwrap()) + 2;
+        stray[at..at + 4].copy_from_slice(&offset.to_be_bytes());
+        assert!(stripped_link_archive_identity(&stray).is_none(), "a symbol naming no member");
+        let macho = archive(&[("a.o/", &dwarf_macho(b"debug"))]);
+        assert!(portable_static_archive_hash(&macho).is_some());
+        assert!(stripped_link_archive_identity(&macho).is_none(), "a Mach-O member");
+        assert!(stripped_link_archive_identity(b"!<thin>\n").is_none());
+        let unknown = raw_archive(&[("a.o/", b"not an object")]);
+        assert!(stripped_link_archive_identity(&unknown).is_none());
+        // No symbol table at all is fine.
+        let plain = raw_archive(&[("a.o/", &object)]);
+        assert!(stripped_link_archive_identity(&plain).is_some());
     }
 }

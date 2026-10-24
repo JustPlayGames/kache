@@ -8832,6 +8832,67 @@ fn linked_archive_use_follows_output_and_oso_root() {
     assert_eq!(use_of("bin", false, under, None), StaticLibUse::Linked);
 }
 
+/// A link that strips debug information on Linux reads its archives without
+/// their debug sections; one that keeps debug information, or links for
+/// another target, still reads them whole.
+#[test]
+fn a_link_that_strips_debug_info_keys_its_archives_without_it() {
+    let archive = Path::new("/opt/lib/libring.a");
+    let use_of = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "src/main.rs", "--crate-type", "bin"];
+        argv.extend_from_slice(extra);
+        let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+        linked_archive_use(&RustcArgs::parse(&argv).unwrap(), archive, None)
+    };
+    let linux = ["--target", "x86_64-unknown-linux-gnu"];
+    let with = |more: &[&'static str]| [&linux[..], more].concat();
+    assert_eq!(use_of(&with(&["-C", "strip=debuginfo"])), StaticLibUse::StrippedLink);
+    assert_eq!(use_of(&with(&["-C", "strip=symbols"])), StaticLibUse::StrippedLink);
+    assert_eq!(use_of(&with(&["-C", "strip=none"])), StaticLibUse::Linked);
+    assert_eq!(use_of(&linux), StaticLibUse::Linked, "no strip");
+    assert_eq!(
+        use_of(&with(&["-C", "strip=debuginfo", "-C", "strip=none"])),
+        StaticLibUse::Linked,
+        "the last -C strip wins"
+    );
+    for target in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-illumos"] {
+        assert_eq!(
+            use_of(&["--target", target, "-C", "strip=debuginfo"]),
+            StaticLibUse::Linked,
+            "{target}"
+        );
+    }
+    let lib = RustcArgs::parse(
+        &["rustc", "src/lib.rs", "--crate-type", "rlib", "-C", "strip=debuginfo"].map(String::from),
+    )
+    .unwrap();
+    assert_eq!(linked_archive_use(&lib, archive, None), StaticLibUse::Bundled);
+
+    let dir = tempfile::tempdir().unwrap();
+    let fh = FileHasher::new();
+    let hash_in = |name: &str, bytes: &[u8], usage: StaticLibUse| {
+        let lib_dir = dir.path().join(name);
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib = lib_dir.join("libring_core.a");
+        std::fs::write(&lib, bytes).unwrap();
+        fh.hash_static_lib_for(&lib, usage).unwrap()
+    };
+    let (home_a, home_b) = crate::native_archive::two_homes_archives_for_tests();
+    let stripped = hash_in("a", &home_a, StaticLibUse::StrippedLink);
+    assert!(stripped.starts_with("gnu-ar-strip-v1:"), "{stripped}");
+    assert_eq!(stripped, hash_in("b", &home_b, StaticLibUse::StrippedLink));
+    assert_ne!(
+        hash_in("c", &home_a, StaticLibUse::Linked),
+        hash_in("d", &home_b, StaticLibUse::Linked),
+        "a link that keeps debug information reads the homes"
+    );
+    assert_ne!(
+        hash_in("e", &home_a, StaticLibUse::Bundled),
+        hash_in("f", &home_b, StaticLibUse::Bundled),
+        "an rlib bundles the archive's bytes"
+    );
+}
+
 /// A DWARF-bearing Mach-O archive shares its structural digest across
 /// checkouts only when rustc bundles it into an rlib. An invocation that
 /// links it itself writes the archive's absolute path into `N_OSO`, so
