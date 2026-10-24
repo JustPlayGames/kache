@@ -15,6 +15,11 @@
 //!   [`PSI_SOME_AVG10`] percent of the last ten seconds. The cgroup's own
 //!   `memory.pressure` is read when there is one, so a container sees its
 //!   limit rather than the host's.
+//! - Windows: no stall measure exists, so the memory the machine has left:
+//!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
+//!   total, or commit (physical memory and page file) under
+//!   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit. Past either, Windows pages
+//!   the desktop out for the compiles and the machine stops responding.
 //! - Elsewhere, and when nothing can be read: no pressure.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +33,16 @@ const SAMPLE_FOR: Duration = Duration::from_millis(250);
 /// percent, from which Linux counts as under pressure.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const PSI_SOME_AVG10: f64 = 10.0;
+
+/// Physical memory available, in percent of the total, under which Windows
+/// counts as under pressure.
+#[cfg(any(test, windows))]
+pub(crate) const WINDOWS_MIN_AVAILABLE_PERCENT: u64 = 10;
+
+/// Commit left (physical memory and page file), in percent of the commit
+/// limit, under which Windows counts as under pressure.
+#[cfg(any(test, windows))]
+pub(crate) const WINDOWS_MIN_COMMIT_PERCENT: u64 = 5;
 
 /// `[cache] scheduler_memory_pressure`, set once at wrapper startup.
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -181,7 +196,41 @@ pub(crate) fn pressured_from(cgroup: Option<&std::path::Path>, host: &std::path:
         .unwrap_or(false)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Whether Windows' memory figures (`GlobalMemoryStatusEx`) are pressure:
+/// physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
+/// total, or commit left under [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit.
+/// Totals of zero are no reading, not pressure.
+#[cfg(any(test, windows))]
+pub(crate) fn windows_pressured(
+    available_physical: u64,
+    total_physical: u64,
+    available_commit: u64,
+    total_commit: u64,
+) -> bool {
+    let short = |available: u64, total: u64, percent: u64| {
+        total > 0 && u128::from(available) * 100 < u128::from(total) * u128::from(percent)
+    };
+    short(available_physical, total_physical, WINDOWS_MIN_AVAILABLE_PERCENT)
+        || short(available_commit, total_commit, WINDOWS_MIN_COMMIT_PERCENT)
+}
+
+#[cfg(windows)]
+fn under_pressure() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a zeroed MEMORYSTATUSEX with its length set is what the call
+    // expects, and it writes only within that struct.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0)
+        && windows_pressured(
+            status.ullAvailPhys,
+            status.ullTotalPhys,
+            status.ullAvailPageFile,
+            status.ullTotalPageFile,
+        )
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn under_pressure() -> bool {
     false
 }
@@ -256,6 +305,22 @@ mod tests {
         assert!(macos_pressured(2));
         assert!(macos_pressured(4));
         assert!(!macos_pressured(0));
+    }
+
+    #[test]
+    fn reads_windows_memory_figures() {
+        const GIB: u64 = 1 << 30;
+        // 64 GiB of RAM, 96 GiB of commit: plenty left of both.
+        assert!(!windows_pressured(20 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
+        // Physical memory under a tenth of the total.
+        assert!(windows_pressured(6 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
+        assert!(!windows_pressured(7 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
+        // Commit nearly spent while physical memory still looks free.
+        assert!(windows_pressured(20 * GIB, 64 * GIB, 4 * GIB, 96 * GIB));
+        assert!(!windows_pressured(20 * GIB, 64 * GIB, 5 * GIB, 96 * GIB));
+        // No reading is no pressure; figures past 2^64 / 100 do not overflow.
+        assert!(!windows_pressured(0, 0, 0, 0));
+        assert!(!windows_pressured(u64::MAX / 2, u64::MAX, u64::MAX / 2, u64::MAX));
     }
 
     #[test]
