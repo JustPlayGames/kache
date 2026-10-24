@@ -54,15 +54,19 @@ pub fn run(version: &str) -> Result<i32> {
                     client_version: version,
                 };
                 let socket = config.socket_path();
-                if let Some(exit) =
-                    execution.try_execute_with_trust(&socket, config.trust_daemon_execution)?
-                {
+                let attempt =
+                    execution.try_execute_attempt(&socket, config.trust_daemon_execution)?;
+                if let kache_ipc::execution::Attempt::Completed(exit) = attempt {
                     return Ok(exit);
                 }
-                // A daemon that is there but not answering is not started again.
+                // A daemon that is there but not answering is not started
+                // again, nor one that answered and declined: starting one
+                // would only find it, at the cost of an engine process.
                 #[cfg(windows)]
-                if !kache_ipc::execution::daemon_unresponsive(&socket)
-                    && let Some(exit) = windows::try_bootstrap(&execution, &socket, config.disabled)?
+                if attempt == kache_ipc::execution::Attempt::Unavailable
+                    && !kache_ipc::execution::daemon_unresponsive(&socket)
+                    && let Some(exit) =
+                        windows::try_bootstrap(&execution, &socket, config.disabled)?
                 {
                     return Ok(exit);
                 }

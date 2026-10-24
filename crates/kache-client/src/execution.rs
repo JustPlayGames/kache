@@ -42,11 +42,24 @@ impl Execution<'_> {
         socket: &Path,
         trusted_pipeline: bool,
     ) -> Result<Option<i32>> {
+        Ok(match self.try_execute_attempt(socket, trusted_pipeline)? {
+            kache_ipc::execution::Attempt::Completed(exit) => Some(exit),
+            _ => None,
+        })
+    }
+
+    /// [`Self::try_execute_with_trust`], telling a running daemon's refusal
+    /// apart from no daemon.
+    pub fn try_execute_attempt(
+        &self,
+        socket: &Path,
+        trusted_pipeline: bool,
+    ) -> Result<kache_ipc::execution::Attempt> {
         let prepared = match self.prepare(trusted_pipeline) {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::debug!(%error, "compiler request cannot be transferred");
-                return Ok(None);
+                return Ok(kache_ipc::execution::Attempt::Unavailable);
             }
         };
         #[cfg(unix)]
@@ -58,11 +71,11 @@ impl Execution<'_> {
             .collect::<Vec<_>>();
         #[cfg(unix)]
         {
-            kache_ipc::execution::try_execute(socket, &prepared.request, &descriptors)
+            kache_ipc::execution::try_execute_attempt(socket, &prepared.request, &descriptors)
         }
         #[cfg(windows)]
         {
-            kache_ipc::execution::try_execute(socket, &prepared.request)
+            kache_ipc::execution::try_execute_attempt(socket, &prepared.request)
         }
     }
 
