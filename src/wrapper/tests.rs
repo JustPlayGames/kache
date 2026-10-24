@@ -236,6 +236,9 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     };
     let (relocatable, _) =
         crate::cache_key::relocatable_record(&args, &reads_out_dir, Some("tree")).unwrap();
+    let (home_free, _) =
+        crate::cache_key::registry_relocatable_record(&args, &reads_out_dir, Some("tree"))
+            .expect("a registry unit's relocated row is filed for every Cargo home too");
 
     let key = |dep_info, tree: &str| crate::cache_key::KeyOutputs {
         dep_info: Some(dep_info),
@@ -253,6 +256,14 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     assert!(hasher.input_prediction(&shared).is_none());
     let record = hasher.portable_prediction_under(&relocatable, "tree").unwrap();
     assert_eq!(record.tree, "tree");
+    let home_free = hasher.portable_prediction_under(&home_free, "tree").unwrap();
+    assert_eq!(home_free.tree, "tree");
+    assert!(
+        !serde_json::to_string(&home_free)
+            .unwrap()
+            .contains(&*dir.path().to_string_lossy()),
+        "the row for every home names no path of this one: {home_free:?}"
+    );
 
     let package_only = crate::cache_key::DepInfo {
         source_files: vec![lib],

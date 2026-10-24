@@ -7430,6 +7430,12 @@ fn record_input_prediction(
             &identity,
             crate::prediction_share::for_remote_portable(&record, registry.as_deref()),
         );
+        // And here, any Cargo home over the same registry.
+        if let Some((identity, record)) =
+            crate::cache_key::registry_relocatable_record(args, dep_info, tree.as_deref())
+        {
+            file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
+        }
     }
     hand_busy_predictions(config, store, &file_hasher);
 }
