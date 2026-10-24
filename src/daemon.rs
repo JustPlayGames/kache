@@ -2018,11 +2018,9 @@ impl Daemon {
             gc_hint_pending: AtomicBool::new(false),
             readonly_skip_warned: Mutex::new(None),
             #[cfg(any(unix, windows))]
-            execution_workers: Arc::new(tokio::sync::Semaphore::new(
-                std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(32),
-            )),
+            execution_workers: Arc::new(tokio::sync::Semaphore::new(execution_worker_count(
+                hardware_threads(),
+            ))),
             config,
         }
     }
@@ -6774,6 +6772,9 @@ pub fn run_server(
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .max_blocking_threads(blocking_thread_limit(execution_worker_count(
+            hardware_threads(),
+        )))
         .build()?;
 
     run_daemon_runtime(
@@ -7603,6 +7604,51 @@ impl Drop for DownloadingGuard {
     }
 }
 
+/// Connection handlers that may do work at once besides the compiler requests
+/// the daemon runs: short requests (lookups, hit stamps, publishes) keep this
+/// many handlers however many compiles hold theirs.
+const BASE_CONNECTION_LIMIT: usize = 128;
+
+/// The most compiler requests one daemon runs at once.
+const MAX_EXECUTION_WORKERS: usize = 1024;
+
+/// Threads of the daemon's blocking pool besides the compiler requests' own:
+/// tokio's default size, for the requests the daemon offloads there (hashing,
+/// GC, seeding, stats), which compiles must not queue behind.
+const OFFLOAD_BLOCKING_THREADS: usize = 512;
+
+fn hardware_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+/// How many compiler requests the daemon runs at once: four per hardware
+/// thread, room for four builds that each start as many units as Cargo does
+/// by default. A request past the limit is declined, and its client then
+/// starts the whole engine itself: an exec of `kache-engine` and its startup,
+/// which cost 0.5-2 s each when hundreds of units start at once (concurrent
+/// builds of fresh worktrees), against milliseconds for a request the daemon
+/// runs. A compile holds its request for as long as rustc runs, so cold
+/// builds beside warm ones keep many requests open: on a 192-thread machine
+/// the earlier limit of 32 sent 12-30 % of such a burst's units through that
+/// start, and one request per hardware thread still a third of them.
+fn execution_worker_count(hardware_threads: usize) -> usize {
+    hardware_threads.saturating_mul(4).clamp(1, MAX_EXECUTION_WORKERS)
+}
+
+/// The daemon's blocking pool: a thread for each compiler request it runs at
+/// once, and tokio's default size for everything else it offloads.
+fn blocking_thread_limit(execution_workers: usize) -> usize {
+    execution_workers + OFFLOAD_BLOCKING_THREADS
+}
+
+/// Connection handlers allowed at once. A compiler request holds its handler
+/// (and its place here) until the compile ends, so the limit grows with the
+/// workers: running compiles must not leave other requests parked here, where a
+/// client waits out its whole handshake timeout and then skips the daemon.
+fn connection_limit(execution_workers: usize) -> usize {
+    BASE_CONNECTION_LIMIT + execution_workers
+}
+
 /// Accept until the shared lifecycle closes admission, an idle budget expires,
 /// or the OS requests shutdown. Per-request guards include response delivery.
 async fn accept_loop(
@@ -7620,8 +7666,9 @@ async fn accept_loop(
     // Bound the number of connection handlers doing work at once. Excess
     // connections park on `acquire_owned` (cheap) instead of all running
     // concurrently, so a burst of local clients can't pile up active handlers.
-    const MAX_CONCURRENT_CONNECTIONS: usize = 128;
-    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(connection_limit(
+        execution_worker_count(hardware_threads()),
+    )));
 
     loop {
         if !lifecycle.accepting_calls() {
