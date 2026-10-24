@@ -7612,6 +7612,11 @@ const BASE_CONNECTION_LIMIT: usize = 128;
 /// The most compiler requests one daemon runs at once.
 const MAX_EXECUTION_WORKERS: usize = 1024;
 
+/// The fewest: a small machine still runs several builds at once (an
+/// editor's checks beside a build, a few checkouts), each starting as many
+/// units as Cargo's jobs, and a request mostly waits for its compiler.
+const MIN_EXECUTION_WORKERS: usize = 64;
+
 /// Threads of the daemon's blocking pool besides the compiler requests' own:
 /// tokio's default size, for the requests the daemon offloads there (hashing,
 /// GC, seeding, stats), which compiles must not queue behind.
@@ -7630,9 +7635,13 @@ fn hardware_threads() -> usize {
 /// runs. A compile holds its request for as long as rustc runs, so cold
 /// builds beside warm ones keep many requests open: on a 192-thread machine
 /// the earlier limit of 32 sent 12-30 % of such a burst's units through that
-/// start, and one request per hardware thread still a third of them.
+/// start, and one request per hardware thread still a third of them. Four per
+/// thread is too few on a small machine: on a 4-thread Windows machine eight
+/// builds at once had 60 % of their requests declined at 16.
 fn execution_worker_count(hardware_threads: usize) -> usize {
-    hardware_threads.saturating_mul(4).clamp(1, MAX_EXECUTION_WORKERS)
+    hardware_threads
+        .saturating_mul(4)
+        .clamp(MIN_EXECUTION_WORKERS, MAX_EXECUTION_WORKERS)
 }
 
 /// The daemon's blocking pool: a thread for each compiler request it runs at

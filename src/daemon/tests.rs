@@ -16170,9 +16170,11 @@ fn the_daemon_runs_four_compiler_requests_per_hardware_thread() {
     // concurrent worktree builds several times that; past the limit each unit
     // pays a whole engine start in its client.
     assert_eq!(execution_worker_count(192), 768);
-    assert_eq!(execution_worker_count(8), 32);
-    assert_eq!(execution_worker_count(1), 4);
-    assert_eq!(execution_worker_count(0), 1);
+    assert_eq!(execution_worker_count(32), 128);
+    // A small machine still runs several builds at once.
+    assert_eq!(execution_worker_count(16), MIN_EXECUTION_WORKERS);
+    assert_eq!(execution_worker_count(4), MIN_EXECUTION_WORKERS);
+    assert_eq!(execution_worker_count(0), MIN_EXECUTION_WORKERS);
     assert_eq!(execution_worker_count(4096), MAX_EXECUTION_WORKERS);
 }
 
