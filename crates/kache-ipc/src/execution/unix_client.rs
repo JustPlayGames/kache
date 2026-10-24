@@ -142,10 +142,15 @@ impl Client {
     pub(super) fn service(&mut self) -> anyhow::Result<bool> {
         use std::io::Read;
         let mut frame = Vec::new();
-        self.control
+        match self
+            .control
             .by_ref()
             .take(MAX_FRAME_BYTES)
-            .read_until(b'\n', &mut frame)?;
+            .read_until(b'\n', &mut frame)
+        {
+            Err(error) if released(&error) => return Ok(false),
+            result => result?,
+        };
         if frame.is_empty() {
             return Ok(false);
         }
@@ -164,10 +169,22 @@ impl Client {
                 Vec::new(),
             ),
         };
-        super::write_message(self.control.get_mut(), &reply)?;
+        // The daemon closes the channel when it gives up on an operation (or
+        // its worker ends) and then reports the compile's outcome on the
+        // request stream. A reply that meets the closed channel is not the
+        // build's failure: stop serving and read that outcome.
+        if let Err(error) = super::write_message(self.control.get_mut(), &reply) {
+            if error.downcast_ref::<io::Error>().is_some_and(released) {
+                return Ok(false);
+            }
+            return Err(error);
+        }
         if !files.is_empty() {
             let files = files.iter().map(AsFd::as_fd).collect::<Vec<_>>();
-            crate::descriptors::send(self.pipes.as_fd(), &[0; 16], &files)?;
+            match crate::descriptors::send(self.pipes.as_fd(), &[0; 16], &files) {
+                Err(error) if released(&error) => return Ok(false),
+                result => result?,
+            }
         }
         Ok(true)
     }
@@ -314,6 +331,18 @@ impl Client {
     }
 }
 
+/// Whether an error on the native operation channel means the daemon has
+/// closed it.
+fn released(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NotConnected
+    )
+}
+
 fn checked(result: libc::c_int) -> io::Result<libc::c_int> {
     if result < 0 {
         Err(io::Error::last_os_error())
@@ -444,6 +473,25 @@ mod tests {
             let (client, _peer) = fixture_with_manifest(root.path(), terminal, 2);
             assert_eq!(client.jobserver.files().len(), 2);
         }
+    }
+
+    #[test]
+    fn a_reply_to_a_daemon_that_closed_the_channel_ends_service_without_failing() {
+        // The daemon gave up on an operation and closed the channel before
+        // this client's answer: the outcome now comes on the request stream,
+        // so the late answer must not fail the build with EPIPE.
+        let root = tempfile::tempdir().unwrap();
+        let (mut client, endpoints) = fixture_with_manifest(root.path(), false, 0);
+        let mut control = UnixStream::from(endpoints.into_iter().next().unwrap());
+        let mut frame = serde_json::to_vec(&Command::TryWait { id: 9 }).unwrap();
+        frame.push(b'\n');
+        control.write_all(&frame).unwrap();
+        drop(control);
+        assert!(!client.service().unwrap());
+
+        // Any other transport error still fails.
+        assert!(released(&io::Error::from(io::ErrorKind::BrokenPipe)));
+        assert!(!released(&io::Error::from(io::ErrorKind::PermissionDenied)));
     }
 
     #[test]

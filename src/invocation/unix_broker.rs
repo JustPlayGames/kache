@@ -32,6 +32,45 @@ struct Channel {
     pipes: UnixDatagram,
 }
 
+/// How long one native operation may run in the client before the daemon
+/// gives up on it. The client answers each operation when it is done, and a
+/// slow answer is a busy client, not a lost one: a client that exits closes
+/// the channel, which ends the wait at once. Under heavy load (clients run
+/// niced, and a box at load 400 left them without CPU for seconds) the client's
+/// answer took longer than the channel's 5 s read timeout; the daemon then
+/// closed the channel, the client's late answer met a broken pipe, and the
+/// build failed although nothing was wrong.
+const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Read one reply frame, waiting out the channel's read timeout while the
+/// client stays connected, up to `deadline`. A timed-out read keeps what it
+/// consumed in `frame`, so the next read continues the same frame.
+fn read_reply_frame(
+    reader: &mut BufReader<UnixStream>,
+    frame: &mut Vec<u8>,
+    deadline: std::time::Duration,
+) -> io::Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        let budget = MAX_FRAME_BYTES.saturating_sub(frame.len() as u64);
+        match reader.by_ref().take(budget).read_until(b'\n', frame) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) && started.elapsed() < deadline =>
+            {
+                tracing::debug!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "native process client is still working on an operation"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl Broker {
     pub(crate) fn new(
         control: OwnedFd,
@@ -82,11 +121,7 @@ impl Broker {
                 kache_ipc::descriptors::send(channel.pipes.as_fd(), &[0; 16], &[contents.as_fd()])?;
             }
             frame.clear();
-            channel
-                .reader
-                .by_ref()
-                .take(MAX_FRAME_BYTES)
-                .read_until(b'\n', &mut frame)?;
+            read_reply_frame(&mut channel.reader, &mut frame, REPLY_DEADLINE)?;
             if frame.last() != Some(&b'\n') {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -528,6 +563,70 @@ mod tests {
             drop(child);
             peer.join().unwrap();
         });
+    }
+
+    #[test]
+    fn a_busy_client_is_awaited_past_the_channel_read_timeout() {
+        // A restore under heavy load: the client answers after the channel's
+        // 5 s read timeout. The daemon used to close the channel there and
+        // fail the compile; the client's late answer then met EPIPE.
+        let (broker, client) = pair();
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(6_500));
+                reader
+                    .get_mut()
+                    .write_all(b"{\"operation_result\":\"done\"}\n")
+                    .unwrap();
+                // The channel stays open for the next operation.
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                reader
+                    .get_mut()
+                    .write_all(b"{\"operation_result\":\"done\"}\n")
+                    .unwrap();
+            });
+            broker.done(Command::Release { id: 1 }).unwrap();
+            broker.done(Command::Release { id: 2 }).unwrap();
+            peer.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn reply_reads_resume_a_partial_frame_and_end_at_a_disconnect_or_the_deadline() {
+        let short = Some(std::time::Duration::from_millis(50));
+        let (control, mut client) = UnixStream::pair().unwrap();
+        control.set_read_timeout(short).unwrap();
+        let mut reader = BufReader::new(control);
+        let mut frame = Vec::new();
+        std::thread::scope(|threads| {
+            threads.spawn(|| {
+                client.write_all(b"{\"operation_").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                client.write_all(b"result\":\"done\"}\n").unwrap();
+            });
+            read_reply_frame(&mut reader, &mut frame, std::time::Duration::from_secs(30)).unwrap();
+        });
+        assert_eq!(frame, b"{\"operation_result\":\"done\"}\n");
+
+        // A silent client past the deadline is given up on.
+        frame.clear();
+        let started = std::time::Instant::now();
+        let error =
+            read_reply_frame(&mut reader, &mut frame, std::time::Duration::from_millis(200))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+
+        // A client that exits ends the wait at once, whatever the deadline.
+        drop(client);
+        let started = std::time::Instant::now();
+        read_reply_frame(&mut reader, &mut frame, std::time::Duration::from_secs(600)).unwrap();
+        assert!(frame.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
