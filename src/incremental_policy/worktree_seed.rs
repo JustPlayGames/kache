@@ -306,6 +306,10 @@ fn portable_args(args: &[String], source: Option<&Path>, cwd: &Path) -> Option<V
                 | "-W"
                 | "-D"
                 | "-F"
+                | "--allow"
+                | "--warn"
+                | "--deny"
+                | "--forbid"
         ) {
             result.push(arg.clone());
             if attached.is_none() {
@@ -760,6 +764,35 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// Cargo passes a `[lints]` table as long-form lint flags
+    /// (`--warn=unexpected_cfgs`); they are lint names, not paths, and seed
+    /// like their short forms, attached or as a separate operand.
+    #[test]
+    fn long_form_lint_flags_seed_like_their_short_forms() {
+        let cwd = tempfile::tempdir().unwrap();
+        let remap = format!("-Zremap-cwd-prefix={VIRTUAL_PREFIX}");
+        for flag in ["--warn", "--allow", "--deny", "--forbid"] {
+            for lint in [
+                vec![format!("{flag}=unexpected_cfgs")],
+                vec![flag.to_string(), "unexpected_cfgs".to_string()],
+            ] {
+                let mut args: Vec<String> = vec!["src/lib.rs".into()];
+                args.extend(lint);
+                args.push(remap.clone());
+                assert_eq!(
+                    portable_args(&args, Some(Path::new("src/lib.rs")), cwd.path()),
+                    Some(args.clone()),
+                    "{args:?}"
+                );
+            }
+            let dangling = vec!["src/lib.rs".into(), remap.clone(), flag.to_string()];
+            assert!(
+                portable_args(&dangling, Some(Path::new("src/lib.rs")), cwd.path()).is_none(),
+                "{dangling:?}"
+            );
+        }
     }
 
     #[test]
