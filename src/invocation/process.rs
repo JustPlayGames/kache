@@ -110,7 +110,7 @@ struct Running {
     child: windows::Child,
     controlled: bool,
     status: Option<ExitStatus>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     rss: Option<crate::opcounts::ChildRss>,
     #[cfg(windows)]
     tree: Option<windows::Job>,
@@ -196,6 +196,15 @@ impl Running {
             } else {
                 self.child.try_wait()?
             };
+            // The job holds the compiler and everything it started, so its
+            // peak is what the compile needed, the linker's share included.
+            #[cfg(windows)]
+            if self.status.is_some()
+                && let Some(rss) = &self.rss
+                && let Some(bytes) = self.tree.as_ref().and_then(windows::Job::peak_memory)
+            {
+                rss.record(bytes);
+            }
             Ok(self.status)
         }
     }
@@ -461,7 +470,7 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
         child,
         controlled,
         status: None,
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         rss: crate::opcounts::child_rss_recorder(),
         #[cfg(windows)]
         tree,
@@ -748,6 +757,22 @@ mod tests {
         }
         assert!(crate::opcounts::invocation_child_rss().unwrap().unwrap() > 1024);
         assert_eq!(child.wait().unwrap().code(), Some(6));
+    }
+
+    /// On Windows the sample is the peak memory of the job the compiler runs
+    /// in, read once it has exited: without it the scheduler never learned a
+    /// crate's size there, and every linking compile took two slots.
+    #[cfg(windows)]
+    #[test]
+    fn a_waited_child_in_a_job_records_its_peak_memory() {
+        let _counts = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        let _cancel = CancellationScope::enter(Some(Cancellation::default()));
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit 6"])
+            .invocation_spawn()
+            .unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(6));
+        assert!(crate::opcounts::invocation_child_rss().unwrap().unwrap() > 1024);
     }
 
     #[cfg(unix)]
