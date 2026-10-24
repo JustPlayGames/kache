@@ -4166,6 +4166,147 @@ fn a_registry_units_row_serves_another_cargo_home() {
     );
 }
 
+/// Registry unit `kt` of the Cargo home `home` under `base` that reads a
+/// generated file from its `OUT_DIR` in checkout `checkout`'s target.
+fn home_out_dir_unit(
+    base: &Path,
+    home: &str,
+    checkout: &str,
+) -> (PathBuf, PathBuf, InvocationEnv, RustcArgs) {
+    let package = base.join(home).join("registry/src/index-1/kt-1.0.0");
+    write_file(&package.join("src/lib.rs"), "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n");
+    let target = base.join(checkout).join("target");
+    let out = target.join("debug/build/kt-1/out");
+    write_file(&out.join("gen.rs"), "pub fn g() {}\n");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    let env = client_invocation(
+        &package,
+        &[
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+            ("OUT_DIR", Some(out.as_os_str())),
+        ],
+    );
+    let argv = [
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "kt".to_string(),
+        package.join("src/lib.rs").display().to_string(),
+        "--out-dir".to_string(),
+        target.join("debug/deps").display().to_string(),
+    ];
+    let args = RustcArgs::parse_for(&argv, &env).unwrap();
+    (package, out, env, args)
+}
+
+/// A registry unit that reads its `OUT_DIR` gets a relocated row that
+/// another Cargo home over the same registry reads, with the registry paths
+/// placed under that home's registry and `OUT_DIR` under its own target.
+/// Without it, every pool member with a home of its own paid the dep-info
+/// pre-pass for such units, even on a hit.
+#[test]
+fn a_registry_units_relocated_row_serves_another_cargo_home() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path();
+    let (one, out_one, env_one, args_one) = home_out_dir_unit(base, "h1", "a");
+    let (two, out_two, env_two, args_two) = home_out_dir_unit(base, "h2", "b");
+    assert_ne!(
+        relocatable_prediction_identity(&args_one, env_one.vars_os().collect()),
+        relocatable_prediction_identity(&args_two, env_two.vars_os().collect()),
+        "the relocated identity folds the home"
+    );
+    let closure = |package: &Path, out: &Path| DepInfo {
+        source_files: vec![package.join("src/lib.rs"), out.join("gen.rs")],
+        env_deps: vec![
+            ("OUT_DIR".to_string(), Some(out.display().to_string())),
+            (
+                "CARGO_MANIFEST_DIR".to_string(),
+                Some(package.display().to_string()),
+            ),
+        ],
+    };
+    let db = base.join("index.db");
+    let hasher = |env: &InvocationEnv| {
+        FileHasher::persistent(&db)
+            .with_invocation_env(env)
+            .with_input_predictions(true)
+    };
+    let guard = out_dir_tree_digest(&out_one, &hasher(&env_one)).unwrap();
+    assert_eq!(
+        out_dir_tree_digest(&out_two, &hasher(&env_two)).as_deref(),
+        Some(guard.as_str()),
+        "the same generated files under both targets"
+    );
+
+    // Home one files both rows, as the wrapper does after its compile.
+    let (identity, record) =
+        relocatable_record_in(&args_one, &closure(&one, &out_one), Some(&guard), env_one.vars_os().collect())
+            .unwrap();
+    hasher(&env_one).record_portable_prediction(&identity, Some("kt"), &record);
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None),
+        Err(Rejection::NoRecord),
+        "home one's own relocated row names home one's registry"
+    );
+    let (home_free, record) = registry_relocatable_record_in(
+        &args_one,
+        &closure(&one, &out_one),
+        Some(&guard),
+        env_one.vars_os().collect(),
+    )
+    .expect("a closure in the registry and OUT_DIR is filed home-free");
+    assert!(home_free.starts_with("shared-registry-out-dir-v1:"));
+    assert_eq!(
+        registry_relocatable_identity(&args_two, env_two.vars_os().collect()),
+        Some(home_free.clone())
+    );
+    assert!(
+        !serde_json::to_string(&record).unwrap().contains(&*base.to_string_lossy()),
+        "no home's or target's path in the filed row: {record:?}"
+    );
+    hasher(&env_one).record_portable_prediction(&home_free, Some("kt"), &record);
+
+    let mut tree = None;
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut tree),
+        Ok(closure(&two, &out_two)),
+        "home two's own spelling of the closure"
+    );
+    assert_eq!(tree.map(|guard| guard.digest), Some(guard.clone()));
+
+    // Checked on this home's disk under this target's guard.
+    write_file(&out_two.join("extra.rs"), "");
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None),
+        Err(Rejection::NoRecord),
+        "another OUT_DIR guard finds no row"
+    );
+    std::fs::remove_file(out_two.join("extra.rs")).unwrap();
+    std::fs::remove_file(two.join("src/lib.rs")).unwrap();
+    assert!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None).is_err(),
+        "a row naming a file missing from this home's package is refused"
+    );
+
+    // A closure naming another absolute path is never filed home-free.
+    let mut outside = closure(&one, &out_one);
+    outside
+        .env_deps
+        .push(("ELSEWHERE".to_string(), Some(base.join("w").display().to_string())));
+    assert_eq!(
+        registry_relocatable_record_in(
+            &args_one,
+            &outside,
+            Some(&guard),
+            env_one.vars_os().collect()
+        ),
+        None
+    );
+}
+
 #[test]
 fn an_out_dir_suffix_is_the_bytes_after_the_directory() {
     let suffix =

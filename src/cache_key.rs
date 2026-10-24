@@ -2181,6 +2181,74 @@ fn relocatable_prediction_identity(
     Some(format!("{RELOCATABLE_PREDICTION_PREFIX}{hash}"))
 }
 
+/// Relocated rows of a registry unit filed with its Cargo home cut out of the
+/// identity as well ([`registry_relocatable_identity`]).
+const REGISTRY_RELOCATABLE_PREFIX: &str = "shared-registry-out-dir-v1:";
+
+/// The identity of a registry unit's relocated row for every Cargo home over
+/// the same registry: the home-free hash ([`rustc_registry_prediction_identity`])
+/// under its own prefix. `None` for any other unit, and for one with no
+/// `OUT_DIR` to relocate.
+///
+/// [`relocatable_prediction_identity`] is the shared hash, which folds the
+/// home's path, so a pool member with a Cargo home of its own never read
+/// another member's relocated row and paid rustc's dep-info pre-pass for
+/// each registry unit that reads its `OUT_DIR`, hit or miss.
+fn registry_relocatable_identity(
+    args: &RustcArgs,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<String> {
+    let manifest_dir = Path::new(env_var_in(&vars, "CARGO_MANIFEST_DIR")?);
+    if !is_registry_package(manifest_dir) || env_var_in(&vars, "OUT_DIR").is_none() {
+        return None;
+    }
+    let identity = rustc_registry_prediction_identity_in(args, vars)?;
+    let hash = identity.strip_prefix(REGISTRY_PREDICTION_PREFIX)?;
+    Some(format!("{REGISTRY_RELOCATABLE_PREFIX}{hash}"))
+}
+
+/// `record`, a relocated row made under `registry`, with its registry paths
+/// written relative to it, so any Cargo home places them under its own.
+/// `None` when it names any other absolute path.
+fn home_free_portable(
+    record: &PortablePrediction,
+    registry: &Path,
+) -> Option<PortablePrediction> {
+    match crate::prediction_share::for_remote_portable(record, Some(registry))? {
+        crate::prediction_share::SharedPrediction::Portable(row) => Some(row),
+        crate::prediction_share::SharedPrediction::Plain(_) => None,
+    }
+}
+
+/// The relocated row any Cargo home over this registry can read, and the
+/// identity to file it under, or `None` when the unit or its closure is not
+/// relocatable or names an absolute path outside the registry and `OUT_DIR`.
+pub(crate) fn registry_relocatable_record(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: Option<&str>,
+) -> Option<(String, PortablePrediction)> {
+    registry_relocatable_record_in(
+        args,
+        dep_info,
+        tree,
+        args.invocation_env().vars_os().collect(),
+    )
+}
+
+/// [`registry_relocatable_record`] against an environment snapshot.
+fn registry_relocatable_record_in(
+    args: &RustcArgs,
+    dep_info: &DepInfo,
+    tree: Option<&str>,
+    vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) -> Option<(String, PortablePrediction)> {
+    let registry = registry_src_of(&vars)?;
+    let identity = registry_relocatable_identity(args, vars.clone())?;
+    let (_, record) = relocatable_record_in(args, dep_info, tree, vars)?;
+    Some((identity, home_free_portable(&record, &registry)?))
+}
+
 /// Rows of a registry unit filed with its Cargo home cut out of the identity
 /// ([`rustc_registry_prediction_identity`]).
 const REGISTRY_PREDICTION_PREFIX: &str = "shared-registry-v1:";
@@ -2789,6 +2857,7 @@ fn relocated_key_inputs(
         .and_then(|value| file_hasher.invocation_env.resolve(Path::new(value)))
         .and_then(|path| path.into_os_string().into_string().ok());
     let registry = registry_src_of(&vars);
+    let home_free = registry_relocatable_identity(args, vars.clone());
     let identity = relocatable_prediction_identity(args, vars).ok_or(Rejection::NoRecord)?;
     let out_dir = out_dir.ok_or(Rejection::NoRecord)?;
     // A `tree` is already in `tree_guard`.
@@ -2818,6 +2887,34 @@ fn relocated_key_inputs(
         &|_| Some(guard.clone()),
         &places,
     )
+    .or_else(|rejection| {
+        // Another Cargo home's row for the same registry unit, placed under
+        // this home's registry and checked like this home's own.
+        let Some(home_free) = home_free.as_deref() else {
+            return Err(rejection);
+        };
+        let Some(record) = file_hasher.portable_prediction_under(home_free, &guard) else {
+            return Err(rejection);
+        };
+        validate_portable_prediction(
+            &record,
+            &|_| Some(guard.clone()),
+            &places,
+            |path| {
+                file_hasher
+                    .invocation_env
+                    .resolve(path)
+                    .and_then(|path| std::fs::metadata(path).ok())
+            },
+            |path| {
+                file_hasher
+                    .invocation_env
+                    .resolve(path)
+                    .is_some_and(|path| path.exists())
+            },
+            |var| file_hasher.invocation_env.var_os(var),
+        )
+    })
 }
 
 /// Use this machine's row for `identity` under `tree` (the guard taken for
