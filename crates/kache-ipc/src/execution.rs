@@ -79,23 +79,67 @@ fn mark_unresponsive(marker: &Path) {
     }
 }
 
+/// How a hand-off ended when it permits local execution, or the exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// The daemon ran the compiler.
+    Completed(i32),
+    /// A running daemon answered and declined (its compiler workers were
+    /// busy): starting a daemon would only find this one.
+    Declined,
+    /// No daemon took the request: none listens, it did not answer, or the
+    /// request could not be made. A daemon may be worth starting.
+    Unavailable,
+}
+
+/// A running daemon's refusal of a request before Commit.
+#[derive(Debug)]
+struct DaemonDeclined(String);
+
+impl std::fmt::Display for DaemonDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the daemon declined the compiler request: {}", self.0)
+    }
+}
+
+impl std::error::Error for DaemonDeclined {}
+
 /// `None` permits local execution. An error means Commit may have reached the
 /// daemon and the caller must not run the compiler again.
-///
-/// A daemon that did not answer one client in [`PREPARE_TIMEOUT`] is skipped
-/// by every client for [`UNRESPONSIVE_BACKOFF`]; then one client tries it
-/// again (it renews the marker first, so the others keep going locally
-/// meanwhile) and clears the marker once it answers.
 pub fn try_execute(
     socket: &Path,
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
 ) -> Result<Option<i32>> {
+    Ok(
+        match try_execute_attempt(
+            socket,
+            request,
+            #[cfg(unix)]
+            descriptors,
+        )? {
+            Attempt::Completed(exit) => Some(exit),
+            Attempt::Declined | Attempt::Unavailable => None,
+        },
+    )
+}
+
+/// [`try_execute`], telling a running daemon's refusal apart from no daemon.
+///
+/// A daemon that did not answer one client in [`PREPARE_TIMEOUT`] is skipped
+/// by every client for [`UNRESPONSIVE_BACKOFF`]; then one client tries it
+/// again (it renews the marker first, so the others keep going locally
+/// meanwhile) and clears the marker once it answers.
+pub fn try_execute_attempt(
+    socket: &Path,
+    request: &ExecutionRequest,
+    #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
+) -> Result<Attempt> {
     let marker = unresponsive_marker(socket);
     let marked = match marker_age(&marker) {
         Some(age) if age < UNRESPONSIVE_BACKOFF => {
             tracing::debug!("daemon did not answer {age:?} ago; compiling locally");
-            return Ok(None);
+            return Ok(Attempt::Unavailable);
         }
         Some(_) => {
             mark_unresponsive(&marker);
@@ -123,10 +167,14 @@ pub fn try_execute(
         let _ = std::fs::remove_file(&marker);
     }
     match result {
-        Ok(exit) => Ok(Some(exit)),
+        Ok(exit) => Ok(Attempt::Completed(exit)),
+        Err(error) if !committed && error.downcast_ref::<DaemonDeclined>().is_some() => {
+            tracing::debug!(%error, "daemon declined compiler execution");
+            Ok(Attempt::Declined)
+        }
         Err(error) if !committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
-            Ok(None)
+            Ok(Attempt::Unavailable)
         }
         Err(error) => Err(error.context(
             "daemon compilation did not complete; the compiler will not be run again locally",
@@ -159,6 +207,9 @@ fn exchange(
     )?;
     let mut reader = std::io::BufReader::new(&stream);
     let ready = read_reply(&mut reader)?;
+    if let ExecutionReply::Declined { reason } = &ready {
+        return Err(DaemonDeclined(reason.clone()).into());
+    }
     #[cfg(unix)]
     {
         let ticket = match ready {
@@ -460,6 +511,7 @@ mod tests {
     enum Disconnect {
         BeforeReady,
         LegacyDaemon,
+        Declined,
         BeforePrepared,
         AfterPrepared,
         AfterCommit,
@@ -507,6 +559,13 @@ mod tests {
     }
 
     fn disconnected_exchange(stage: Disconnect) -> Result<Option<i32>> {
+        Ok(match attempted_exchange(stage)? {
+            Attempt::Completed(exit) => Some(exit),
+            Attempt::Declined | Attempt::Unavailable => None,
+        })
+    }
+
+    fn attempted_exchange(stage: Disconnect) -> Result<Attempt> {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let path = root.path().join("control");
         let listener = UnixListener::bind(&path).unwrap();
@@ -533,6 +592,16 @@ mod tests {
                 assert_eq!(request.entry, ExecutionEntry::Compiler);
                 assert_eq!(request.argv[0].decode().unwrap(), "/bin/true");
                 if matches!(stage, Disconnect::BeforeReady) {
+                    return;
+                }
+                if matches!(stage, Disconnect::Declined) {
+                    write_message(
+                        &mut stream,
+                        &ExecutionReply::Declined {
+                            reason: "compiler workers are busy".into(),
+                        },
+                    )
+                    .unwrap();
                     return;
                 }
                 if matches!(stage, Disconnect::LegacyDaemon) {
@@ -592,7 +661,7 @@ mod tests {
                 }
                 write_message(&mut stream, &ExecutionReply::Accepted).unwrap();
             });
-            let result = try_execute(
+            let result = try_execute_attempt(
                 &path,
                 &context.request,
                 &context.files.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
@@ -602,11 +671,44 @@ mod tests {
         })
     }
 
+    /// A client that may start a daemon (Windows) starts one only when none
+    /// answered: a running daemon that declined would only be found again.
+    #[test]
+    fn a_running_daemons_refusal_is_told_apart_from_no_daemon() {
+        assert_eq!(
+            attempted_exchange(Disconnect::Declined).unwrap(),
+            Attempt::Declined
+        );
+        for stage in [
+            Disconnect::BeforeReady,
+            Disconnect::LegacyDaemon,
+            Disconnect::BeforePrepared,
+        ] {
+            assert_eq!(
+                attempted_exchange(stage).unwrap(),
+                Attempt::Unavailable,
+                "{stage:?}"
+            );
+        }
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let context = fixture(root.path());
+        assert_eq!(
+            try_execute_attempt(
+                &root.path().join("absent"),
+                &context.request,
+                &context.files.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            Attempt::Unavailable
+        );
+    }
+
     #[test]
     fn execution_disconnects_before_commit_allow_local_fallback() {
         for stage in [
             Disconnect::BeforeReady,
             Disconnect::LegacyDaemon,
+            Disconnect::Declined,
             Disconnect::BeforePrepared,
         ] {
             assert_eq!(disconnected_exchange(stage).unwrap(), None, "{stage:?}");
@@ -780,7 +882,11 @@ mod unresponsive_tests {
         for _ in 0..5 {
             assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
         }
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
 
         // Past the backoff, one client tries again: it renews the marker first,
         // so the others keep compiling locally while it waits.
@@ -790,7 +896,10 @@ mod unresponsive_tests {
             let prober = threads.spawn(|| try_execute(&socket, &request, &[]).unwrap());
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             while !daemon_unresponsive(&socket) {
-                assert!(std::time::Instant::now() < deadline, "the prober did not renew the marker");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the prober did not renew the marker"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
             let started = std::time::Instant::now();
