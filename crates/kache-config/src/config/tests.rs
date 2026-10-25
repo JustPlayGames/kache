@@ -1153,16 +1153,16 @@ fn disk_share_budget_floors_caps_and_rounds() {
     // cannot change both sides of the assertion.
     assert_eq!(disk_share_budget(None), 50 << 30);
     assert_eq!(disk_share_budget(Some(0)), 50 << 30);
-    // 10GiB disk: 5% is 0.5GiB, rounds to 1GiB, then floor 5GiB.
-    assert_eq!(disk_share_budget(Some(10 * GIB)), 5 << 30);
-    // 200GiB disk: 5% is exactly 10GiB.
-    assert_eq!(disk_share_budget(Some(200 * GIB)), 10 * GIB);
-    // 256GiB disk: 5% is 12.8GiB, nearest GiB is 13GiB.
-    assert_eq!(disk_share_budget(Some(256 * GIB)), 13 * GIB);
-    // 4TiB disk: 5% is 204.8GiB, cap 100GiB.
+    // 10GiB disk: 20% is 2GiB, then floor 10GiB.
+    assert_eq!(disk_share_budget(Some(10 * GIB)), 10 << 30);
+    // 200GiB disk: 20% is exactly 40GiB.
+    assert_eq!(disk_share_budget(Some(200 * GIB)), 40 * GIB);
+    // 256GiB disk: 20% is 51.2GiB, nearest GiB is 51GiB.
+    assert_eq!(disk_share_budget(Some(256 * GIB)), 51 * GIB);
+    // 4TiB disk: 20% is 819.2GiB, cap 100GiB.
     assert_eq!(disk_share_budget(Some(4 * 1024 * GIB)), 100 << 30);
-    // Exactly at the cap: 2000GiB * 5% = 100GiB.
-    assert_eq!(disk_share_budget(Some(2000 * GIB)), 100 << 30);
+    // Exactly at the cap: 500GiB * 20% = 100GiB.
+    assert_eq!(disk_share_budget(Some(500 * GIB)), 100 << 30);
 }
 
 #[test]
@@ -1183,7 +1183,7 @@ fn describe_max_size_names_the_disk_share_when_derived() {
     let text = describe_max_size(derived, disk);
     assert_eq!(
         text,
-        "10.0 GiB (5% of 200.0 GiB, floor 5.0 GiB, cap 100.0 GiB)"
+        "40.0 GiB (20% of 200.0 GiB, floor 10.0 GiB, cap 100.0 GiB)"
     );
     assert_eq!(
         describe_max_size(2 * GIB, disk),
@@ -1196,7 +1196,7 @@ fn describe_max_size_names_the_disk_share_when_derived() {
     );
     assert!(
         describe_max_size(DISK_SHARE_FALLBACK, Some(0)).contains("disk size unknown"),
-        "a zero-byte probe is unknown, not 5% of 0: {}",
+        "a zero-byte probe is unknown, not 20% of 0: {}",
         describe_max_size(DISK_SHARE_FALLBACK, Some(0))
     );
 }
@@ -2309,7 +2309,7 @@ fn a_shard_budget_is_the_explicit_max_size_or_its_own_disk_share() {
         assert_eq!(path, shard_dir, "the shard's own filesystem is measured");
         Some(200 * GIB)
     });
-    assert_eq!(derived.max_size, 10 * GIB, "5% of the shard's 200GiB");
+    assert_eq!(derived.max_size, 40 * GIB, "20% of the shard's 200GiB");
     let unknown = main.for_volume_store(&shard, |_| None);
     assert_eq!(unknown.max_size, DISK_SHARE_FALLBACK);
     assert_eq!(main.max_size, 50 * GIB, "the main budget is untouched");

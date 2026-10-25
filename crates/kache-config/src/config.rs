@@ -62,11 +62,18 @@ pub const DEFAULT_MIN_STORE_COMPILE_MS: u64 = 0;
 pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 0;
 
 /// Disk-share store budget when `KACHE_MAX_SIZE` / `[cache] local_max_size`
-/// are unset. 5% of the volume that holds the store, rounded to the nearest
-/// GiB, then clamped to 5GiB..=100GiB. A failed size probe falls back to
+/// are unset. 20% of the volume that holds the store, rounded to the nearest
+/// GiB, then clamped to 10GiB..=100GiB. A failed size probe falls back to
 /// 50GiB so the store stays bounded.
-pub const DISK_SHARE_PERCENT: u64 = 5;
-pub const DISK_SHARE_FLOOR: u64 = 5 * 1024 * 1024 * 1024;
+///
+/// One debug build of a large workspace stores about 10GiB (a 190-crate GUI
+/// app with its server: 9.9GiB), and its tests, clippy and a wasm build each
+/// store as much again. At 5% with a 5GiB floor, a disk under 200GiB evicted
+/// entries of the build that was running, and a 256GiB one kept less than two
+/// builds. The free-space floor (`auto_recover_min_free_bytes`, 10GiB) still
+/// evicts before the disk fills, whatever this budget allows.
+pub const DISK_SHARE_PERCENT: u64 = 20;
+pub const DISK_SHARE_FLOOR: u64 = 10 * 1024 * 1024 * 1024;
 pub const DISK_SHARE_CAP: u64 = 100 * 1024 * 1024 * 1024;
 pub const DISK_SHARE_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
 
@@ -4953,7 +4960,7 @@ pub fn describe_max_size(max_size: u64, filesystem_bytes: Option<u64>) -> String
     }
 }
 
-/// `5% of 1.8 TiB, floor 5.0 GiB, cap 100.0 GiB`: how the disk-share default
+/// `20% of 1.8 TiB, floor 10.0 GiB, cap 100.0 GiB`: how the disk-share default
 /// was derived for a volume of `total` bytes.
 pub fn disk_share_note(total: u64) -> String {
     format!(

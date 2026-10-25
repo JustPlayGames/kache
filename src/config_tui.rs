@@ -141,7 +141,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
                 .unwrap_or_default(),
             env_var: "KACHE_MAX_SIZE",
             env_value: env_val("KACHE_MAX_SIZE"),
-            default_hint: "(default: 5% of the cache disk, 5GiB–100GiB)",
+            default_hint: "(default: 20% of the cache disk, 10GiB–100GiB)",
             validation_error: None,
             env_locked: env.max_size,
         },
