@@ -283,6 +283,36 @@ fn macos_max_files_per_proc() -> libc::rlim_t {
     }
 }
 
+/// Windows: move the daemon to below-normal priority, so the work it does for
+/// builds (its own and the compilers it runs) yields to what the person at the
+/// computer is doing, as `nice` does for the builds that start it on Unix.
+///
+/// A daemon `kache` starts itself inherits the priority of the build that
+/// started it, normal for a plain `cargo build`; one started by `kache daemon
+/// install`'s scheduled task already runs below normal. A process already at
+/// below-normal or idle priority is left alone, never raised. Returns whether
+/// the priority changed.
+#[cfg(windows)]
+pub fn lower_daemon_priority() -> std::io::Result<bool> {
+    use windows_sys::Win32::System::Threading::{
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, IDLE_PRIORITY_CLASS,
+        SetPriorityClass,
+    };
+    // SAFETY: the pseudo-handle of this process needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    let class = unsafe { GetPriorityClass(process) };
+    if class == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if class == BELOW_NORMAL_PRIORITY_CLASS || class == IDLE_PRIORITY_CLASS {
+        return Ok(false);
+    }
+    if unsafe { SetPriorityClass(process, BELOW_NORMAL_PRIORITY_CLASS) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
 /// Resolve when the OS asks the daemon to stop. SIGTERM/SIGINT on Unix,
 /// Ctrl+C / console-close on Windows.
 pub async fn wait_for_shutdown() {
@@ -446,6 +476,27 @@ mod tests {
     fn ps_available() -> bool {
         std::env::var_os("PATH")
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
+    }
+
+    /// The daemon lowers a normal-priority process to below normal and never
+    /// raises one that already runs lower. Each nextest test is a process of
+    /// its own, so this changes no other test's priority.
+    #[cfg(windows)]
+    #[test]
+    fn daemon_priority_drops_to_below_normal_but_never_rises() {
+        use windows_sys::Win32::System::Threading::{
+            BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass,
+            IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, SetPriorityClass,
+        };
+        let process = unsafe { GetCurrentProcess() };
+        let class = || unsafe { GetPriorityClass(process) };
+        assert_ne!(unsafe { SetPriorityClass(process, IDLE_PRIORITY_CLASS) }, 0);
+        assert!(!super::lower_daemon_priority().unwrap());
+        assert_eq!(class(), IDLE_PRIORITY_CLASS);
+        assert_ne!(unsafe { SetPriorityClass(process, NORMAL_PRIORITY_CLASS) }, 0);
+        assert!(super::lower_daemon_priority().unwrap());
+        assert_eq!(class(), BELOW_NORMAL_PRIORITY_CLASS);
+        assert!(!super::lower_daemon_priority().unwrap());
     }
 
     /// launchd's 256/unlimited must land on the per-process cap, never on
