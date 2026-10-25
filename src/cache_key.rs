@@ -4354,12 +4354,16 @@ fn resolve_key_inputs(
         // would compile the same unit a second time instead of waiting for
         // the entry the holder stores.
         let mut owns_flight = false;
+        // Whether another process held the flight first: then it has just
+        // compiled this unit, and its entry is most likely this one's.
+        let mut followed_a_peer = false;
         if prediction.is_err()
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
             let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
             owns_flight = flight.lock.is_some();
+            followed_a_peer = flight.waited;
             *file_hasher.discovery_flight.borrow_mut() = flight.lock;
             // The previous owner may have published while this process
             // waited; a flight taken at once had no owner to publish. The
@@ -4415,10 +4419,16 @@ fn resolve_key_inputs(
                 tracing::trace!("[key:{}] inputs=deferred(new crate)", crate_name);
                 return Err(anyhow::Error::new(DeferredDiscovery { miss_certain: true }));
             }
+            // A compile that links is stopped on a hit only before its
+            // codegen starts, which for a small crate is milliseconds after
+            // its dep-info: right after a peer compiled the unit, the hit is
+            // all but certain and the pre-pass finds it as early, without
+            // a compile that may run to its end anyway.
             Err(reason)
                 if owns_flight
                     && DEFER_DISCOVERY.with(std::cell::Cell::get)
-                    && COMPILE_WHILE_KEYING.with(std::cell::Cell::get) =>
+                    && COMPILE_WHILE_KEYING.with(std::cell::Cell::get)
+                    && !(followed_a_peer && args.invokes_linker()) =>
             {
                 prediction_decision(reason.as_str());
                 tracing::trace!(
