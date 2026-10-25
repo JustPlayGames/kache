@@ -213,6 +213,12 @@ pub struct StatsResponse {
     /// its own config and labels the affected lines as client-derived.
     #[serde(default)]
     pub effective_config: Option<EffectiveConfig>,
+    /// Compiles the daemon has taken from wrappers (hand-offs) and not
+    /// stored and logged yet. Their wrappers, and Cargo, may have exited:
+    /// the store and the event log are complete once this reads 0. An older
+    /// daemon reports 0.
+    #[serde(default)]
+    pub publishes_pending: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

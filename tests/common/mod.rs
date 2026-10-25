@@ -319,6 +319,57 @@ fn wait_for_daemon_lock_release(lock_path: &Path, timeout: Duration) -> Result<(
 
 /// Stops a fixture's daemon before its runtime directory is removed.
 /// Declare after the TempDir, or before it in a fixture's field list.
+/// `<cache_dir>/events.jsonl` once the daemon serving `cache_dir` has
+/// stored and logged every compile handed to it
+/// ([`wait_for_daemon_publishes`]), or empty when there is none.
+#[allow(dead_code)]
+pub fn settled_events(cache_dir: &Path) -> String {
+    wait_for_daemon_publishes(cache_dir);
+    std::fs::read_to_string(cache_dir.join("events.jsonl")).unwrap_or_default()
+}
+
+/// Wait until the daemon serving `cache_dir` (its runtime directory, with
+/// `<cache_dir>/config.toml`) has stored and logged every compile its
+/// wrappers handed it.
+///
+/// A rustc miss may hand its store to the daemon, which writes the miss's
+/// event once the entry is committed: after the wrapper, and maybe Cargo,
+/// exited. A test that reads the event log or the store right after a build
+/// waits here first. The wait asks `kache daemon status` until the daemon
+/// reports nothing pending, and ends at once when no daemon runs; past two
+/// minutes it fails the test with the daemon's last answer.
+#[allow(dead_code)]
+pub fn wait_for_daemon_publishes(cache_dir: &Path) {
+    let run_lock = daemon_run_lock_path(cache_dir);
+    let config = isolated_config_path(cache_dir);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if !daemon_run_lock_is_held(&run_lock) {
+            return;
+        }
+        let answer = hermetic_command(kache_binary(), cache_dir, Some(&config))
+            .args(["--json", "daemon", "status"])
+            .env("KACHE_LOG", "off")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_else(|error| error.to_string());
+        if let Ok(status) = serde_json::from_str::<serde_json::Value>(&answer)
+            && (status["daemon_running"] == false
+                || status["publishes_pending"].as_u64() == Some(0))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon for {} still had hand-offs to store after 120 s: {answer}",
+            cache_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[allow(dead_code)]
 pub struct DaemonGuard {
     program: PathBuf,

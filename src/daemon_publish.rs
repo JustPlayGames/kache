@@ -175,6 +175,12 @@ impl PublishProgress {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Take back an [`Self::accepted`] whose job never reached the queue.
+    fn withdrawn(&self) {
+        self.pending
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     fn finished(&self) {
         self.pending
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -343,6 +349,10 @@ impl Daemon {
             .rustc
             .as_ref()
             .is_some_and(|rustc| rustc.staged.is_some());
+        // Counted before the receipt is taken: a wrapper whose answer is
+        // late reads the accepted receipt and exits, and from then until the
+        // worker logs the job its compile must show as pending.
+        let progress = self.publish_queue().progress();
         // Own separate links before acknowledging. A client may time out
         // after acceptance and remove every path it sent us.
         let claimed = tokio::task::spawn_blocking(move || {
@@ -372,6 +382,7 @@ impl Daemon {
                 // the daemon's from the rename on, with nothing to link or
                 // copy before the answer. A wrapper that cancelled first
                 // removes them and registers the entry itself.
+                progress.accepted();
                 return match accept_receipt(&request) {
                     Ok(()) => Ok(Some(PublishJob {
                         request,
@@ -379,8 +390,14 @@ impl Daemon {
                         _lock: lock,
                         _unit: unit,
                     })),
-                    Err(error) if receipt_cancelled(&error) => Ok(None),
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        progress.withdrawn();
+                        if receipt_cancelled(&error) {
+                            Ok(None)
+                        } else {
+                            Err(error)
+                        }
+                    }
                 };
             }
             let files = request
@@ -397,10 +414,12 @@ impl Daemon {
             // Exactly one wins, even if the socket reply is lost. A missing
             // receipt means the wrapper already gave up. It publishes only if
             // it can take the key back, so keep these snapshots and the claim.
+            progress.accepted();
             let owns_event = match accept_receipt(&request) {
                 Ok(()) => true,
                 Err(error) if receipt_cancelled(&error) => false,
                 Err(error) => {
+                    progress.withdrawn();
                     remove_handoff_files(&owned);
                     return Err(error);
                 }
@@ -422,7 +441,6 @@ impl Daemon {
             Ok(Err(error)) => return refused(&format!("snapshot failed: {error:#}")),
             Err(error) => return refused(&format!("snapshot task failed: {error}")),
         };
-        self.publish_queue().progress.accepted();
         permit.send(job);
         Response::ok()
     }
@@ -2246,6 +2264,8 @@ mod tests {
         );
         let response = daemon.handle_publish_cc(request.clone()).await;
         assert!(response.ok, "{response:?}");
+        let progress = daemon.publish_queue().progress();
+        assert_eq!(progress.pending(), 1, "a queued job is pending");
         let job = rx.try_recv().expect("the cancelled hand-off is queued");
         assert_eq!(job.request.cache_key, request.cache_key);
         assert_ne!(job.request.files, request.files);
@@ -2259,6 +2279,7 @@ mod tests {
             BuildClaim::Contended
         ));
         publish_one(&daemon, &config, &store, job);
+        assert_eq!(progress.pending(), 0);
         assert!(store.get(&request.cache_key).unwrap().is_some());
         assert!(matches!(
             store.claim_build(&request.cache_key).unwrap(),
@@ -2301,6 +2322,11 @@ mod tests {
         std::fs::set_permissions(parent, original).unwrap();
         assert!(!response.ok, "{response:?}");
         assert!(response.error.unwrap().contains("snapshot failed"));
+        assert_eq!(
+            daemon.publish_queue().progress().pending(),
+            0,
+            "a refused hand-off is not left pending"
+        );
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)

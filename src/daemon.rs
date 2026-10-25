@@ -2869,6 +2869,7 @@ impl Daemon {
             },
             in_flight,
             effective_config: Some(self.effective_config.clone()),
+            publishes_pending: self.publish_queue.progress().pending() as u64,
         })
     }
 
