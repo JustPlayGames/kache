@@ -1247,6 +1247,34 @@ fn wait_for_store_in_flight(store: &Store, cache_key: &str, crate_name: &str) ->
     committed
 }
 
+/// Longest a unit that cannot stop on a hit waits for another checkout's
+/// entry of it, which the daemon is storing, to land. Past it the unit
+/// compiles, as it did before.
+const UNIT_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether an entry of `crate_name`'s unit `unit` was in flight and landed
+/// (or was given up on by its owner) within [`UNIT_IN_FLIGHT_WAIT`].
+fn wait_for_unit_in_flight(store: &Store, crate_name: &str, unit: &str) -> bool {
+    if !store.unit_in_flight(crate_name, unit) {
+        return false;
+    }
+    tracing::debug!("{crate_name}: another checkout's entry is being stored; waiting for it");
+    let waited = std::time::Instant::now();
+    let mut attempt = 0;
+    while store.unit_in_flight(crate_name, unit) {
+        if waited.elapsed() >= UNIT_IN_FLIGHT_WAIT || crate::invocation::process::check().is_err() {
+            crate::opcounts::record_flight_wait(waited.elapsed());
+            return false;
+        }
+        std::thread::sleep(
+            crate::store::lock_poll_interval(attempt).min(std::time::Duration::from_millis(10)),
+        );
+        attempt += 1;
+    }
+    crate::opcounts::record_flight_wait(waited.elapsed());
+    true
+}
+
 /// The entry under `cache_key` when a compile that may stop reaches its
 /// dep-info. One another process is storing right now is waited for, with
 /// a compile that links frozen meanwhile so that the wait never costs the
@@ -4371,7 +4399,7 @@ fn run_parsed_rustc(
             hash_stats: inputs_hash_stats,
             too_new: inputs_too_new,
             key_ms: inputs_key_ms,
-            guard_inputs: extra_inputs_guard_inputs,
+            guard_inputs: extra_inputs_guard_inputs.clone(),
         },
         match precompiled
             .as_mut()
@@ -4404,6 +4432,54 @@ fn run_parsed_rustc(
                 key_record,
             );
         }
+    };
+    // A unit the store had never held when its key was computed may have
+    // come from another checkout since: its entry is stored by the daemon,
+    // which the wrapper that compiled it handed it to before it let its
+    // peers go, and lands a moment later. A compile that may stop at its
+    // dep-info finds or waits for an entry still in flight as it runs; one
+    // that links without stopping (a binary, a build script, a proc macro)
+    // waits for it to land instead. Either keys again, as any unit the
+    // store holds does, once it has landed, rather than compiling the unit
+    // a second time.
+    let unit = args.get_codegen_opt("metadata").unwrap_or("");
+    let keyed = if keyed.deferred
+        && !keyed.stop_on_hit
+        && deferred_seed.is_none()
+        && ((!stop_on_hit_allowed(args) && wait_for_unit_in_flight(&store, crate_name, unit))
+            || store
+                .file_hash_cache()
+                .has_entry_for_unit(crate_name, unit)
+                .unwrap_or(false))
+    {
+        match compute_rustc_cache_key(
+            config,
+            compiler,
+            args,
+            workspace_root.as_deref(),
+            invocation_start_ns,
+            Some(&store),
+            &key_env,
+            ExtraInputsKey {
+                digest: extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+                build_script_inputs: build_script_inputs.digest(),
+                hash_stats: inputs_hash_stats,
+                too_new: inputs_too_new,
+                key_ms: inputs_key_ms,
+                guard_inputs: extra_inputs_guard_inputs,
+            },
+            // The flight this invocation holds stays held: no second join.
+            KeyDiscovery::Rederived,
+            &mut key_record,
+        ) {
+            Ok(again) if !again.deferred => ComputedKey {
+                discovery_flight: keyed.discovery_flight,
+                ..again
+            },
+            _ => keyed,
+        }
+    } else {
+        keyed
     };
     let ComputedKey {
         mut cache_key,
