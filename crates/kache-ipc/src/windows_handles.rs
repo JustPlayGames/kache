@@ -129,6 +129,18 @@ impl PeerProcess {
         Ok(peer)
     }
 
+    /// The pinned frontend's priority class, the priority of the build it
+    /// compiles for.
+    pub fn priority_class(&self) -> io::Result<u32> {
+        let class = unsafe {
+            windows_sys::Win32::System::Threading::GetPriorityClass(self.process.as_raw_handle())
+        };
+        if class == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(class)
+    }
+
     pub fn verify_connection(&self, stream: &impl PeerCredentials) -> io::Result<()> {
         require_peer(stream, self.pid)?;
         self.require_alive()

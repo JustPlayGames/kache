@@ -283,19 +283,29 @@ fn macos_max_files_per_proc() -> libc::rlim_t {
     }
 }
 
-/// Windows: move the daemon to below-normal priority, so the work it does for
-/// builds (its own and the compilers it runs) yields to what the person at the
-/// computer is doing, as `nice` does for the builds that start it on Unix.
+/// Windows: the daemon's priorities. It runs at normal priority, its
+/// background work below normal ([`run_below_normal`]), and its part of each
+/// compile at the priority of the build it compiles for
+/// ([`run_at_client_priority`]).
 ///
-/// A daemon `kache` starts itself inherits the priority of the build that
-/// started it, normal for a plain `cargo build`; one started by `kache daemon
-/// install`'s scheduled task already runs below normal. A process already at
-/// below-normal or idle priority is left alone, never raised. Returns whether
-/// the priority changed.
+/// tasty.42 ran the whole daemon below normal. The frontends hand each
+/// compile to the daemon with a few seconds' deadline before they give up
+/// and run a kache-engine of their own, and when rustc filled every core at
+/// normal priority the below-normal daemon lost that race: its threads,
+/// the accept loop's among them, ran only when Windows' starvation boost
+/// picked them, every few seconds. Every compile of the build then ran its
+/// own engine, the very load the low priority was meant to spare the
+/// person at the computer.
+///
+/// A daemon `kache` starts itself inherits a normal-priority build's class.
+/// One started below normal (`kache daemon install`'s scheduled task, or a
+/// build started below normal) is raised to normal; a process at idle
+/// priority, or above normal, is left alone. Returns whether the class
+/// changed.
 #[cfg(windows)]
-pub fn lower_daemon_priority() -> std::io::Result<bool> {
+pub fn set_daemon_priority() -> std::io::Result<bool> {
     use windows_sys::Win32::System::Threading::{
-        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, IDLE_PRIORITY_CLASS,
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, NORMAL_PRIORITY_CLASS,
         SetPriorityClass,
     };
     // SAFETY: the pseudo-handle of this process needs no closing.
@@ -304,13 +314,129 @@ pub fn lower_daemon_priority() -> std::io::Result<bool> {
     if class == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if class == BELOW_NORMAL_PRIORITY_CLASS || class == IDLE_PRIORITY_CLASS {
+    if class != BELOW_NORMAL_PRIORITY_CLASS {
         return Ok(false);
     }
-    if unsafe { SetPriorityClass(process, BELOW_NORMAL_PRIORITY_CLASS) } == 0 {
+    if unsafe { SetPriorityClass(process, NORMAL_PRIORITY_CLASS) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(true)
+}
+
+/// Windows: the base priority of a process priority class, the level its
+/// threads run at before any thread-relative adjustment or boost.
+#[cfg(windows)]
+fn class_base_priority(class: u32) -> i32 {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+        IDLE_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+    };
+    match class {
+        IDLE_PRIORITY_CLASS => 4,
+        BELOW_NORMAL_PRIORITY_CLASS => 6,
+        ABOVE_NORMAL_PRIORITY_CLASS => 10,
+        HIGH_PRIORITY_CLASS => 13,
+        REALTIME_PRIORITY_CLASS => 24,
+        _ => 8,
+    }
+}
+
+/// Windows: the thread-relative priority (-2..=2) that brings a thread of a
+/// process in `own` class as close as it can get to `level`.
+#[cfg(windows)]
+fn relative_priority(own: u32, level: i32) -> i32 {
+    (level - class_base_priority(own)).clamp(-2, 2)
+}
+
+/// Windows: the daemon's own class, read once the daemon set it
+/// ([`set_daemon_priority`] runs before any thread asks).
+#[cfg(windows)]
+fn own_priority_class() -> u32 {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetPriorityClass, NORMAL_PRIORITY_CLASS,
+    };
+    static CLASS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: the pseudo-handle of this process needs no closing.
+    *CLASS.get_or_init(|| match unsafe { GetPriorityClass(GetCurrentProcess()) } {
+        0 => NORMAL_PRIORITY_CLASS,
+        class => class,
+    })
+}
+
+/// Windows: put the calling thread at `relative`, logging a refusal.
+#[cfg(windows)]
+fn set_thread_priority(relative: i32) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    // SAFETY: the pseudo-handle of this thread needs no closing.
+    if unsafe { SetThreadPriority(GetCurrentThread(), relative) } == 0 {
+        tracing::debug!(
+            "could not set a daemon thread's priority: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Windows: a daemon thread back at the priority it had when the guard drops
+/// ([`run_at_client_priority`], [`run_below_normal`]).
+#[cfg(windows)]
+#[must_use]
+pub struct ThreadPriority {
+    restore: Option<i32>,
+}
+
+#[cfg(windows)]
+impl Drop for ThreadPriority {
+    fn drop(&mut self) {
+        if let Some(previous) = self.restore {
+            set_thread_priority(previous);
+        }
+    }
+}
+
+/// Windows: run the calling thread as close to `level` as the daemon's class
+/// allows until the guard drops.
+#[cfg(windows)]
+fn run_at_level(level: i32) -> ThreadPriority {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+    // MAXLONG: GetThreadPriority's failure value (not in windows-sys).
+    const THREAD_PRIORITY_ERROR_RETURN: i32 = i32::MAX;
+    let wanted = relative_priority(own_priority_class(), level);
+    // SAFETY: the pseudo-handle of this thread needs no closing.
+    let previous = unsafe { GetThreadPriority(GetCurrentThread()) };
+    if previous == THREAD_PRIORITY_ERROR_RETURN || previous == wanted {
+        return ThreadPriority { restore: None };
+    }
+    set_thread_priority(wanted);
+    ThreadPriority {
+        restore: Some(previous),
+    }
+}
+
+/// Windows: run the calling daemon thread below normal until the guard drops:
+/// for its background work (GC sweeps, store walks), which no compile waits
+/// for and which yields to what the person at the computer is doing.
+#[cfg(windows)]
+pub fn run_below_normal() -> ThreadPriority {
+    use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
+    run_at_level(class_base_priority(BELOW_NORMAL_PRIORITY_CLASS))
+}
+
+/// Windows: run the calling daemon thread at the priority of the frontend
+/// whose compile it runs (`client_class`, that process's priority class),
+/// until the guard drops.
+///
+/// The frontend starts rustc at its own priority, the build's. The daemon's
+/// part of the same compile (keys, lookup, store) runs in the daemon, and
+/// below the build's priority it waits behind every other unit's rustc while
+/// cargo waits for it. At the build's priority it competes as the compile
+/// itself does, and a build started below normal keeps its pipeline below
+/// normal too. Never above normal.
+#[cfg(windows)]
+pub fn run_at_client_priority(client_class: u32) -> ThreadPriority {
+    use windows_sys::Win32::System::Threading::NORMAL_PRIORITY_CLASS;
+    run_at_level(
+        class_base_priority(client_class).min(class_base_priority(NORMAL_PRIORITY_CLASS)),
+    )
 }
 
 /// Resolve when the OS asks the daemon to stop. SIGTERM/SIGINT on Unix,
@@ -478,12 +604,12 @@ mod tests {
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
     }
 
-    /// The daemon lowers a normal-priority process to below normal and never
-    /// raises one that already runs lower. Each nextest test is a process of
-    /// its own, so this changes no other test's priority.
+    /// The daemon raises a below-normal process to normal and leaves every
+    /// other class alone. Each nextest test is a process of its own, so this
+    /// changes no other test's priority.
     #[cfg(windows)]
     #[test]
-    fn daemon_priority_drops_to_below_normal_but_never_rises() {
+    fn daemon_priority_rises_from_below_normal_only() {
         use windows_sys::Win32::System::Threading::{
             BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass,
             IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, SetPriorityClass,
@@ -491,12 +617,12 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         let class = || unsafe { GetPriorityClass(process) };
         assert_ne!(unsafe { SetPriorityClass(process, IDLE_PRIORITY_CLASS) }, 0);
-        assert!(!super::lower_daemon_priority().unwrap());
+        assert!(!super::set_daemon_priority().unwrap());
         assert_eq!(class(), IDLE_PRIORITY_CLASS);
-        assert_ne!(unsafe { SetPriorityClass(process, NORMAL_PRIORITY_CLASS) }, 0);
-        assert!(super::lower_daemon_priority().unwrap());
-        assert_eq!(class(), BELOW_NORMAL_PRIORITY_CLASS);
-        assert!(!super::lower_daemon_priority().unwrap());
+        assert_ne!(unsafe { SetPriorityClass(process, BELOW_NORMAL_PRIORITY_CLASS) }, 0);
+        assert!(super::set_daemon_priority().unwrap());
+        assert_eq!(class(), NORMAL_PRIORITY_CLASS);
+        assert!(!super::set_daemon_priority().unwrap());
     }
 
     /// launchd's 256/unlimited must land on the per-process cap, never on
