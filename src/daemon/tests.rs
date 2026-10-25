@@ -3047,6 +3047,7 @@ fn automatic_gc_runs_store_housekeeping_and_records_it() {
             key_locks_remaining: 1,
             predictions_pruned: 0,
             file_hashes_pruned: 0,
+            ..Default::default()
         })
     );
     assert!(!lock_path(1).exists());
