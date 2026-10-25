@@ -737,6 +737,23 @@ fn cloned_targets_summary_only_appears_for_retained_blocks() {
         "{line}"
     );
     assert!(!line.contains("snapshots"), "{line}");
+    assert!(!line.contains("over Limit"), "{line}");
+
+    // A store over its cap says how much of the excess targets hold.
+    disk.store_bytes = 100;
+    disk.store_limit_bytes = 95;
+    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    assert!(
+        line.contains(": it is why Cache reads 5 B over Limit, and only cleaning those targets"),
+        "{line}"
+    );
+    disk.store_limit_bytes = 90;
+    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    assert!(
+        line.contains("; Cache reads 10 B over Limit, 7 B of it held there"),
+        "{line}"
+    );
+    disk.store_bytes = 0;
 
     disk.snapshot_retained_bytes = 5;
     let line = cloned_targets_row(&disk)

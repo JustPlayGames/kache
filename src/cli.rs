@@ -734,8 +734,23 @@ fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
     if cloned > 0 {
         // Evicting a blob a target still holds frees nothing, so a size
         // sweep leaves these out, and the Cache size can stay above Limit.
+        // Say so where it does: a store reading over its cap looks broken.
+        let over = disk.store_bytes.saturating_sub(disk.store_limit_bytes);
+        let why = match over {
+            _ if disk.store_limit_bytes == 0 => String::new(),
+            0 => String::new(),
+            over if over <= cloned => format!(
+                ": it is why Cache reads {} over Limit, and only cleaning those targets frees it",
+                term::bytes(over)
+            ),
+            over => format!(
+                "; Cache reads {} over Limit, {} of it held there",
+                term::bytes(over),
+                term::bytes(cloned)
+            ),
+        };
         notes.push(format!(
-            "{} cloned into target/, which the limit leaves out",
+            "{} cloned into target/, which the limit leaves out{why}",
             term::bytes(cloned)
         ));
     }
