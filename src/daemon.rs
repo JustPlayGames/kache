@@ -1867,6 +1867,9 @@ pub(crate) struct Daemon {
     request_clock: Arc<crate::maintenance::RequestClock>,
     /// Set while a hinted sweep is queued or running; further hints coalesce.
     gc_hint_pending: AtomicBool,
+    /// The stores whose sweep for a delegated compile is queued or running;
+    /// further requests for one of them coalesce into that sweep.
+    invocation_gc_pending: Mutex<HashSet<PathBuf>>,
     /// When this read-only daemon last warned that it skipped a writable
     /// build's upload.
     readonly_skip_warned: Mutex<Option<Instant>>,
@@ -2021,6 +2024,7 @@ impl Daemon {
             stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
+            invocation_gc_pending: Mutex::new(HashSet::new()),
             readonly_skip_warned: Mutex::new(None),
             #[cfg(any(unix, windows))]
             execution_workers: Arc::new(tokio::sync::Semaphore::new(execution_worker_count(
@@ -6265,15 +6269,43 @@ impl Daemon {
     /// A delegated compiler already resolved its cache policy. Keep that
     /// snapshot when it requests eviction after a put. The wrapper's shared
     /// throttle limits requests; each sweep also takes the store's gc.lock.
+    /// A request for a store whose sweep is already queued or running joins
+    /// it: that sweep measures the store when it starts, so it covers this
+    /// put too, and a burst of requests costs one blocking thread instead of
+    /// a recovery pass and a store open each.
     pub(crate) fn request_gc_for_invocation(self: &Arc<Self>, config: Config) {
+        if !self.claim_invocation_gc(&config.cache_dir) {
+            return;
+        }
         let daemon = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            // Released on unwind too, or one panic would swallow every later request.
+            struct Release<'a>(&'a Daemon, &'a Path);
+            impl Drop for Release<'_> {
+                fn drop(&mut self) {
+                    self.0
+                        .invocation_gc_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(self.1);
+                }
+            }
+            let _release = Release(&daemon, &config.cache_dir);
             #[cfg(windows)]
             let _low = crate::platform::run_below_normal();
             if let Err(error) = daemon.sweep_invocation_under_size_pressure(&config) {
                 tracing::warn!("invocation GC sweep failed: {error:#}");
             }
         });
+    }
+
+    /// Claim the sweep for a delegated compile's store; false while one is
+    /// queued or running for it.
+    fn claim_invocation_gc(&self, cache_dir: &Path) -> bool {
+        self.invocation_gc_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cache_dir.to_path_buf())
     }
 
     fn sweep_invocation_under_size_pressure(&self, config: &Config) -> Result<()> {

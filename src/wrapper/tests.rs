@@ -1012,6 +1012,37 @@ fn auto_gc_wanted_fires_only_over_budget_and_respects_throttle() {
     );
 }
 
+/// Wrappers that store at the same moment all find the same expired stamp;
+/// exactly one of them may ask for a sweep. Before the claim moved ahead of
+/// the size query, every one that passed the check before the first wrote
+/// the stamp asked for its own (a hint, or a detached `kache gc` each).
+#[test]
+fn concurrent_auto_gc_checks_claim_the_interval_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1024;
+    let store = Store::open(&cfg).unwrap();
+    for key in ["stampede-1", "stampede-2", "stampede-3"] {
+        put_test_entry(&store, dir.path(), key);
+    }
+    drop(store);
+    let threads = 16;
+    let start = std::sync::Barrier::new(threads);
+    let wanted = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let store = Store::open(&cfg).unwrap();
+                start.wait();
+                if auto_gc_wanted(&cfg, &store) {
+                    wanted.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    assert_eq!(wanted.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 #[cfg(unix)]
 fn disk_pressure_hints_even_below_cache_budget_and_the_detached_worker_recovers() {
