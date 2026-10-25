@@ -138,10 +138,16 @@ fn cargo_config_candidates(
     candidates
 }
 
+/// Add `config_dir`'s config files after the lower-precedence ones already
+/// listed. A file listed already (Cargo's home, read again as an ancestor of
+/// the current directory) moves here: Cargo reads it once, with the
+/// precedence of its place among the ancestors, so a config farther up
+/// cannot override it.
 fn push_config_candidates(config_dir: &Path, candidates: &mut Vec<PathBuf>) {
     for name in CARGO_CONFIG_NAMES {
         let path = config_dir.join(name);
-        if path.exists() && !candidates.iter().any(|candidate| candidate == &path) {
+        if path.exists() {
+            candidates.retain(|candidate| candidate != &path);
             candidates.push(path);
         }
     }
@@ -250,6 +256,21 @@ mod tests {
         );
 
         let setting = cargo_wrapper_setting_from(Some(&project), None, Some(home));
+        assert_eq!(
+            setting,
+            Some(("kache".into(), project.join(".cargo/config.toml")))
+        );
+
+        // Cargo's home inside the project is read once, as the nearest
+        // ancestor: a config farther up does not override it.
+        std::fs::create_dir_all(dir.path().join("workspace/.cargo")).unwrap();
+        std::fs::write(
+            dir.path().join("workspace/.cargo/config.toml"),
+            "[build]\nrustc-wrapper = \"sccache\"\n",
+        )
+        .unwrap();
+        let setting =
+            cargo_wrapper_setting_from(Some(&project), Some(project.join(".cargo")), None);
         assert_eq!(
             setting,
             Some(("kache".into(), project.join(".cargo/config.toml")))
