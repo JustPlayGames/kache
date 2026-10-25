@@ -1043,6 +1043,8 @@ pub fn status(json: bool) -> Result<()> {
             daemon_config_path: Option<String>,
             startup_log: Option<String>,
             service_executable_mismatch: bool,
+            /// Handed-off compiles the daemon has not stored and logged yet.
+            publishes_pending: Option<u64>,
         }
         return crate::machine::emit(
             "daemon-status",
@@ -1065,6 +1067,7 @@ pub fn status(json: bool) -> Result<()> {
                     .map(|config| config.config_path.clone()),
                 startup_log: config.as_ref().map(|cfg| startup_log(cfg).to_string()),
                 service_executable_mismatch: exe_problem.is_some(),
+                publishes_pending: daemon_stats.as_ref().map(|stats| stats.publishes_pending),
             },
             if running {
                 Vec::new()
@@ -1083,6 +1086,17 @@ pub fn status(json: bool) -> Result<()> {
         daemon_stats.as_ref().map(|stats| stats.version.as_str()),
         crate::VERSION,
     ));
+    if let Some(pending) = daemon_stats
+        .as_ref()
+        .map(|stats| stats.publishes_pending)
+        .filter(|pending| *pending > 0)
+    {
+        status_rows.push((
+            "Storing",
+            term::counted(pending, "compile", "compiles"),
+            "handed off by builds, not stored yet".into(),
+        ));
+    }
     status_rows.extend(format_service_line(
         installed_service_path.as_deref(),
         legacy_service_installed,

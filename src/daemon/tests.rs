@@ -947,6 +947,7 @@ fn compile_started_wire_tags_and_stats_default() {
             auto_recover_min_free_bytes: None,
             auto_recover_targets: None,
         }),
+        publishes_pending: 0,
     })
     .unwrap();
     {
@@ -4473,6 +4474,7 @@ fn test_stats_response_serde() {
         prefetch: PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
         effective_config: None,
+        publishes_pending: 0,
     };
     let resp = Response::ok_stats(stats.clone());
     let json = serde_json::to_string(&resp).unwrap();
@@ -4558,6 +4560,7 @@ fn test_stats_response_with_entries() {
         prefetch: PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
         effective_config: None,
+        publishes_pending: 0,
     };
     let resp = Response::ok_stats(stats);
     let json = serde_json::to_string(&resp).unwrap();

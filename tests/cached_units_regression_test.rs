@@ -177,9 +177,8 @@ fn run(command: &mut Command) -> Output {
 
 /// Events written since `mark`, oldest first.
 fn events_since(cache: &Path, mark: usize) -> Vec<Value> {
-    let path = cache.join("events.jsonl");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    text.lines()
+    common::settled_events(cache)
+        .lines()
         .skip(mark)
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("event json"))
@@ -187,9 +186,7 @@ fn events_since(cache: &Path, mark: usize) -> Vec<Value> {
 }
 
 fn event_count(cache: &Path) -> usize {
-    std::fs::read_to_string(cache.join("events.jsonl"))
-        .map(|text| text.lines().count())
-        .unwrap_or(0)
+    common::settled_events(cache).lines().count()
 }
 
 fn field<'a>(event: &'a Value, name: &str) -> &'a str {
