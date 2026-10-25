@@ -890,7 +890,7 @@ fn record_put(
 /// cancelled receipt) and let go of its key, once its files are gone.
 fn release(daemon: &Arc<Daemon>, config: &Config, published: Published) {
     if published.job.owns_event {
-        crate::wrapper::write_event(config, &published.event);
+        crate::wrapper::write_daemon_event(config, &published.event);
     }
     drop(published.job);
     daemon.publish_queue().progress.finished();

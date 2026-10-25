@@ -209,6 +209,16 @@ pub(crate) fn log_event_for_build(event_log_path: &Path, event: &BuildEvent) -> 
     )
 }
 
+/// Append a build event the daemon logs for a compile handed to it, waiting
+/// out a busy log for a while: no build waits for it.
+pub(crate) fn log_event_from_daemon(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
+    append_log_line(
+        event_log_path,
+        serde_json::to_string(event).context("serializing event")?,
+        LogLock::Daemon,
+    )
+}
+
 /// Append a heartbeat line to the event log (kunobi-ninja/kache#131).
 pub fn log_heartbeat(event_log_path: &Path, event: &HeartbeatEvent) -> Result<()> {
     append_log_line(

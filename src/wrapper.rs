@@ -9936,8 +9936,22 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 /// Append `event` to the event log and rotate the logs. Best-effort: nothing
 /// here may fail a build.
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
+    write_event_with(config, event, events::log_event_for_build);
+}
+
+/// [`write_event`] for the daemon, which logs the compiles handed to it and
+/// waits out a busy log ([`events::log_event_from_daemon`]).
+pub(crate) fn write_daemon_event(config: &Config, event: &BuildEvent) {
+    write_event_with(config, event, events::log_event_from_daemon);
+}
+
+fn write_event_with(
+    config: &Config,
+    event: &BuildEvent,
+    log: fn(&std::path::Path, &BuildEvent) -> anyhow::Result<()>,
+) {
     let _trace = crate::phase_trace::phase("event_log");
-    if events::log_event_for_build(&config.event_log_path(), event).is_err() {
+    if log(&config.event_log_path(), event).is_err() {
         return;
     }
     let _ = events::rotate_events_if_needed(
