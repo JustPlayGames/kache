@@ -7445,15 +7445,50 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const ACCEPT_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(50);
 
-/// The pause before accepting again after `error`, if any.
-fn accept_backoff(error: &std::io::Error) -> Option<Duration> {
+/// Longest pause between accept attempts that keep failing on Windows.
+#[cfg(windows)]
+const ACCEPT_FAILING_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// The pause before accepting again after `error`, the `failures`-th accept
+/// error in a row, if any.
+///
+/// On Windows every accept error pauses, growing from 10 ms to a second.
+/// interprocess's pipe listener connects a client and then creates the next
+/// pipe instance; when that creation fails (CreateNamedPipeW out of memory
+/// or quota under memory pressure) it keeps the connected instance and
+/// returns the error, and every later accept fails the same way at once
+/// until creation succeeds again. Retrying at once spun a core and wrote a
+/// warning per turn; the client already connected is handed out by the
+/// first accept that can create an instance, after a pause or not.
+fn accept_backoff(error: &std::io::Error, failures: u32) -> Option<Duration> {
     #[cfg(unix)]
-    if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
-        return Some(ACCEPT_EXHAUSTED_BACKOFF);
+    {
+        let _ = failures;
+        if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+            return Some(ACCEPT_EXHAUSTED_BACKOFF);
+        }
+        None
     }
-    #[cfg(not(unix))]
-    let _ = error;
-    None
+    #[cfg(windows)]
+    {
+        let _ = error;
+        Some(
+            Duration::from_millis(10u64 << failures.saturating_sub(1).min(7))
+                .min(ACCEPT_FAILING_BACKOFF_MAX),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (error, failures);
+        None
+    }
+}
+
+/// Whether the `failures`-th accept error in a row is logged: the first and
+/// then each power of two, so a listener that keeps failing cannot flood
+/// the log.
+fn accept_error_logged(failures: u32) -> bool {
+    failures.is_power_of_two()
 }
 
 /// Maximum time to let accepted IPC handlers finish their current response
@@ -7782,6 +7817,8 @@ async fn accept_loop(
         execution_worker_count(hardware_threads()),
     )));
 
+    // Accept errors in a row, for the backoff and the log's rate.
+    let mut accept_failures: u32 = 0;
     loop {
         if !lifecycle.accepting_calls() {
             tracing::info!("shutdown requested via protocol, draining...");
@@ -7805,6 +7842,7 @@ async fn accept_loop(
                 // interprocess returns `Stream` directly (no peer address tuple)
                 match accept {
                     Ok(stream) => {
+                        accept_failures = 0;
                         // Capture the request's monotonic age before it can park
                         // behind the handler limiter. A later dispatch must not
                         // restart a client whose end-to-end budget already ran
@@ -7839,8 +7877,11 @@ async fn accept_loop(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("accept error: {e}");
-                        if let Some(pause) = accept_backoff(&e) {
+                        accept_failures = accept_failures.saturating_add(1);
+                        if accept_error_logged(accept_failures) {
+                            tracing::warn!("accept error ({accept_failures} in a row): {e}");
+                        }
+                        if let Some(pause) = accept_backoff(&e, accept_failures) {
                             tokio::time::sleep(pause).await;
                         }
                     }
