@@ -115,6 +115,18 @@ pub struct RecordFileHashesRequest {
     pub rows: Vec<FileHashRow>,
 }
 
+/// Build events a wrapper could not log because the event log stayed busy
+/// past the build's budget for it. The daemon logs them, waiting for the log
+/// as no build does, and counts them pending until then
+/// (`StatsResponse::publishes_pending`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordEventsRequest {
+    /// The event log the wrapper writes. The daemon logs only to its own
+    /// and refuses any other.
+    pub event_log: String,
+    pub events: Vec<BuildEvent>,
+}
+
 /// Target roots a wrapper's index was too busy to record. The daemon records
 /// each in its own store when the index lets it, under the same checks as the
 /// wrapper (`Store::remember_target_root_built_by`).

@@ -9936,7 +9936,15 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 /// Append `event` to the event log and rotate the logs. Best-effort: nothing
 /// here may fail a build.
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
-    write_event_with(config, event, events::log_event_for_build);
+    if !write_event_with(config, event, events::log_event_for_build) {
+        // The log stayed busy past the build's budget: the daemon logs it
+        // instead, or, without one, the event is dropped as before.
+        let _ = crate::daemon::send_events(
+            &config.socket_path(),
+            &config.event_log_path(),
+            vec![event.clone()],
+        );
+    }
 }
 
 /// [`write_event`] for the daemon, which logs the compiles handed to it and
@@ -9945,14 +9953,16 @@ pub(crate) fn write_daemon_event(config: &Config, event: &BuildEvent) {
     write_event_with(config, event, events::log_event_from_daemon);
 }
 
+/// Log `event` with `log` and rotate the logs. False when the event was not
+/// logged.
 fn write_event_with(
     config: &Config,
     event: &BuildEvent,
     log: fn(&std::path::Path, &BuildEvent) -> anyhow::Result<()>,
-) {
+) -> bool {
     let _trace = crate::phase_trace::phase("event_log");
     if log(&config.event_log_path(), event).is_err() {
-        return;
+        return false;
     }
     let _ = events::rotate_events_if_needed(
         &config.event_log_path(),
@@ -9965,6 +9975,7 @@ fn write_event_with(
         config.event_log_max_size,
         config.event_log_keep_lines,
     );
+    true
 }
 
 /// The parts of a rustc key's [`KeyOutputs`](crate::cache_key::KeyOutputs)
