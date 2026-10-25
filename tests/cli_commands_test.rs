@@ -472,6 +472,51 @@ fn daemon_lifecycle_commands_say_what_happened() {
     assert!(run("stop").contains("daemon is not running"));
 }
 
+/// A daemon that answers late (one starved behind a full machine, a
+/// below-normal one behind normal-priority compiles, a paused one) is still
+/// stopped: `daemon stop` keeps asking while it holds its run lock, instead
+/// of giving up after one request's deadline and leaving it running.
+#[cfg(unix)]
+#[test]
+fn stop_stops_a_daemon_that_answers_late() {
+    let e = env();
+    let start = e.cmd().args(["daemon", "start"]).output().unwrap();
+    assert!(start.status.success(), "{start:?}");
+    let state = std::fs::read_to_string(e.cache.join("daemon.state.json")).unwrap();
+    let pid = serde_json::from_str::<serde_json::Value>(&state).unwrap()["pid"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let signal = |name: &str| {
+        let status = std::process::Command::new("kill")
+            .args([name, &pid])
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill {name} {pid}");
+    };
+    signal("-STOP");
+    // Longer than one shutdown request's 5 s deadline.
+    let resume = std::thread::spawn({
+        let pid = pid.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_secs(7));
+            std::process::Command::new("kill")
+                .args(["-CONT", &pid])
+                .status()
+                .unwrap();
+        }
+    });
+    let stop = e.cmd().args(["daemon", "stop"]).output().unwrap();
+    resume.join().unwrap();
+    assert!(stop.status.success(), "{stop:?}");
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("daemon stopped"),
+        "{stop:?}"
+    );
+    let gone = e.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&gone.stderr).contains("daemon is not running"));
+}
+
 #[cfg(unix)]
 #[test]
 fn path_resolvable_unknown_subcommand_is_still_a_usage_error() {

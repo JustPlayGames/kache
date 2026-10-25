@@ -9606,20 +9606,65 @@ fn fetch_stats(
 ///
 /// Wait for ownership release after a verified drain acknowledgement. A timeout
 /// leaves unfinished work running and reports failure.
+///
+/// A daemon that holds its run lock but does not answer in time is asked
+/// again until [`STOP_ANSWER_BUDGET`]: one starved behind a full machine
+/// (on Windows a below-normal daemon behind normal-priority compiles) or
+/// paused answers late, and giving up after one request's deadline left it
+/// running.
 pub fn send_shutdown_request(config: &Config) -> Result<()> {
-    if let Err(error) = request_shutdown(config) {
-        if daemon_is_absent(&error, daemon_run_lock_is_held(&config.socket_path())?) {
+    let socket_path = config.socket_path();
+    let deadline = Instant::now() + STOP_ANSWER_BUDGET;
+    while let Err(error) = request_shutdown(config) {
+        let held = daemon_run_lock_is_held(&socket_path)?;
+        if daemon_is_absent(&error, held) {
             eprintln!("daemon is not running");
             return Ok(());
         }
-        return Err(error);
+        if !held {
+            // It let go of the lock while we asked: it stopped.
+            break;
+        }
+        if !unanswered(&error) || Instant::now() >= deadline {
+            return Err(error);
+        }
+        tracing::debug!("daemon did not answer the stop request yet: {error:#}");
+        std::thread::sleep(Duration::from_millis(250));
     }
     anyhow::ensure!(
-        wait_for_run_lock_release(&config.socket_path(), Duration::from_secs(35))?,
+        wait_for_run_lock_release(&socket_path, Duration::from_secs(35))?,
         "daemon is still draining; ownership has not been released"
     );
     eprintln!("daemon stopped");
     Ok(())
+}
+
+/// How long `kache daemon stop` keeps asking a daemon that holds its run
+/// lock and does not answer.
+const STOP_ANSWER_BUDGET: Duration = Duration::from_secs(35);
+
+/// Whether a request failed because nobody answered in time, which a daemon
+/// holding its run lock can still do, as opposed to an answer it gave.
+fn unanswered(error: &anyhow::Error) -> bool {
+    use kunobi_daemon::client::RequestError;
+    if lifecycle_client::transient(error) {
+        return true;
+    }
+    let timed_out = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        )
+    };
+    error.chain().any(|cause| {
+        match cause.downcast_ref::<RequestError>() {
+            Some(RequestError::Late) => return true,
+            Some(RequestError::Unavailable(_)) => return true,
+            Some(RequestError::Protocol(error)) if timed_out(error) => return true,
+            _ => {}
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(timed_out)
+    })
 }
 
 fn request_shutdown(config: &Config) -> Result<()> {
