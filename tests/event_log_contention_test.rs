@@ -130,6 +130,9 @@ fn version_probe_returns_while_another_process_holds_the_event_lock() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("rustc "));
+        // The event the held log refused went to the daemon, which may be
+        // writing it now.
+        common::wait_for_daemon_publishes(&cache);
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
