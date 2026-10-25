@@ -313,11 +313,23 @@ fn exchange(
     }
 }
 
+/// The pause before the `attempt`-th retry of [`retry_until`]: 1 ms for the
+/// first eight, then doubling every eight to at most 16 ms. A reply that is
+/// already on its way is still picked up within a millisecond or two, while
+/// a client waiting seconds on a busy daemon polls about 60 times a second
+/// instead of a thousand (each poll a PeekNamedPipe or open on Windows,
+/// across every compile waiting at once).
+#[cfg(any(test, windows))]
+fn retry_pause(attempt: u32) -> Duration {
+    Duration::from_millis(1u64 << (attempt / 8).min(4))
+}
+
 #[cfg(any(test, windows))]
 fn retry_until<T>(
     deadline: Option<std::time::Instant>,
     mut operation: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
+    let mut attempt = 0u32;
     loop {
         match operation() {
             Err(error)
@@ -329,7 +341,8 @@ fn retry_until<T>(
                 if deadline.is_some_and(|until| std::time::Instant::now() >= until) {
                     return Err(std::io::ErrorKind::TimedOut.into());
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(retry_pause(attempt));
+                attempt = attempt.saturating_add(1);
             }
             result => return result,
         }
@@ -779,6 +792,24 @@ mod protocol_tests {
             .unwrap_err();
         worker.join().unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn a_long_wait_polls_tens_of_times_a_second_not_a_thousand() {
+        // A client waiting on a busy daemon retries until its deadline; at a
+        // fixed 1 ms that was about 500 polls in half a second per waiting
+        // compile.
+        let mut attempts = 0u32;
+        let started = std::time::Instant::now();
+        let error = retry_until::<()>(Some(started + Duration::from_millis(500)), || {
+            attempts += 1;
+            Err(std::io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(attempts < 100, "{attempts} polls in 500 ms");
+        assert_eq!(retry_pause(0), Duration::from_millis(1));
+        assert_eq!(retry_pause(100), Duration::from_millis(16));
     }
 
     #[test]
