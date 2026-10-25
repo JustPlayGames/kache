@@ -4438,15 +4438,17 @@ fn run_parsed_rustc(
     // which the wrapper that compiled it handed it to before it let its
     // peers go, and lands a moment later. A compile that may stop at its
     // dep-info finds or waits for an entry still in flight as it runs; one
-    // that links without stopping (a binary, a build script, a proc macro)
-    // waits for it to land instead. Either keys again, as any unit the
-    // store holds does, once it has landed, rather than compiling the unit
-    // a second time.
+    // that links (a binary, a build script, a proc macro) waits for it to
+    // land instead: off Linux it cannot stop at all, and on Linux only
+    // before its codegen, which a small crate starts milliseconds after
+    // its dep-info. Either keys again, as any unit the store holds does,
+    // once it has landed, rather than compiling the unit a second time.
     let unit = args.get_codegen_opt("metadata").unwrap_or("");
     let keyed = if keyed.deferred
         && !keyed.stop_on_hit
         && deferred_seed.is_none()
-        && ((!stop_on_hit_allowed(args) && wait_for_unit_in_flight(&store, crate_name, unit))
+        && (((!stop_on_hit_allowed(args) || args.invokes_linker())
+            && wait_for_unit_in_flight(&store, crate_name, unit))
             || store
                 .file_hash_cache()
                 .has_entry_for_unit(crate_name, unit)
@@ -7157,16 +7159,13 @@ fn compile_before_key(
     let executed = if stop_on_hit {
         let tree = tree_guard.clone();
         let mut on_dep_info = || {
-            // Another checkout's entry for this unit, still being stored, is
-            // likely this compile's hit. Keying takes long enough for rustc
-            // to start its codegen, after which a compile that links can no
-            // longer be stopped: freeze it first.
-            if ctx
-                .store
-                .unit_in_flight(crate_name, args.get_codegen_opt("metadata").unwrap_or(""))
-            {
-                crate::compile::hold_while_deciding();
-            }
+            // The store holds this unit, or another checkout's entry for it
+            // is being stored: either is likely this compile's hit. Keying
+            // takes long enough for rustc to start its codegen, after which
+            // a compile that links can no longer be stopped: freeze it first
+            // (a compile that does not link is not frozen; it can be killed
+            // at any point).
+            crate::compile::hold_while_deciding();
             let Some(dep_info) = emitted_dep_info(args) else {
                 return true;
             };

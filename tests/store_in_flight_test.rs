@@ -23,6 +23,11 @@ use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 /// What the wrapper logs when a lookup finds the key's entry being stored.
 const WAITING: &str = "its entry is being stored; waiting for the commit";
 
+/// What it logs when a unit that links, the index having never held it,
+/// finds another checkout's entry of it being stored, and waits for that
+/// before it compiles at all.
+const WAITING_FOR_UNIT: &str = "another checkout's entry is being stored; waiting for it";
+
 fn write(path: &Path, body: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, body).unwrap();
@@ -32,7 +37,7 @@ fn manifest(name: &str, extra: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}")
 }
 
-/// A proc macro (a compile that links, frozen while it waits), shaped like a
+/// A proc macro (a compile that links, which waits before it starts), shaped like a
 /// registry package, and a workspace lib (a compile that does not link)
 /// that uses it.
 fn write_fixture(root: &Path) {
@@ -133,7 +138,9 @@ fn events(cache: &Path) -> Vec<Value> {
 /// Whether `pm` in the build logging to `log` waited for its entry being
 /// stored.
 fn waited(log: &Path) -> bool {
-    std::fs::read_to_string(log).is_ok_and(|log| log.contains(&format!("pm: {WAITING}")))
+    std::fs::read_to_string(log).is_ok_and(|log| {
+        log.contains(&format!("pm: {WAITING}")) || log.contains(&format!("pm: {WAITING_FOR_UNIT}"))
+    })
 }
 
 /// Whether `pm` in the build logging to `log` waits for another process:
@@ -141,6 +148,7 @@ fn waited(log: &Path) -> bool {
 fn waits(log: &Path) -> bool {
     std::fs::read_to_string(log).is_ok_and(|log| {
         log.contains(&format!("pm: {WAITING}"))
+            || log.contains(&format!("pm: {WAITING_FOR_UNIT}"))
             || log.contains("waiting for pm to be built by another process")
     })
 }
