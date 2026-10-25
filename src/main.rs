@@ -471,7 +471,8 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
     // File layer: persistent log at info level (overridable via KACHE_LOG_FILE).
     //
     // CLI/daemon mode: always enabled at the default `kache.log` path — these
-    // run rarely, so 2 syscalls (stat + open) per invocation is fine.
+    // run rarely. The file is opened on the first line written (see
+    // [`LazyLogFile`]), so a command that logs nothing writes nothing.
     //
     // Wrapper mode: cargo can fan out hundreds of `kache rustc …` processes
     // per build, so the file layer is OFF by default to avoid the per-crate
@@ -488,22 +489,10 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
         } else {
             (|| -> Option<_> {
                 let path = log_file_path_for(env)?;
-                std::fs::create_dir_all(path.parent()?).ok()?;
-
-                // Simple rotation: truncate if file exceeds 5 MB.
-                // Skipped when a custom path is provided — the caller owns
-                // the file lifecycle (e.g. the bench wipes it per phase).
-                if env.var_os("KACHE_LOG_FILE_PATH").is_none()
-                    && std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES)
-                {
-                    let _ = std::fs::write(&path, b"--- log rotated ---\n");
-                }
-
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .ok()?;
+                // Rotation is skipped for a custom path: the caller owns the
+                // file lifecycle (e.g. the bench wipes it per phase).
+                let rotate = env.var_os("KACHE_LOG_FILE_PATH").is_none();
+                let file = LazyLogFile::new(path, rotate);
 
                 let file_filter = env
                     .var("KACHE_LOG_FILE")
@@ -526,6 +515,62 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
             .with(stderr_layer)
             .with(file_layer),
     )
+}
+
+/// The log file, opened on the first line written. A command that logs
+/// nothing (`kache --help`, `kache --version`, most read-only commands)
+/// creates neither the file nor its folder. The first write creates the
+/// folder, truncates a file past [`MAX_LOG_BYTES`] when `rotate` is set, and
+/// opens it for appending; if that fails, lines are dropped, as before when
+/// the file could not be opened.
+struct LazyLogFile {
+    path: PathBuf,
+    rotate: bool,
+    file: Option<std::fs::File>,
+    failed: bool,
+}
+
+impl LazyLogFile {
+    fn new(path: PathBuf, rotate: bool) -> Self {
+        Self {
+            path,
+            rotate,
+            file: None,
+            failed: false,
+        }
+    }
+
+    fn open(&self) -> Option<std::fs::File> {
+        std::fs::create_dir_all(self.path.parent()?).ok()?;
+        if self.rotate && std::fs::metadata(&self.path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+            let _ = std::fs::write(&self.path, b"--- log rotated ---\n");
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok()
+    }
+}
+
+impl std::io::Write for LazyLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.file.is_none() && !self.failed {
+            self.file = self.open();
+            self.failed = self.file.is_none();
+        }
+        match &mut self.file {
+            Some(file) => file.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.file {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
 }
 
 /// How main reads argv, decided before any of it is parsed.
@@ -2040,10 +2085,8 @@ mod tests {
         assert!(!second.contains("own-warning"));
         assert!(!second.contains("own-debug"));
         assert!(!second.contains("first"));
-        assert_eq!(
-            std::fs::read(root.path().join("first/logs/wrapper.log")).unwrap(),
-            b""
-        );
+        // Its filter let nothing through, so its file was never opened.
+        assert!(!root.path().join("first/logs/wrapper.log").exists());
         let log = std::fs::read_to_string(root.path().join("second/logs/wrapper.log")).unwrap();
         assert_eq!(log.matches("own-warning").count(), 2);
         assert_eq!(log.matches("own-error").count(), 2);

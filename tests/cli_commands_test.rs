@@ -216,6 +216,43 @@ fn help_lists_subcommands() {
         .stdout(predicates::str::contains("completions"));
 }
 
+/// Commands that only print leave no trace: no log file in the default cache
+/// folder and no probe memo in the store. `kache --help` once ran the C
+/// compiler probe on kache itself and opened the log before it had a line.
+/// Unix only: the test redirects the default cache folder through HOME and
+/// `XDG_CACHE_HOME`, which Windows does not read.
+#[cfg(unix)]
+#[test]
+fn printing_commands_write_nothing() {
+    fn files_under(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let e = env();
+    for args in [
+        &["--help"][..],
+        &["--version"],
+        &["help", "stats"],
+        &["stats", "--help"],
+    ] {
+        e.cmd()
+            .env("XDG_CACHE_HOME", e.home.join(".cache"))
+            .args(args)
+            .assert()
+            .success();
+    }
+    let mut written = Vec::new();
+    files_under(&e.home, &mut written);
+    files_under(&e.cache, &mut written);
+    assert!(written.is_empty(), "{written:?}");
+}
+
 #[test]
 fn unknown_subcommand_is_a_usage_error() {
     let e = env();
