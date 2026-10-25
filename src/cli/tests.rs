@@ -753,6 +753,23 @@ fn cloned_targets_summary_only_appears_for_retained_blocks() {
         line.contains("; Cache reads 10 B over Limit, 7 B of it held there"),
         "{line}"
     );
+    // Past what targets hold, the store's own excess is either inside the
+    // 10 % it may pass Limit by before a sweep starts, or due for a sweep.
+    disk.store_limit_bytes = 1000;
+    disk.cloned_into_targets_bytes = 70;
+    disk.store_bytes = 1100;
+    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    assert!(
+        line.contains("70 B of it held there, the other 30 B within the 10 % a store may grow"),
+        "{line}"
+    );
+    disk.store_bytes = 1200;
+    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    assert!(
+        line.contains("the other 130 B past the sweep's start"),
+        "{line}"
+    );
+    disk.cloned_into_targets_bytes = 7;
     disk.store_bytes = 0;
 
     disk.snapshot_retained_bytes = 5;
