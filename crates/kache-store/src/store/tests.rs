@@ -11958,6 +11958,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
             key_locks_remaining: 1,
             predictions_pruned: 1,
             file_hashes_pruned: 1,
+            ..Default::default()
         }
     );
     assert!(!stale.exists());

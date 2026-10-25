@@ -841,6 +841,39 @@ fn remove_stale_lock_file(
     fs::remove_file(path).is_ok()
 }
 
+/// Unlink up to `cap` lock files in `dir` whose names `is_lock_name`
+/// accepts and that sit stale and unheld, by the same rules as the key lock
+/// sweep ([`remove_stale_lock_file`]). For lock directories outside
+/// `store/` that grow with every distinct key, such as the scheduler's
+/// flights. A missing or unreadable directory counts as empty.
+pub fn sweep_stale_lock_files(
+    dir: &Path,
+    is_lock_name: impl Fn(&str) -> bool,
+    min_age: Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+) -> KeyLockSweepStats {
+    let mut stats = KeyLockSweepStats::default();
+    let Ok(names) = fs::read_dir(dir) else {
+        return stats;
+    };
+    for name in names.flatten() {
+        let name = name.file_name();
+        if !name.to_str().is_some_and(&is_lock_name) {
+            continue;
+        }
+        stats.seen += 1;
+        // Past the cap the walk only counts, which costs no stat.
+        if stats.removed >= cap {
+            continue;
+        }
+        if remove_stale_lock_file(&dir.join(&name), min_age, now, || {}) {
+            stats.removed += 1;
+        }
+    }
+    stats
+}
+
 fn metadata_is_stale(meta: &fs::Metadata, now: std::time::SystemTime, min_age: Duration) -> bool {
     meta.modified()
         .is_ok_and(|modified| key_lock_is_stale(modified, now, min_age))
@@ -1254,6 +1287,14 @@ pub struct HousekeepingStats {
     pub predictions_pruned: usize,
     /// File hash memo rows deleted as not written for a month (#1206).
     pub file_hashes_pruned: usize,
+    /// Scheduler flight files (compile and discovery flights) unlinked as
+    /// stale. Filled by the caller that sweeps the scheduler's directory.
+    #[serde(default)]
+    pub flights_removed: usize,
+    /// Flight files left after the pass: recent or held ones, and whatever
+    /// the per-sweep cap deferred.
+    #[serde(default)]
+    pub flights_remaining: usize,
 }
 
 /// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or
@@ -5973,6 +6014,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             key_locks_remaining: locks.remaining(),
             predictions_pruned,
             file_hashes_pruned,
+            ..HousekeepingStats::default()
         }
     }
 
