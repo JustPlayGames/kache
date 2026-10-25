@@ -6758,6 +6758,12 @@ pub fn run_server(
         Ok(None) => {}
         Err(error) => tracing::warn!("could not raise the open-file limit: {error}"),
     }
+    #[cfg(windows)]
+    match crate::platform::lower_daemon_priority() {
+        Ok(true) => tracing::info!("running below normal priority"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("could not lower the daemon's priority: {error}"),
+    }
     let coord = DaemonCoordFile::for_socket(&socket_path);
     coord
         .write_phase(DaemonPhase::Starting)
