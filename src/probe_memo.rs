@@ -83,6 +83,190 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) {
     }
 }
 
+/// How long a memo may go unread before GC removes it. Memos are keyed by a
+/// tool's path, its file's identity, the environment and the working
+/// directory, so every toolchain update, new checkout and new environment
+/// leaves a set behind that nothing reads again, and nothing else removes
+/// them: a shared build machine's default folder held 1.7 million after a
+/// few days. Removing one that is still wanted costs one probe.
+pub(crate) const MEMO_IDLE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Most memos one GC sweep removes, across every directory it looks in. A
+/// removal is a stat and an unlink, so a full batch takes a few seconds in
+/// the daemon's below-normal-priority sweep, and a backlog of a million
+/// converges in about ten sweeps.
+pub(crate) const MEMO_SWEEP_CAP: usize = 100_000;
+
+/// The subdirectory of a cache directory that holds probe memos.
+const PROBES_DIR: &str = "probes";
+
+/// Per-build tree answers under `probes/`, which [`crate::session_tree`]
+/// sweeps itself, a directory per Cargo invocation.
+const SESSION_TREES_DIR: &str = "session-trees";
+
+/// Memos an older kache wrote in the cache directory itself, before they
+/// moved under `probes/`. Nothing reads them there any more.
+const LEGACY_ROOT_MEMOS: &[&str] = &[
+    "rustc-ver-",
+    "rustc-sysroot-",
+    "rustc-cwd-",
+    "linker-ver-",
+    "clippy-ver-",
+    "msvc-banner-",
+];
+
+/// What [`sweep_idle_memos`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MemoSweepStats {
+    pub(crate) removed: usize,
+    /// Memo files left: ones read or written within [`MEMO_IDLE`], and
+    /// whatever the per-sweep cap deferred.
+    pub(crate) remaining: usize,
+}
+
+/// The cache directories whose memos a GC of the store at `cache_dir`
+/// sweeps: that store's own (tree memos and compiler probe records follow
+/// the configured store) when it may write there, and the directory the
+/// environment selects for the per-user memos ([`crate::config::probe_memo_dir`]:
+/// `KACHE_CACHE_DIR`, else the default folder, `~/.cache/kache` or
+/// `%LOCALAPPDATA%\kache`), which a store set in `config.toml` does not
+/// move.
+pub(crate) fn memo_sweep_roots(cache_dir: &Path, store_writable: bool) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if store_writable {
+        roots.push(cache_dir.to_path_buf());
+    }
+    // This crate's own tests run GC against stores in temporary
+    // directories: never against the memos of the account running them.
+    if !cfg!(test)
+        && let Some(selected) = crate::config::probe_memo_dir().parent()
+    {
+        roots.push(selected.to_path_buf());
+    }
+    roots
+}
+
+/// Remove the memos under each of `roots` that nothing has read or written
+/// for [`MEMO_IDLE`], up to [`MEMO_SWEEP_CAP`] per sweep: the files of
+/// `<root>/probes` and of its subdirectories but the session trees, and the
+/// old-layout memos in `<root>` itself. Use is the later of a file's
+/// modification and access times; where a volume records no access times a
+/// memo in use is removed once per [`MEMO_IDLE`] and probed again. A reader
+/// that loses the race to a removal reads "not cached" and probes, as for
+/// any missing memo.
+pub(crate) fn sweep_idle_memos(roots: &[PathBuf]) -> MemoSweepStats {
+    sweep_idle_memos_at(
+        roots,
+        MEMO_IDLE,
+        MEMO_SWEEP_CAP,
+        std::time::SystemTime::now(),
+    )
+}
+
+fn sweep_idle_memos_at(
+    roots: &[PathBuf],
+    idle: std::time::Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+) -> MemoSweepStats {
+    let mut sweep = MemoSweep {
+        idle,
+        cap,
+        now,
+        seen: 0,
+        removed: 0,
+    };
+    let mut swept: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let identity = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if swept.contains(&identity) {
+            continue;
+        }
+        swept.push(identity);
+        sweep.dir(root, is_legacy_root_memo, None);
+        let mut subdirs = Vec::new();
+        sweep.dir(&root.join(PROBES_DIR), |_| true, Some(&mut subdirs));
+        for subdir in subdirs {
+            sweep.dir(&subdir, |_| true, None);
+        }
+    }
+    MemoSweepStats {
+        removed: sweep.removed,
+        remaining: sweep.seen - sweep.removed,
+    }
+}
+
+fn is_legacy_root_memo(name: &str) -> bool {
+    name.ends_with(".txt")
+        && LEGACY_ROOT_MEMOS
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+struct MemoSweep {
+    idle: std::time::Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+    seen: usize,
+    removed: usize,
+}
+
+impl MemoSweep {
+    /// Sweep the regular files of `dir` that `accept` names, and collect its
+    /// subdirectories but the session trees into `subdirs`.
+    fn dir(
+        &mut self,
+        dir: &Path,
+        accept: impl Fn(&str) -> bool,
+        mut subdirs: Option<&mut Vec<PathBuf>>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            // The directory entry's type costs no stat where the filesystem
+            // reports it (Linux, Windows).
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if let Some(subdirs) = subdirs.as_deref_mut()
+                    && entry.file_name() != SESSION_TREES_DIR
+                {
+                    subdirs.push(entry.path());
+                }
+                continue;
+            }
+            if !kind.is_file() || !entry.file_name().to_str().is_some_and(&accept) {
+                continue;
+            }
+            self.seen += 1;
+            // Past the cap the walk only counts, which costs no stat.
+            if self.removed >= self.cap {
+                continue;
+            }
+            let path = entry.path();
+            if std::fs::symlink_metadata(&path).is_ok_and(|meta| self.is_idle(&meta))
+                && std::fs::remove_file(&path).is_ok()
+            {
+                self.removed += 1;
+            }
+        }
+    }
+
+    fn is_idle(&self, meta: &std::fs::Metadata) -> bool {
+        let last_use = [meta.modified(), meta.accessed()]
+            .into_iter()
+            .filter_map(Result::ok)
+            .max();
+        last_use.is_some_and(|used| {
+            self.now
+                .duration_since(used)
+                .is_ok_and(|age| age >= self.idle)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +354,76 @@ mod tests {
             .flatten()
             .count();
         assert_eq!(leftovers, 1, "no staging files linger beside the memo");
+    }
+
+    #[test]
+    fn gc_removes_memos_nobody_used_for_the_idle_time() {
+        let idle = std::time::Duration::from_secs(3600);
+        let now = std::time::SystemTime::now();
+        let stale = now - 2 * idle;
+        let file = |path: PathBuf, modified, accessed| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"memo").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(modified)
+                        .set_accessed(accessed),
+                )
+                .unwrap();
+            path
+        };
+        let store = tempfile::tempdir().unwrap();
+        let default = tempfile::tempdir().unwrap();
+        let (a, b) = (store.path(), default.path());
+        let idle_memos = [
+            file(a.join("probes/rustc-ver-1.txt"), stale, stale),
+            file(a.join("probes/tree-digests/0f0f"), stale, stale),
+            file(a.join("rustc-ver-1.txt"), stale, stale),
+            file(b.join("probes/0f0f.json"), stale, stale),
+            file(b.join("clippy-ver-2.txt"), stale, stale),
+        ];
+        let kept = [
+            // Read lately: the access time is the last use.
+            file(a.join("probes/linker-placement-1.json"), stale, now),
+            file(b.join("probes/root-manifest/v1-x"), now, stale),
+            // Another sweep owns the session trees.
+            file(b.join("probes/session-trees/1-2/0f0f"), stale, stale),
+            // Not a memo of the old layout.
+            file(a.join("rustc-ver.lock"), stale, stale),
+            file(a.join("index.db"), stale, stale),
+        ];
+
+        // A root named twice is swept once.
+        let roots = [a.to_path_buf(), b.to_path_buf(), a.join(".")];
+        assert_eq!(
+            sweep_idle_memos_at(&roots, idle, 100, now),
+            MemoSweepStats {
+                removed: 5,
+                remaining: 2
+            }
+        );
+        assert!(idle_memos.iter().all(|path| !path.exists()));
+        assert!(kept.iter().all(|path| path.exists()));
+
+        // The cap bounds one sweep; the next one takes the rest.
+        let more = [
+            file(b.join("probes/1.json"), stale, stale),
+            file(b.join("probes/2.json"), stale, stale),
+            file(b.join("probes/3.json"), stale, stale),
+        ];
+        assert_eq!(
+            sweep_idle_memos_at(&roots, idle, 2, now),
+            MemoSweepStats {
+                removed: 2,
+                remaining: 3
+            }
+        );
+        assert_eq!(more.iter().filter(|path| path.exists()).count(), 1);
+        assert_eq!(sweep_idle_memos_at(&roots, idle, 2, now).removed, 1);
     }
 
     #[test]

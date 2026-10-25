@@ -1295,6 +1295,14 @@ pub struct HousekeepingStats {
     /// the per-sweep cap deferred.
     #[serde(default)]
     pub flights_remaining: usize,
+    /// Probe memos unlinked as unused for a week. Filled by the caller
+    /// that sweeps the memo directories.
+    #[serde(default)]
+    pub memos_removed: usize,
+    /// Memo files left after the pass: recently used ones, and whatever the
+    /// per-sweep cap deferred.
+    #[serde(default)]
+    pub memos_remaining: usize,
 }
 
 /// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or

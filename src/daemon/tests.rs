@@ -4271,33 +4271,6 @@ fn test_run_gc_cleans_registered_incremental_dirs_once() {
     assert!(incremental_dir.exists());
 }
 
-#[test]
-fn clean_tool_version_caches_removes_only_old_tool_version_txt() {
-    // Branch: old rustc/linker version-cache file cleanup.
-    let dir = tempfile::tempdir().unwrap();
-    let old_rustc = dir.path().join("rustc-ver-old.txt");
-    let old_linker = dir.path().join("linker-ver-old.txt");
-    let fresh_rustc = dir.path().join("rustc-ver-fresh.txt");
-    let old_other = dir.path().join("other-ver-old.txt");
-    for path in [&old_rustc, &old_linker, &fresh_rustc, &old_other] {
-        std::fs::write(path, b"version").unwrap();
-    }
-
-    let old = filetime::FileTime::from_system_time(
-        std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600),
-    );
-    for path in [&old_rustc, &old_linker, &old_other] {
-        filetime::set_file_mtime(path, old).unwrap();
-    }
-
-    Daemon::clean_tool_version_caches(dir.path());
-
-    assert!(!old_rustc.exists());
-    assert!(!old_linker.exists());
-    assert!(fresh_rustc.exists());
-    assert!(old_other.exists());
-}
-
 // ── Socket integration tests ─────────────────────────────────
 
 #[tokio::test]

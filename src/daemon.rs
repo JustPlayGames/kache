@@ -6586,10 +6586,6 @@ impl Daemon {
                 ))
             })()?;
 
-        // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
-        // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
-        Self::clean_tool_version_caches(&self.config.cache_dir);
-
         // Key lock files and input predictions grow with every distinct key
         // and eviction removes neither (#1126). Still under gc.lock.
         let mut housekeeping = gc_store.sweep_housekeeping();
@@ -6599,6 +6595,13 @@ impl Daemon {
             housekeeping.flights_removed = flights.removed;
             housekeeping.flights_remaining = flights.remaining;
         }
+        // Probe memos grow with every tool, checkout and environment.
+        let memos = crate::probe_memo::sweep_idle_memos(&crate::probe_memo::memo_sweep_roots(
+            &config.cache_dir,
+            !gc_store.is_read_only(),
+        ));
+        housekeeping.memos_removed = memos.removed;
+        housekeeping.memos_remaining = memos.remaining;
         let prestage_pruned =
             crate::prestage::prune(&self.config.cache_dir, std::time::SystemTime::now());
         tracing::info!(
@@ -6606,6 +6609,8 @@ impl Daemon {
             key_locks_remaining = housekeeping.key_locks_remaining,
             flights_removed = housekeeping.flights_removed,
             flights_remaining = housekeeping.flights_remaining,
+            memos_removed = housekeeping.memos_removed,
+            memos_remaining = housekeeping.memos_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
             file_hashes_pruned = housekeeping.file_hashes_pruned,
             prestage_pruned,
@@ -6692,28 +6697,6 @@ impl Daemon {
             size: evict_stats,
             total: stats,
         })
-    }
-
-    /// Remove tool-version cache files older than 7 days.
-    fn clean_tool_version_caches(cache_dir: &Path) {
-        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
-
-        let Ok(entries) = std::fs::read_dir(cache_dir) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if (name.starts_with("rustc-ver-") || name.starts_with("linker-ver-"))
-                && name.ends_with(".txt")
-                && let Ok(meta) = entry.metadata()
-                && let Ok(modified) = meta.modified()
-                && modified < cutoff
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
     }
 }
 

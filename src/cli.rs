@@ -4252,10 +4252,17 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         housekeeping.flights_removed = flights.removed;
         housekeeping.flights_remaining = flights.remaining;
     }
+    // Probe memos grow with every tool, checkout and environment.
+    let memos = crate::probe_memo::sweep_idle_memos(&crate::probe_memo::memo_sweep_roots(
+        &config.cache_dir,
+        !store.is_read_only(),
+    ));
+    housekeeping.memos_removed = memos.removed;
+    housekeeping.memos_remaining = memos.remaining;
     combined.housekeeping = Some(housekeeping);
     if verbose {
         println!(
-            "Housekeeping: removed {} ({} remain), {} ({} remain), {}, {}.",
+            "Housekeeping: removed {} ({} remain), {} ({} remain), {} ({} remain), {}, {}.",
             term::counted(
                 housekeeping.key_locks_removed as u64,
                 "stale key lock",
@@ -4268,6 +4275,12 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
                 "stale flights"
             ),
             housekeeping.flights_remaining,
+            term::counted(
+                housekeeping.memos_removed as u64,
+                "unused probe memo",
+                "unused probe memos"
+            ),
+            housekeeping.memos_remaining,
             term::counted(
                 housekeeping.predictions_pruned as u64,
                 "unused input prediction",
