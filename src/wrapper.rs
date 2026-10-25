@@ -1222,9 +1222,14 @@ fn lookup_local_entry<'a>(
 /// How long a lookup that missed an entry another process is storing right
 /// now ([`Store::store_in_flight`]) waits for its commit. A store holds the
 /// key for milliseconds, and the daemon's hand-off of one until the index's
-/// write lock frees (p99 3.9 s on a shared build machine under a burst);
-/// past this, the unit compiles as it would have without the wait.
-const STORE_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// write lock frees (p99 3.9 s on a shared build machine under a burst, and
+/// past 6 s under heavier load). The wait ends as soon as the storing
+/// process lets go of the key, committed or not, and the mark names a live
+/// process, so its length is how long a store may take, not how long a
+/// lookup waits: at 5 s a slow commit made the peer compile the unit a
+/// second time. Past this, the unit compiles as it would have without the
+/// wait.
+const STORE_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wait, bounded, for the entry another process is storing under
 /// `cache_key` right now. `true` once it is committed. Without this, a unit
@@ -1285,8 +1290,18 @@ fn stored_at_dep_info(
     crate_name: &str,
 ) -> Result<Option<EntryMeta>> {
     let stored = store.get(cache_key)?;
-    if stored.is_some() || !store.store_in_flight(cache_key) {
+    if stored.is_some() {
         return Ok(stored);
+    }
+    if !store.store_in_flight(cache_key) {
+        // The store may have committed and let go of the key between the
+        // lookup and the check: look once more, when a meta.json says an
+        // entry may be there, rather than compile the unit a second time.
+        return if store.entry_dir(cache_key).join("meta.json").exists() {
+            store.get(cache_key)
+        } else {
+            Ok(None)
+        };
     }
     crate::compile::hold_while_deciding();
     if wait_for_store_in_flight(store, cache_key, crate_name) {
