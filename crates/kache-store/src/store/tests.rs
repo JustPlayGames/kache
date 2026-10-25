@@ -1818,6 +1818,77 @@ fn publish_rename_fails_on_a_settled_error_or_an_obstructed_name() {
     assert_eq!(calls, crate::atomic::TRANSIENT_ATTEMPTS);
 }
 
+/// The no-replace publish's `AlreadyExists` is a race to retry on every
+/// platform, beside Windows' own transient codes; other errors are not.
+#[test]
+fn a_taken_name_is_a_transient_publish_error() {
+    assert!(is_transient_publish_error(&std::io::Error::from(
+        std::io::ErrorKind::AlreadyExists
+    )));
+    assert!(!is_transient_publish_error(&std::io::Error::from(
+        std::io::ErrorKind::NotFound
+    )));
+    assert!(!is_transient_publish_error(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
+}
+
+/// The race behind `publish_racing_an_unlink_never_errors`, in order: the
+/// link finds another put's blob at the name (`AlreadyExists`), and a
+/// remover unlinks that blob before the probe looks. The name is vacant, so
+/// the next attempt publishes instead of failing the put.
+#[cfg(unix)]
+#[test]
+fn a_winner_unlinked_after_the_link_failed_is_published_on_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob");
+    let staged = dir.path().join("staged");
+    fs::write(&blob, b"same-bytes").unwrap();
+    fs::write(&staged, b"same-bytes").unwrap();
+    set_blob_readonly(&blob);
+
+    let calls = std::cell::Cell::new(0u32);
+    let outcome = publish_rename(
+        || {
+            calls.set(calls.get() + 1);
+            let linked = publish_without_replacing(&staged, &blob);
+            if calls.get() == 1 {
+                assert_eq!(
+                    linked.as_ref().unwrap_err().kind(),
+                    std::io::ErrorKind::AlreadyExists
+                );
+                // The remover, between the failed link and the probe.
+                unlink_blob(&blob);
+            }
+            linked
+        },
+        || publish_dest_state(&blob),
+        is_transient_publish_error,
+    )
+    .unwrap();
+    assert_eq!(outcome, PublishRename::Published);
+    assert_eq!(calls.get(), 2);
+    assert_eq!(fs::read(&blob).unwrap(), b"same-bytes");
+    assert!(!staged.exists(), "the staged name is gone once linked");
+}
+
+/// A name some other put keeps taking back, vacant after every failed
+/// link: the budget ends deferred to the locked phase, not as an error.
+#[test]
+fn a_name_freed_after_every_failed_link_defers_the_publish() {
+    let calls = std::cell::Cell::new(0u32);
+    let outcome = publish_rename(
+        || {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        },
+        || PublishDest::Vacant,
+        is_transient_publish_error,
+    );
+    assert_eq!(outcome.unwrap(), PublishRename::Deferred);
+    assert_eq!(calls.get(), crate::atomic::TRANSIENT_ATTEMPTS);
+}
+
 /// The real rename onto a read-only winner, past the early `is_file`
 /// check the way a lost race gets there. Unix replaces the identical
 /// blob; Windows refuses with ERROR_ACCESS_DENIED. Either way one rename

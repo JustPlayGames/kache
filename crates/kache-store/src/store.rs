@@ -918,6 +918,19 @@ fn publish_without_replacing(staged: &Path, blob: &Path) -> std::io::Result<()> 
     }
 }
 
+/// Whether a failed [`publish_without_replacing`] is a race to retry.
+///
+/// Its `AlreadyExists` says a file held the blob's name when the link ran.
+/// Each attempt probes the name right after: a file there is a lost race,
+/// settled at once; a name found vacant means a remover unlinked that file
+/// between the link and the probe, so the next attempt can publish, and a
+/// budget that ends on a vacant name is deferred to the put's locked phase,
+/// as a Windows delete-pending name is. Without this the remover's unlink
+/// made the put fail with "File exists".
+fn is_transient_publish_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists || crate::atomic::is_transient_rename_error(e)
+}
+
 fn publish_dest_state(blob: &Path) -> PublishDest {
     match fs::metadata(blob) {
         Ok(meta) if meta.is_file() => PublishDest::File,
@@ -5679,7 +5692,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             staged,
             &blob,
             || publish_without_replacing(staged, &blob),
-            crate::atomic::is_transient_rename_error,
+            is_transient_publish_error,
         )?;
         if outcome != PublishRename::Published {
             return Ok(false);
