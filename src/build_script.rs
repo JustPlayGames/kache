@@ -733,33 +733,41 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     }
     // Everything below writes into `OUT_DIR` itself.
     detach_out_dir(&run.environment.out_dir)?;
+    let mut missed_key = None;
     if let Some(prediction) = &prediction {
-        let key_start = std::time::Instant::now();
-        let key = run.action_key(prediction)?;
-        let key_ms = key_start.elapsed().as_millis() as u64;
-        let lookup_start = std::time::Instant::now();
-        let meta = run.store.get(&key)?;
-        let lookup_ms = lookup_start.elapsed().as_millis() as u64;
-        if let Some(meta) = meta {
-            let restore_start = std::time::Instant::now();
-            match run.restore(&meta) {
-                Ok(size) => {
-                    let restore_ms = restore_start.elapsed().as_millis() as u64;
-                    run.log(
-                        EventResult::LocalHit,
-                        &key,
-                        key_ms,
-                        lookup_ms,
-                        restore_ms,
-                        0,
-                        StorePutResult::default(),
-                        size,
-                        meta.compile_time_ms,
-                    );
-                    return Ok(0);
-                }
-                Err(error) => continue_after_restore_failure(error)?,
+        match run.restore_recorded(prediction)? {
+            Lookup::Hit => return Ok(0),
+            Lookup::Miss(key) => missed_key = Some(key),
+        }
+    }
+    // Checkouts building the same commit at once all reach the same script
+    // with nothing stored yet, and each ran it: a slow one (a C library's
+    // build) took a minute and a half in every checkout. As crate compiles
+    // do, the first takes a flight, here for the key it missed, or with no
+    // prediction yet for the script and its configuration; the others wait
+    // for it, then look again and restore what it recorded. The flight is
+    // held until the run is recorded. A waiter that still misses (the owner
+    // could not record its run, or its inputs differ here) runs at once,
+    // without the flight, so such scripts are not run one after another.
+    let flight = run.config.scheduler.then(|| {
+        let identity = match &missed_key {
+            Some(key) => format!("build-script-run:{key}"),
+            None => format!("build-script-identity:{}", run.identity()),
+        };
+        crate::scheduler::join_discovery_flight(&run.config.cache_dir, &identity)
+    });
+    let mut _flight = None;
+    let mut prediction = prediction;
+    if let Some(flight) = flight {
+        if flight.waited {
+            prediction = run.prediction()?;
+            if let Some(prediction) = &prediction
+                && let Lookup::Hit = run.restore_recorded(prediction)?
+            {
+                return Ok(0);
             }
+        } else {
+            _flight = flight.lock;
         }
     }
 
@@ -810,6 +818,14 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         run.log_unrecorded(&format!("{error:#}"), second.compile_ms);
     }
     Ok(0)
+}
+
+/// What [`Run::restore_recorded`] found under a prediction's key.
+enum Lookup {
+    /// Restored into `OUT_DIR`, logged and replayed.
+    Hit,
+    /// Nothing usable stored under this key.
+    Miss(String),
 }
 
 /// One execution of the real build script, its output held back from Cargo
@@ -2084,6 +2100,39 @@ impl Run {
     /// [`skips_bound_runs`]): a launcher installed before the run was
     /// recorded (another build at the same time, a seeded target directory)
     /// gets here. `None` when the run may be recorded.
+    /// Look up the run `prediction` keys and restore it when stored. A
+    /// restore that fails is cleaned up and reported as a miss.
+    fn restore_recorded(&self, prediction: &Prediction) -> Result<Lookup> {
+        let key_start = std::time::Instant::now();
+        let key = self.action_key(prediction)?;
+        let key_ms = key_start.elapsed().as_millis() as u64;
+        let lookup_start = std::time::Instant::now();
+        let meta = self.store.get(&key)?;
+        let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+        if let Some(meta) = meta {
+            let restore_start = std::time::Instant::now();
+            match self.restore(&meta) {
+                Ok(size) => {
+                    let restore_ms = restore_start.elapsed().as_millis() as u64;
+                    self.log(
+                        EventResult::LocalHit,
+                        &key,
+                        key_ms,
+                        lookup_ms,
+                        restore_ms,
+                        0,
+                        StorePutResult::default(),
+                        size,
+                        meta.compile_time_ms,
+                    );
+                    return Ok(Lookup::Hit);
+                }
+                Err(error) => continue_after_restore_failure(error)?,
+            }
+        }
+        Ok(Lookup::Miss(key))
+    }
+
     fn run_bound_elsewhere(
         &self,
         real: &Path,
