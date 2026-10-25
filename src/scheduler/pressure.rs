@@ -18,9 +18,21 @@
 //! - Windows: no stall measure exists, so the memory the machine has left:
 //!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
 //!   total, or commit (physical memory and page file) under
-//!   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit. Past either, Windows pages
-//!   the desktop out for the compiles and the machine stops responding.
+//!   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit, or commit charged past the
+//!   physical memory. Past any of them, Windows pages the desktop out for
+//!   the compiles and the machine stops responding.
 //! - Elsewhere, and when nothing can be read: no pressure.
+//!
+//! Pressure is the late signal. Before it, the scheduler's memory gate
+//! ([`fits`]) admits a compile only while the memory available now, less
+//! what compiles admitted in the last moments are still expected to take
+//! and less the compile's own expected peak, stays above a reserve: the
+//! larger of [`RESERVE_PERCENT`] of the memory and [`RESERVE_FLOOR`]. The
+//! available memory is what the operating system reports, so it sees
+//! everything else on the machine (a WSL2 VM, an IDE, a browser, another
+//! user's builds), which slots sized from total memory never did. One
+//! compile always runs: a compile that finds no other compile holding a
+//! slot is admitted whatever the memory.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -43,6 +55,37 @@ pub(crate) const WINDOWS_MIN_AVAILABLE_PERCENT: u64 = 10;
 /// limit, under which Windows counts as under pressure.
 #[cfg(any(test, windows))]
 pub(crate) const WINDOWS_MIN_COMMIT_PERCENT: u64 = 5;
+
+/// Share of the machine's memory, in percent, the memory gate keeps free.
+pub(crate) const RESERVE_PERCENT: u64 = 20;
+
+/// The least memory the gate keeps free, whatever the share: below this a
+/// desktop pages out.
+pub(crate) const RESERVE_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The memory the gate keeps free on a machine with `total` bytes.
+pub(crate) fn reserve_bytes(total: u64) -> u64 {
+    (total / 100 * RESERVE_PERCENT).max(RESERVE_FLOOR)
+}
+
+/// The memory a machine (or this process's cgroup) has, and has available
+/// now, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoryReading {
+    pub(crate) available: u64,
+    pub(crate) total: u64,
+}
+
+/// Whether a compile expected to peak at `expected` bytes fits now: the
+/// available memory, less `pending` bytes compiles admitted moments ago
+/// have yet to take and less `expected`, stays at or above the reserve.
+pub(crate) fn fits(reading: MemoryReading, pending: u64, expected: u64) -> bool {
+    reading
+        .available
+        .saturating_sub(pending)
+        .saturating_sub(expected)
+        >= reserve_bytes(reading.total)
+}
 
 /// `[cache] scheduler_memory_pressure`, set once at wrapper startup.
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -90,12 +133,60 @@ pub(crate) fn force(pressured: Option<bool>) {
     FORCED.with(|forced| forced.set(pressured));
 }
 
-/// Whether admission should hold back now.
-pub(crate) fn now() -> bool {
-    if !INVOCATION_ENABLED.with(|slot| {
+// A memory reading a test sets for its own thread. While a test pins the
+// pressure answer and sets no reading, the gate has no reading: slot-count
+// fixtures do not depend on the host's memory.
+#[cfg(test)]
+thread_local! {
+    static FORCED_MEMORY: std::cell::Cell<Option<MemoryReading>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_memory(reading: Option<MemoryReading>) {
+    FORCED_MEMORY.with(|forced| forced.set(reading));
+}
+
+/// Whether the memory policy (pressure and the gate) is on for this
+/// invocation: `[cache] scheduler_memory_pressure`.
+pub(crate) fn enabled() -> bool {
+    INVOCATION_ENABLED.with(|slot| {
         slot.get()
             .unwrap_or_else(|| ENABLED.load(Ordering::Relaxed))
-    }) {
+    })
+}
+
+/// The memory reading the gate admits against, `None` when the policy is
+/// off or nothing can be read. Reused for [`SAMPLE_FOR`] like pressure.
+pub(crate) fn memory_now() -> Option<MemoryReading> {
+    if !enabled() {
+        return None;
+    }
+    #[cfg(test)]
+    if let Some(reading) = FORCED_MEMORY.with(std::cell::Cell::get) {
+        return Some(reading);
+    }
+    #[cfg(test)]
+    if FORCED.with(std::cell::Cell::get).is_some() {
+        return None;
+    }
+    thread_local! {
+        static LAST_MEMORY: std::cell::Cell<Option<(Instant, Option<MemoryReading>)>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let now = Instant::now();
+    LAST_MEMORY.with(|last| match last.get() {
+        Some((at, reading)) if now.saturating_duration_since(at) < SAMPLE_FOR => reading,
+        _ => {
+            let reading = read_memory();
+            last.set(Some((now, reading)));
+            reading
+        }
+    })
+}
+
+/// Whether admission should hold back now.
+pub(crate) fn now() -> bool {
+    if !enabled() {
         return false;
     }
     #[cfg(test)]
@@ -198,7 +289,8 @@ pub(crate) fn pressured_from(cgroup: Option<&std::path::Path>, host: &std::path:
 
 /// Whether Windows' memory figures (`GlobalMemoryStatusEx`) are pressure:
 /// physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
-/// total, or commit left under [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit.
+/// total, commit left under [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit, or
+/// more commit charged than there is physical memory.
 /// Totals of zero are no reading, not pressure.
 #[cfg(any(test, windows))]
 pub(crate) fn windows_pressured(
@@ -210,8 +302,14 @@ pub(crate) fn windows_pressured(
     let short = |available: u64, total: u64, percent: u64| {
         total > 0 && u128::from(available) * 100 < u128::from(total) * u128::from(percent)
     };
+    // Commit charged beyond physical memory cannot all be resident: once
+    // the programs touch it, Windows pages. The limit grows with a
+    // system-managed page file, so the share of it left says little.
+    let committed_past_memory = total_physical > 0
+        && total_commit.saturating_sub(available_commit) > total_physical;
     short(available_physical, total_physical, WINDOWS_MIN_AVAILABLE_PERCENT)
         || short(available_commit, total_commit, WINDOWS_MIN_COMMIT_PERCENT)
+        || committed_past_memory
 }
 
 #[cfg(windows)]
@@ -233,6 +331,90 @@ fn under_pressure() -> bool {
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn under_pressure() -> bool {
     false
+}
+
+/// `MemAvailable:` and `MemTotal:` of `/proc/meminfo`, in bytes.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn meminfo_reading(text: &str) -> Option<MemoryReading> {
+    let field = |name: &str| {
+        let kib: u64 = text
+            .lines()
+            .find_map(|line| line.strip_prefix(name))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        kib.checked_mul(1024)
+    };
+    Some(MemoryReading {
+        available: field("MemAvailable:")?,
+        total: field("MemTotal:")?,
+    })
+}
+
+/// The machine's reading bounded by a cgroup limit and its headroom: a
+/// container's compiles fit in its own limit, not the host's memory.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn within_cgroup(
+    machine: MemoryReading,
+    limit: Option<u64>,
+    headroom: Option<u64>,
+) -> MemoryReading {
+    match (limit, headroom) {
+        (Some(limit), Some(headroom)) => MemoryReading {
+            available: machine.available.min(headroom),
+            total: machine.total.min(limit),
+        },
+        // A limit whose usage cannot be read: its size bounds the total,
+        // and nothing is known about its use.
+        (Some(limit), None) => MemoryReading {
+            available: machine.available.min(limit),
+            total: machine.total.min(limit),
+        },
+        _ => machine,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_memory() -> Option<MemoryReading> {
+    use std::path::Path;
+    use std::sync::OnceLock;
+    static DOMAIN: OnceLock<Option<super::ResourceDomain>> = OnceLock::new();
+    let machine = meminfo_reading(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+    let domain = DOMAIN.get_or_init(|| {
+        super::ResourceDomain::from_files(
+            Path::new("/proc/self/cgroup"),
+            Path::new("/proc/self/mountinfo"),
+        )
+    });
+    Some(match domain.as_ref().map(super::ResourceDomain::snapshot) {
+        Some(snapshot) => within_cgroup(
+            machine,
+            snapshot.memory_limit_bytes,
+            snapshot.memory_headroom_bytes,
+        ),
+        None => machine,
+    })
+}
+
+#[cfg(windows)]
+fn read_memory() -> Option<MemoryReading> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: as in `under_pressure`.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0).then_some(
+        MemoryReading {
+            available: status.ullAvailPhys,
+            total: status.ullTotalPhys,
+        },
+    )
+}
+
+/// macOS keeps pressure to the kernel's verdict; the gate has no reading.
+#[cfg(not(any(target_os = "linux", windows)))]
+fn read_memory() -> Option<MemoryReading> {
+    None
 }
 
 #[cfg(test)]
@@ -315,12 +497,77 @@ mod tests {
         // Physical memory under a tenth of the total.
         assert!(windows_pressured(6 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
         assert!(!windows_pressured(7 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
-        // Commit nearly spent while physical memory still looks free.
-        assert!(windows_pressured(20 * GIB, 64 * GIB, 4 * GIB, 96 * GIB));
-        assert!(!windows_pressured(20 * GIB, 64 * GIB, 5 * GIB, 96 * GIB));
+        // Commit nearly spent while physical memory still looks free (a
+        // small page file: what is charged is still under the RAM).
+        assert!(windows_pressured(20 * GIB, 64 * GIB, 3 * GIB, 66 * GIB));
+        assert!(!windows_pressured(20 * GIB, 64 * GIB, 4 * GIB, 66 * GIB));
         // No reading is no pressure; figures past 2^64 / 100 do not overflow.
         assert!(!windows_pressured(0, 0, 0, 0));
         assert!(!windows_pressured(u64::MAX / 2, u64::MAX, u64::MAX / 2, u64::MAX));
+    }
+
+    #[test]
+    fn the_reserve_is_a_fifth_of_memory_and_never_under_4_gib() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(reserve_bytes(8 * GIB), 4 * GIB);
+        assert_eq!(reserve_bytes(20 * GIB), 4 * GIB);
+        assert_eq!(reserve_bytes(64 * GIB), 64 * GIB / 100 * 20);
+        assert_eq!(reserve_bytes(196 * GIB), 196 * GIB / 100 * 20);
+        assert_eq!(reserve_bytes(0), 4 * GIB);
+    }
+
+    #[test]
+    fn a_compile_fits_while_the_reserve_stays_free() {
+        const GIB: u64 = 1 << 30;
+        let reading = MemoryReading {
+            available: 10 * GIB,
+            total: 16 * GIB,
+        };
+        assert!(fits(reading, 0, 6 * GIB));
+        assert!(!fits(reading, 0, 6 * GIB + 1));
+        assert!(fits(reading, 2 * GIB, 4 * GIB));
+        assert!(!fits(reading, 2 * GIB, 5 * GIB));
+        assert!(!fits(reading, u64::MAX, u64::MAX), "saturates");
+    }
+
+    #[test]
+    fn reads_meminfo_and_bounds_it_by_the_cgroup() {
+        const KIB: u64 = 1024;
+        let text = "MemTotal:       16000000 kB\nMemFree:  100 kB\nMemAvailable:    9000000 kB\n";
+        let machine = meminfo_reading(text).unwrap();
+        assert_eq!(
+            machine,
+            MemoryReading {
+                available: 9_000_000 * KIB,
+                total: 16_000_000 * KIB
+            }
+        );
+        assert_eq!(meminfo_reading("MemTotal: 1 kB\n"), None);
+        let limit = 4_000_000 * KIB;
+        assert_eq!(
+            within_cgroup(machine, Some(limit), Some(KIB)),
+            MemoryReading {
+                available: KIB,
+                total: limit
+            }
+        );
+        assert_eq!(
+            within_cgroup(machine, Some(limit), None),
+            MemoryReading {
+                available: limit,
+                total: limit
+            }
+        );
+        assert_eq!(within_cgroup(machine, None, None), machine);
+    }
+
+    #[test]
+    fn windows_commit_above_physical_memory_is_pressure() {
+        const GIB: u64 = 1 << 30;
+        // 64 GiB of RAM, 30 available, but 70 of a 90 GiB commit limit
+        // committed: touching it all would page.
+        assert!(windows_pressured(30 * GIB, 64 * GIB, 20 * GIB, 90 * GIB));
+        assert!(!windows_pressured(30 * GIB, 64 * GIB, 26 * GIB, 90 * GIB));
     }
 
     #[test]
