@@ -129,41 +129,76 @@ fn observe(config: &Config, deadline: Instant) -> Result<ObservedOwner> {
                 ObservedOwner::Pending
             });
         }
-        Ok(None) => {
-            if let Some(health) = current_socket(&config.socket_path(), deadline)? {
-                return Ok(ObservedOwner::Ready(health));
-            }
+        Ok(None) => match probe_socket(&config.socket_path(), deadline)? {
+            SocketProbe::Ready(health) => return Ok(ObservedOwner::Ready(health)),
+            SocketProbe::Outdated => return Ok(ObservedOwner::AbsentOrOutdated),
+            SocketProbe::Unanswered => {}
+        },
+        Err(error) if transient(&error) => {
+            tracing::debug!("daemon health probe failed transiently: {error:#}");
         }
-        Err(error) if transient(&error) => {}
         Err(error) => return Err(error),
     }
-    // This legacy record plus a held lock permits waiting, never claiming ready.
-    Ok(if starting_daemon_epoch(config).is_some() {
-        ObservedOwner::Pending
-    } else {
-        ObservedOwner::AbsentOrOutdated
+    // Nothing answered. A process that holds the run lock is a daemon that is
+    // starting or busy, not one shown to be outdated: wait for it, never drain
+    // it. Draining on a probe that merely went unanswered (a Windows pipe with
+    // every instance taken, a full accept queue) sent wrappers into the drain
+    // phase against a healthy daemon that never received the request, and
+    // each waited out the whole 35 s drain budget before compiling.
+    Ok(
+        if starting_daemon_epoch(config).is_some()
+            || daemon_run_lock_is_held(&config.socket_path())?
+        {
+            ObservedOwner::Pending
+        } else {
+            ObservedOwner::AbsentOrOutdated
+        },
+    )
+}
+
+/// What the legacy JSON endpoint said to a health probe.
+enum SocketProbe {
+    Ready(DaemonHealth),
+    /// It answered, from a release older than this client.
+    Outdated,
+    /// No usable answer: unreachable, timed out, or not ok.
+    Unanswered,
+}
+
+#[cfg(test)]
+pub(super) fn current_socket(socket: &Path, deadline: Instant) -> Result<Option<DaemonHealth>> {
+    Ok(match probe_socket(socket, deadline)? {
+        SocketProbe::Ready(health) => Some(health),
+        SocketProbe::Outdated | SocketProbe::Unanswered => None,
     })
 }
 
-pub(super) fn current_socket(socket: &Path, deadline: Instant) -> Result<Option<DaemonHealth>> {
+fn probe_socket(socket: &Path, deadline: Instant) -> Result<SocketProbe> {
     let timeout = deadline
         .saturating_duration_since(Instant::now())
         .min(Duration::from_secs(2));
     if timeout.is_zero() {
-        return Ok(None);
+        return Ok(SocketProbe::Unanswered);
     }
     let response =
         match lifecycle_control::legacy_request(socket, &Request::Health, Instant::now() + timeout)
         {
             Ok(response) => response,
             Err(error) if !transient(&error) => return Err(error),
-            Err(_) => return Ok(None),
+            Err(error) => {
+                tracing::debug!("daemon socket health probe failed transiently: {error:#}");
+                return Ok(SocketProbe::Unanswered);
+            }
         };
     let response: Response = serde_json::from_str(&response)?;
     let Some(health) = response.health.filter(|_| response.ok) else {
-        return Ok(None);
+        return Ok(SocketProbe::Unanswered);
     };
-    Ok((!client_version_is_newer(VERSION, &health.version)).then_some(health))
+    Ok(if client_version_is_newer(VERSION, &health.version) {
+        SocketProbe::Outdated
+    } else {
+        SocketProbe::Ready(health)
+    })
 }
 
 struct KacheReplacement<'a> {
@@ -215,6 +250,7 @@ impl Driver for KacheReplacement<'_> {
             }
             Step::Drain => {
                 if !self.stopping {
+                    tracing::debug!(force = self.force, "daemon replacement drains the running daemon");
                     if daemon_run_lock_is_held(&socket)? {
                         // The daemon owns persistence and its allowed cancellation
                         // policy. Never kill it merely because readiness is slow.
@@ -631,6 +667,26 @@ mod tests {
             observe(&config, Instant::now() + Duration::from_secs(1)).unwrap(),
             ObservedOwner::Pending
         ));
+    }
+
+    #[test]
+    fn an_owner_that_does_not_answer_is_waited_for_not_drained() {
+        // A daemon holds the run lock but its probe goes unanswered (on
+        // Windows: every pipe instance busy). A plain start must wait for
+        // it; draining it cost each racing wrapper the 35 s drain budget.
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
+            .unwrap()
+            .unwrap();
+        let mut start = driver(&config);
+        start.force = false;
+        assert_eq!(
+            start
+                .perform(Step::Recheck, Some(Instant::now() + Duration::from_secs(1)))
+                .unwrap(),
+            Progress::Pending
+        );
     }
 
     #[test]
