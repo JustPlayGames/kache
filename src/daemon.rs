@@ -9,7 +9,8 @@ pub use kache_protocol::{
     BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest, CompileStartedRequest,
     DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome, HashFileRequest,
     HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest, PrefetchRequest,
-    PrefetchStatsSnapshot, PrestageRequest, RecordFileHashesRequest, RecordPredictionsRequest,
+    PrefetchStatsSnapshot, PrestageRequest, RecordEventsRequest, RecordFileHashesRequest,
+    RecordPredictionsRequest,
     RecordTargetRootsRequest, RemoteCheckRequest, SeedTargetRequest, StampHitsRequest, StatsEntry,
     StatsRequest, TransferDirection, TransferEvent, UploadJob,
 };
@@ -1848,6 +1849,9 @@ pub(crate) struct Daemon {
     /// Target roots wrappers handed over (RecordTargetRoots), by target
     /// path, written by [`Daemon::flush_handed_rows`].
     pending_target_roots: Mutex<HashMap<String, kache_protocol::TargetRootRow>>,
+    /// Requests of build events wrappers handed over (RecordEvents) that
+    /// are not logged yet ([`Daemon::handle_record_events`]).
+    events_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Input prediction rows wrappers handed over (RecordPredictions), by
     /// identity (the latest wins), written by [`Daemon::flush_handed_rows`].
     pending_predictions: Mutex<HashMap<String, kache_protocol::PredictionRow>>,
@@ -2011,6 +2015,7 @@ impl Daemon {
             pending_file_hashes: Mutex::new(Vec::new()),
             pending_memo_rows: Mutex::new(Vec::new()),
             pending_target_roots: Mutex::new(HashMap::new()),
+            events_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_predictions: Mutex::new(HashMap::new()),
             pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
             stamp_store: OnceLock::new(),
@@ -2724,6 +2729,7 @@ impl Daemon {
             | Request::PublishRustc(_)
             | Request::PredictionFetch(_)
             | Request::PredictionPublish(_)
+            | Request::RecordEvents(_)
             | Request::Prestage(_)
             | Request::SeedTarget(_)
             | Request::BuildStarted(_) => {
@@ -2869,7 +2875,8 @@ impl Daemon {
             },
             in_flight,
             effective_config: Some(self.effective_config.clone()),
-            publishes_pending: self.publish_queue.progress().pending() as u64,
+            publishes_pending: (self.publish_queue.progress().pending()
+                + self.events_pending.load(Ordering::Acquire)) as u64,
         })
     }
 
@@ -3174,6 +3181,30 @@ impl Daemon {
         for root in &req.roots {
             pending.insert(root.target.clone(), root.clone());
         }
+        Response::ok()
+    }
+
+    /// Log build events a wrapper's event log was too busy to take, on a
+    /// blocking thread that waits for the log as no build does. Counted
+    /// pending from before the answer until logged, so a build whose
+    /// wrappers have all exited is complete in the log once
+    /// `publishes_pending` reads 0. Refused for another event log, and when
+    /// [`MAX_PENDING_EVENT_REQUESTS`] are waiting.
+    pub fn handle_record_events(self: &Arc<Self>, req: RecordEventsRequest) -> Response {
+        if Path::new(&req.event_log) != self.config.event_log_path() {
+            return Response::err("events for another event log");
+        }
+        if self.events_pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_EVENT_REQUESTS {
+            self.events_pending.fetch_sub(1, Ordering::AcqRel);
+            return Response::err("event queue full");
+        }
+        let daemon = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            for event in &req.events {
+                crate::wrapper::write_daemon_event(&daemon.config, event);
+            }
+            daemon.events_pending.fetch_sub(1, Ordering::AcqRel);
+        });
         Response::ok()
     }
 
@@ -8469,6 +8500,7 @@ async fn handle_connection_started_at(
             Ok(Request::RecordFileHashes(req)) => daemon.handle_record_file_hashes(&req),
             Ok(Request::RecordTargetRoots(req)) => daemon.handle_record_target_roots(&req),
             Ok(Request::RecordPredictions(req)) => daemon.handle_record_predictions(&req),
+            Ok(Request::RecordEvents(req)) => daemon.handle_record_events(req),
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
@@ -9005,6 +9037,38 @@ pub fn send_target_root(
         roots: vec![root],
     });
     send_request_fire_and_forget(socket_path, &req).is_ok()
+}
+
+/// Build events a wrapper may hand over waiting to be logged at once; past
+/// it the daemon refuses more and the wrappers drop theirs, as before.
+const MAX_PENDING_EVENT_REQUESTS: usize = 4096;
+
+/// How long a wrapper waits for the daemon to take events the event log was
+/// too busy for. The answer comes before the daemon logs them, so it is a
+/// round trip; past it the events are dropped, as a busy log drops them.
+const EVENT_HANDOFF_WAIT: Duration = Duration::from_millis(500);
+
+/// Hand build events the event log was too busy to take to the daemon
+/// ([`Request::RecordEvents`]) and wait for it to count them. True once the
+/// daemon took them; false when no daemon runs, none answered in time, or
+/// it refused them (an older daemon does).
+pub fn send_events(
+    socket_path: &Path,
+    event_log: &Path,
+    events: Vec<kache_protocol::BuildEvent>,
+) -> bool {
+    #[cfg(unix)]
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::RecordEvents(RecordEventsRequest {
+        event_log: event_log.to_string_lossy().into_owned(),
+        events,
+    });
+    send_request_with_timeout(socket_path, &req, EVENT_HANDOFF_WAIT)
+        .ok()
+        .and_then(|line| serde_json::from_str::<Response>(&line).ok())
+        .is_some_and(|response| response.ok)
 }
 
 /// Hand input prediction rows the index was too busy for to the daemon

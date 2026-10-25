@@ -4274,6 +4274,53 @@ fn test_run_gc_cleans_registered_incremental_dirs_once() {
 
 // ── Socket integration tests ─────────────────────────────────
 
+/// Events a wrapper's busy log could not take are logged by the daemon,
+/// which counts them pending until they are in the log; another event log's
+/// are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handed_over_events_are_pending_until_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket_path = config.socket_path();
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let request = |log: &Path| {
+        Request::RecordEvents(RecordEventsRequest {
+            event_log: log.to_string_lossy().into_owned(),
+            events: vec![events::BuildEvent::new_for_test(
+                "handed",
+                events::EventResult::LocalHit,
+            )],
+        })
+    };
+    let foreign = one_shot_request(&daemon, &socket_path, &request(&dir.path().join("x"))).await;
+    assert!(!foreign.ok);
+
+    // A reader holds the log: the event waits, pending.
+    let log = config.event_log_path();
+    let reader = crate::events::open_log_lock(&log).unwrap();
+    reader.lock_shared().unwrap();
+    assert!(
+        one_shot_request(&daemon, &socket_path, &request(&log))
+            .await
+            .ok
+    );
+    let pending = || daemon.events_pending.load(Ordering::Acquire);
+    assert_eq!(pending(), 1);
+    reader.unlock().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pending() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the handed event was never logged"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let logged = crate::events::read_events(&log).unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].crate_name, "handed");
+}
+
 #[tokio::test]
 async fn test_socket_gc_roundtrip() {
     let dir = tempfile::tempdir().unwrap();

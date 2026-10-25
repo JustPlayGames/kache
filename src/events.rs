@@ -1245,7 +1245,7 @@ pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
     Ok(events)
 }
 
-fn open_log_lock(log_path: &Path) -> Result<File> {
+pub(crate) fn open_log_lock(log_path: &Path) -> Result<File> {
     OpenOptions::new()
         .create(true)
         .truncate(false)

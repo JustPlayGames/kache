@@ -58,6 +58,11 @@ pub enum Request {
     /// to take. Older daemons reject the unknown variant, and the rows cost
     /// the next build a pre-pass.
     RecordPredictions(RecordPredictionsRequest),
+    /// A wrapper hands over the build events the event log was too busy to
+    /// take, so `kache stats` and the log still count those compiles. Older
+    /// daemons reject the unknown variant and the wrapper drops the events,
+    /// as it did before.
+    RecordEvents(RecordEventsRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),
@@ -213,8 +218,8 @@ pub struct StatsResponse {
     /// its own config and labels the affected lines as client-derived.
     #[serde(default)]
     pub effective_config: Option<EffectiveConfig>,
-    /// Compiles the daemon has taken from wrappers (hand-offs) and not
-    /// stored and logged yet. Their wrappers, and Cargo, may have exited:
+    /// Compiles and events the daemon has taken from wrappers (hand-offs)
+    /// and not stored and logged yet. Their wrappers, and Cargo, may have exited:
     /// the store and the event log are complete once this reads 0. An older
     /// daemon reports 0.
     #[serde(default)]
