@@ -2094,9 +2094,24 @@ pub(crate) mod shim {
     }
 
     fn invoked_as_compiler_for(arg0: &str, env: &super::InvocationEnv) -> bool {
+        if names_kache(arg0) {
+            return false;
+        }
         let argv = [arg0.to_owned()];
         super::rustdoc::RustdocCompiler::recognizes(&argv)
             || super::cc::CcCompiler::recognizes_for(&argv, env)
+    }
+
+    /// Whether `arg0` is kache's own frontend or engine by name: kache run as
+    /// itself, never a compiler. Without this every `kache <command>`, even
+    /// `kache --help`, ran the C-family probe on kache and left its negative
+    /// memo in the default cache folder.
+    pub(crate) fn names_kache(arg0: &str) -> bool {
+        super::command_basename(arg0)
+            .map(super::strip_windows_exe_suffix)
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("kache") || name.eq_ignore_ascii_case("kache-engine")
+            })
     }
 
     /// The real compiler behind a shim: the first `name` on `PATH` that is not
