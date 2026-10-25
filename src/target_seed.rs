@@ -1552,8 +1552,17 @@ pub(crate) fn before_probe_for(
 /// (Cargo runs hundreds of wrappers a build), but a seeding happens once per
 /// new target directory and leaves no other trace of what it copied.
 pub(crate) fn note_in_log(line: &str) {
+    note_in_log_for(&crate::invocation::InvocationEnv::capture(), line);
+}
+
+/// [`note_in_log`] into the file the log's file layer would write for `env`:
+/// `KACHE_LOG_FILE_PATH` when set, not the default log beside the default
+/// cache folder.
+fn note_in_log_for(env: &crate::invocation::InvocationEnv, line: &str) {
     use std::io::Write;
-    let path = crate::diagnostic_log_path();
+    let Some(path) = crate::log_file_path_for(env) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -3857,6 +3866,26 @@ source = "git+https://example.com/gitdep#abc"
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
+    }
+
+    /// A seeding's note goes where the log's file layer writes:
+    /// `KACHE_LOG_FILE_PATH`, never the default log beside the default cache
+    /// folder (found on Windows, where that is `%LOCALAPPDATA%\\kache`).
+    #[test]
+    fn a_seeding_note_honours_the_log_file_path() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("os-cache");
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("KACHE_LOG_FILE_PATH", "logs/seed.log")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+        .with_cache_dir(Some(cache.clone()));
+        note_in_log_for(&env, "seeded target");
+        let logged = std::fs::read_to_string(root.path().join("logs/seed.log")).unwrap();
+        assert!(logged.contains("INFO kache::target_seed: seeded target"), "{logged}");
+        assert!(!cache.exists(), "nothing is written beside the default cache folder");
     }
 
     /// A target directory seeding creates carries Cargo's tag, so kache

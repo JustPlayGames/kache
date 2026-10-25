@@ -377,6 +377,17 @@ fn diagnostic_log_path_for(env: &invocation::InvocationEnv) -> PathBuf {
     }
 }
 
+/// The file the log's file layer writes: `KACHE_LOG_FILE_PATH` when set
+/// (relative to the invocation's directory), else [`diagnostic_log_path_for`].
+/// `None` when a relative path has no directory to resolve against.
+pub(crate) fn log_file_path_for(env: &invocation::InvocationEnv) -> Option<PathBuf> {
+    let path = env
+        .var_os("KACHE_LOG_FILE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| diagnostic_log_path_for(env));
+    env.resolve(&path)
+}
+
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,11 +487,7 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
             None
         } else {
             (|| -> Option<_> {
-                let path = env
-                    .var_os("KACHE_LOG_FILE_PATH")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| diagnostic_log_path_for(env));
-                let path = env.resolve(&path)?;
+                let path = log_file_path_for(env)?;
                 std::fs::create_dir_all(path.parent()?).ok()?;
 
                 // Simple rotation: truncate if file exceeds 5 MB.
