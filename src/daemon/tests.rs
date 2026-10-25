@@ -2019,15 +2019,29 @@ fn accept_backoff_pauses_only_on_descriptor_exhaustion() {
     use std::io::{Error, ErrorKind};
     for errno in [libc::EMFILE, libc::ENFILE] {
         assert_eq!(
-            accept_backoff(&Error::from_raw_os_error(errno)),
+            accept_backoff(&Error::from_raw_os_error(errno), 1),
             Some(ACCEPT_EXHAUSTED_BACKOFF)
         );
     }
     assert_eq!(
-        accept_backoff(&Error::from_raw_os_error(libc::ECONNABORTED)),
+        accept_backoff(&Error::from_raw_os_error(libc::ECONNABORTED), 1),
         None
     );
-    assert_eq!(accept_backoff(&Error::from(ErrorKind::Other)), None);
+    assert_eq!(accept_backoff(&Error::from(ErrorKind::Other), 1), None);
+}
+
+/// On Windows a listener whose accept keeps failing (pipe instance creation
+/// refused under memory pressure) backs off instead of spinning, and logs
+/// only the first error and each power of two.
+#[cfg(windows)]
+#[test]
+fn a_failing_pipe_listener_backs_off_instead_of_spinning() {
+    let error = std::io::Error::from_raw_os_error(1450); // ERROR_NO_SYSTEM_RESOURCES
+    assert_eq!(accept_backoff(&error, 1), Some(Duration::from_millis(10)));
+    assert_eq!(accept_backoff(&error, 2), Some(Duration::from_millis(20)));
+    assert_eq!(accept_backoff(&error, 50), Some(ACCEPT_FAILING_BACKOFF_MAX));
+    let logged: Vec<u32> = (1..=20).filter(|n| accept_error_logged(*n)).collect();
+    assert_eq!(logged, [1, 2, 4, 8, 16]);
 }
 
 #[test]
