@@ -6268,6 +6268,8 @@ impl Daemon {
     pub(crate) fn request_gc_for_invocation(self: &Arc<Self>, config: Config) {
         let daemon = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            let _low = crate::platform::run_below_normal();
             if let Err(error) = daemon.sweep_invocation_under_size_pressure(&config) {
                 tracing::warn!("invocation GC sweep failed: {error:#}");
             }
@@ -6291,6 +6293,8 @@ impl Daemon {
             }
         }
         let _release = Release(&self.gc_hint_pending);
+        #[cfg(windows)]
+        let _low = crate::platform::run_below_normal();
         if let Err(e) = self.sweep_under_size_pressure() {
             tracing::warn!("hinted GC sweep failed: {e:#}");
         }
@@ -6782,10 +6786,10 @@ pub fn run_server(
         Err(error) => tracing::warn!("could not raise the open-file limit: {error}"),
     }
     #[cfg(windows)]
-    match crate::platform::lower_daemon_priority() {
-        Ok(true) => tracing::info!("running below normal priority"),
+    match crate::platform::set_daemon_priority() {
+        Ok(true) => tracing::info!("raised from below normal to normal priority"),
         Ok(false) => {}
-        Err(error) => tracing::warn!("could not lower the daemon's priority: {error}"),
+        Err(error) => tracing::warn!("could not set the daemon's priority: {error}"),
     }
     let coord = DaemonCoordFile::for_socket(&socket_path);
     coord
@@ -7140,6 +7144,8 @@ async fn server_main(
             interval.tick().await;
             let cache_dir = sweep_cache_dir.clone();
             let _ = tokio::task::spawn_blocking(move || {
+                #[cfg(windows)]
+                let _low = crate::platform::run_below_normal();
                 let removed =
                     crate::prestage::sweep_staged(&cache_dir, std::time::SystemTime::now());
                 if removed > 0 {
@@ -7167,6 +7173,8 @@ async fn server_main(
             // the accept loop and in-flight RemoteCheck stay responsive (#281).
             let gc = gc_daemon.clone();
             match tokio::task::spawn_blocking(move || {
+                #[cfg(windows)]
+                let _low = crate::platform::run_below_normal();
                 gc.run_gc(
                     GcPolicy::Automatic {
                         max_age_hours: gc.config.gc_max_age_hours,
@@ -7226,6 +7234,8 @@ async fn server_main(
     let migration_config = config.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
+            #[cfg(windows)]
+            let _low = crate::platform::run_below_normal();
             if let Ok(store) = Store::open(&migration_config) {
                 store.migrate_to_blobs(|_, _| {})
             } else {

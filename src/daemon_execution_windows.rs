@@ -225,6 +225,8 @@ pub(super) async fn handle(
         write_reply(stream, &ExecutionReply::Accepted),
     )
     .await??;
+    // Read before the broker takes the peer: the pipeline runs at its priority.
+    let client_class = peer.priority_class().ok();
     let cancellation = Cancellation::default();
     let _cancel = CancelOnDrop(cancellation.clone());
     let (send, mut calls) = tokio::sync::mpsc::channel(8);
@@ -249,6 +251,7 @@ pub(super) async fn handle(
     let mut worker = tokio::task::spawn_blocking(move || {
         let _activity = activity;
         let _permit = permit;
+        let _priority = client_class.map(crate::platform::run_at_client_priority);
         match prepared.entry {
             ExecutionEntry::Compiler => crate::run_compiler_invocation(&prepared.args, context),
             ExecutionEntry::Original => crate::run_original_compiler_invocation(
