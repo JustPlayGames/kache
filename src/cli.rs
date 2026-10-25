@@ -1279,7 +1279,7 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
 /// Parenthetical for a cap that is the disk-share budget, matching
 /// [`crate::config::describe_max_size`].
 ///
-/// One store whose cap equals that budget says `5% of <disk>, floor 5.0 GiB,
+/// One store whose cap equals that budget says `20% of <disk>, floor 10.0 GiB,
 /// cap 100.0 GiB`, or `default; disk size unknown` when the probe failed. Any
 /// other cap, and a summary that covers more than one store, stays unlabeled.
 fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<u64>) -> String {

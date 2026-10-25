@@ -98,7 +98,7 @@ local_max_size = "200GiB"
 | `KACHE_READONLY_STORE` | `cache.readonly_store` | unset | Another store on this machine to read after the local one, never written. See [Read-only store](#read-only-store). |
 | none | `cache.volumes` | unset | Volume-local store shards, e.g. `[cache.volumes] "D:" = "D:/kache-store"`. Builds on a mapped volume share inodes there instead of copying across mounts. Unmapped volumes use the main store. GC sweeps each shard with its own budget; see [Volume shards](#volume-shards). |
 | `KACHE_SOCKET_PATH` | none | `<runtime_dir>/daemon.sock` | Absolute daemon endpoint override |
-| `KACHE_MAX_SIZE` | `cache.local_max_size` | 5% of the cache disk, rounded to the nearest GiB, floored at 5GiB and capped at 100GiB; 50GiB when the disk size cannot be read | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
+| `KACHE_MAX_SIZE` | `cache.local_max_size` | 20% of the cache disk, rounded to the nearest GiB, floored at 10GiB and capped at 100GiB; 50GiB when the disk size cannot be read | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
@@ -217,7 +217,7 @@ The equivalent environment setting is `KACHE_GC_EVICT_SHARED=1`. With this optio
 
 Every GC driver sweeps each `[cache.volumes]` shard as well as the main store: `kache gc`, the daemon's 6-hour sweep, its sweep after an upload or a build's hint, and the detached auto-GC worker. Each shard is swept like the main store, with the same age, duplicate, and size passes.
 
-Each shard has its own budget. An explicit `local_max_size` or `KACHE_MAX_SIZE` applies to each shard as it is. Without one, a shard's budget is 5% of the filesystem that holds it, floored at 5GiB and capped at 100GiB, the same rule as the main store.
+Each shard has its own budget. An explicit `local_max_size` or `KACHE_MAX_SIZE` applies to each shard as it is. Without one, a shard's budget is 20% of the filesystem that holds it, floored at 10GiB and capped at 100GiB, the same rule as the main store.
 
 A shard keeps its own `gc.lock`, `auto-gc-backoff.json`, `gc_stats.json` and `savings.json` in its store dir, so its trigger, backoff and held bytes do not mix with the main store's. `kache gc` prints one line per shard after the main store's.
 

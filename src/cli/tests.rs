@@ -5598,20 +5598,20 @@ fn render_stats_offline_and_not_configured() {
 fn cache_limit_note_names_the_disk_share_budget() {
     const GIB: u64 = 1 << 30;
     let share = format!(
-        " (5% of {}, floor 5.0 GiB, cap 100.0 GiB)",
+        " (20% of {}, floor 10.0 GiB, cap 100.0 GiB)",
         ByteSize(200 * GIB)
     );
-    // 5% of 200 GiB is 10 GiB, inside the floor and the cap.
-    assert_eq!(cache_limit_note(0, 10 * GIB, Some(200 * GIB)), share);
-    assert_eq!(cache_limit_note(1, 10 * GIB, Some(200 * GIB)), share);
-    assert_eq!(cache_limit_note(2, 10 * GIB, Some(200 * GIB)), "");
+    // 20% of 200 GiB is 40 GiB, inside the floor and the cap.
+    assert_eq!(cache_limit_note(0, 40 * GIB, Some(200 * GIB)), share);
+    assert_eq!(cache_limit_note(1, 40 * GIB, Some(200 * GIB)), share);
+    assert_eq!(cache_limit_note(2, 40 * GIB, Some(200 * GIB)), "");
     assert_eq!(cache_limit_note(0, 7 * GIB, Some(200 * GIB)), "");
-    // 5% of 1 GiB rounds to 0, then the floor raises the budget to 5 GiB.
-    let floor = cache_limit_note(0, 5 * GIB, Some(GIB));
+    // 20% of 1 GiB rounds to 0, then the floor raises the budget to 10 GiB.
+    let floor = cache_limit_note(0, 10 * GIB, Some(GIB));
     assert!(floor.contains("floor"), "{floor}");
-    assert!(floor.contains("floor 5.0 GiB"), "{floor}");
+    assert!(floor.contains("floor 10.0 GiB"), "{floor}");
     assert!(floor.contains(&ByteSize(GIB).to_string()), "{floor}");
-    // 5% of 4000 GiB is 200 GiB, then the cap lowers the budget to 100 GiB.
+    // 20% of 4000 GiB is 800 GiB, then the cap lowers the budget to 100 GiB.
     let cap = cache_limit_note(0, 100 * GIB, Some(4000 * GIB));
     assert!(cap.contains("cap"), "{cap}");
     assert!(cap.contains("cap 100.0 GiB"), "{cap}");
