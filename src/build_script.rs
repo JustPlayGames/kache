@@ -1914,7 +1914,7 @@ impl Run {
         let manifest: Manifest =
             serde_json::from_slice(&std::fs::read(self.store.blob_path(&manifest.hash))?)?;
         anyhow::ensure!(
-            matches!(manifest.version, 1..=rooted_links::MANIFEST_VERSION),
+            matches!(manifest.version, 1..=BYTES_MANIFEST_VERSION),
             "unsupported build-script manifest"
         );
         // Also guard legacy entries before touching the current output tree.
@@ -2005,9 +2005,10 @@ impl Run {
         }
         rooted_links::validate_restored_relative(&self.environment, &manifest.symlinks)?;
         size += outside::restore(&self.store, &self.environment, meta, manifest, &rewritten)?;
+        let (stdout, stderr) = manifest.streams()?;
         replay(
-            &self.environment.denormalize(manifest.stdout.as_bytes()),
-            &self.environment.denormalize(manifest.stderr.as_bytes()),
+            &self.environment.denormalize(&stdout),
+            &self.environment.denormalize(&stderr),
         );
         Ok(size)
     }
@@ -2136,8 +2137,10 @@ impl Run {
         started: std::time::SystemTime,
         tools: &ToolSnapshot,
     ) -> Result<()> {
-        let stdout_text =
-            std::str::from_utf8(stdout).context("build-script stdout is not UTF-8")?;
+        // What Cargo reads of it: a compiler's warnings in the system code
+        // page (CP852 on Czech Windows) are lines Cargo skips.
+        let stdout_text = cargo_readable_lines(stdout);
+        let stdout_text = stdout_text.as_ref();
         let Some((inputs, env, default_package)) =
             parse_declarations(stdout_text, &self.environment)
         else {
@@ -2196,11 +2199,16 @@ impl Run {
             return Err(InputsChanged.into());
         }
         let key_ms = key_start.elapsed().as_millis() as u64;
+        let (stdout, stdout_bytes) = recorded_stream(&self.environment.normalize(stdout));
+        let (stderr, stderr_bytes) = recorded_stream(&self.environment.normalize(stderr));
         let manifest = Manifest {
             // Version 1 would restore placeholders verbatim, version 2 would
-            // leave symlinks out, and version 3 would replay a link search
-            // without the files it names outside OUT_DIR.
-            version: if rooted_symlinks.is_empty() {
+            // leave symlinks out, version 3 would replay a link search
+            // without the files it names outside OUT_DIR, and version 5
+            // would replay text in place of the bytes the script wrote.
+            version: if stdout_bytes.is_some() || stderr_bytes.is_some() {
+                BYTES_MANIFEST_VERSION
+            } else if rooted_symlinks.is_empty() {
                 outside::manifest_version(!symlinks.is_empty(), !rewritten.is_empty(), has_outside)
             } else {
                 rooted_links::MANIFEST_VERSION
@@ -2209,8 +2217,10 @@ impl Run {
             empty_files,
             symlinks,
             rooted_symlinks,
-            stdout: String::from_utf8_lossy(&self.environment.normalize(stdout)).into_owned(),
-            stderr: String::from_utf8_lossy(&self.environment.normalize(stderr)).into_owned(),
+            stdout,
+            stderr,
+            stdout_bytes,
+            stderr_bytes,
             rewritten,
             outside_directories: outside_outputs.directories,
             outside_empty_files: outside_outputs.empty_files,
@@ -2320,14 +2330,29 @@ fn unrecorded_reason(why: &str) -> String {
     format!("refused|build-script run not recorded: {why}")
 }
 
+/// The manifest version of a run whose stdout or stderr is not UTF-8 (a
+/// compiler's warnings in the system code page, as cl.exe prints them on a
+/// Windows in another language), kept as written in `stdout_bytes` and
+/// `stderr_bytes`. Older readers refuse it and run the script.
+const BYTES_MANIFEST_VERSION: u32 = 6;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Manifest {
     version: u32,
     /// Every directory under `OUT_DIR`, so empty ones come back too.
     directories: Vec<String>,
     empty_files: Vec<EmptyFile>,
+    /// What the script printed, or with `stdout_bytes` the lines of it that
+    /// Cargo reads.
     stdout: String,
     stderr: String,
+    /// The script's stdout as it wrote it, in hex, when it is not UTF-8
+    /// (version 6). Replayed instead of `stdout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_bytes: Option<String>,
+    /// Its stderr, the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_bytes: Option<String>,
     /// Files stored with their roots as placeholders (version 2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rewritten: Vec<String>,
@@ -2346,6 +2371,51 @@ struct Manifest {
     outside_empty_files: Vec<EmptyFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     outside_symlinks: Vec<Symlink>,
+}
+
+impl Manifest {
+    /// The stdout and stderr to replay, byte for byte as the run wrote them
+    /// (with the run's roots as placeholders).
+    fn streams(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let stream = |text: &str, bytes: Option<&str>| -> Result<Vec<u8>> {
+            match bytes {
+                Some(hex) => hex::decode(hex).context("a recorded stream is not hex"),
+                None => Ok(text.as_bytes().to_vec()),
+            }
+        };
+        Ok((
+            stream(&self.stdout, self.stdout_bytes.as_deref())?,
+            stream(&self.stderr, self.stderr_bytes.as_deref())?,
+        ))
+    }
+}
+
+/// A stream for the manifest: the text itself when it is UTF-8, else the
+/// lines of it Cargo reads beside the bytes in hex.
+fn recorded_stream(bytes: &[u8]) -> (String, Option<String>) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), None),
+        Err(_) => (
+            cargo_readable_lines(bytes).into_owned(),
+            Some(hex::encode(bytes)),
+        ),
+    }
+}
+
+/// The lines of a build script's stdout that Cargo reads: it splits the
+/// output at newlines and skips every line that is not UTF-8.
+fn cargo_readable_lines(stdout: &[u8]) -> std::borrow::Cow<'_, str> {
+    if let Ok(text) = std::str::from_utf8(stdout) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut text = String::new();
+    for line in stdout.split(|byte| *byte == b'\n') {
+        if let Ok(line) = std::str::from_utf8(line) {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    std::borrow::Cow::Owned(text)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -5660,6 +5730,54 @@ mod tests {
         (make("a/target"), make("b/target"))
     }
 
+    /// cl.exe on a Czech Windows prints its warnings in CP852, so a script
+    /// that relays them (cc's `cargo:warning=` lines) writes stdout that is
+    /// not UTF-8. The run is recorded all the same, its declarations read
+    /// from the lines Cargo reads, and another target directory replays the
+    /// bytes it wrote, its own paths in place of the first one's.
+    #[test]
+    fn a_run_whose_output_is_not_utf8_is_recorded_and_replayed_byte_for_byte() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        // "upozorněn" and "neplatný" in CP852 (0xD8 = ě, 0xEC = ý): not UTF-8.
+        let warning: &[u8] = b"cargo:warning=vp8l.c(12): upozorn\xd8n\xa1 C4244: neplatn\xec";
+        let stdout_for = |run: &Run| -> Vec<u8> {
+            let mut out = b"cargo:rerun-if-changed=build.rs\n".to_vec();
+            out.extend_from_slice(warning);
+            out.extend_from_slice(
+                format!(
+                    "\ncargo:rustc-link-search=native={}\n",
+                    run.environment.out_dir.display()
+                )
+                .as_bytes(),
+            );
+            out
+        };
+        let stderr: &[u8] = b"cl : P\xd8\xa1kazov\xa0 \xa9\xa0dka\n";
+        assert!(std::str::from_utf8(&stdout_for(&a)).is_err());
+        a.record(&stdout_for(&a), stderr, 5, after).unwrap();
+
+        let prediction = b.prediction().unwrap().expect("the run is recorded");
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        let manifest = stored_manifest(&b, &meta);
+        assert_eq!(manifest.version, BYTES_MANIFEST_VERSION);
+        let (out, err) = manifest.streams().unwrap();
+        assert_eq!(b.environment.denormalize(&out), stdout_for(&b));
+        assert_eq!(b.environment.denormalize(&err), stderr);
+        assert!(
+            !manifest.stdout.contains("warning"),
+            "the text names only what Cargo reads: {}",
+            manifest.stdout
+        );
+        b.restore(&meta).unwrap();
+    }
+
     /// A library the script names under the target directory, beside `OUT_DIR`,
     /// is restored in the next checkout at that checkout's path. Cargo's `deps`
     /// directory and a system directory named in the same stdout are not.
@@ -5918,7 +6036,7 @@ mod tests {
             ),
             start: std::time::Instant::now(),
         };
-        for version in [0, 6] {
+        for version in [0, BYTES_MANIFEST_VERSION + 1] {
             let meta = put_manifest(
                 &run,
                 &format!("v{version}"),
@@ -6083,6 +6201,8 @@ mod tests {
             empty_files: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
+            stdout_bytes: None,
+            stderr_bytes: None,
             rewritten: Vec::new(),
             symlinks: vec![link("d/a", ".."), link("d/a/c", "../x")],
             rooted_symlinks: Vec::new(),

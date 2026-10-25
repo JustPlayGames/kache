@@ -143,7 +143,7 @@ pub(super) fn validate_restored_relative(
 
 pub(super) fn validate_manifest(manifest: &Manifest) -> Result<()> {
     anyhow::ensure!(
-        manifest.rooted_symlinks.is_empty() || manifest.version == MANIFEST_VERSION,
+        manifest.rooted_symlinks.is_empty() || manifest.version >= MANIFEST_VERSION,
         "rooted build-script links require manifest version 5"
     );
     for link in &manifest.rooted_symlinks {
