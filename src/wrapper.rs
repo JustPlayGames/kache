@@ -562,15 +562,16 @@ fn auto_gc_stamp_path(cache_dir: &Path) -> PathBuf {
 
 /// Decide whether a background GC should be spawned: auto-GC enabled, the
 /// throttle interval elapsed, and the store over `max_size` plus slack.
-/// Touches the stamp *before* the size query so concurrent wrappers don't
-/// stampede on the SQLite `SUM`. Split from [`after_store`] so the decision
-/// is unit-testable without spawning processes.
+/// Claims the interval *before* the size query, under the check lock, so of
+/// the wrappers that store at once only one runs the SQLite `SUM` and only
+/// one asks for a sweep. Split from [`after_store`] so the decision is
+/// unit-testable without spawning processes.
 fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     if !config.auto_gc {
         return false;
     }
     let stamp = auto_gc_stamp_path(&config.cache_dir);
-    if !auto_gc_check_due(&stamp) {
+    if !auto_gc_check_due(&stamp) || !claim_due_auto_gc_check(config, &stamp) {
         return false;
     }
 
@@ -587,16 +588,6 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     // A `[cache.volumes]` shard is judged against its own budget and backoff.
     let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
     if !auto_gc_sweep_due(&swept, total) && !crate::disk_recovery::wanted(&swept) {
-        let now_str = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_default();
-        let _ = std::fs::write(&stamp, now_str);
-        return false;
-    }
-
-    // Exceeded threshold — claim this check slot before spawning GC
-    if !claim_auto_gc_check(config, &stamp) {
         return false;
     }
 
@@ -621,6 +612,29 @@ fn auto_gc_check_due(stamp: &Path) -> bool {
         }
     }
     true
+}
+
+/// Claim the check interval that [`auto_gc_check_due`] found due, for this
+/// process alone. Every wrapper that stores in the same moment sees the same
+/// expired stamp, so the claim is made under an exclusive lock beside it,
+/// and the stamp is looked at again once the lock is held: only the first
+/// holder finds it still due. A holder that is busy means another process is
+/// claiming right now, which drops this check. Without a lock file (a full
+/// volume may refuse to create one) the claim goes ahead unlocked, as it
+/// always has, since that is when recovery matters most.
+fn claim_due_auto_gc_check(config: &Config, stamp: &Path) -> bool {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(stamp.with_extension("lock"));
+    let Ok(lock) = lock else {
+        return claim_auto_gc_check(config, stamp);
+    };
+    if lock.try_lock().is_err() {
+        return false;
+    }
+    auto_gc_check_due(stamp) && claim_auto_gc_check(config, stamp)
 }
 
 /// Claim the check slot by rewriting `stamp`. Without a free-space floor, a
@@ -726,10 +740,9 @@ fn is_storage_full(error: &anyhow::Error) -> bool {
 fn space_recovery_wanted(config: &Config, store: &Store) -> bool {
     let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
     let stamp = auto_gc_stamp_path(&config.cache_dir);
-    if !crate::disk_recovery::wanted(&swept) || !auto_gc_check_due(&stamp) {
-        return false;
-    }
-    claim_auto_gc_check(config, &stamp)
+    crate::disk_recovery::wanted(&swept)
+        && auto_gc_check_due(&stamp)
+        && claim_due_auto_gc_check(config, &stamp)
 }
 
 /// A running daemon owns automatic eviction, so it gets a hint and nothing is
