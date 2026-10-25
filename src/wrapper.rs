@@ -381,7 +381,7 @@ fn auto_gc_backoff_path(cache_dir: &Path) -> PathBuf {
 }
 
 /// Size above which an automatic sweep starts: `max_size` plus slack.
-fn auto_gc_threshold(max_size: u64) -> u64 {
+pub(crate) fn auto_gc_threshold(max_size: u64) -> u64 {
     max_size.saturating_add(max_size / 100 * AUTO_GC_SLACK_PERCENT)
 }
 

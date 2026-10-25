@@ -743,11 +743,32 @@ fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
                 ": it is why Cache reads {} over Limit, and only cleaning those targets frees it",
                 term::bytes(over)
             ),
-            over => format!(
-                "; Cache reads {} over Limit, {} of it held there",
-                term::bytes(over),
-                term::bytes(cloned)
-            ),
+            over => {
+                // The rest is the store's own bytes past Limit. A sweep
+                // starts only once they pass Limit by 10 %, and then evicts
+                // to 90 % of it, so a store between the two is as intended.
+                let trigger = crate::wrapper::auto_gc_threshold(disk.store_limit_bytes);
+                let private = disk.store_bytes.saturating_sub(cloned);
+                let rest = if private <= trigger {
+                    format!(
+                        ", the other {} within the 10 % a store may grow past Limit before a \
+                         sweep starts (at {} not held by targets)",
+                        term::bytes(over - cloned),
+                        term::bytes(trigger)
+                    )
+                } else {
+                    format!(
+                        ", the other {} past the sweep's start at {}: the next check sweeps it",
+                        term::bytes(over - cloned),
+                        term::bytes(trigger)
+                    )
+                };
+                format!(
+                    "; Cache reads {} over Limit, {} of it held there{rest}",
+                    term::bytes(over),
+                    term::bytes(cloned)
+                )
+            }
         };
         notes.push(format!(
             "{} cloned into target/, which the limit leaves out{why}",
