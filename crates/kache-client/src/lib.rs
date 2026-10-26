@@ -19,6 +19,12 @@ pub use frontend::run;
 /// Internal argv envelope passed from the frontend to its companion engine.
 pub const FORWARDED_ARGV_FLAG: &str = "--kache-forwarded-argv-v1";
 
+/// Set on the engine a frontend forwards to after the running daemon
+/// declined this compile. The engine then neither asks the daemon again nor
+/// starts one: a busy daemon would decline again, costing every compile a
+/// second round trip while it is busiest.
+pub const FRONTEND_DECLINED_ENV: &str = "KACHE_FRONTEND_DECLINED";
+
 mod entry;
 pub use entry::{EngineEntry, engine_entry};
 
