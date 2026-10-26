@@ -1357,6 +1357,27 @@ impl ResourceSnapshot {
     }
 }
 
+/// Bytes of a cgroup's `memory.current` it reclaims before paging out
+/// anything in use: its inactive file cache and reclaimable slab, from
+/// `memory.stat`. memory.current counts the page cache, and a long-running
+/// container's cache fills its limit, so limit less usage alone reads as
+/// no memory left while most of it is cache the next allocation takes
+/// back. Active file cache (pages read more than once, the build's own
+/// rlibs among them) stays counted as used. 0 when unreadable.
+#[cfg(any(test, target_os = "linux"))]
+fn reclaimable_memory(stat: &Path) -> u64 {
+    let Ok(text) = fs::read_to_string(stat) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            matches!(name, "inactive_file" | "slab_reclaimable")
+                .then(|| value.trim().parse::<u64>().ok())?
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
 /// A parsed cgroup-v2 CPU quota and period.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CpuLimit {
@@ -1450,7 +1471,10 @@ impl ResourceDomain {
                         None => limit,
                     });
                     if let Some(current) = read_u64_file(&path.join("memory.current")) {
-                        let headroom = limit.saturating_sub(current);
+                        let headroom = limit
+                            .saturating_sub(current)
+                            .saturating_add(reclaimable_memory(&path.join("memory.stat")))
+                            .min(limit);
                         memory_headroom_bytes = Some(match memory_headroom_bytes {
                             Some(current) => current.min(headroom),
                             None => headroom,
@@ -1922,6 +1946,45 @@ mod tests {
         let snapshot = domain.snapshot();
         assert_eq!(snapshot.memory_current_bytes, Some(125));
         assert_eq!(snapshot.memory_headroom_bytes, Some(0));
+    }
+
+    /// memory.current counts the page cache, which fills a long-running
+    /// container's limit: the headroom also counts what the cgroup reclaims
+    /// before it pages anything in use, its inactive file cache and
+    /// reclaimable slab. Active file cache stays counted as used.
+    #[test]
+    fn resource_snapshot_counts_reclaimable_cache_as_headroom() {
+        const MIB: u64 = 1 << 20;
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let current = dir.path().join("cgroup/job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("memory.max"), format!("{}\n", 8192 * MIB)).unwrap();
+        fs::write(current.join("memory.current"), format!("{}\n", 7680 * MIB)).unwrap();
+        fs::write(
+            current.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nactive_file {}\ninactive_file {}\nslab_reclaimable {}\n",
+                3000 * MIB,
+                4096 * MIB,
+                1024 * MIB,
+                3072 * MIB,
+                256 * MIB
+            ),
+        )
+        .unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_headroom_bytes, Some((512 + 3072 + 256) * MIB));
+        // Never more than the limit, whatever the counters say.
+        fs::write(
+            current.join("memory.stat"),
+            format!("inactive_file {}\n", 16384 * MIB),
+        )
+        .unwrap();
+        assert_eq!(domain.snapshot().memory_headroom_bytes, Some(8192 * MIB));
+        // No memory.stat: the limit less its usage, as before.
+        fs::remove_file(current.join("memory.stat")).unwrap();
+        assert_eq!(domain.snapshot().memory_headroom_bytes, Some(512 * MIB));
     }
 
     #[test]
