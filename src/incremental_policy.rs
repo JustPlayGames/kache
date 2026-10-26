@@ -24,6 +24,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod cleanup;
+pub(crate) mod private_outputs;
 mod worktree_seed;
 pub(crate) use cleanup::{preview_stale, prune_stale};
 pub(crate) use worktree_seed::compiler_supports_automatic_seed;
