@@ -440,7 +440,11 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
         )?;
         let (child, job) = windows::Child::remote(id, pid, handles, broker);
         (child, Some(job))
-    } else if controlled {
+    } else if controlled || crate::opcounts::child_rss_recorder().is_some() {
+        // A compile the daemon declined runs here, outside any request, and
+        // Windows 11 declines every hand-off. Its job is what measures the
+        // compile's peak memory, the linker's share included, and kills the
+        // whole tree when the client goes away, as the daemon's job does.
         let (child, job) = windows::spawn(command)?;
         (windows::Child::local(child), Some(job))
     } else {
@@ -762,6 +766,21 @@ mod tests {
     /// On Windows the sample is the peak memory of the job the compiler runs
     /// in, read once it has exited: without it the scheduler never learned a
     /// crate's size there, and every linking compile took two slots.
+    /// A compile the daemon declines runs in the client, outside any
+    /// request: Windows 11 declines every hand-off, so this is how compiles
+    /// run there, and without a job no peak was ever recorded.
+    #[cfg(windows)]
+    #[test]
+    fn a_waited_child_outside_a_request_records_its_peak_memory() {
+        let _counts = crate::opcounts::InvocationScope::enter(std::time::Instant::now());
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit 6"])
+            .invocation_spawn()
+            .unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(6));
+        assert!(crate::opcounts::invocation_child_rss().unwrap().unwrap() > 1024);
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_waited_child_in_a_job_records_its_peak_memory() {
