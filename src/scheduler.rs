@@ -256,23 +256,25 @@ struct Permit {
 
 /// A compile's expected peak, recorded under `scheduler/admitted/` while it
 /// runs so that other compiles' memory gate counts it ([`pending_bytes`]).
-/// The file's name carries the bytes; its age, how much of them still
-/// counts. Removed on drop.
+/// The file's name carries the bytes, then the pid and a counter, then
+/// `-m` when the peak was measured ([`unmeasured_running`]); its age, how
+/// much of the bytes still counts. Removed on drop.
 struct Admission {
     path: PathBuf,
 }
 
 impl Admission {
-    fn record(root: &Path, expected: u64) -> Option<Self> {
+    fn record(root: &Path, expected: u64, measured: bool) -> Option<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let dir = admitted_dir(root);
         fs::create_dir_all(&dir).ok()?;
         for _ in 0..4 {
             let name = format!(
-                "{expected}-{}-{}",
+                "{expected}-{}-{}{}",
                 std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                if measured { MEASURED_SUFFIX } else { "" }
             );
             let path = dir.join(name);
             match fs::OpenOptions::new()
@@ -298,6 +300,31 @@ impl Drop for Admission {
 
 fn admitted_dir(root: &Path) -> PathBuf {
     root.join("admitted")
+}
+
+/// Ends the record of a compile admitted on a measured peak. A record
+/// without it (a guessed peak, or a kache from before it) counts as
+/// unmeasured.
+const MEASURED_SUFFIX: &str = "-m";
+
+/// Whether a compile admitted under `root` on a guessed peak still runs:
+/// its record is there and not stale.
+fn unmeasured_running(root: &Path, now: std::time::SystemTime) -> bool {
+    let Ok(entries) = fs::read_dir(admitted_dir(root)) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(MEASURED_SUFFIX))
+            && entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() < ADMISSION_STALE
+                })
+    })
 }
 
 /// The bytes compiles admitted under `root` are still expected to take that
@@ -351,14 +378,17 @@ fn others_compiling(root: &Path) -> bool {
 struct MemoryGate<'a> {
     root: &'a Path,
     expected: u64,
+    /// Whether `expected` is the compile's measured peak.
+    measured: bool,
     last: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl<'a> MemoryGate<'a> {
-    fn new(root: &'a Path, expected: u64) -> Self {
+    fn new(root: &'a Path, expected: u64, measured: bool) -> Self {
         Self {
             root,
             expected,
+            measured,
             last: std::cell::Cell::new(None),
         }
     }
@@ -382,8 +412,10 @@ impl<'a> MemoryGate<'a> {
         let Some(reading) = pressure::memory_now() else {
             return true;
         };
-        let pending = pending_bytes(self.root, std::time::SystemTime::now());
-        pressure::fits(reading, pending, self.expected) || !others_compiling(self.root)
+        let now = std::time::SystemTime::now();
+        let pending = pending_bytes(self.root, now);
+        let measured = self.measured && !unmeasured_running(self.root, now);
+        pressure::fits(reading, pending, self.expected, measured) || !others_compiling(self.root)
     }
 }
 
@@ -633,9 +665,10 @@ impl Scheduler {
     }
 
     fn acquire_compile_permit(&self, crate_name: &str, is_link: bool) -> Option<Permit> {
-        self.acquire_permit_expecting(
+        self.acquire_permit_weighed(
             self.weight_for(crate_name, is_link),
             self.expected_bytes(crate_name, is_link),
+            read_weight(&self.weights_dir(), crate_name).is_some(),
         )
     }
 
@@ -645,15 +678,21 @@ impl Scheduler {
         self.acquire_permit_expecting(weight, UNMEASURED_COMPILE_BYTES)
     }
 
-    /// Take `weight` slots for a compile expected to peak at `expected`
-    /// bytes, once the memory gate admits it, blocking up to the wait
-    /// timeout. The whole call is attributed to `permit_wait_ms`: an
-    /// immediately free pool costs microseconds, a saturated one costs the
-    /// wait.
+    /// [`Self::acquire_permit_weighed`] a compile whose peak is guessed.
+    #[cfg(test)]
     fn acquire_permit_expecting(&self, weight: u32, expected: u64) -> Option<Permit> {
+        self.acquire_permit_weighed(weight, expected, false)
+    }
+
+    /// Take `weight` slots for a compile expected to peak at `expected`
+    /// bytes (`measured`: its last measured peak), once the memory gate
+    /// admits it, blocking up to the wait timeout. The whole call is
+    /// attributed to `permit_wait_ms`: an immediately free pool costs
+    /// microseconds, a saturated one costs the wait.
+    fn acquire_permit_weighed(&self, weight: u32, expected: u64, measured: bool) -> Option<Permit> {
         let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
-        let gate = MemoryGate::new(&self.root, expected);
+        let gate = MemoryGate::new(&self.root, expected, measured);
         let slots = self.wait_for_permit_gated(
             0..self.pool_size,
             |waited| {
@@ -665,7 +704,7 @@ impl Scheduler {
         crate::opcounts::record_permit_wait(started.elapsed());
         let slots = slots?;
         let admission = pressure::enabled()
-            .then(|| Admission::record(&self.root, expected))
+            .then(|| Admission::record(&self.root, expected, measured))
             .flatten();
         Some(Permit {
             _slots: slots,
@@ -1290,6 +1329,11 @@ pub(crate) struct ResourceSnapshot {
     pub(crate) cpuset_cpus: Option<u32>,
     pub(crate) memory_current_bytes: Option<u64>,
     pub(crate) memory_headroom_bytes: Option<u64>,
+    /// Of the usage behind `memory_headroom_bytes`, the cache its cgroups
+    /// reclaim before paging anything in use (inactive file cache and
+    /// reclaimable slab, from `memory.stat`), never past a limit. 0 when
+    /// the headroom is unknown.
+    pub(crate) memory_reclaimable_bytes: u64,
     /// False when the visible cgroup mount starts below the hierarchy root,
     /// so a tighter limit may exist above it.
     pub(crate) ancestor_limits_complete: bool,
@@ -1306,6 +1350,7 @@ impl ResourceSnapshot {
             cpuset_cpus: None,
             memory_current_bytes: None,
             memory_headroom_bytes: None,
+            memory_reclaimable_bytes: 0,
             ancestor_limits_complete: false,
             current_memory_events: None,
         }
@@ -1344,6 +1389,7 @@ impl ResourceSnapshot {
             memory_limit_bytes = self.memory_limit_bytes,
             memory_current_bytes = self.memory_current_bytes,
             memory_headroom_bytes = self.memory_headroom_bytes,
+            memory_reclaimable_bytes = self.memory_reclaimable_bytes,
             ancestor_limits_complete = self.ancestor_limits_complete,
             current_memory_events_known = self.current_memory_events.is_some(),
             current_memory_low = events.low,
@@ -1355,6 +1401,26 @@ impl ResourceSnapshot {
             "scheduler resource snapshot; resource-aware admission is future work"
         );
     }
+}
+
+/// Bytes of a cgroup's `memory.current` it reclaims before paging out
+/// anything in use: its inactive file cache and reclaimable slab, from
+/// `memory.stat`. memory.current counts the page cache, and a long-running
+/// container's cache fills its limit. Active file cache (pages read more
+/// than once, the build's own rlibs among them) stays counted as used.
+/// 0 when unreadable.
+#[cfg(any(test, target_os = "linux"))]
+fn reclaimable_memory(stat: &Path) -> u64 {
+    let Ok(text) = fs::read_to_string(stat) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            matches!(name, "inactive_file" | "slab_reclaimable")
+                .then(|| value.trim().parse::<u64>().ok())?
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// A parsed cgroup-v2 CPU quota and period.
@@ -1436,6 +1502,8 @@ impl ResourceDomain {
     pub(crate) fn snapshot(&self) -> ResourceSnapshot {
         let mut memory_limit_bytes: Option<u64> = None;
         let mut memory_headroom_bytes: Option<u64> = None;
+        // The headroom again with each cgroup's reclaimable cache counted.
+        let mut reclaimable_headroom: Option<u64> = None;
         let mut memory_limits_complete = self.ancestor_limits_complete;
         let mut memory_headroom_complete = true;
         let mut cpu_limit: Option<CpuLimit> = None;
@@ -1454,6 +1522,13 @@ impl ResourceDomain {
                         memory_headroom_bytes = Some(match memory_headroom_bytes {
                             Some(current) => current.min(headroom),
                             None => headroom,
+                        });
+                        let with_cache = headroom
+                            .saturating_add(reclaimable_memory(&path.join("memory.stat")))
+                            .min(limit);
+                        reclaimable_headroom = Some(match reclaimable_headroom {
+                            Some(current) => current.min(with_cache),
+                            None => with_cache,
                         });
                     } else {
                         memory_headroom_complete = false;
@@ -1491,8 +1566,13 @@ impl ResourceDomain {
             .ok()
             .and_then(|text| parse_memory_events(&text));
 
+        let memory_reclaimable_bytes = match (memory_headroom_bytes, reclaimable_headroom) {
+            (Some(headroom), Some(with_cache)) => with_cache.saturating_sub(headroom),
+            _ => 0,
+        };
         ResourceSnapshot {
             memory_limit_bytes,
+            memory_reclaimable_bytes,
             cpu_limit,
             cpuset_cpus: fs::read_to_string(self.current.join("cpuset.cpus.effective"))
                 .ok()
@@ -1924,6 +2004,44 @@ mod tests {
         assert_eq!(snapshot.memory_headroom_bytes, Some(0));
     }
 
+    /// memory.current counts the page cache, which fills a long-running
+    /// container's limit: the snapshot also reports what the cgroup
+    /// reclaims before it pages anything in use, its inactive file cache and
+    /// reclaimable slab, never past the limit. Active file cache stays used.
+    #[test]
+    fn resource_snapshot_reports_the_cache_a_cgroup_reclaims_first() {
+        const MIB: u64 = 1 << 20;
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let current = dir.path().join("cgroup/job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("memory.max"), format!("{}\n", 8192 * MIB)).unwrap();
+        fs::write(current.join("memory.current"), format!("{}\n", 7680 * MIB)).unwrap();
+        fs::write(
+            current.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nactive_file {}\ninactive_file {}\nslab_reclaimable {}\n",
+                3000 * MIB,
+                4096 * MIB,
+                1024 * MIB,
+                3072 * MIB,
+                256 * MIB
+            ),
+        )
+        .unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_headroom_bytes, Some(512 * MIB));
+        assert_eq!(snapshot.memory_reclaimable_bytes, (3072 + 256) * MIB);
+        fs::write(
+            current.join("memory.stat"),
+            format!("inactive_file {}\n", 16384 * MIB),
+        )
+        .unwrap();
+        assert_eq!(domain.snapshot().memory_reclaimable_bytes, 7680 * MIB);
+        fs::remove_file(current.join("memory.stat")).unwrap();
+        assert_eq!(domain.snapshot().memory_reclaimable_bytes, 0);
+    }
+
     #[test]
     fn resource_snapshot_uses_each_ancestor_usage_for_headroom() {
         let dir = temp_cache();
@@ -2065,6 +2183,7 @@ mod tests {
             cpuset_cpus: Some(3),
             memory_current_bytes: Some(256 << 20),
             memory_headroom_bytes: Some(768 << 20),
+            memory_reclaimable_bytes: 0,
             ancestor_limits_complete: true,
             current_memory_events: Some(MemoryEvents {
                 low: 1,
@@ -3123,11 +3242,22 @@ mod tests {
 
     impl PinnedMemory {
         fn new(available_gib: u64, total_gib: u64) -> Self {
+            Self::pin(available_gib, total_gib, None)
+        }
+
+        /// A cgroup's reading: `reclaimable_gib` of its usage is cache it
+        /// reclaims before paging anything in use.
+        fn in_cgroup(available_gib: u64, total_gib: u64, reclaimable_gib: u64) -> Self {
+            Self::pin(available_gib, total_gib, Some(reclaimable_gib))
+        }
+
+        fn pin(available_gib: u64, total_gib: u64, reclaimable_gib: Option<u64>) -> Self {
             const GIB: u64 = 1024 * 1024 * 1024;
             pressure::force(Some(false));
             pressure::force_memory(Some(pressure::MemoryReading {
                 available: available_gib * GIB,
                 total: total_gib * GIB,
+                reclaimable: reclaimable_gib.map(|gib| gib * GIB),
             }));
             Self
         }
@@ -3172,6 +3302,46 @@ mod tests {
             .acquire_permit_expecting(1, 7 * GIB)
             .expect("with no other compile it runs whatever the memory");
         drop(alone);
+    }
+
+    /// In a cgroup, while every compile involved has a measured peak, the
+    /// gate keeps a smaller reserve and counts the cache the cgroup reclaims
+    /// first. One compile still running on a guessed peak brings back the
+    /// full reserve with the cache counted as used, and outside a cgroup (a
+    /// desktop) the full reserve always stays.
+    #[test]
+    fn the_gate_relaxes_only_in_a_cgroup_while_every_peak_is_measured() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = temp_cache();
+        // Slots enough for every weight: only the memory gate decides.
+        let scheduler = gate_scheduler(dir.path(), 32);
+        write_weight(&scheduler.weights_dir(), "small", GIB / 2).unwrap();
+        write_weight(&scheduler.weights_dir(), "big", 6 * GIB).unwrap();
+        write_weight(&scheduler.weights_dir(), "mid", 3 * GIB).unwrap();
+        // 16 GiB, 10 available: 10 - 0.5 - 6 = 3.5 GiB left, under the full
+        // reserve (4 GiB), over the measured one (1 GiB).
+        let both_measured = |memory: PinnedMemory, then: &str| {
+            let small = scheduler.acquire_compile_permit("small", false).unwrap();
+            let admitted = scheduler.acquire_compile_permit(then, false).is_some();
+            drop(memory);
+            drop(small);
+            admitted
+        };
+        assert!(
+            !both_measured(PinnedMemory::new(10, 16), "big"),
+            "outside a cgroup the full reserve stays"
+        );
+        assert!(both_measured(PinnedMemory::in_cgroup(10, 16, 0), "big"));
+        // An 8 GiB cgroup with 2 GiB unused and 4 GiB of cache it reclaims
+        // first: 2 + 4 - 0.5 - 3 = 2.5 GiB left with the cache counted.
+        assert!(both_measured(PinnedMemory::in_cgroup(2, 8, 4), "mid"));
+        let _memory = PinnedMemory::in_cgroup(2, 8, 4);
+        let guessed = scheduler.acquire_compile_permit("never-built", false).unwrap();
+        assert!(
+            scheduler.acquire_compile_permit("mid", false).is_none(),
+            "a compile running on a guessed peak keeps the full reserve"
+        );
+        drop(guessed);
     }
 
     #[test]
