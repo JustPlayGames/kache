@@ -416,6 +416,12 @@ fn recent_held_bytes(backoff: Option<AutoGcBackoff>, now: u64) -> u64 {
         .map_or(0, |b| b.held)
 }
 
+/// The bytes the last automatic sweep found held by target directories,
+/// while that figure is recent; 0 without one.
+pub(crate) fn recent_auto_gc_held(cache_dir: &Path) -> u64 {
+    recent_held_bytes(read_auto_gc_backoff(cache_dir), unix_now_secs())
+}
+
 fn read_auto_gc_backoff(cache_dir: &Path) -> Option<AutoGcBackoff> {
     let json = std::fs::read(auto_gc_backoff_path(cache_dir)).ok()?;
     serde_json::from_slice(&json).ok()
