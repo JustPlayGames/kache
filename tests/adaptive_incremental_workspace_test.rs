@@ -285,6 +285,92 @@ fn unselected_workspace_crates_seed_then_stay_active() {
     );
 }
 
+/// A link that takes an rlib an incremental compile wrote keys on bytes no
+/// other build writes, so it compiles with no key and no entry. An example
+/// shows it: examples never take an incremental lane of their own, so each
+/// edit used to store a new one. A fresh target builds the same sources
+/// without incremental state and keys and stores the link as before, and the
+/// next fresh target hits it.
+#[test]
+fn a_link_of_incrementally_compiled_libraries_is_not_stored() {
+    let checkout = tempfile::tempdir().unwrap();
+    let project = checkout_path(checkout.path());
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    create_workspace(&project);
+    fs::create_dir_all(project.join("app/examples")).unwrap();
+    fs::write(
+        project.join("app/examples/demo.rs"),
+        "fn main() { print!(\"{}\", adaptive_mid::answer()); }\n",
+    )
+    .unwrap();
+    let future = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600;
+    let build = |target: &str, mtime: Option<i64>, answer: u64| {
+        let source = project.join("lib/src/lib.rs");
+        fs::write(&source, format!("pub fn answer() -> u64 {{ {answer} }}\n")).unwrap();
+        if let Some(mtime) = mtime {
+            filetime::set_file_mtime(&source, FileTime::from_unix_time(mtime, 0)).unwrap();
+        }
+        settle_writes(&[project.as_path()]);
+        let before = |name| crate_events(cache.path(), name).len();
+        let counts = ["adaptive_lib", "adaptive_mid", "demo"].map(before);
+        let target = project.join(target);
+        let output = build_command(&project, cache.path(), &target, "adaptive-app")
+            .args(["--example", "demo"])
+            .output()
+            .expect("failed to build the example");
+        assert!(
+            output.status.success(),
+            "example build failed for variant {answer}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let run = Command::new(target.join(format!(
+            "debug/examples/demo{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+        .output()
+        .expect("failed to run the example");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), answer.to_string());
+        ["adaptive_lib", "adaptive_mid", "demo"]
+            .into_iter()
+            .zip(counts)
+            .map(|(name, before)| {
+                let events = crate_events(cache.path(), name);
+                assert_eq!(events.len(), before + 1, "{name} events: {events:#?}");
+                events.into_iter().nth(before).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let events = build("target", None, 1);
+    assert_eq!(events[2]["result"], "miss", "event: {:#}", events[2]);
+
+    // The edit loop: the libraries seed, then stay active, and the example
+    // links what they wrote.
+    for (mtime, answer, lane) in [
+        (future, 2, "adaptive seed"),
+        (future + 1, 3, "adaptive active"),
+    ] {
+        let events = build("target", Some(mtime), answer);
+        assert_passthrough(&events[0], lane);
+        assert_passthrough(&events[1], lane);
+        let demo = &events[2];
+        assert_passthrough(demo, "private link: adaptive_mid");
+        assert_eq!(demo["key_ms"], 0, "event: {demo:#}");
+        assert_eq!(demo["dep_info_runs"], 0, "event: {demo:#}");
+    }
+
+    let events = build("fresh", None, 3);
+    assert_eq!(events[0]["result"], "miss", "event: {:#}", events[0]);
+    assert_eq!(events[2]["result"], "miss", "event: {:#}", events[2]);
+    let events = build("fresher", None, 3);
+    assert_eq!(events[2]["result"], "local_hit", "event: {:#}", events[2]);
+}
+
 /// A rustc that writes `$RACE_NEXT` over `$RACE_SOURCE` once, just before
 /// the compile of `$RACE_CRATE` reads it: a save that lands after Kache took
 /// the unit's key. The dep-info pre-pass passes `--emit dep-info` as two

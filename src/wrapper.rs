@@ -4215,6 +4215,24 @@ fn run_parsed_rustc(
             let _ = lease.finish(CompileOutcome::CompileError);
         }
     }
+    if incremental_fast_path_allowed(
+        unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
+        excluded_source.is_some() || user_bypass.is_some(),
+        skip_user_facing,
+        reentered,
+    ) && let Some(name) = private_link_extern(args)
+    {
+        return intentional_passthrough_with_event(
+            config,
+            args,
+            crate_name,
+            &event_root,
+            start,
+            adaptive_unit.as_ref(),
+            format!("{PRIVATE_LINK_REASON}{name} was compiled incrementally"),
+            key_record,
+        );
+    }
     let rustc_route = volume_route_path_rustc(args);
     let mut fallback_stores = Vec::new();
     let trace_store_open = crate::phase_trace::phase("store_open");
@@ -7146,6 +7164,7 @@ fn adaptive_compile_before_key(
     after_rustc_exit(result.exit_code, &result.stderr, &ctx.args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
     let _ = lease.finish(outcome);
+    mark_private_outputs(result.exit_code, &result.artifacts);
     let cache_key = observed.as_ref().map_or("", |(key, _)| key.as_str());
     log_event(
         ctx.config,
@@ -7394,6 +7413,34 @@ fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
         args.invocation_env(),
     )
     .ok()
+}
+
+/// Passthrough reason of a link [`private_link_extern`] keeps out of the
+/// cache. The prefix is a contract: reports group passthroughs by it.
+const PRIVATE_LINK_REASON: &str = "private link: ";
+
+/// The extern of a linking unit that an incremental compile wrote and kache
+/// did not store ([`crate::incremental_policy::private_outputs`]). The unit's
+/// key hashes that file, which no other checkout or later build writes again,
+/// so storing it would cost its dep-info pre-pass and its store on every
+/// edit for an entry nothing can hit. Such a unit compiles as a user-facing
+/// executable does with `cache_executables` off: incremental, with no key
+/// and no entry. A fresh checkout compiles its libraries without incremental
+/// state and keys and stores its links as before.
+fn private_link_extern(args: &RustcArgs) -> Option<&str> {
+    if !args.invokes_linker() {
+        return None;
+    }
+    args.externs
+        .iter()
+        .find(|dependency| {
+            dependency
+                .path
+                .as_deref()
+                .and_then(|path| args.resolve_invocation_path(path))
+                .is_some_and(|path| crate::incremental_policy::private_outputs::is_private(&path))
+        })
+        .map(|dependency| dependency.name.as_str())
 }
 
 /// Whether `args` compiles an executable kept out of the cache because
@@ -9234,6 +9281,16 @@ fn worktree_donor_profiles(
         .collect()
 }
 
+/// After a compile under a private lease, mark what it wrote: a link that
+/// takes one of these files keys on bytes no other build writes.
+fn mark_private_outputs(exit_code: i32, artifacts: &ArtifactSet) {
+    if exit_code == 0 {
+        crate::incremental_policy::private_outputs::mark(
+            artifacts.outputs().iter().map(|artifact| artifact.path.as_path()),
+        );
+    }
+}
+
 /// Compile under the private lease; no result enters the artifact cache.
 #[allow(clippy::too_many_arguments)]
 fn adaptive_incremental_with_event<R: Into<String>>(
@@ -9351,6 +9408,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
     let kept = lease.finish(outcome);
+    mark_private_outputs(result.exit_code, &result.artifacts);
     tracing::debug!(
         ?kind,
         ?outcome,
