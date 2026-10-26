@@ -9055,7 +9055,33 @@ fn test_cache_line() -> CacheLine {
         bytes: 3 << 20,
         limit: 5 << 30,
         entries: 1_234,
+        held: 0,
     }
+}
+
+#[test]
+fn a_cache_over_its_limit_by_bytes_targets_hold_says_so() {
+    let under = test_cache_line();
+    assert_eq!(
+        under.text(),
+        "Cache    3.0 MiB of 5.0 GiB · 1,234 entries · kept under its limit automatically; `kache clean --cache` empties it"
+    );
+    let over = CacheLine {
+        bytes: 588 << 30,
+        limit: 450 << 30,
+        entries: 1_234,
+        held: 145 << 30,
+    };
+    assert_eq!(
+        over.text(),
+        "Cache    588.0 GiB of 450.0 GiB · 1,234 entries · 145.0 GiB of it still linked from target/, which the limit leaves out (cleaning those targets frees it); the rest is kept under its limit automatically; `kache clean --cache` empties it"
+    );
+    let held_under = CacheLine {
+        bytes: 400 << 30,
+        ..over
+    };
+    assert!(held_under.text().contains("kept under its limit automatically;"));
+    assert!(!held_under.text().contains("still linked"));
 }
 
 #[test]

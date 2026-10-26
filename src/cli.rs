@@ -6477,6 +6477,7 @@ impl TrackedPlan {
             bytes: store.physical_size()?,
             limit: config.max_size,
             entries: store.entry_count()? as u64,
+            held: crate::wrapper::recent_auto_gc_held(&config.cache_dir),
         };
         let remove: std::collections::HashSet<String> = remove
             .iter()
@@ -6598,6 +6599,33 @@ struct CacheLine {
     bytes: u64,
     limit: u64,
     entries: u64,
+    /// Bytes of `bytes` the last automatic sweep found still linked from
+    /// target directories. No sweep can free them, so the limit leaves them
+    /// out and the store can read over it while they stay.
+    held: u64,
+}
+
+impl CacheLine {
+    /// The preview's Cache line. Over the limit because of held bytes, it
+    /// says so: "kept under its limit" next to a size over it reads broken.
+    fn text(&self) -> String {
+        let size = format!(
+            "Cache    {} of {} · {}",
+            term::bytes(self.bytes),
+            term::bytes(self.limit),
+            term::counted(self.entries, "entry", "entries")
+        );
+        let tail = "`kache clean --cache` empties it";
+        if self.held == 0 || self.bytes <= self.limit {
+            return format!("{size} · kept under its limit automatically; {tail}");
+        }
+        format!(
+            "{size} · {} of it still linked from target/, which the limit leaves out \
+             (cleaning those targets frees it); the rest is kept under its limit \
+             automatically; {tail}",
+            term::bytes(self.held.min(self.bytes))
+        )
+    }
 }
 
 /// What a tracked clean selects, in words.
@@ -6697,12 +6725,7 @@ fn plan_lines(
         });
     }
     lines.push(String::new());
-    lines.push(format!(
-        "Cache    {} of {} · {} · kept under its limit automatically; `kache clean --cache` empties it",
-        term::bytes(cache.bytes),
-        term::bytes(cache.limit),
-        term::counted(cache.entries, "entry", "entries")
-    ));
+    lines.push(cache.text());
     lines.push(String::new());
     lines.push(match end {
         PlanEnd::DryRun => "Dry run, nothing removed.".to_string(),
