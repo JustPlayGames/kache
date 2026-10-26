@@ -1478,7 +1478,7 @@ enum WrapperTarget {
 }
 
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
-    let context = invocation::InvocationContext {
+    let mut context = invocation::InvocationContext {
         daemon: None,
         env: invocation::InvocationEnv::capture(),
         io: invocation::io::InvocationIo::capture(),
@@ -1494,8 +1494,17 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             })
             .unwrap_or_else(|| "kache".to_owned()),
     };
+    // The frontend already asked the daemon, which declined: asking again,
+    // or starting one, only adds a round trip to a busy daemon.
+    let declined = context
+        .env
+        .var_os(kache_client::FRONTEND_DECLINED_ENV)
+        .is_some();
+    context.env.remove(kache_client::FRONTEND_DECLINED_ENV);
     #[cfg(any(unix, windows))]
-    let config = if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
+    let config = if declined {
+        Some(config::Config::load_for(&context.env)?)
+    } else if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
         let config = config::Config::load_for(&context.env)?;
         if let Some(exit) = invocation::execution::try_execute_with_trust(
             &config.socket_path(),

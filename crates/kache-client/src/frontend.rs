@@ -25,7 +25,7 @@ pub fn run(version: &str) -> Result<i32> {
         || std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some()
         || std::env::var_os("KACHE_BUILD_SCRIPT_PATH").is_some()
     {
-        return forward_engine(&executable, version, &args, started_at);
+        return forward_engine(&executable, version, &args, started_at, false);
     }
     #[cfg(any(unix, windows))]
     {
@@ -59,6 +59,9 @@ pub fn run(version: &str) -> Result<i32> {
                 if let kache_ipc::execution::Attempt::Completed(exit) = attempt {
                     return Ok(exit);
                 }
+                if attempt == kache_ipc::execution::Attempt::Declined {
+                    return forward_engine(&executable, version, &args, started_at, true);
+                }
                 // A daemon that is there but not answering is not started
                 // again, nor one that answered and declined: starting one
                 // would only find it, at the cost of an engine process.
@@ -73,7 +76,7 @@ pub fn run(version: &str) -> Result<i32> {
             }
         }
     }
-    forward_engine(&executable, version, &args, started_at)
+    forward_engine(&executable, version, &args, started_at, false)
 }
 
 fn forward_engine(
@@ -81,8 +84,12 @@ fn forward_engine(
     version: &str,
     args: &[OsString],
     started_at: std::time::Instant,
+    declined: bool,
 ) -> Result<i32> {
     let mut command = engine_command(executable, version, args, started_at)?;
+    if declined {
+        command.env(crate::FRONTEND_DECLINED_ENV, "1");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

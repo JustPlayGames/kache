@@ -196,6 +196,11 @@ impl InvocationEnv {
         vars.push((name.to_owned(), value));
     }
 
+    /// Drop a variable, so that nothing this invocation starts inherits it.
+    pub fn remove(&mut self, name: &str) {
+        std::sync::Arc::make_mut(&mut self.vars).retain(|(key, _)| !name_matches(key, name));
+    }
+
     /// Search the client's PATH after rooting relative entries in its cwd.
     pub fn resolve_program(&self, program: &Path) -> Option<PathBuf> {
         if program.is_absolute() || program.components().count() > 1 {
