@@ -68,23 +68,58 @@ pub(crate) fn reserve_bytes(total: u64) -> u64 {
     (total / 100 * RESERVE_PERCENT).max(RESERVE_FLOOR)
 }
 
+/// Share of the memory, in percent, the gate keeps free while every compile
+/// it weighs has a measured peak.
+pub(crate) const MEASURED_RESERVE_PERCENT: u64 = 5;
+
+/// The least memory the gate keeps free while every peak is measured.
+pub(crate) const MEASURED_RESERVE_FLOOR: u64 = 1024 * 1024 * 1024;
+
+/// The memory the gate keeps free while every compile it weighs (the one
+/// asking and every one still running) has a measured peak: then the
+/// expected peaks are what the compiles take, and the reserve only covers
+/// what the machine does besides. Never more than [`reserve_bytes`].
+pub(crate) fn measured_reserve_bytes(total: u64) -> u64 {
+    (total / 100 * MEASURED_RESERVE_PERCENT)
+        .max(MEASURED_RESERVE_FLOOR)
+        .min(reserve_bytes(total))
+}
+
 /// The memory a machine (or this process's cgroup) has, and has available
 /// now, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MemoryReading {
     pub(crate) available: u64,
     pub(crate) total: u64,
+    /// Inside a cgroup's memory limit, the part of its usage that is cache
+    /// it reclaims before paging anything in use: its inactive file cache
+    /// and reclaimable slab. `None` outside one, where `available` already
+    /// counts the cache, and where a desktop may need the full reserve.
+    pub(crate) reclaimable: Option<u64>,
 }
 
 /// Whether a compile expected to peak at `expected` bytes fits now: the
 /// available memory, less `pending` bytes compiles admitted moments ago
 /// have yet to take and less `expected`, stays at or above the reserve.
-pub(crate) fn fits(reading: MemoryReading, pending: u64, expected: u64) -> bool {
-    reading
-        .available
-        .saturating_sub(pending)
-        .saturating_sub(expected)
-        >= reserve_bytes(reading.total)
+///
+/// Inside a cgroup's limit (a container: no desktop to keep responsive)
+/// and with `measured` (every compile involved has a measured peak), the
+/// reserve is [`measured_reserve_bytes`] and the cache the cgroup reclaims
+/// first counts as available. A guessed peak can be several times too
+/// small (a crate like `windows` takes about 5 GB against the 512 MiB
+/// guessed), so while one is involved the full reserve stays, and so does
+/// the cache counted as used: on an 8 GB cgroup counting the cache alone
+/// let a cold build's compiles be OOM-killed. Outside a cgroup nothing
+/// changes: the reserve is what keeps a desktop from paging out.
+pub(crate) fn fits(reading: MemoryReading, pending: u64, expected: u64, measured: bool) -> bool {
+    let (available, reserve) = match reading.reclaimable {
+        Some(cache) if measured => (
+            reading.available.saturating_add(cache).min(reading.total),
+            measured_reserve_bytes(reading.total),
+        ),
+        _ => (reading.available, reserve_bytes(reading.total)),
+    };
+    available.saturating_sub(pending).saturating_sub(expected) >= reserve
 }
 
 /// `[cache] scheduler_memory_pressure`, set once at wrapper startup.
@@ -349,6 +384,7 @@ pub(crate) fn meminfo_reading(text: &str) -> Option<MemoryReading> {
     Some(MemoryReading {
         available: field("MemAvailable:")?,
         total: field("MemTotal:")?,
+        reclaimable: None,
     })
 }
 
@@ -359,17 +395,20 @@ pub(crate) fn within_cgroup(
     machine: MemoryReading,
     limit: Option<u64>,
     headroom: Option<u64>,
+    reclaimable: u64,
 ) -> MemoryReading {
     match (limit, headroom) {
         (Some(limit), Some(headroom)) => MemoryReading {
             available: machine.available.min(headroom),
             total: machine.total.min(limit),
+            reclaimable: Some(reclaimable),
         },
         // A limit whose usage cannot be read: its size bounds the total,
         // and nothing is known about its use.
         (Some(limit), None) => MemoryReading {
             available: machine.available.min(limit),
             total: machine.total.min(limit),
+            reclaimable: None,
         },
         _ => machine,
     }
@@ -392,6 +431,7 @@ fn read_memory() -> Option<MemoryReading> {
             machine,
             snapshot.memory_limit_bytes,
             snapshot.memory_headroom_bytes,
+            snapshot.memory_reclaimable_bytes,
         ),
         None => machine,
     })
@@ -407,6 +447,7 @@ fn read_memory() -> Option<MemoryReading> {
         MemoryReading {
             available: status.ullAvailPhys,
             total: status.ullTotalPhys,
+            reclaimable: None,
         },
     )
 }
@@ -522,12 +563,13 @@ mod tests {
         let reading = MemoryReading {
             available: 10 * GIB,
             total: 16 * GIB,
+            reclaimable: None,
         };
-        assert!(fits(reading, 0, 6 * GIB));
-        assert!(!fits(reading, 0, 6 * GIB + 1));
-        assert!(fits(reading, 2 * GIB, 4 * GIB));
-        assert!(!fits(reading, 2 * GIB, 5 * GIB));
-        assert!(!fits(reading, u64::MAX, u64::MAX), "saturates");
+        assert!(fits(reading, 0, 6 * GIB, false));
+        assert!(!fits(reading, 0, 6 * GIB + 1, false));
+        assert!(fits(reading, 2 * GIB, 4 * GIB, false));
+        assert!(!fits(reading, 2 * GIB, 5 * GIB, false));
+        assert!(!fits(reading, u64::MAX, u64::MAX, false), "saturates");
     }
 
     #[test]
@@ -539,26 +581,29 @@ mod tests {
             machine,
             MemoryReading {
                 available: 9_000_000 * KIB,
-                total: 16_000_000 * KIB
+                total: 16_000_000 * KIB,
+                reclaimable: None,
             }
         );
         assert_eq!(meminfo_reading("MemTotal: 1 kB\n"), None);
         let limit = 4_000_000 * KIB;
         assert_eq!(
-            within_cgroup(machine, Some(limit), Some(KIB)),
+            within_cgroup(machine, Some(limit), Some(KIB), KIB),
             MemoryReading {
                 available: KIB,
-                total: limit
+                total: limit,
+                reclaimable: Some(KIB),
             }
         );
         assert_eq!(
-            within_cgroup(machine, Some(limit), None),
+            within_cgroup(machine, Some(limit), None, KIB),
             MemoryReading {
                 available: limit,
-                total: limit
+                total: limit,
+                reclaimable: None,
             }
         );
-        assert_eq!(within_cgroup(machine, None, None), machine);
+        assert_eq!(within_cgroup(machine, None, None, KIB), machine);
     }
 
     #[test]
