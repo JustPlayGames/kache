@@ -1,5 +1,6 @@
 //! Admission compares the file-access context before using daemon threads.
 
+use crate::token_attributes;
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
@@ -150,14 +151,24 @@ fn equivalent(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
         && client_statistics.ModifiedId.LowPart == daemon_statistics.ModifiedId.LowPart;
     // Windows exposes opaque security attributes even on ordinary tokens.
     // Compare every documented access field below; permit opaque attributes
-    // only on unchanged token copies with the same kernel-issued ModifiedId.
+    // on unchanged token copies with the same kernel-issued ModifiedId, and
+    // across generations only Windows 11's per-process nonce, whose values
+    // differ in every process (a child of the daemon's own included).
     // https://learn.microsoft.com/windows/win32/api/winnt/ns-winnt-token_statistics
     let client_access = Information::read(client, TokenAccessInformation)?;
     let daemon_access = Information::read(daemon, TokenAccessInformation)?;
     let a = client_access.value::<TOKEN_ACCESS_INFORMATION>()?;
     let b = daemon_access.value::<TOKEN_ACCESS_INFORMATION>()?;
-    if ((!a.SecurityAttributes.is_null() || !b.SecurityAttributes.is_null()) && !same_generation)
-        || a.TokenType != TokenPrimary
+    if (!a.SecurityAttributes.is_null() || !b.SecurityAttributes.is_null())
+        && !same_generation
+        && !token_attributes::only_process_nonce_differs(
+            &security_attributes(client)?,
+            &security_attributes(daemon)?,
+        )
+    {
+        return Ok(false);
+    }
+    if a.TokenType != TokenPrimary
         || b.TokenType != TokenPrimary
         || a.Flags != b.Flags
         || optional_sid(&client_access, a.TrustLevelSid)?
@@ -200,6 +211,10 @@ fn equivalent(client: HANDLE, daemon: HANDLE) -> io::Result<bool> {
         return Ok(false);
     }
     Ok(default_dacl(client)? == default_dacl(daemon)?)
+}
+
+fn security_attributes(token: HANDLE) -> io::Result<Vec<token_attributes::Attribute>> {
+    token_attributes::parse(Information::read(token, TokenSecurityAttributes)?.bytes())
 }
 
 fn optional_sid(info: &Information, pointer: PSID) -> io::Result<Option<Vec<u8>>> {
@@ -299,6 +314,24 @@ mod tests {
             (copied.TokenId.HighPart, copied.TokenId.LowPart)
         );
         assert!(equivalent(token.as_raw_handle(), duplicate.as_raw_handle()).unwrap());
+    }
+
+    #[test]
+    fn a_child_of_the_same_user_has_the_same_context() {
+        use std::os::windows::io::AsHandle;
+        // Windows 11 gives the child a ModifiedId and TSA://ProcUnique values
+        // of its own; nothing else about its token differs.
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/q", "/k"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let matches = matches_daemon(child.as_handle());
+        drop(child.stdin.take());
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(matches.unwrap());
     }
 
     #[test]
