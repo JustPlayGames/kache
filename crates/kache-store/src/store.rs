@@ -479,8 +479,40 @@ struct EntryFields<'a> {
     compile_time_ms: u64,
 }
 
+thread_local! {
+    static WRITABLE_OUTPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While held, puts on this thread store the outputs their policy calls
+/// [`ArtifactPolicy::rewritable_output`] by copy (or reflink), never by
+/// sharing the output's inode with the read-only blob: the output stays the
+/// writable file the compiler wrote. For a unit `cargo fix` may compile
+/// again without the wrapper: rustc refuses to replace a read-only output.
+pub struct WritableOutputsScope {
+    previous: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl WritableOutputsScope {
+    pub fn enter(writable: bool) -> Self {
+        Self {
+            previous: WRITABLE_OUTPUTS.with(|slot| slot.replace(writable)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for WritableOutputsScope {
+    fn drop(&mut self) {
+        WRITABLE_OUTPUTS.with(|slot| slot.set(self.previous));
+    }
+}
+
 fn hardlink_eligible<P: ArtifactPolicy>(store_name: &str, executable: bool) -> bool {
     if executable {
+        return false;
+    }
+    if WRITABLE_OUTPUTS.with(std::cell::Cell::get) && P::rewritable_output(store_name) {
         return false;
     }
     #[cfg(windows)]

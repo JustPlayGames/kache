@@ -5366,6 +5366,8 @@ fn run_parsed_rustc(
     // The put is on the build's critical path. When the index is too busy
     // to register the entry at once, the daemon may finish it
     // (`rustc_handoff`).
+    let _writable_metadata =
+        kache_store::WritableOutputsScope::enter(keeps_metadata_writable(args));
     let put = if rustc_handoff::wanted(config, &store) {
         let handoff = rustc_handoff::RustcHandoff {
             cache_key: &cache_key,
@@ -6182,18 +6184,23 @@ fn restore_link_strategy(
     executable: bool,
     shared_loadable: Option<ArtifactKind>,
 ) -> link::LinkStrategy {
-    restore_link_strategy_for(kind, executable, false, shared_loadable)
+    restore_link_strategy_for(kind, executable, false, shared_loadable, false)
 }
 
 /// [`restore_link_strategy`] for a file that may be a shared rlib
-/// (`shared_rlib`, see [`restores_as_shared_rlib`]).
+/// (`shared_rlib`, see [`restores_as_shared_rlib`]), of a unit whose
+/// metadata must stay writable (`writable_metadata`, see
+/// [`keeps_metadata_writable`]).
 fn restore_link_strategy_for(
     kind: ArtifactKind,
     executable: bool,
     shared_rlib: bool,
     shared_loadable: Option<ArtifactKind>,
+    writable_metadata: bool,
 ) -> link::LinkStrategy {
-    if shared_rlib && !executable && kind.link_strategy() == link::LinkStrategy::Hardlink {
+    if writable_metadata && kind == ArtifactKind::Metadata {
+        link::LinkStrategy::WritableCopy
+    } else if shared_rlib && !executable && kind.link_strategy() == link::LinkStrategy::Hardlink {
         link::LinkStrategy::SharedLibHardlink
     } else if shared_loadable == Some(kind) {
         link::LinkStrategy::ExecutableHardlink
@@ -6249,6 +6256,18 @@ fn restores_as_shared_rlib(
 /// User-facing binaries, tests, examples and other dylibs stay private
 /// copies, because a post-build `strip` rewrites them in place. The platform
 /// decides the rest: macOS may re-sign a restored loadable in place.
+/// Whether the `.rmeta` of this unit must be a writable file of its own,
+/// restored and stored without sharing the blob's inode: a unit of a path
+/// package (a workspace member or path dependency), which Cargo builds
+/// without `--cap-lints allow`. `cargo fix` and `cargo clippy --fix`
+/// compile such units again without any wrapper, and rustc refuses to
+/// replace an output it cannot write (kunobi-ninja/kache#1697). The
+/// metadata of registry and git dependencies, which Cargo caps, and every
+/// rlib keep sharing the blob's inode.
+fn keeps_metadata_writable(args: &RustcArgs) -> bool {
+    !args.cargo_capped_lints()
+}
+
 fn shared_inode_loadable(args: &RustcArgs, platform_allows: bool) -> Option<ArtifactKind> {
     if !platform_allows {
         None
@@ -6315,6 +6334,7 @@ fn materialize_cached_artifact(
     platform: &dyn crate::compiler::Platform,
     context: &str,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+    writable_metadata: bool,
 ) -> Result<RestoredBytes> {
     let store_path = store.blob_path(&cached_file.hash);
     if !store_path.exists() {
@@ -6376,8 +6396,13 @@ fn materialize_cached_artifact(
         }
     };
 
-    let strategy =
-        restore_link_strategy_for(kind, cached_file.executable, shared_rlib, shared_loadable);
+    let strategy = restore_link_strategy_for(
+        kind,
+        cached_file.executable,
+        shared_rlib,
+        shared_loadable,
+        writable_metadata,
+    );
     // A fresh transformed file can keep its original mode. Only the blob path
     // needs a private inode when it belongs to another process's store.
     let blob_strategy =
@@ -6565,6 +6590,11 @@ fn output_already_holds(
             return false;
         }
         if (strategy.is_executable() || cached_file.executable) && metadata.mode() & 0o111 != 0o111
+        {
+            return false;
+        }
+        if strategy == link::LinkStrategy::WritableCopy
+            && (metadata.nlink() != 1 || metadata.mode() & 0o200 == 0)
         {
             return false;
         }
@@ -8747,6 +8777,7 @@ fn restore_from_cache_with_memo_store(
             &*platform,
             "rustc restore",
             extra_inputs,
+            keeps_metadata_writable(args),
         )?;
         if let RestoredBytes::ExactBlobCopy(fingerprint) = restored {
             exact_restores.push((fingerprint, &cached_file.hash));
