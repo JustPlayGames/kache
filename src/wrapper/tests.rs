@@ -4578,6 +4578,7 @@ fn materialize_cached_artifact_reports_missing_blob_as_cache_miss() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap_err()
     .to_string();
@@ -4622,6 +4623,7 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -4692,6 +4694,7 @@ fn materialize_cached_artifact_restores_executable_bit_recorded_at_insert() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -4734,6 +4737,7 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -4866,6 +4870,7 @@ fn materialize_shared_loadable_restores_a_loadable_file_and_leaves_the_blob() {
         &crate::compiler::platform::LinuxPlatform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5205,7 +5210,7 @@ fn only_a_pipelined_rlib_restores_as_a_shared_inode() {
     ]);
     assert!(!restores_as_shared_rlib(&to_output, "libhk-1.rlib", &both));
     assert_eq!(
-        restore_link_strategy_for(ArtifactKind::Library, false, unix, None),
+        restore_link_strategy_for(ArtifactKind::Library, false, unix, None, false),
         if unix {
             link::LinkStrategy::SharedLibHardlink
         } else {
@@ -5213,9 +5218,54 @@ fn only_a_pipelined_rlib_restores_as_a_shared_inode() {
         }
     );
     assert_eq!(
-        restore_link_strategy_for(ArtifactKind::Library, true, true, None),
+        restore_link_strategy_for(ArtifactKind::Library, true, true, None, false),
         link::LinkStrategy::Copy,
         "an executable never shares that way"
+    );
+}
+
+/// `cargo fix` compiles a path package's units again without any wrapper,
+/// and rustc refuses to replace a read-only `.rmeta` (kunobi-ninja/kache#1697):
+/// such a unit's metadata restores as a writable copy. A dependency Cargo
+/// caps, and every rlib, keep sharing the blob's inode.
+#[test]
+fn only_a_path_package_restores_its_metadata_as_a_writable_copy() {
+    let unit = |capped: bool| {
+        let mut argv = vec![
+            "rustc",
+            "--crate-name",
+            "dep",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata,link",
+            "--out-dir",
+            "/t/deps",
+        ];
+        if capped {
+            argv.extend(["--cap-lints", "allow"]);
+        }
+        rustc_args(&argv)
+    };
+    assert!(keeps_metadata_writable(&unit(false)));
+    assert!(!keeps_metadata_writable(&unit(true)));
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Metadata, false, false, None, true),
+        link::LinkStrategy::WritableCopy
+    );
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Metadata, false, false, None, false),
+        link::LinkStrategy::Hardlink
+    );
+    let unix = cfg!(unix);
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Library, false, unix, None, true),
+        if unix {
+            link::LinkStrategy::SharedLibHardlink
+        } else {
+            link::LinkStrategy::Hardlink
+        },
+        "a path package's rlib still shares"
     );
 }
 
@@ -5248,6 +5298,7 @@ fn materialize_reports_a_plain_library_restore_as_an_exact_blob_copy() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5286,6 +5337,7 @@ fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5322,6 +5374,7 @@ fn materialize_reports_an_untouched_external_action_as_an_exact_blob_copy() {
         &platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5364,6 +5417,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap() else {
         panic!("a plain library restore should be exact");
@@ -5442,6 +5496,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
         &RewritingPlatform(dir.path().join("verified")),
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5479,6 +5534,7 @@ fn restore_loadable(
         platform,
         "test restore",
         None,
+        false,
     )
     .unwrap()
 }
@@ -5801,6 +5857,7 @@ fn materialize_cached_artifact_unpacks_debug_bundle_beside_binary() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5896,6 +5953,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -12181,6 +12239,7 @@ fn a_read_only_store_restores_by_copy() {
             &*platform,
             "test restore",
             None,
+            false,
         )
         .unwrap();
     };
@@ -12263,6 +12322,7 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
             &*platform,
             "test restore",
             None,
+            false,
         )
         .unwrap();
         let target_meta = std::fs::metadata(&target).unwrap();

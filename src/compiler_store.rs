@@ -21,6 +21,12 @@ impl ArtifactPolicy for CompilerArtifactPolicy {
             .iter()
             .any(|kind| crate::compiler::rustc::crate_type_produces_metadata(kind))
     }
+    fn rewritable_output(name: &str) -> bool {
+        matches!(
+            crate::compiler::classify_by_filename(name),
+            crate::compiler::ArtifactKind::Metadata
+        )
+    }
     fn emit_kind(name: &str) -> Option<&'static str> {
         crate::compiler::emit_kind_for_filename(name)
     }
@@ -170,6 +176,70 @@ mod tests {
         }
         for name in ["foo.rlib", "foo.rmeta", "foo.o", "foo.wasm"] {
             assert!(CompilerArtifactPolicy::stable_after_store(name), "{name}");
+        }
+    }
+
+    /// Inside a `WritableOutputsScope` a put leaves the `.rmeta` the writable
+    /// file rustc wrote (stored by copy) and still shares the rlib's inode;
+    /// outside it, both are stored by hardlink as before.
+    #[cfg(unix)]
+    #[test]
+    fn writable_outputs_keep_metadata_off_the_blob_and_rlibs_on_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::write(probe.path().join("a"), b"probe").unwrap();
+        if kache_store::link::try_reflink(&probe.path().join("a"), &probe.path().join("b")).is_ok()
+        {
+            eprintln!("the test filesystem reflinks: no put shares an inode");
+            return;
+        }
+        for writable in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(kache_store::config::Config {
+                cache_dir: temp.path().join("cache"),
+                max_size: 1 << 20,
+                gc_evict_shared: false,
+                upload_spool_max_jobs: 128,
+                deferred_durability: false,
+            })
+            .unwrap();
+            let files: Vec<_> = ["libfoo-1.rmeta", "libfoo-1.rlib"]
+                .into_iter()
+                .map(|name| {
+                    let path = temp.path().join(name);
+                    std::fs::write(&path, format!("{name} {writable}")).unwrap();
+                    (path, name.to_string())
+                })
+                .collect();
+            {
+                let _scope = WritableOutputsScope::enter(writable);
+                store
+                    .put(
+                        &"b".repeat(64),
+                        "foo",
+                        &["lib".into()],
+                        &[],
+                        "x86_64-unknown-linux-gnu",
+                        "dev",
+                        &files,
+                        "",
+                        "",
+                    )
+                    .unwrap();
+            }
+            let meta = store.get(&"b".repeat(64)).unwrap().unwrap();
+            for (path, name) in &files {
+                let file = meta.files.iter().find(|file| &file.name == name).unwrap();
+                let output = std::fs::metadata(path).unwrap();
+                let blob = std::fs::metadata(store.blob_path(&file.hash)).unwrap();
+                let shares = output.ino() == blob.ino() && output.dev() == blob.dev();
+                if writable && name.ends_with(".rmeta") {
+                    assert!(!shares, "{name} shares the blob inside the scope");
+                    assert_ne!(output.permissions().mode() & 0o200, 0, "{name} read-only");
+                } else {
+                    assert!(shares, "{name} (writable scope {writable}) does not share");
+                }
+            }
         }
     }
 

@@ -40,4 +40,11 @@ pub trait ArtifactPolicy {
     fn allow_executable_hardlink(_name: &str, _crate_types: &[String]) -> bool {
         false
     }
+    /// Whether `name` is an output a tool other than the wrapper may write
+    /// over in place, so that inside a [`WritableOutputsScope`] it is never
+    /// stored by sharing its inode with the read-only blob: Rust metadata,
+    /// which `cargo fix` compiles again without any wrapper.
+    fn rewritable_output(_name: &str) -> bool {
+        false
+    }
 }
