@@ -758,6 +758,10 @@ fn place_tree(
     deadline: Instant,
     relocation: Option<&relocation::Relocation>,
 ) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if link_in_place(from, to, counts, relocation, deadline)? {
+        return Ok(());
+    }
     let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
     let placed = std::sync::Mutex::new(Vec::new());
     let tree = Placing {
@@ -790,6 +794,66 @@ fn place_tree(
         let _ = std::fs::remove_file(&staging);
     }
     copied
+}
+
+/// Link the donor file `from` straight to its final name `to`, once this
+/// seeding knows clones fail ([`FileCounts::no_clones`]) and when
+/// [`shares_inode`] allows a link: a link makes the name whole at once, as
+/// the rename of a staged copy does, and spares the journal that rename.
+/// False when `from` is not such a file or the link cannot be made: the
+/// caller stages it as before.
+#[cfg(unix)]
+fn link_in_place(
+    from: &Path,
+    to: &Path,
+    counts: &FileCounts,
+    relocation: Option<&relocation::Relocation>,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    if !counts.no_clones.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let metadata = std::fs::symlink_metadata(from)?;
+    if !metadata.is_file() || !shares_inode(Path::new(""), &metadata) {
+        return Ok(false);
+    }
+    if Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    // Dep-info and a build script's records are written anew, never linked.
+    if let Some(relocation) = relocation
+        && relocation.contents(from, deadline)?.is_some()
+    {
+        return Ok(false);
+    }
+    if !link_read_only(from, to) {
+        return Ok(false);
+    }
+    counts.linked.fetch_add(1, Ordering::Relaxed);
+    if let Some(placed) = placed_file(from, &metadata, to) {
+        counts
+            .placed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(placed);
+    }
+    Ok(true)
+}
+
+/// The [`PlacedFile`] for the donor file `from`, with `metadata` read before
+/// it was placed at `at`, when it is large enough for the hash memo.
+fn placed_file(from: &Path, metadata: &std::fs::Metadata, at: &Path) -> Option<PlacedFile> {
+    (metadata.len() >= crate::target_dedup::MIN_BYTES).then(|| PlacedFile {
+        from: from.to_path_buf(),
+        before: kache_store::file_hash::FileFingerprint {
+            path: from.to_string_lossy().into_owned(),
+            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            mtime_ns: kache_store::file_hash::metadata_mtime_ns(metadata),
+            ctime_ns: kache_store::file_hash::metadata_ctime_ns(metadata),
+            inode: kache_store::file_hash::metadata_inode(metadata),
+        },
+        at: at.to_path_buf(),
+    })
 }
 
 /// A tree [`place_tree`] copies: where it comes from, where it is placed,
@@ -925,27 +989,16 @@ fn copy_tree(
         .transpose()?
         .flatten();
     if let Some(contents) = contents {
-        std::fs::write(to, &contents)?;
+        write_stamped(to, &mut &contents[..], &metadata)?;
         tree.counts.copied.fetch_add(1, Ordering::Relaxed);
-        return stamp(to, &metadata);
+        return Ok(());
     }
     place_file(from, below, to, &metadata, tree.counts)?;
-    if metadata.len() >= crate::target_dedup::MIN_BYTES {
-        let before = kache_store::file_hash::FileFingerprint {
-            path: from.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-            mtime_ns: kache_store::file_hash::metadata_mtime_ns(&metadata),
-            ctime_ns: kache_store::file_hash::metadata_ctime_ns(&metadata),
-            inode: kache_store::file_hash::metadata_inode(&metadata),
-        };
+    if let Some(placed) = placed_file(from, &metadata, to) {
         tree.placed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(PlacedFile {
-                from: from.to_path_buf(),
-                before,
-                at: to.to_path_buf(),
-            });
+            .push(placed);
     }
     Ok(())
 }
@@ -961,11 +1014,78 @@ fn stamp(to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
     std::fs::set_permissions(to, metadata.permissions())
 }
 
+/// Write `contents` to a new file `to` with `metadata`'s modification time
+/// and permissions, set through the open file. On a busy journal each
+/// metadata call waits its turn: `std::fs::copy` and [`stamp`] made five of
+/// them (create, mode, write, time by path, mode again by path), this makes
+/// three, and a fourth only when the umask took bits from the mode.
+#[cfg(unix)]
+fn write_stamped(
+    to: &Path,
+    contents: &mut impl std::io::Read,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mode = metadata.permissions().mode() & 0o7777;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(to)?;
+    std::io::copy(contents, &mut file)?;
+    // After the write, which clears set-id bits.
+    if file.metadata()?.permissions().mode() & 0o7777 != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    filetime::set_file_handle_times(
+        &file,
+        None,
+        Some(filetime::FileTime::from_last_modification_time(metadata)),
+    )
+}
+
+/// Without a mode to create a file with, written and then stamped.
+#[cfg(not(unix))]
+fn write_stamped(
+    to: &Path,
+    contents: &mut impl std::io::Read,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    std::io::copy(contents, &mut std::fs::File::create(to)?)?;
+    stamp(to, metadata)
+}
+
+/// Whether a clone failed because this filesystem, or this pair of
+/// directories, cannot clone at all, as ext4 and tmpfs refuse every one.
+fn cannot_clone(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    #[cfg(unix)]
+    if let Some(code) = error.raw_os_error() {
+        return [
+            libc::EOPNOTSUPP,
+            libc::ENOTSUP,
+            libc::EXDEV,
+            libc::ENOTTY,
+            libc::ENOSYS,
+        ]
+        .contains(&code);
+    }
+    error.kind() == std::io::ErrorKind::Unsupported
+}
+
 /// Files a seeding gave by hard link and by copy or clone.
 #[derive(Debug, Default)]
 struct FileCounts {
     linked: AtomicUsize,
     copied: AtomicUsize,
+    /// Set once a clone fails because the filesystem cannot make one
+    /// ([`cannot_clone`]). Each failed clone created and removed a file in
+    /// the target, two waits on a busy journal, so the seeding stops
+    /// asking.
+    no_clones: std::sync::atomic::AtomicBool,
     /// Files placed for good, at their final paths.
     placed: std::sync::Mutex<Vec<PlacedFile>>,
 }
@@ -983,16 +1103,26 @@ fn place_file(
 ) -> std::io::Result<()> {
     #[cfg(not(unix))]
     let _ = below;
-    if kache_store::link::try_reflink(from, to).is_err() {
-        #[cfg(unix)]
-        if shares_inode(below, metadata) && link_read_only(from, to) {
-            counts.linked.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+    if !counts.no_clones.load(Ordering::Relaxed) {
+        match kache_store::link::try_reflink(from, to) {
+            Ok(()) => {
+                counts.copied.fetch_add(1, Ordering::Relaxed);
+                return stamp(to, metadata);
+            }
+            Err(error) if cannot_clone(&error) => {
+                counts.no_clones.store(true, Ordering::Relaxed);
+            }
+            Err(_) => {}
         }
-        std::fs::copy(from, to)?;
     }
+    #[cfg(unix)]
+    if shares_inode(below, metadata) && link_read_only(from, to) {
+        counts.linked.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    write_stamped(to, &mut std::fs::File::open(from)?, metadata)?;
     counts.copied.fetch_add(1, Ordering::Relaxed);
-    stamp(to, metadata)
+    Ok(())
 }
 
 /// Whether a donor file may be given to the new target as a hard link rather
@@ -4127,7 +4257,7 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o644)).unwrap();
         let recorded = dir.path().join("recorded");
         write(&recorded, "");
-        std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o757)).unwrap();
         let to = dir.path().join("copy");
         place_file(
             &from,
@@ -4138,7 +4268,7 @@ source = "git+https://example.com/gitdep#abc"
         )
         .unwrap();
         let mode = std::fs::metadata(&to).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o751);
+        assert_eq!(mode & 0o777, 0o757);
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
     }
 
@@ -4190,6 +4320,126 @@ source = "git+https://example.com/gitdep#abc"
             std::io::ErrorKind::PermissionDenied
         );
         assert_eq!(std::fs::read_to_string(&blob).unwrap(), "rlib");
+    }
+
+    /// The events inotify reports for the entries of one directory.
+    #[cfg(target_os = "linux")]
+    struct Watch(std::os::fd::OwnedFd);
+
+    #[cfg(target_os = "linux")]
+    impl Watch {
+        fn new(dir: &Path) -> Self {
+            use std::os::fd::FromRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: inotify_init1 has no preconditions; a valid descriptor
+            // is owned from here on.
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            // SAFETY: fd was just returned by inotify_init1 and is open.
+            let watch = Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            let mask = libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_TO
+                | libc::IN_MODIFY
+                | libc::IN_CLOSE_WRITE;
+            // SAFETY: fd is an inotify descriptor and path a C string.
+            assert!(unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) } >= 0);
+            watch
+        }
+
+        /// Each event so far: its mask and the entry's name.
+        fn events(&self) -> Vec<(u32, String)> {
+            use std::io::Read;
+            use std::os::fd::AsFd;
+            let mut file = std::fs::File::from(self.0.as_fd().try_clone_to_owned().unwrap());
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = file.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            let mut events = Vec::new();
+            let mut at = 0;
+            let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+            while at + 16 <= bytes.len() {
+                let (mask, len) = (word(at + 4), word(at + 12) as usize);
+                let name = &bytes[at + 16..at + 16 + len];
+                let name = name.split(|&byte| byte == 0).next().unwrap_or_default();
+                events.push((mask, String::from_utf8_lossy(name).into_owned()));
+                at += 16 + len;
+            }
+            events
+        }
+    }
+
+    /// Under a busy journal, every metadata call of a copy waits its turn.
+    /// A filesystem that cannot clone (ext4) refuses the first clone of a
+    /// seeding, and each later attempt only created and removed a file in
+    /// the target. And a final name never holds a file being written: each
+    /// one appears whole, by link or by rename, so a seeding cut short
+    /// leaves no partial artifact.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seeding_asks_for_a_clone_once_and_never_writes_a_final_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("probe"), "probe");
+        if kache_store::link::try_reflink(&dir.path().join("probe"), &dir.path().join("clone"))
+            .is_ok()
+        {
+            eprintln!("skipping: this filesystem clones");
+            return;
+        }
+        let from = dir.path().join("donor");
+        let blobs = ["a", "b", "c", "d"].map(|name| from.join(format!("lib{name}-0123.rlib")));
+        for (blob, text) in blobs.iter().zip(["a", "b", "c", "d"]) {
+            write(blob, text);
+            std::fs::set_permissions(blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let dep_info = from.join("dep-0123.d");
+        write(&dep_info, "d");
+        let deps = dir.path().join("deps");
+        std::fs::create_dir(&deps).unwrap();
+        let watch = Watch::new(&deps);
+        let counts = FileCounts::default();
+        for file in blobs.iter().chain([&dep_info]) {
+            let to = deps.join(file_name(file));
+            place_tree(file, &to, no_runs().path(), &counts, later(), None).unwrap();
+            assert_eq!(
+                std::fs::read(&to).unwrap(),
+                std::fs::read(file).unwrap(),
+                "{}",
+                to.display()
+            );
+        }
+        let events = watch.events();
+        let removed = events
+            .iter()
+            .filter(|(mask, _)| mask & libc::IN_DELETE != 0)
+            .count();
+        assert!(removed <= 1, "a clone is asked for once: {events:?}");
+        for (mask, name) in &events {
+            if !name.starts_with(STAGING) {
+                assert_eq!(
+                    mask & (libc::IN_MODIFY | libc::IN_CLOSE_WRITE),
+                    0,
+                    "{name} was written in place: {events:?}"
+                );
+            }
+        }
+        if !writes_anything() {
+            // Once the filesystem has refused a clone, a file nobody may
+            // write is linked straight to its name.
+            let renamed = events
+                .iter()
+                .filter(|(mask, name)| mask & libc::IN_MOVED_TO != 0 && name.ends_with(".rlib"))
+                .count();
+            assert!(renamed <= 1, "{events:?}");
+            assert_eq!(counts.linked.load(Ordering::Relaxed), 4);
+        }
     }
 
     #[cfg(unix)]
