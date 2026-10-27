@@ -61,6 +61,8 @@ fn read_reply_frame(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) && started.elapsed() < deadline =>
             {
+                // A cancelled request stops waiting (upstream #1733).
+                super::process::check()?;
                 tracing::debug!(
                     waited_ms = started.elapsed().as_millis() as u64,
                     "native process client is still working on an operation"
@@ -517,6 +519,99 @@ mod tests {
         )
         .unwrap();
         (broker, client)
+    }
+
+    #[test]
+    fn slow_workspace_replies_outlive_the_native_control_deadline() {
+        let (broker, client) = pair();
+        broker
+            .channel
+            .lock()
+            .unwrap()
+            .reader
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let result = std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<Command>(&frame).unwrap(),
+                    Command::Workspace(_)
+                ));
+                reader.get_mut().write_all(b"{\"operation_").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = reader.get_mut().write_all(b"result\":\"done\"}\n");
+            });
+            let result = broker.done(Command::Workspace(
+                kache_protocol::execution::unix::Workspace::Permissions {
+                    path: NativeString::capture(std::ffi::OsStr::new("/tmp/slow-restore")),
+                    mode: 0o644,
+                },
+            ));
+            peer.join().unwrap();
+            result
+        });
+        result.unwrap();
+        assert_eq!(
+            broker
+                .channel
+                .lock()
+                .unwrap()
+                .reader
+                .get_ref()
+                .read_timeout()
+                .unwrap(),
+            Some(std::time::Duration::from_millis(20))
+        );
+        assert!(
+            broker
+                .done(Command::Workspace(
+                    kache_protocol::execution::unix::Workspace::Permissions {
+                        path: NativeString::capture(std::ffi::OsStr::new(
+                            "/tmp/disconnected-restore"
+                        )),
+                        mode: 0o644,
+                    },
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cancellation_ends_a_slow_workspace_reply() {
+        let (broker, client) = pair();
+        broker
+            .channel
+            .lock()
+            .unwrap()
+            .reader
+            .get_mut()
+            .set_read_timeout(Some(std::time::Duration::from_millis(20)))
+            .unwrap();
+        let cancellation = super::super::process::Cancellation::default();
+        let _scope = super::super::process::CancellationScope::borrow(Some(cancellation.clone()));
+        std::thread::scope(|threads| {
+            let peer = threads.spawn(move || {
+                let mut reader = BufReader::new(client);
+                let mut frame = String::new();
+                reader.read_line(&mut frame).unwrap();
+                cancellation.cancel();
+                assert_eq!(reader.read(&mut [0]).unwrap(), 0);
+            });
+            let error = broker
+                .done(Command::Workspace(
+                    kache_protocol::execution::unix::Workspace::Permissions {
+                        path: NativeString::capture(std::ffi::OsStr::new("/tmp/cancelled-restore")),
+                        mode: 0o644,
+                    },
+                ))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            peer.join().unwrap();
+        });
     }
 
     #[test]

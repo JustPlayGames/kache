@@ -118,8 +118,8 @@ enum Commands {
         #[arg(long)]
         no_service: bool,
 
-        /// Leave shell startup files alone: no C/C++ shims on PATH and no test
-        /// runner (Cargo native dependencies are still configured)
+        /// Leave shell setup alone: no C/C++ shims on PATH, test runner, or
+        /// completions (Cargo native dependencies are still configured)
         #[arg(long)]
         no_shell: bool,
 
@@ -174,6 +174,10 @@ enum Commands {
         /// Remove corrupted entries (implies --verify)
         #[arg(long)]
         repair: bool,
+
+        /// Compile a temporary Rust library and verify a local cache hit (no remote access)
+        #[arg(long)]
+        probe: bool,
     },
 
     /// Pull from and push to the configured remote
@@ -305,6 +309,11 @@ enum Commands {
         /// misses with the build before it
         crate_name: Option<String>,
 
+        /// List every skip and passthrough across the retained build history,
+        /// with counts by reason and the affected crates
+        #[arg(long, conflicts_with = "crate_name")]
+        all: bool,
+
         /// Without a crate: only builds recorded for this build tree
         #[arg(long, conflicts_with = "crate_name")]
         root: Option<PathBuf>,
@@ -360,9 +369,12 @@ enum Commands {
         redact: bool,
     },
 
-    /// Open the configuration editor
+    /// Edit or inspect configuration (opens the editor without a subcommand)
     #[command(display_order = 3)]
-    Config,
+    Config {
+        #[command(subcommand)]
+        command: Option<config_cli::Command>,
+    },
 
     /// Log in to the planner with your Kunobi account
     #[command(display_order = 31)]

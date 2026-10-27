@@ -301,7 +301,7 @@ async fn an_older_daemon_leaves_the_store_to_the_wrapper() {
     let compiled = compiled("older-daemon");
     let older = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let server = {
-        use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
+        use interprocess::local_socket::traits::tokio::Listener as _;
         let socket = compiled.config.socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = crate::transport::ListenerOptions::new()
@@ -312,9 +312,11 @@ async fn an_older_daemon_leaves_the_store_to_the_wrapper() {
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
             while let Ok(stream) = listener.accept().await {
-                let (read, mut write) = stream.split();
+                let mut write = &stream;
                 let mut line = String::new();
-                let _ = tokio::io::BufReader::new(read).read_line(&mut line).await;
+                let _ = tokio::io::BufReader::new(&stream)
+                    .read_line(&mut line)
+                    .await;
                 older.lock().unwrap().push(line.clone());
                 // What an older daemon says to a variant it does not know.
                 let _ = write

@@ -722,11 +722,9 @@ pub mod jobserver;
 
 #[cfg(any(unix, windows))]
 pub mod execution;
-#[cfg(any(windows, test))]
-mod token_attributes;
 #[cfg(windows)]
 pub mod windows_msvc;
 #[cfg(windows)]
 pub mod windows_process;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod windows_security;

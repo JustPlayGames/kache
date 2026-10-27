@@ -2170,6 +2170,7 @@ mod tests {
                 daemon_publish: None,
                 daemon_publish_rustc: None,
                 trust_daemon_execution: None,
+                daemon_execution_concurrency: None,
                 auto_gc: None,
                 index_auto_compact: None,
                 auto_clean_orphaned_targets: None,
