@@ -259,7 +259,9 @@ pub struct Config {
     /// reclamation. Set via `KACHE_GC_EVICT_SHARED=1`/`=true` or
     /// `[cache] gc_evict_shared = true`.
     pub gc_evict_shared: bool,
-    /// Daemon idle timeout in seconds (default 0 = no timeout).
+    /// Daemon idle timeout in seconds (default 0 = no timeout). Unset, a
+    /// daemon a build starts by itself (no login service) stops after an hour
+    /// without work; set it to 0 to keep such a daemon running.
     pub daemon_idle_timeout_secs: u64,
     /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
     /// seconds (default 300). Tuned higher than hyper's 90s default so that
