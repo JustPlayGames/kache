@@ -311,6 +311,9 @@ fn observe_oracle_compile(
     }
 
     let extra = apply_oracle_state(root, state);
+    // This oracle expects a stored cold result and a warm hit. Input writes
+    // must precede the invocation's timestamp guard window.
+    common::settle_writes(&[root]);
     let rustc_args = oracle_rustc_args(root, out_dir, &extra);
     let mut command = if let Some(cache_dir) = cache_dir {
         let config_path = isolated_config_path(cache_dir);
@@ -493,8 +496,9 @@ fn generated_semantic_cache_oracle_matches_bare_rustc() {
         assert_eq!(
             compiled_hit_counts(cache_dir.path()),
             (1, 1),
-            "{}: the before state must prove a real cache hit",
-            case.name
+            "{}: the before state must prove a real cache hit\nevents: {}",
+            case.name,
+            std::fs::read_to_string(cache_dir.path().join("events.jsonl")).unwrap_or_default()
         );
 
         let kache_after = observe_oracle_compile(
@@ -1098,11 +1102,15 @@ fn option_env_presence_changes_cached_behavior() {
             );
             assert_eq!(compile_and_observe(value, true), direct);
             let events = std::fs::read_to_string(cache.path().join("events.jsonl")).unwrap();
-            let last: serde_json::Value =
-                serde_json::from_str(events.lines().last().unwrap()).unwrap();
+            let last = events
+                .lines()
+                .rev()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|event| event["crate_name"] == "presence")
+                .expect("presence compilation event");
             assert_eq!(
                 last["result"], "local_hit",
-                "unchanged value must actually hit"
+                "unchanged value must actually hit: {last}"
             );
         }
     }

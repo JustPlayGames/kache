@@ -51,6 +51,7 @@ fn kache_process_as(program: &Path, home: &Path, cache_dir: &Path) -> std::proce
         .env("SHELL", "/bin/bash")
         .env_remove("ZDOTDIR")
         .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS);
     cmd
 }
@@ -1058,17 +1059,256 @@ fn init_preview_backs_up_existing_startup_files_before_each_edit() {
         .iter()
         .position(|step| step.starts_with("test_runner "))
         .unwrap();
+    let completions = steps
+        .iter()
+        .position(|step| step.starts_with("completions "))
+        .unwrap();
     assert_eq!(steps[shell + 1], "backup create .bashrc", "{steps:?}");
     assert_eq!(steps[tests + 1], "backup create .bashrc", "{steps:?}");
+    assert_eq!(steps[completions + 1], "backup create .bashrc", "{steps:?}");
     assert_eq!(
         steps
             .iter()
             .filter(|step| step.starts_with("backup "))
             .count(),
-        2,
+        3,
         "{steps:?}"
     );
     assert_eq!(plan["test_activation_required"], true, "{plan}");
+}
+
+#[cfg(unix)]
+#[test]
+fn init_installs_and_updates_shell_completions() {
+    for (shell, relative_script, startup) in [
+        (
+            "bash",
+            ".local/share/kache/completions/kache.bash",
+            Some(".bashrc"),
+        ),
+        (
+            "zsh",
+            ".local/share/kache/completions/kache.zsh",
+            Some(".zshrc"),
+        ),
+        ("fish", ".config/fish/completions/kache.fish", None),
+    ] {
+        let e = env();
+        let script = e.home.join(relative_script);
+        let run = |check| {
+            let mut command = e.cmd();
+            command
+                .args(["init", "--yes", "--no-service", "--json"])
+                .env("SHELL", format!("/bin/{shell}"));
+            if check {
+                command.arg("--check");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{shell}: {output:?}");
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+        let completion_step = |result: &serde_json::Value| {
+            result["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["component"] == "completions")
+                .unwrap_or_else(|| panic!("completions missing: {result}"))
+                .clone()
+        };
+        assert_eq!(completion_step(&run(true))["action"], "configure");
+        assert!(!script.exists(), "preview wrote {script:?}");
+        assert_eq!(completion_step(&run(false))["action"], "configure");
+        let generated = e.cmd().args(["completions", shell]).output().unwrap();
+        assert!(generated.status.success());
+        assert_eq!(std::fs::read(&script).unwrap(), generated.stdout);
+        if let Some(startup) = startup {
+            let text = std::fs::read_to_string(e.home.join(startup)).unwrap();
+            assert!(text.contains("# >>> kache shell completions >>>"), "{text}");
+            assert!(text.contains(script.to_str().unwrap()), "{text}");
+        }
+        assert_eq!(completion_step(&run(true))["action"], "keep");
+        assert_eq!(completion_step(&run(false))["action"], "keep");
+        std::fs::write(&script, "# old completions\n").unwrap();
+        assert_eq!(completion_step(&run(false))["action"], "configure");
+        assert_eq!(std::fs::read(&script).unwrap(), generated.stdout);
+        assert!(
+            std::fs::read_dir(script.parent().unwrap())
+                .unwrap()
+                .any(|entry| {
+                    let entry = entry.unwrap();
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".kache-shell-backup-")
+                        && std::fs::read(entry.path()).unwrap() == b"# old completions\n"
+                })
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_leaves_completions_alone_when_shell_setup_is_skipped_or_cancelled() {
+    let e = env();
+    let output = e
+        .cmd()
+        .args(["init", "--yes", "--no-service", "--no-shell", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !result["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["component"] == "completions")
+    );
+    assert!(!e.home.join(".local/share/kache/completions").exists());
+    assert!(!e.home.join(".bashrc").exists());
+
+    let cancelled = env();
+    cancelled
+        .cmd()
+        .args(["init", "--no-service"])
+        .write_stdin("n\n")
+        .assert()
+        .success();
+    assert!(
+        !cancelled
+            .home
+            .join(".local/share/kache/completions")
+            .exists()
+    );
+    assert!(!cancelled.home.join(".bashrc").exists());
+
+    let unsupported = env();
+    let output = unsupported
+        .cmd()
+        .args(["init", "--check", "--no-service", "--json"])
+        .env("SHELL", "/bin/tcsh")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let completions = result["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["component"] == "completions")
+        .unwrap();
+    assert_eq!(completions["action"], "unsupported");
+    assert!(
+        !unsupported
+            .home
+            .join(".local/share/kache/completions")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn init_completions_follow_custom_shell_and_data_directories() {
+    for shell in ["zsh", "fish"] {
+        let e = env();
+        let data = e.home.join("custom ' data");
+        let config = e.home.join("custom ' config");
+        let dots = e.home.join("dotfiles");
+        let output = e
+            .cmd()
+            .args(["init", "--yes", "--no-service", "--json"])
+            .env("SHELL", format!("/bin/{shell}"))
+            .env("ZDOTDIR", &dots)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", &data)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{shell}: {output:?}");
+        let script = if shell == "zsh" {
+            data.join("kache/completions/kache.zsh")
+        } else {
+            config.join("fish/completions/kache.fish")
+        };
+        assert!(script.exists(), "{script:?}");
+        assert!(!e.home.join(".local/share/kache/completions").exists());
+        if shell == "zsh" {
+            assert!(
+                std::fs::read_to_string(dots.join(".zshrc"))
+                    .unwrap()
+                    .contains("kache shell completions")
+            );
+            assert!(!e.home.join(".zshrc").exists());
+        }
+        let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let completion = receipt["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["component"] == "completions")
+            .unwrap();
+        assert!(
+            completion["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path.as_str() == script.to_str())
+        );
+        assert_eq!(completion["action"], "configure");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn init_reports_completion_activation_even_when_compiler_shims_are_active() {
+    let e = env();
+    let original_path = std::env::var_os("PATH").unwrap();
+    e.cmd()
+        .args(["init", "--yes", "--no-service"])
+        .env("PATH", &original_path)
+        .assert()
+        .success();
+    let shims = e.home.join(".local/lib/kache/shims");
+    let active_path =
+        std::env::join_paths(std::iter::once(shims).chain(std::env::split_paths(&original_path)))
+            .unwrap();
+    let script = e.home.join(".local/share/kache/completions/kache.bash");
+    let generated = std::fs::read(&script).unwrap();
+    let run = |check, path: &std::ffi::OsStr| {
+        let mut command = e.cmd();
+        command
+            .args(["init", "--yes", "--no-service", "--json"])
+            .env("PATH", path);
+        if check {
+            command.arg("--check");
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    // A configured terminal needs no reload until the completion script changes.
+    let ready = run(true, &active_path);
+    assert_eq!(ready["shell_activation_required"], false, "{ready}");
+    std::fs::write(&script, "# old completions\n").unwrap();
+    let preview = run(true, &active_path);
+    assert_eq!(preview["shell_activation_required"], true, "{preview}");
+    let shell = preview["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["component"] == "shell")
+        .unwrap();
+    assert_eq!(shell["action"], "keep", "only completions need an update");
+    assert_eq!(std::fs::read(&script).unwrap(), b"# old completions\n");
+    let applied = run(false, &active_path);
+    assert_eq!(applied["shell_activation_required"], true, "{applied}");
+    assert_eq!(std::fs::read(&script).unwrap(), generated);
+    // Compiler activation alone must still request a new terminal.
+    let compiler_only = run(true, &original_path);
+    assert_eq!(
+        compiler_only["shell_activation_required"], true,
+        "{compiler_only}"
+    );
 }
 
 /// With a login shell init cannot set up, it installs no shims, so there is
@@ -2589,6 +2829,124 @@ fn init_rejects_unavailable_daemon_replacement() {
     );
 }
 
+/// Services installed before the engine split remain valid entry points.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn init_recognizes_both_binaries_from_the_current_installation() {
+    let e = env();
+    let service = if cfg!(target_os = "macos") {
+        e.home.join("Library/LaunchAgents/ninja.kunobi.kache.plist")
+    } else {
+        e.home.join(".config/systemd/user/kache.service")
+    };
+    std::fs::create_dir_all(service.parent().unwrap()).unwrap();
+    let other = e.home.join("other-kache");
+    std::fs::copy(KACHE_BIN, &other).unwrap();
+    // A hardlinked frontend can belong to a different engine installation.
+    // Keep the fixture on the binary's volume so the hardlink is portable.
+    let foreign = tempfile::tempdir_in(Path::new(KACHE_BIN).parent().unwrap()).unwrap();
+    let foreign_frontend = foreign.path().join("kache");
+    std::fs::hard_link(KACHE_BIN, &foreign_frontend).unwrap();
+    kache_fs::testutil::write_executable(
+        &foreign.path().join("kache-engine"),
+        "#!/bin/sh\nexit 1\n",
+    );
+    let fake_bin = e.home.join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    kache_fs::testutil::write_executable(&fake_bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    let path = std::env::join_paths(std::iter::once(fake_bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    for (exe, action) in [
+        (Path::new(KACHE_BIN), "keep"),
+        (Path::new(env!("CARGO_BIN_EXE_kache-engine")), "keep"),
+        (other.as_path(), "update"),
+        (foreign_frontend.as_path(), "update"),
+    ] {
+        let content = if cfg!(target_os = "macos") {
+            format!(
+                "<plist><dict><key>ProgramArguments</key><array><string>{}</string><string>daemon</string><string>run</string></array></dict></plist>",
+                exe.display()
+            )
+        } else {
+            format!("[Service]\nExecStart={} daemon run\n", exe.display())
+        };
+        std::fs::write(&service, content).unwrap();
+        let output = e
+            .cmd()
+            .args(["init", "--check", "--no-shell", "--json"])
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let service = body["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["component"] == "login_service")
+            .unwrap();
+        assert_eq!(service["action"], action, "{}: {body}", exe.display());
+    }
+}
+
+/// Service registration can succeed before the daemon is ready, or even when
+/// it never starts. Init must report the health result in both cases.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn init_waits_for_a_new_service_and_rejects_failed_startup() {
+    for fails in [false, true] {
+        let e = env();
+        let bin = e.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tool = if cfg!(target_os = "macos") {
+            "launchctl"
+        } else {
+            "systemctl"
+        };
+        let script = r#"#!/bin/sh
+case " $* " in
+  *" bootstrap "*|*" enable "*)
+    if [ "$KACHE_TEST_START_FAILS" = 0 ]; then
+      (sleep 1.5; "$KACHE_TEST_BIN" daemon run) >/dev/null 2>&1 &
+    fi
+    ;;
+esac
+exit 0
+"#;
+        kache_fs::testutil::write_executable(&bin.join(tool), script);
+        kache_fs::testutil::write_executable(&bin.join("loginctl"), "#!/bin/sh\nexit 0\n");
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let user_config = e.home.join(".config/kache/config.toml");
+        std::fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_config,
+            format!("[cache]\nlocal_store = {:?}\n", e.cache.to_str().unwrap()),
+        )
+        .unwrap();
+        let output = e
+            .cmd()
+            .args(["init", "--yes", "--no-shell", "--json"])
+            .env("PATH", path)
+            .env("KACHE_TEST_BIN", KACHE_BIN)
+            .env("KACHE_TEST_START_FAILS", if fails { "1" } else { "0" })
+            .timeout(std::time::Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), !fails, "{output:?}");
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["success"], !fails, "{body}");
+        if !fails {
+            assert_eq!(body["daemon_running"], true, "{body}");
+            assert_eq!(body["service_installed"], true, "{body}");
+        }
+    }
+}
+
 /// A stale daemon must be replaced through the installed service manager.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
@@ -2849,7 +3207,7 @@ fn init_with_user_systemd_installs_the_login_service() {
         .assert()
         .success()
         .stdout(predicates::str::contains("Service installed"))
-        .stdout(predicates::str::contains("still starting"));
+        .stdout(predicates::str::contains("Background cache: started"));
     assert!(e.home.join(".config/systemd/user/kache.service").exists());
 }
 
@@ -5347,6 +5705,186 @@ fn same_release_copy_keeps_the_running_daemon() {
 }
 
 #[test]
+fn doctor_probe_restores_a_rust_library_without_touching_the_configured_store() {
+    let e = env();
+    let rustup_home = std::env::var_os("RUSTUP_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap().join(".rustup"));
+    let output = e
+        .cmd()
+        .env("RUSTUP_HOME", rustup_home)
+        .args(["--json", "doctor", "--probe"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Cache probe")
+        .unwrap();
+    assert_eq!(check["pass"], true, "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("identical bytes")
+    );
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("isolated temporary cache")
+    );
+    let db = rusqlite::Connection::open(e.cache.join("index.db")).unwrap();
+    let entries: i64 = db
+        .query_row("SELECT count(*) FROM entries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        entries, 0,
+        "probe artifacts must not enter the configured store"
+    );
+    assert!(
+        !e.cache.join("events.jsonl").exists(),
+        "probe events remain isolated"
+    );
+}
+
+#[test]
+fn doctor_probe_reports_a_missing_compiler_without_polluting_json() {
+    let e = env();
+    let output = e
+        .cmd()
+        .env("PATH", &e.home)
+        .args(["--json", "doctor", "--probe"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let check = body["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["label"] == "Cache probe")
+        .unwrap();
+    assert_eq!(check["pass"], false, "{check}");
+    assert!(check["detail"].as_str().unwrap().contains("compilation"));
+    assert!(check["fix"].as_str().unwrap().contains("Rust toolchain"));
+    assert!(body["issues"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn doctor_compares_the_running_daemons_context_with_this_invocation() {
+    let e = env();
+    e.cmd()
+        .env("KACHE_PREFETCH_ENABLED", "1")
+        .args(["daemon", "start"])
+        .assert()
+        .success();
+    for enabled in ["1", "0"] {
+        let output = e
+            .cmd()
+            .env("KACHE_PREFETCH_ENABLED", enabled)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let checks = body["checks"].as_array().unwrap();
+        let config = checks
+            .iter()
+            .find(|check| check["label"] == "Daemon config")
+            .unwrap();
+        assert_eq!(config["pass"], enabled == "1", "{config}");
+        if enabled == "0" {
+            assert!(
+                config["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("prefetch_enabled")
+            );
+        }
+        let process = checks
+            .iter()
+            .find(|check| check["label"] == "Daemon process")
+            .unwrap();
+        assert!(
+            process["detail"].as_str().unwrap().contains("pid "),
+            "{process}"
+        );
+        #[cfg(unix)]
+        assert!(
+            process["detail"]
+                .as_str()
+                .unwrap()
+                .contains("open-file limits at startup: soft"),
+            "{process}"
+        );
+    }
+}
+
+#[test]
+fn explain_json_distinguishes_uncached_compiles_hits_and_compiler_queries() {
+    let e = env();
+    for (result, reason, expected) in [
+        ("passthrough", "store unavailable: fixture", "not_cached"),
+        ("local_hit", "", "all_hits"),
+        ("remote_hit", "", "all_hits"),
+        ("prefetch_hit", "", "all_hits"),
+        (
+            "passthrough",
+            "not-a-compile|--print cfg",
+            "no_cache_lookups",
+        ),
+    ] {
+        let event = serde_json::json!({"ts": chrono::Utc::now(), "crate_name":"demo", "result":result, "elapsed_ms":1, "size":1, "passthrough_reason":reason, "schema":26});
+        std::fs::write(e.cache.join("events.jsonl"), format!("{event}\n")).unwrap();
+        let output = e
+            .cmd()
+            .args(["--json", "explain", "demo"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["diagnosis"], expected, "{body}");
+    }
+}
+
+#[test]
+fn doctor_reports_recent_store_warning_when_database_is_healthy() {
+    let e = env();
+    let hash = blake3::hash(e.cache.as_os_str().as_encoded_bytes()).to_hex();
+    let marker = e.home.join(format!("kache-store-warn-{}", &hash[..16]));
+    let file = std::fs::File::create(&marker).unwrap();
+    kache_store::markers::write_marker_timestamp(&file);
+    drop(file);
+
+    let output = e
+        .cmd()
+        .env("TMPDIR", &e.home)
+        .env("TMP", &e.home)
+        .env("TEMP", &e.home)
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = body["checks"].as_array().unwrap();
+    for label in ["Store DB", "Store access"] {
+        let check = checks.iter().find(|check| check["label"] == label).unwrap();
+        assert_eq!(check["pass"], true, "{check}");
+    }
+    let warning = checks
+        .iter()
+        .find(|check| check["label"] == "Store build warning")
+        .expect("doctor preserves the warning despite its successful database open");
+    assert_eq!(warning["pass"], false);
+    assert_eq!(warning["optional"], true);
+    assert!(warning["fix"].as_str().unwrap().contains("KACHE_LOG_FILE"));
+}
+
+#[test]
 fn quarantine_backups_are_reported_and_only_removed_by_confirmed_full_clean() {
     let e = env();
     let names = [
@@ -5405,4 +5943,172 @@ fn quarantine_backups_are_reported_and_only_removed_by_confirmed_full_clean() {
     }
     assert!(e.cache.join("index.db").is_file());
     e.cmd().args(["--json", "list"]).assert().success();
+}
+
+/// The skips view must retain every reason and invocation, including fast
+/// entries below the full report's slowest-table threshold.
+#[test]
+fn explain_all_lists_complete_history() {
+    let e = env();
+    let root_a = e.home.join("a").to_string_lossy().into_owned();
+    let root_b = e.home.join("b").to_string_lossy().into_owned();
+    let mut events = (0..15)
+        .map(|index| {
+            serde_json::json!({
+                "ts": format!("2026-01-01T00:00:{index:02}Z"),
+                "crate_name": format!("crate_{index}"),
+                "root": root_a,
+                "session_id": "earlier",
+                "result": "passthrough",
+                "passthrough_reason": format!("unsupported|flag {index}"),
+                "elapsed_ms": index + 1,
+                "size": 0,
+                "cache_key": "",
+                "schema": 14
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut skipped = events[0].clone();
+    skipped["ts"] = "2026-01-01T01:00:00Z".into();
+    skipped["root"] = root_b.clone().into();
+    skipped["session_id"] = "latest".into();
+    skipped["crate_name"] = "store_declined".into();
+    skipped["result"] = "skipped".into();
+    skipped["skip_reason"] = "inputs-changed".into();
+    events.push(skipped.clone());
+    let mut probe = skipped.clone();
+    probe["result"] = "passthrough".into();
+    probe["crate_name"] = "rustc".into();
+    probe["passthrough_reason"] = "not-a-compile|--print cfg".into();
+    events.push(probe);
+    let mut hit = skipped.clone();
+    hit["result"] = "local_hit".into();
+    events.push(hit);
+    let mut repeated = skipped;
+    repeated["crate_name"] = "another_declined".into();
+    events.push(repeated);
+    std::fs::write(
+        e.cache.join("events.jsonl"),
+        events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    let read = |args: &[&str]| {
+        let output = e.cmd().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let all = read(&["--json", "explain", "--all"]);
+    assert_eq!(all["command"], "explain");
+    assert_eq!(all["scope"], "retained history");
+    assert_eq!(all["passthroughs"], 15);
+    assert_eq!(all["skipped"], 2);
+    assert_eq!(all["probes"], 1);
+    assert_eq!(all["entries"].as_array().unwrap().len(), 18);
+    assert_eq!(all["reasons"].as_array().unwrap().len(), 17);
+    assert_eq!(all["reasons"][0]["reason"], "inputs-changed");
+    assert_eq!(all["reasons"][0]["count"], 2);
+    assert_eq!(all["entries"][0]["crate_name"], "crate_14");
+    assert_eq!(all["entries"][0]["root"], root_a);
+
+    let latest = read(&["--json", "explain"]);
+    assert_eq!(latest["root"], root_b);
+    assert_eq!(latest["misses"], 0);
+    assert!(
+        latest.get("entries").is_none(),
+        "plain explain keeps its build summary"
+    );
+    let rooted = read(&["--json", "explain", "--all", "--root", &root_a]);
+    assert_eq!(rooted["entries"].as_array().unwrap().len(), 15);
+    assert_eq!(rooted["root"], root_a);
+    let rooted_all = read(&["--json", "explain", "--all", "--root", &root_b]);
+    assert_eq!(rooted_all["entries"].as_array().unwrap().len(), 3);
+    let missing_root = e.home.join("missing");
+    let empty = read(&[
+        "--json",
+        "explain",
+        "--all",
+        "--root",
+        missing_root.to_str().unwrap(),
+    ]);
+    assert!(empty["entries"].as_array().unwrap().is_empty());
+
+    e.cmd()
+        .args(["explain", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "15 passthroughs, 2 skipped, 1 compiler queries",
+        ))
+        .stdout(predicates::str::contains("crate_0"))
+        .stdout(predicates::str::contains("crate_14"))
+        .stdout(predicates::str::contains("store_declined"))
+        .stdout(predicates::str::contains("inputs-changed"))
+        .stdout(predicates::str::contains("--print cfg"))
+        .stdout(predicates::str::contains("retained event-log history"));
+    e.cmd()
+        .args(["explain", "--all", "--root", missing_root.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "No skips or passthroughs recorded",
+        ));
+    for args in [
+        vec!["explain", "serde", "--all"],
+        vec!["explain", "--skips"],
+    ] {
+        e.cmd().args(args).assert().failure().code(2);
+    }
+}
+
+#[test]
+fn explain_all_includes_rotated_history() {
+    let e = env();
+    let archive = e.cache.join("events.jsonl.archive");
+    std::fs::create_dir(&archive).unwrap();
+    let event = serde_json::json!({
+        "ts": "2026-01-01T00:00:00Z",
+        "crate_name": "archived_crate",
+        "root": e.home.to_str().unwrap(),
+        "result": "passthrough",
+        "passthrough_reason": "adaptive seed",
+        "elapsed_ms": 2,
+        "size": 0,
+        "cache_key": "",
+        "schema": 14
+    });
+    let compressed = zstd::stream::encode_all(format!("{event}\n").as_bytes(), 1).unwrap();
+    std::fs::write(
+        archive.join("1767225600-1767225600-1-1.jsonl.zst"),
+        compressed,
+    )
+    .unwrap();
+    // An archived-only history is still available after the live log is gone.
+    let output = e
+        .cmd()
+        .args(["--json", "explain", "--all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(value["entries"][0]["crate_name"], "archived_crate");
+    e.cmd()
+        .args(["explain", "--all"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("edit rebuild:"))
+        .stdout(predicates::str::contains("archived_crate"));
+    e.cmd()
+        .args(["explain"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("no recorded build to explain"));
 }

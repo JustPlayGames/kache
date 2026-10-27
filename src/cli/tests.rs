@@ -2822,13 +2822,6 @@ fn test_compute_project_stats_classifies_remaining_buckets() {
 }
 
 #[test]
-fn test_parse_cargo_lock_crate_names_nonexistent() {
-    // When Cargo.lock doesn't exist in cwd, should return None
-    // We can't guarantee cwd lacks Cargo.lock, so just test the function doesn't panic
-    let _ = parse_cargo_lock_crate_names();
-}
-
-#[test]
 fn test_parse_cargo_lock_crate_names_from_valid_missing_and_bad_files() {
     // Cargo.lock parser -> valid names, missing file, and malformed TOML.
     let dir = tempfile::tempdir().unwrap();
@@ -3459,9 +3452,12 @@ fn test_get_workspace_crate_names_lists_members() {
         std::fs::write(root.join(m).join("src/lib.rs"), "").unwrap();
     }
 
-    let names = get_workspace_crate_names(root.join("Cargo.toml").to_str().unwrap()).unwrap();
-    assert!(names.contains(&"a".to_string()), "got {names:?}");
-    assert!(names.contains(&"b".to_string()), "got {names:?}");
+    let names = sync_scope::resolve(Some(root.join("Cargo.toml").to_str().unwrap()), false)
+        .unwrap()
+        .workspace
+        .unwrap();
+    assert!(names.contains("a"), "got {names:?}");
+    assert!(names.contains("b"), "got {names:?}");
 }
 
 #[test]
@@ -3469,18 +3465,7 @@ fn test_get_workspace_crate_names_errors_on_bad_manifest() {
     let dir = tempfile::tempdir().unwrap();
     let bad = dir.path().join("Cargo.toml");
     std::fs::write(&bad, "this is not valid toml [[[").unwrap();
-    assert!(get_workspace_crate_names(bad.to_str().unwrap()).is_err());
-}
-
-#[test]
-fn test_workspace_filter_bad_manifest_is_empty_set() {
-    // Explicit bad manifest path -> warning branch with empty filter.
-    let dir = tempfile::tempdir().unwrap();
-    let bad = dir.path().join("Cargo.toml");
-    std::fs::write(&bad, "not toml [[[[").unwrap();
-
-    let filter = workspace_filter(Some(bad.to_str().unwrap())).unwrap();
-    assert!(filter.is_empty());
+    assert!(sync_scope::resolve(Some(bad.to_str().unwrap()), false).is_err());
 }
 
 // ── backend-neutral remote tests ──────────────────────────────────────────
@@ -3886,6 +3871,7 @@ fn save_manifest_config(
         daemon_publish: false,
         daemon_publish_rustc: false,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -5240,6 +5226,7 @@ fn render_stats_prefetch_section_gated_on_activity() {
 /// from client-side rendering.
 fn effective_config_like(config: &Config) -> crate::daemon::EffectiveConfig {
     crate::daemon::EffectiveConfig {
+        process: None,
         max_size: config.max_size,
         cache_dir: config.cache_dir.display().to_string(),
         runtime_dir: config.runtime_dir.display().to_string(),
@@ -7024,6 +7011,74 @@ fn build_entry_pack(key: &str, crate_name: &str) -> Vec<u8> {
     let meta: crate::store::EntryMeta =
         serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap()).unwrap();
     crate::remote_layout::create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap()
+}
+
+#[tokio::test]
+async fn lockfile_sync_pulls_hyphenated_packages_from_compiler_crate_prefixes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    let store = Store::open(&config).unwrap();
+    let remote = test_remote_cfg();
+    let backend = TestBackend::memory();
+    let packages = [
+        ("aho-corasick", "aho_corasick"),
+        ("wasm-bindgen-shared", "wasm_bindgen_shared"),
+        ("serde", "serde"),
+    ];
+    let lock = dir.path().join("Cargo.lock");
+    let mut content = String::from("version = 3\n");
+    let mut expected_lists = Vec::new();
+    let mut expected_gets = Vec::new();
+    let mut keys = Vec::new();
+    for (package, crate_name) in packages {
+        content.push_str(&format!(
+            "\n[[package]]\nname = {package:?}\nversion = \"1.0.0\"\n"
+        ));
+        let key = sync_test_cache_key(crate_name);
+        backend
+            .seed(
+                &format!("prefix/v3/manifests/{crate_name}/{key}.json"),
+                b"{}".to_vec(),
+            )
+            .await;
+        let pack_path = format!("prefix/v3/packs/{crate_name}/{key}.tar.zst");
+        backend
+            .seed(&pack_path, build_entry_pack(&key, crate_name))
+            .await;
+        expected_lists.push(format!("prefix/v3/manifests/{crate_name}/"));
+        expected_gets.push(pack_path);
+        keys.push(key);
+    }
+    // Different versions of one package still need only one prefix listing.
+    content.push_str("\n[[package]]\nname = \"aho-corasick\"\nversion = \"2.0.0\"\n");
+    std::fs::write(&lock, content).unwrap();
+    let crates = parse_cargo_lock_crate_names_from(&lock).unwrap();
+    sync_with_client(
+        &as_cache_remote(as_remote_backend(&backend), &remote),
+        &config,
+        &store,
+        None,
+        true,
+        false,
+        false,
+        false,
+        Some(&crates),
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    let mut listed = backend.list_calls();
+    listed.sort();
+    expected_lists.sort();
+    assert_eq!(listed, expected_lists);
+    let mut downloaded = backend.get_calls();
+    downloaded.sort();
+    expected_gets.sort();
+    assert_eq!(downloaded, expected_gets);
+    for key in keys {
+        assert!(config.store_dir().join(key).join("meta.json").exists());
+    }
 }
 
 #[tokio::test]
@@ -10246,6 +10301,8 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
         rustdoc: Some("configure"),
         test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
         test_changes: vec![(rc.clone(), rc_exists)],
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "keep",
         recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
         service: Some("keep"),
@@ -10301,6 +10358,8 @@ fn init_steps_list_each_edit_with_the_backup_before_it() {
         rustdoc: Some("keep"),
         test_runner: None,
         test_changes: Vec::new(),
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "ask",
         service: None,
         ..facts(true, true, true)
@@ -10425,6 +10484,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
         rustdoc: Some("configure"),
         test_runner: None,
         test_changes: Vec::new(),
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "ask",
         recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
         service: Some("configure"),
@@ -10457,6 +10518,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
             rustdoc: None,
             test_runner: None,
             test_changes: Vec::new(),
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "keep",
             service_installed_now: false,
         },
@@ -10477,6 +10540,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
             rustdoc: Some("configure"),
             test_runner: None,
             test_changes: Vec::new(),
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "configure",
             service_installed_now: true,
         },
@@ -10505,6 +10570,8 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
             rustdoc: Some("failed"),
             test_runner: None,
             test_changes: Vec::new(),
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "keep",
             service_installed_now: false,
         },
@@ -10519,6 +10586,40 @@ fn a_run_reports_declined_and_failed_steps_as_not_done() {
         ]
     );
     assert_eq!(components(&kept)[4], "login_service keep");
+
+    // Completion edits are replanned after other shell edits. Report the
+    // backups from the applied plan, not the earlier preview.
+    let completion_path = PathBuf::from("/home/me/.local/share/kache/completions/kache.bash");
+    let completed = run_facts(
+        &SetupFacts {
+            completion_changes: vec![(PathBuf::from("/old-preview"), true)],
+            ..plan
+        },
+        RunOutcome {
+            cargo_applied: false,
+            rustdoc: None,
+            test_runner: None,
+            test_changes: Vec::new(),
+            completions: Some(SetupStep::new(
+                "completions",
+                "configure",
+                vec![completion_path.clone()],
+            )),
+            completion_changes: vec![(completion_path.clone(), true)],
+            recovery: "keep",
+            service_installed_now: false,
+        },
+    );
+    let steps = setup_steps(&completed);
+    let completion = steps.iter().find(|s| s.component == "completions").unwrap();
+    assert_eq!(completion.action, "configure");
+    assert_eq!(
+        completion.paths.as_slice(),
+        std::slice::from_ref(&completion_path)
+    );
+    let backups: Vec<_> = steps.iter().filter(|s| s.component == "backup").collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(backups[0].paths, [completion_path]);
 }
 
 #[test]
@@ -10556,6 +10657,8 @@ fn a_run_reports_the_test_runner_it_planned_after_the_shell_edits() {
         rustdoc: None,
         test_runner: Some(SetupStep::new("test_runner", "unsupported", Vec::new())),
         test_changes: Vec::new(),
+        completions: None,
+        completion_changes: Vec::new(),
         recovery: "keep",
         recovery_path: PathBuf::from("/home/me/.config/kache/config.toml"),
         service: None,
@@ -10568,6 +10671,8 @@ fn a_run_reports_the_test_runner_it_planned_after_the_shell_edits() {
             rustdoc: None,
             test_runner: Some(SetupStep::new("test_runner", "configure", vec![rc.clone()])),
             test_changes: vec![(rc.clone(), true)],
+            completions: None,
+            completion_changes: Vec::new(),
             recovery: "keep",
             service_installed_now: false,
         },

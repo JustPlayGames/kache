@@ -200,7 +200,10 @@ fn exchange(
     };
     #[cfg(windows)]
     let mut client = windows_client::Client::default();
+    #[cfg(unix)]
     let stream = Connection::connect(socket)?;
+    #[cfg(windows)]
+    let stream = Connection::connect(socket, request.channels.trusted_pipeline(true))?;
     write_message(
         &mut &stream,
         &kache_protocol::Request::ExecuteV1(Box::new(request.clone())),
@@ -994,6 +997,7 @@ mod windows_tests {
                 stdout: 0,
                 stderr: 0,
                 process_broker: true,
+                trusted_pipeline: false,
             },
         }
     }
@@ -1011,7 +1015,7 @@ mod windows_tests {
             let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
             let inner = retry_until(Some(deadline), || listener.accept())
                 .context("accepting the execution client")?;
-            let connection = Connection::from_stream(inner, deadline)?;
+            let connection = Connection::from_stream(inner, deadline, false)?;
             let mut reader = std::io::BufReader::new(&connection);
             let mut line = String::new();
             reader
@@ -1133,6 +1137,65 @@ mod windows_tests {
         assert_eq!(exchange_with(Peer::Workspace).unwrap(), Some(19));
     }
 
+    #[test]
+    fn converting_a_client_handle_preserves_the_accepted_connection() -> Result<()> {
+        use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode::Bytes};
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::OwnedHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, SECURITY_IDENTIFICATION,
+        };
+
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("control");
+        let listener = crate::ListenerOptions::new()
+            .name(crate::socket_name(&path)?)
+            .nonblocking(ListenerNonblockingMode::Both)
+            .create_sync()?;
+        let (accepted, wait_for_accept) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || -> Result<()> {
+            let deadline = std::time::Instant::now() + PREPARE_TIMEOUT;
+            let inner = retry_until(Some(deadline), || listener.accept())?;
+            let connection = Connection::from_stream(inner, deadline, false)?;
+            // accept has created another free instance. Reopening the client's
+            // handle here would switch to that instance and close this one.
+            accepted.send(())?;
+            let mut bytes = [0; 5];
+            (&connection).read_exact(&mut bytes)?;
+            ensure!(bytes == *b"bound", "request left its original connection");
+            (&connection).write_all(&bytes)?;
+            Ok(())
+        });
+        let result = (|| -> Result<()> {
+            let handle: OwnedHandle = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .security_qos_flags(SECURITY_IDENTIFICATION)
+                .open(format!(r"\\.\pipe\{}", crate::daemon_endpoint(&path)))?
+                .into();
+            wait_for_accept.recv_timeout(PREPARE_TIMEOUT)?;
+            let pipe = DuplexPipeStream::<Bytes>::try_from(handle).map_err(std::io::Error::from)?;
+            let inner = interprocess::os::windows::named_pipe::local_socket::Stream::from(pipe);
+            let connection = Connection::from_stream(
+                inner.into(),
+                std::time::Instant::now() + PREPARE_TIMEOUT,
+                false,
+            )?;
+            (&connection).write_all(b"bound")?;
+            let mut reply = [0; 5];
+            (&connection).read_exact(&mut reply)?;
+            ensure!(reply == *b"bound", "reply left its original connection");
+            Ok(())
+        })();
+        server
+            .join()
+            .expect("named-pipe server panicked")
+            .with_context(|| format!("client returned {result:?}"))?;
+        result
+    }
+
     fn assert_identification_only(connection: &Connection) -> Result<()> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows_sys::Win32::Security::{
@@ -1210,7 +1273,12 @@ mod windows_tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!crate::windows_security::matches_daemon(child.0.as_handle()).unwrap());
+        for trusted_pipeline in [false, true] {
+            assert!(
+                !crate::windows_security::matches_daemon(child.0.as_handle(), trusted_pipeline)
+                    .unwrap()
+            );
+        }
         // Establish that a same-SID-only check would accept this real peer.
         use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode::Bytes};
         let pipe = DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(

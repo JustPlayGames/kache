@@ -11215,7 +11215,9 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
 
 /// `--diagnostic-width` only wraps printed text: a build from a terminal (Cargo
 /// passes the terminal's width) and one from a pipe (no width) share a key,
-/// in both spellings, while the format flags beside it stay keyed.
+/// in both spellings, while the format flags beside it stay keyed. A malformed
+/// or repeated width stays keyed (upstream #1708), so a cached success cannot
+/// hide the argument error rustc reports for it.
 #[test]
 fn diagnostic_width_leaves_the_key_alone() {
     let _lock = key_test_lock();
@@ -11244,6 +11246,19 @@ fn diagnostic_width_leaves_the_key_alone() {
         key_of_flags(&flag_base(&source, &["--diagnostic-width=80"])),
         "the format stays keyed"
     );
+    for retained in [
+        vec!["--diagnostic-width"],
+        vec!["--diagnostic-width="],
+        vec!["--diagnostic-width=not-a-number"],
+        vec!["--diagnostic-width=0"],
+        vec!["--diagnostic-width=65536"],
+        vec!["--diagnostic-width=80", "--diagnostic-width=120"],
+        vec!["--diagnostic-width=80", "--diagnostic-width", "120"],
+    ] {
+        let mut flags = json.to_vec();
+        flags.extend(retained.iter().copied());
+        assert_ne!(piped, key_of_flags(&flag_base(&source, &flags)), "{retained:?}");
+    }
 }
 
 /// kunobi-ninja/kache#399: lexical `.`/`..` collapse + separator unification.
