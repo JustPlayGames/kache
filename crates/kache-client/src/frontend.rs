@@ -11,8 +11,9 @@ pub fn run(version: &str) -> Result<i32> {
     let started_at = std::time::Instant::now();
     let args = std::env::args_os().collect::<Vec<_>>();
     anyhow::ensure!(
-        args.get(1)
-            .is_none_or(|arg| arg != crate::FORWARDED_ARGV_FLAG),
+        args.get(1).is_none_or(|arg| {
+            arg != crate::FORWARDED_ARGV_FLAG && arg != crate::FORWARDED_ARGV_FILE_FLAG
+        }),
         "kache-engine points to the client; reinstall both Kache binaries together"
     );
     let executable = std::env::current_exe().context("locating the Kache client")?;
@@ -101,9 +102,41 @@ fn forward_engine(
     }
     #[cfg(not(unix))]
     {
-        let status = command.status().context("starting the Kache engine")?;
+        let status = match command.status() {
+            #[cfg(windows)]
+            Err(error) if crate::argv_file::command_line_too_long(&error) => {
+                // The engine reads the file whenever it asks for its
+                // arguments, so it stays until the engine has exited.
+                let (mut short, _file) = through_argv_file(&command, &std::env::temp_dir())?;
+                short
+                    .status()
+                    .context("starting the Kache engine with its arguments in a file")?
+            }
+            status => status.context("starting the Kache engine")?,
+        };
         Ok(status.code().unwrap_or(1))
     }
+}
+
+/// `command` with its arguments in a file: a compiler command line just short
+/// of Windows' limit fits Cargo's start of the frontend (so Cargo wrote no
+/// argfile) but not the engine's, which adds the envelope.
+#[cfg(windows)]
+fn through_argv_file(
+    command: &Command,
+    directory: &std::path::Path,
+) -> Result<(Command, crate::argv_file::ArgvFile)> {
+    let file = crate::argv_file::ArgvFile::create(directory, command.get_args())
+        .context("writing the Kache engine's arguments to a file")?;
+    let mut short = Command::new(command.get_program());
+    short.arg(crate::FORWARDED_ARGV_FILE_FLAG).arg(file.path());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => short.env(key, value),
+            None => short.env_remove(key),
+        };
+    }
+    Ok((short, file))
 }
 
 fn engine_command(
@@ -188,6 +221,48 @@ mod tests {
                 &args.into_iter().map(OsString::from).collect::<Vec<_>>()
             ));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_command_line_windows_refuses_goes_to_the_engine_in_a_file() {
+        use std::ffi::OsStr;
+        let directory = tempfile::tempdir().unwrap();
+        let long = "x".repeat(40_000);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .arg(crate::FORWARDED_ARGV_FLAG)
+            .arg(&long)
+            .env(crate::FRONTEND_DECLINED_ENV, "1")
+            .env_remove("KACHE_ARGV_FILE_TEST_REMOVED");
+        let error = command.status().unwrap_err();
+        assert!(crate::argv_file::command_line_too_long(&error), "{error}");
+
+        let (short, file) = through_argv_file(&command, directory.path()).unwrap();
+        assert_eq!(short.get_program(), command.get_program());
+        assert_eq!(
+            short.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new(crate::FORWARDED_ARGV_FILE_FLAG),
+                file.path().as_os_str()
+            ]
+        );
+        let envs = short.get_envs().collect::<Vec<_>>();
+        assert!(envs.contains(&(
+            OsStr::new(crate::FRONTEND_DECLINED_ENV),
+            Some(OsStr::new("1"))
+        )));
+        assert!(envs.contains(&(OsStr::new("KACHE_ARGV_FILE_TEST_REMOVED"), None)));
+        assert_eq!(
+            crate::argv_file::read(file.path()).unwrap(),
+            [
+                OsString::from(crate::FORWARDED_ARGV_FLAG),
+                OsString::from(long)
+            ]
+        );
+        let path = file.path().to_owned();
+        drop(file);
+        assert!(!path.exists());
     }
 }
 

@@ -19,6 +19,13 @@ pub use frontend::run;
 /// Internal argv envelope passed from the frontend to its companion engine.
 pub const FORWARDED_ARGV_FLAG: &str = "--kache-forwarded-argv-v1";
 
+/// The engine's only arguments, this flag and a file's path, when the
+/// envelope would not fit a command line: the file holds it, from
+/// [`FORWARDED_ARGV_FLAG`] on.
+pub const FORWARDED_ARGV_FILE_FLAG: &str = "--kache-forwarded-argv-file-v1";
+
+mod argv_file;
+
 /// Set on the engine a frontend forwards to after the running daemon
 /// declined this compile. The engine then neither asks the daemon again nor
 /// starts one: a busy daemon would decline again, costing every compile a
