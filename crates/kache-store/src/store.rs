@@ -7054,6 +7054,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
         held: &std::collections::HashMap<String, u64>,
+        probe_held_per_entry: bool,
         stop: &mut dyn FnMut(Duration) -> bool,
     ) -> GcStats {
         let walk_started = std::time::Instant::now();
@@ -7105,6 +7106,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // Found held by this sweep's probe, and counted there: its
             // removal would be refused.
             if held.contains_key(key) {
+                continue;
+            }
+            // The removal would refuse it too, but only after waiting for
+            // the index's write lock, which builds hold most of the time on
+            // a disk filling up; a read finds it without the lock.
+            if probe_held_per_entry && self.held_by_live_file(key).unwrap_or(false) {
+                stats.entries_unreclaimable += 1;
                 continue;
             }
             let write_started = std::time::Instant::now();
@@ -7193,14 +7201,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         probe_held_bytes: bool,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
-        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut |_| false)
+        let held_probe = if probe_held_bytes {
+            HeldProbe::Upfront
+        } else {
+            HeldProbe::AtRemoval
+        };
+        self.evict_with_stop(policy, stop_at, held_probe, origin, &mut |_| false)
     }
 
     fn evict_with_stop(
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
-        probe_held_bytes: bool,
+        held_probe: HeldProbe,
         origin: SweepOrigin,
         stop: &mut dyn FnMut(Duration) -> bool,
     ) -> Result<GcStats> {
@@ -7228,7 +7241,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         );
         // Duplicate eviction has a byte budget too, but only the size pass
         // probes the whole store for external retainers.
-        let held = if probe_held_bytes {
+        let held = if held_probe == HeldProbe::Upfront {
             self.held_by_live_files(&candidates)?
         } else {
             std::collections::HashMap::new()
@@ -7259,6 +7272,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             shadow.as_ref(),
             &durable_upload_keys,
             &held,
+            held_probe == HeldProbe::PerEntry,
             stop,
         );
         stats.bytes_held = bytes_held;
@@ -7313,6 +7327,38 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         Ok(held)
+    }
+
+    /// Whether a live file outside the store (a hardlink or clone in a
+    /// target directory) holds a blob `cache_key` holds the last reference
+    /// to, so that evicting it frees nothing: the check
+    /// `remove_entry_guarded` makes under the write lock, read without it.
+    /// False under `gc_evict_shared` and for an entry with no blob rows.
+    fn held_by_live_file(&self, cache_key: &str) -> Result<bool> {
+        if self.config.gc_evict_shared {
+            return Ok(false);
+        }
+        // Read every row first, as in held_by_live_files: no read statement
+        // stays open across the filesystem probes.
+        let last_refs = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT b.hash, b.refcount, eb.refs
+                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                 WHERE eb.cache_key = ?1",
+            )?;
+            stmt.query_map(params![cache_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(last_refs.into_iter().any(|(hash, refcount, refs)| {
+            holds_last_reference(refcount, refs)
+                && crate::filesystem::blob_has_external_retainer(&self.blob_path(&hash))
+        }))
     }
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
@@ -7374,7 +7420,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             None,
-            false,
+            HeldProbe::PerEntry,
             SweepOrigin::Automatic,
             &mut stop,
         )
@@ -7423,6 +7469,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             &durable_upload_keys,
             &std::collections::HashMap::new(),
+            false,
             &mut |_| false,
         ))
     }
@@ -8777,6 +8824,20 @@ fn finish_transaction(db: &rusqlite::Connection, succeeded: bool) -> Result<()> 
         return Err(error.into());
     }
     Ok(())
+}
+
+/// How an eviction walk finds entries whose removal frees nothing, because
+/// a live file outside the store holds their blobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldProbe {
+    /// Left to the removal, which refuses them under the write lock.
+    AtRemoval,
+    /// Every candidate probed before the walk, the held bytes counted apart
+    /// (the size pass).
+    Upfront,
+    /// Each entry probed as the walk reaches it, before the write lock:
+    /// disk recovery, which cannot wait for a probe of the whole store.
+    PerEntry,
 }
 
 /// Stores whose eviction candidate scan a test made slow, by cache dir.

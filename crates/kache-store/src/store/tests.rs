@@ -4987,6 +4987,39 @@ fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
     );
 }
 
+/// Disk recovery passes over an entry a target directory still hardlinks
+/// without waiting for the index's write lock: removing it frees nothing,
+/// and on a disk filling up builds hold that lock most of the time. The
+/// removal used to find it held only once it had the lock.
+#[test]
+fn disk_pressure_skips_a_hardlinked_entry_without_the_write_lock() {
+    static WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn give_up(_: i32) -> bool {
+        WAITED.store(true, Ordering::SeqCst);
+        false
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (store, config) = store_with_one_evictable_entry(dir.path(), "held");
+    let meta = store.get("held").unwrap().unwrap();
+    let retainer = dir.path().join("target-copy.rlib");
+    std::fs::hard_link(store.blob_path(&meta.files[0].hash), &retainer).unwrap();
+    store.set_last_accessed_for_test("held", "-1 hour");
+    store.db.busy_handler(Some(give_up)).unwrap();
+    let build = Connection::open(config.index_db_path()).unwrap();
+    build.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let stats = store.evict_for_disk_pressure(|_| false).unwrap();
+    build.execute_batch("ROLLBACK").unwrap();
+
+    assert!(
+        !WAITED.load(Ordering::SeqCst),
+        "asked for the lock: {stats:?}"
+    );
+    assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+    assert_eq!(stats.entries_failed, 0, "{stats:?}");
+    assert!(store.contains("held") && retainer.is_file());
+}
+
 #[test]
 fn shared_entry_retention_requires_the_last_positive_reference() {
     assert!(holds_last_reference(1, 1));
