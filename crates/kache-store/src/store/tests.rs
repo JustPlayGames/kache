@@ -4784,7 +4784,7 @@ fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budge
     assert_eq!(store.evict().unwrap().entries_evicted, 0);
     assert_eq!(
         store
-            .evict_for_disk_pressure(|| true)
+            .evict_for_disk_pressure(|_| true)
             .unwrap()
             .entries_evicted,
         0
@@ -4793,7 +4793,7 @@ fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budge
 
     let mut checks = 0;
     let stats = store
-        .evict_for_disk_pressure(|| {
+        .evict_for_disk_pressure(|_| {
             checks += 1;
             checks >= 3
         })
@@ -4803,7 +4803,7 @@ fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budge
     assert_eq!(store.list_entries("last_accessed").unwrap().len(), 1);
     assert_eq!(
         store
-            .evict_for_disk_pressure(|| false)
+            .evict_for_disk_pressure(|_| false)
             .unwrap()
             .entries_evicted,
         1
@@ -4969,7 +4969,7 @@ fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
     assert!(store.contains("kept"), "entry remains restorable");
     assert!(blob.is_file(), "store name remains");
 
-    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    let pressure = store.evict_for_disk_pressure(|_| false).unwrap();
     assert_eq!(pressure.entries_evicted, 0);
     assert_eq!(pressure.entries_unreclaimable, 1);
     assert!(store.contains("kept"));
@@ -5122,7 +5122,7 @@ fn durable_upload_intent_pins_payload_across_every_eviction_policy_until_retired
     assert!(size.entries_pinned >= 1);
     assert!(store.contains(&pending_key));
 
-    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    let pressure = store.evict_for_disk_pressure(|_| false).unwrap();
     assert!(pressure.entries_pinned >= 1);
     assert!(store.contains(&pending_key));
 
@@ -5887,7 +5887,7 @@ fn an_automatic_sweep_keeps_what_the_remote_just_delivered() {
     assert_eq!(automatic.entries_import_pinned, 1);
     assert_eq!(automatic.entries_pinned, 1, "counted as held back too");
 
-    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    let pressure = store.evict_for_disk_pressure(|_| false).unwrap();
     assert_eq!(pressure.entries_import_pinned, 1);
     assert!(store.contains("imported_key"));
 
@@ -14895,7 +14895,7 @@ fn read_only_store_serves_hits_and_writes_nothing() {
         "evict must be refused on a read-only store"
     );
     assert!(
-        ro.evict_for_disk_pressure(|| false).is_err(),
+        ro.evict_for_disk_pressure(|_| false).is_err(),
         "evict_for_disk_pressure must be refused on a read-only store"
     );
     assert!(

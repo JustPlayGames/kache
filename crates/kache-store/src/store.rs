@@ -6933,6 +6933,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         &self,
         origin: SweepOrigin,
     ) -> Result<Vec<crate::eviction::EntryFeatures>> {
+        #[cfg(any(test, feature = "test-support"))]
+        slow_eviction_scan_for_test(&self.config.cache_dir);
         let mut stmt = self.db.prepare(
             "SELECT cache_key, size, hit_count, content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0,
@@ -7040,7 +7042,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// This is the *mechanism* half: the grace check, blob refcount decrement,
     /// and refuse-on-corrupt-meta guard all live in `remove_entry_guarded` and
     /// are deliberately not reachable from a policy. `stop_at` bounds a
-    /// size-driven sweep; `None` removes everything selected.
+    /// size-driven sweep; `None` removes everything selected. `stop` is asked
+    /// before each entry, with the time this walk has taken so far: the scan
+    /// and selection before it are not part of a removal budget.
     fn apply_eviction(
         &self,
         order: &[String],
@@ -7050,8 +7054,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
         held: &std::collections::HashMap<String, u64>,
-        stop: &mut dyn FnMut() -> bool,
+        stop: &mut dyn FnMut(Duration) -> bool,
     ) -> GcStats {
+        let walk_started = std::time::Instant::now();
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
         let (slice, pause) = self.eviction_pacing;
@@ -7070,7 +7075,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         });
 
         for key in order {
-            if stop() {
+            if stop(walk_started.elapsed()) {
                 break;
             }
             if let Some(target) = target
@@ -7188,7 +7193,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         probe_held_bytes: bool,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
-        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut || false)
+        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut |_| false)
     }
 
     fn evict_with_stop(
@@ -7197,7 +7202,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stop_at: Option<(u64, u64)>,
         probe_held_bytes: bool,
         origin: SweepOrigin,
-        stop: &mut dyn FnMut() -> bool,
+        stop: &mut dyn FnMut(Duration) -> bool,
     ) -> Result<GcStats> {
         let candidates = self.eviction_candidates_for(origin)?;
         let order = policy.select(&candidates);
@@ -7353,11 +7358,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Reclaim eligible entries even below the cache size budget. The caller
     /// holds `gc.lock` and stops on measured free space or a work deadline.
-    /// Recent accesses, imports, upload intents and external retainers keep
-    /// the same protection as other automatic sweeps.
-    pub fn evict_for_disk_pressure(&self, mut stop: impl FnMut() -> bool) -> Result<GcStats> {
+    /// `stop` gets the time spent removing entries so far: the candidate scan
+    /// before the first removal (a minute on a large index) is not counted,
+    /// or a deadline of seconds would end the pass before it removed
+    /// anything. Recent accesses, imports, upload intents and external
+    /// retainers keep the same protection as other automatic sweeps.
+    pub fn evict_for_disk_pressure(
+        &self,
+        mut stop: impl FnMut(Duration) -> bool,
+    ) -> Result<GcStats> {
         self.refuse_write("evict")?;
-        if stop() {
+        if stop(Duration::ZERO) {
             return Ok(GcStats::default());
         }
         self.evict_with_stop(
@@ -7412,7 +7423,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             &durable_upload_keys,
             &std::collections::HashMap::new(),
-            &mut || false,
+            &mut |_| false,
         ))
     }
 
@@ -8767,5 +8778,51 @@ fn finish_transaction(db: &rusqlite::Connection, succeeded: bool) -> Result<()> 
     }
     Ok(())
 }
+
+/// Stores whose eviction candidate scan a test made slow, by cache dir.
+#[cfg(any(test, feature = "test-support"))]
+static SLOW_EVICTION_SCANS: std::sync::Mutex<Vec<(PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "test-support"))]
+fn slow_eviction_scan_for_test(cache_dir: &Path) {
+    let delay = SLOW_EVICTION_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find_map(|(dir, delay)| (dir == cache_dir).then_some(*delay));
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
+    }
+}
+
+/// Test hook: while alive, the eviction candidate scan of the store in
+/// `cache_dir` takes at least `delay` longer, as the scan of a large index
+/// does.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct SlowEvictionScanGuard(PathBuf);
+
+#[cfg(any(test, feature = "test-support"))]
+impl SlowEvictionScanGuard {
+    pub fn new(cache_dir: &Path, delay: Duration) -> Self {
+        SLOW_EVICTION_SCANS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((cache_dir.to_path_buf(), delay));
+        Self(cache_dir.to_path_buf())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for SlowEvictionScanGuard {
+    fn drop(&mut self) {
+        SLOW_EVICTION_SCANS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(dir, _)| dir != &self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests;
