@@ -236,8 +236,38 @@ struct Unit {
     hash: String,
 }
 
-/// The donor's units of `packages`.
+/// The donor's units of `packages`, in the order the donor built them
+/// ([`built_at`]), so a seeding the deadline cuts short has copied units
+/// whose dependencies it copied too: Cargo rebuilds a unit whose dependency
+/// it rebuilds, so a unit copied without its dependencies is copied in vain.
 fn units(profile: &Path, layout: Layout, packages: &BTreeSet<String>) -> Vec<Unit> {
+    let mut units = units_by_name(profile, layout, packages);
+    // Stable: units built at the same time keep their names' order, and a
+    // unit without a time goes last.
+    units.sort_by_cached_key(|unit| {
+        let built = built_at(profile, layout, unit);
+        (built.is_none(), built)
+    });
+    units
+}
+
+/// When the donor built `unit`: when Cargo last added a file to the unit's
+/// fingerprint directory, which it fills once the unit is built. A
+/// dependency is built, and its fingerprint written, before the units that
+/// use it start. Not the unit's own directory in the per-unit layout,
+/// which also changes when Cargo makes the unit's other directories.
+fn built_at(profile: &Path, layout: Layout, unit: &Unit) -> Option<std::time::SystemTime> {
+    let fingerprint = match layout {
+        Layout::PerUnit => marker(profile, layout, unit).join("fingerprint"),
+        Layout::Shared => marker(profile, layout, unit),
+    };
+    std::fs::symlink_metadata(fingerprint)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+/// The donor's units of `packages`, by package and hash.
+fn units_by_name(profile: &Path, layout: Layout, packages: &BTreeSet<String>) -> Vec<Unit> {
     let mut units = Vec::new();
     match layout {
         Layout::PerUnit => {
@@ -1418,7 +1448,7 @@ fn ranked_donors<'a>(
                     if check_lane && layout == Layout::Shared {
                         check_units(&profile, packages)
                     } else {
-                        units(&profile, layout, packages).len()
+                        units_by_name(&profile, layout, packages).len()
                     }
                 })
             })
@@ -1449,7 +1479,7 @@ fn ranked_donors<'a>(
 /// used 1,285, held fewer units in all.
 fn check_units(profile: &Path, packages: &BTreeSet<String>) -> usize {
     let deps = deps_by_hash(&profile.join("deps"));
-    let held = units(profile, Layout::Shared, packages);
+    let held = units_by_name(profile, Layout::Shared, packages);
     match check_demand(profile, packages, &deps) {
         Some(demand) => held
             .iter()
@@ -2122,6 +2152,57 @@ source = "git+https://example.com/gitdep#abc"
             .map(|unit| (unit.package, unit.hash))
             .collect();
         assert_eq!(found, [("dep".to_string(), HASH.to_string())]);
+    }
+
+    /// A seeding cut short by its deadline copies a prefix of the units.
+    /// A unit whose dependency was left out is rebuilt anyway, so units go
+    /// in the order the donor built them, dependencies first: Cargo writes
+    /// a unit's fingerprint only once the unit is built. In the donor of a
+    /// 1,075-unit workspace, a cut after 458 units in name order left 242
+    /// of them waiting on a dependency that was not copied; in build order,
+    /// none.
+    #[test]
+    fn units_come_in_the_order_the_donor_built_them() {
+        for layout in [Layout::Shared, Layout::PerUnit] {
+            let dir = tempfile::tempdir().unwrap();
+            let profile = dir.path().join(PROFILE);
+            let fingerprint = |package: &str, hash: &str| match layout {
+                Layout::Shared => profile
+                    .join(".fingerprint")
+                    .join(format!("{package}-{hash}")),
+                Layout::PerUnit => profile
+                    .join("build")
+                    .join(package)
+                    .join(hash)
+                    .join("fingerprint"),
+            };
+            // Built in the order zeta, alpha, mid: neither the names' order
+            // nor the hashes'.
+            let built = [
+                ("zeta", OTHER, 100),
+                ("alpha", HASH, 200),
+                ("mid", OTHER, 300),
+            ];
+            for (package, hash, _) in built {
+                write(&fingerprint(package, hash).join("lib"), "fp");
+            }
+            for (package, hash, offset) in built {
+                let at = filetime::FileTime::from_unix_time(1_700_000_000 + offset, 0);
+                filetime::set_file_mtime(fingerprint(package, hash), at).unwrap();
+                if layout == Layout::PerUnit {
+                    // The unit's own directory changes at other times.
+                    let early = filetime::FileTime::from_unix_time(1_600_000_000 - offset, 0);
+                    filetime::set_file_mtime(marker(&profile, layout, &unit(package, hash)), early)
+                        .unwrap();
+                }
+            }
+            let packages: BTreeSet<String> = ["alpha", "mid", "zeta"].map(str::to_string).into();
+            let found: Vec<String> = units(&profile, layout, &packages)
+                .into_iter()
+                .map(|unit| unit.package)
+                .collect();
+            assert_eq!(found, ["zeta", "alpha", "mid"], "{layout:?}");
+        }
     }
 
     #[test]
