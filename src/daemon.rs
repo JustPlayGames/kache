@@ -6239,6 +6239,18 @@ impl Daemon {
         !self.gc_hint_pending.swap(true, Ordering::SeqCst)
     }
 
+    /// Whether the volume of the main store, or of a `[cache.volumes]`
+    /// shard with an index, is running low on free space.
+    fn any_store_low_on_disk(&self) -> bool {
+        crate::disk_recovery::low_on_disk(&self.config)
+            || self
+                .config
+                .volume_stores
+                .iter()
+                .filter(|shard| crate::volume_gc::shard_has_index(&shard.store))
+                .any(|shard| crate::disk_recovery::low_on_disk_at(&self.config, &shard.store))
+    }
+
     /// Stage the target directory's recorded executables in the background;
     /// the wrapper that hinted does not wait.
     fn handle_prestage(self: &Arc<Self>, req: &PrestageRequest) -> Response {
@@ -7223,6 +7235,8 @@ async fn server_main(
         }
     });
 
+    let free_space_handle = spawn_free_space_watch(daemon.clone(), FREE_SPACE_CHECK_INTERVAL);
+
     let maintenance_handle = config
         .index_auto_compact
         .then(|| crate::maintenance::spawn_periodic(config.clone(), daemon.request_clock.clone()));
@@ -7351,6 +7365,7 @@ async fn server_main(
     .await;
 
     gc_handle.abort();
+    free_space_handle.abort();
     if let Some(h) = maintenance_handle {
         h.abort();
     }
@@ -7727,6 +7742,28 @@ const MAX_EXECUTION_WORKERS: usize = 1024;
 
 /// How often the daemon sweeps the store (age, housekeeping, size).
 const PERIODIC_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// How often the daemon reads free space on its own, a `statvfs` per store.
+/// Wrappers ask at most once in five minutes, and only after storing: builds
+/// filling a disk at 3 GiB a minute take 16 GiB in that time, more than the
+/// default floor.
+const FREE_SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The daemon's own free-space timer: every `period`, a store whose volume
+/// runs low gets the sweep a wrapper's hint starts, with disk recovery
+/// first. The hint's claim keeps one such sweep at a time.
+fn spawn_free_space_watch(daemon: Arc<Daemon>, period: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if daemon.any_store_low_on_disk() {
+                daemon.handle_gc_hint();
+            }
+        }
+    })
+}
 
 /// The soonest a started daemon sweeps. A daemon restarts while builds wait
 /// on it (an update, a crash), and its clients come back storing at once:

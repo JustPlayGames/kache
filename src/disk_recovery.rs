@@ -72,10 +72,16 @@ fn below_low_band(floor: u64, usage: Option<VolumeUsage>) -> bool {
 /// space (see [`low_band`]). Automatic eviction then starts without waiting
 /// out the backoff a sweep left. Off with automatic GC or the floor.
 pub(crate) fn low_on_disk(config: &Config) -> bool {
+    low_on_disk_at(config, &config.cache_dir)
+}
+
+/// [`low_on_disk`] for the volume holding `path`, with the floor of
+/// `config`.
+pub(crate) fn low_on_disk_at(config: &Config, path: &Path) -> bool {
     config.auto_gc
         && below_low_band(
             config.auto_recover_min_free_bytes,
-            kache_fs::volume_usage(&config.cache_dir),
+            kache_fs::volume_usage(path),
         )
 }
 

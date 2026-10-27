@@ -3369,6 +3369,45 @@ fn disk_pressure_reaches_main_and_shards_below_budget_and_respects_locks_and_bac
     );
 }
 
+/// No build stores, so no wrapper asks: the daemon's own timer sees the
+/// volume run low and sweeps through the backoff a sweep left.
+#[test]
+#[cfg(unix)]
+fn the_daemon_sweeps_on_its_own_when_the_disk_runs_low() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    config.max_size = 100;
+    config.auto_recover_min_free_bytes = 10;
+    let store = Store::open(&config).unwrap();
+    put_upload_evict_entry(&store, dir.path(), "old", 200, false);
+    crate::wrapper::record_auto_gc_outcome(&config, 200, 0);
+    let volume = |free| {
+        kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(kache_fs::VolumeUsage { total: 1000, free }),
+        )
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _enter = runtime.enter();
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let watch = spawn_free_space_watch(daemon, Duration::from_millis(5));
+    let healthy = volume(25);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(store.contains("old"), "the backoff holds while space lasts");
+    drop(healthy);
+    let _low = volume(24);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.contains("old") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    watch.abort();
+    assert!(!store.contains("old"), "the daemon swept on its own");
+}
+
 /// Hardlink `key`'s blob into a stand-in target directory, which then
 /// holds its blocks.
 fn hold_in_target_dir(store: &Store, dir: &std::path::Path, key: &str) {
