@@ -479,20 +479,31 @@ fn auto_gc_backoff_holds(
 
 /// The start condition of every automatic sweep, whichever driver asks: the
 /// store is over the trigger, leaving out what the last sweep found held by
-/// target directories, and that sweep left no backoff that still holds.
-/// `kache gc` does not ask.
+/// target directories, and that sweep left no backoff that still holds, or
+/// the disk is running low. `kache gc` does not ask.
 pub(crate) fn auto_gc_sweep_due(config: &Config, total: u64) -> bool {
     auto_gc_due_at(
         read_auto_gc_backoff(&config.cache_dir),
         unix_now_secs(),
         total,
         config.max_size,
+        || crate::disk_recovery::low_on_disk(config),
     )
 }
 
-fn auto_gc_due_at(backoff: Option<AutoGcBackoff>, now: u64, total: u64, max_size: u64) -> bool {
+/// A backoff waits for new data a sweep could free, but a disk running low
+/// cannot wait: builds filled one at 3 GiB a minute while a 600 s backoff
+/// held off the sweep that later freed 27 GiB a minute. `low_on_disk` is
+/// asked only when the backoff is all that stands in the way.
+fn auto_gc_due_at(
+    backoff: Option<AutoGcBackoff>,
+    now: u64,
+    total: u64,
+    max_size: u64,
+    low_on_disk: impl FnOnce() -> bool,
+) -> bool {
     total.saturating_sub(recent_held_bytes(backoff, now)) > auto_gc_threshold(max_size)
-        && !auto_gc_backoff_holds(backoff, now, total, max_size)
+        && (!auto_gc_backoff_holds(backoff, now, total, max_size) || low_on_disk())
 }
 
 /// Called by every automatic driver after a sweep that left the store at
