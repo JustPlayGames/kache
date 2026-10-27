@@ -4464,33 +4464,7 @@ fn skipped_gc_stats() -> crate::store::GcStats {
 }
 
 fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats) {
-    total.entries_evicted = total.entries_evicted.saturating_add(part.entries_evicted);
-    total.bytes_freed = total.bytes_freed.saturating_add(part.bytes_freed);
-    total.blobs_removed = total.blobs_removed.saturating_add(part.blobs_removed);
-    total.duration_ms = total.duration_ms.saturating_add(part.duration_ms);
-    total.entries_pinned = total.entries_pinned.saturating_add(part.entries_pinned);
-    total.entries_unreclaimable = total
-        .entries_unreclaimable
-        .saturating_add(part.entries_unreclaimable);
-    total.disk_bytes_reclaimed = total
-        .disk_bytes_reclaimed
-        .saturating_add(part.disk_bytes_reclaimed);
-    total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
-    total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
-    total.entries_busy_snapshot = total
-        .entries_busy_snapshot
-        .saturating_add(part.entries_busy_snapshot);
-    total.entries_recent_prefiltered = total
-        .entries_recent_prefiltered
-        .saturating_add(part.entries_recent_prefiltered);
-    total.entries_import_pinned = total
-        .entries_import_pinned
-        .saturating_add(part.entries_import_pinned);
-    total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
-    // A measurement of the store, not work done: two sweeps probing the same
-    // held bytes must not add up to twice as many.
-    total.bytes_held = total.bytes_held.max(part.bytes_held);
-    total.skipped |= part.skipped;
+    total.add(part);
 }
 
 fn compile_time_backfill_message(result: Result<usize>) -> String {

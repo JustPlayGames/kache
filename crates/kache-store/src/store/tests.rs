@@ -5109,6 +5109,37 @@ fn a_low_disk_sweep_stops_at_the_usual_target_once_space_is_back() {
     assert_eq!(stats.bytes_held, 400, "{stats:?}");
 }
 
+/// A sweep ranks the store once, at its start, so what changed since
+/// (entries used or written meanwhile) it ranks as it was. On 2026-10-26
+/// the 18:22 sweep was still walking its ranking, down to entries of a
+/// few MB, half an hour later with builds taking 3 GiB a minute; the
+/// sweep that ranked afresh at 19:18 freed 27 GiB a minute. On a low disk
+/// a sweep whose ranking has aged ranks again once it has removed
+/// something. Here the second entry was in use when the sweep ranked.
+#[test]
+fn a_sweep_on_a_low_disk_ranks_again_once_its_ranking_ages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 300;
+    let mut store = Store::open(&config).unwrap();
+    store.ranking_fresh_for = Duration::ZERO;
+    put_idle_entry(&store, dir.path(), "old", 200);
+    put_idle_entry(&store, dir.path(), "in-use", 200);
+    store.set_last_accessed_for_test("in-use", "+0 seconds");
+
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || {
+            if !store.contains("old") {
+                store.set_last_accessed_for_test("in-use", "-2 hours");
+            }
+            store.contains("in-use")
+        })
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 2, "{stats:?}");
+    assert!(!store.contains("in-use"), "{stats:?}");
+}
+
 #[test]
 fn shared_entry_retention_requires_the_last_positive_reference() {
     assert!(holds_last_reference(1, 1));
