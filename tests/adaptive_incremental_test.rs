@@ -786,6 +786,7 @@ fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
 fn a_check_of_an_executable_is_cached_when_executables_are_not() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     fs::create_dir(project.path().join("src")).unwrap();
     fs::write(
         project.path().join("Cargo.toml"),
