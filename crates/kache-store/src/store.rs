@@ -7053,8 +7053,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stop_at: Option<(u64, u64)>,
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
-        held: &std::collections::HashMap<String, u64>,
-        probe_held_per_entry: bool,
+        held: &mut std::collections::HashMap<String, u64>,
+        mut probe_held_per_entry: bool,
         stop: &mut dyn FnMut(Duration) -> bool,
         short_of_space: &mut dyn FnMut() -> bool,
     ) -> GcStats {
@@ -7068,6 +7068,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None => (0, None),
         };
         let mut evicted = std::collections::HashSet::new();
+        // Entries a walk without the up-front probe has checked for a live
+        // file's hold.
+        let mut probed: std::collections::HashSet<&str> = std::collections::HashSet::new();
         // The shadow's victims are stamped with the sweep's start, so the
         // sweep's own tombstones are never older than them.
         let swept_at: Option<String> = shadow.and_then(|_| {
@@ -7080,11 +7083,38 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if stop(walk_started.elapsed()) {
                 break;
             }
-            if let Some(target) = target
-                && current_size <= target
-                && !short_of_space()
-            {
-                break;
+            if let Some(target) = target {
+                // Without the up-front probe, `current_size` still counts
+                // what target directories hold among the entries not
+                // reached yet: free space alone decides until the disk has
+                // room again, and then the probe runs on those entries.
+                let unprobed = probe_held_per_entry;
+                if unprobed || current_size <= target {
+                    let short = short_of_space();
+                    if unprobed && !short {
+                        probe_held_per_entry = false;
+                        match self.held_by_live_files(
+                            by_key.keys().copied().filter(|key| !probed.contains(key)),
+                        ) {
+                            Ok(rest) => {
+                                let rest_bytes: u64 = rest.values().sum();
+                                stats.bytes_held += rest_bytes;
+                                stats.entries_unreclaimable += rest.len();
+                                current_size = current_size.saturating_sub(rest_bytes);
+                                held.extend(rest);
+                            }
+                            Err(e) => {
+                                // The target cannot be trusted without it;
+                                // stop rather than evict for held bytes.
+                                tracing::warn!("gc: probing for held entries failed: {e:#}");
+                                break;
+                            }
+                        }
+                    }
+                    if !short && current_size <= target {
+                        break;
+                    }
+                }
             }
             if durable_upload_keys.contains(key) {
                 stats.entries_pinned += 1;
@@ -7113,9 +7143,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // The removal would refuse it too, but only after waiting for
             // the index's write lock, which builds hold most of the time on
             // a disk filling up; a read finds it without the lock.
-            if probe_held_per_entry && self.held_by_live_file(key).unwrap_or(false) {
-                stats.entries_unreclaimable += 1;
-                continue;
+            if probe_held_per_entry {
+                probed.insert(key.as_str());
+                let held_bytes = self.held_by_live_file(key).unwrap_or(0);
+                if held_bytes > 0 {
+                    stats.entries_unreclaimable += 1;
+                    stats.bytes_held += held_bytes;
+                    current_size = current_size.saturating_sub(held_bytes);
+                    continue;
+                }
             }
             let write_started = std::time::Instant::now();
             let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
@@ -7251,26 +7287,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         );
         // Duplicate eviction has a byte budget too, but only the size pass
         // probes the whole store for external retainers.
-        let held = if held_probe == HeldProbe::Upfront {
-            self.held_by_live_files(&candidates)?
+        let mut held = if held_probe == HeldProbe::Upfront {
+            self.held_by_live_files(candidates.iter().map(|entry| entry.key.as_str()))?
         } else {
             std::collections::HashMap::new()
         };
         let bytes_held: u64 = held.values().sum();
+        let entries_held = held.len();
         let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(bytes_held), target));
-        let shadow = stop_at.map(|(current, target)| {
-            use crate::eviction::EvictionPolicy as _;
-            let candidate = crate::eviction::ValueDensityPolicy;
-            let shadow_order = candidate.select(&candidates);
-            ShadowSelection {
-                policy: candidate.name(),
-                victims: crate::eviction::would_evict_for_budget(
-                    &candidates,
-                    &shadow_order,
-                    current.saturating_sub(target),
-                ),
+        // The shadow ranks for the byte budget, which a walk without the
+        // up-front probe does not know yet.
+        let shadow = match stop_at {
+            Some((current, target)) if held_probe == HeldProbe::Upfront => {
+                use crate::eviction::EvictionPolicy as _;
+                let candidate = crate::eviction::ValueDensityPolicy;
+                let shadow_order = candidate.select(&candidates);
+                Some(ShadowSelection {
+                    policy: candidate.name(),
+                    victims: crate::eviction::would_evict_for_budget(
+                        &candidates,
+                        &shadow_order,
+                        current.saturating_sub(target),
+                    ),
+                })
             }
-        });
+            _ => None,
+        };
         let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
             candidates.iter().map(|e| (e.key.as_str(), e)).collect();
         let durable_upload_keys = self.durable_upload_keys()?;
@@ -7281,13 +7323,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stop_at,
             shadow.as_ref(),
             &durable_upload_keys,
-            &held,
+            &mut held,
             held_probe == HeldProbe::PerEntry,
             stop,
             short_of_space,
         );
-        stats.bytes_held = bytes_held;
-        stats.entries_unreclaimable += held.len();
+        stats.bytes_held += bytes_held;
+        stats.entries_unreclaimable += entries_held;
         Ok(stats)
     }
 
@@ -7299,16 +7341,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// get under a budget they keep it over (kunobi-ninja/kache#1206).
     ///
     /// Empty under `gc_evict_shared`, which evicts such entries anyway.
-    fn held_by_live_files(
+    fn held_by_live_files<'k>(
         &self,
-        candidates: &[crate::eviction::EntryFeatures],
+        keys: impl Iterator<Item = &'k str>,
     ) -> Result<std::collections::HashMap<String, u64>> {
         let mut held = std::collections::HashMap::new();
         if self.config.gc_evict_shared {
             return Ok(held);
         }
-        let keys: std::collections::HashSet<&str> =
-            candidates.iter().map(|entry| entry.key.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = keys.collect();
         // Read every row first: the probes below touch the filesystem, and a
         // read statement left open across them would pin the WAL snapshot.
         let last_refs = {
@@ -7340,20 +7381,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(held)
     }
 
-    /// Whether a live file outside the store (a hardlink or clone in a
-    /// target directory) holds a blob `cache_key` holds the last reference
-    /// to, so that evicting it frees nothing: the check
+    /// The bytes of the blobs `cache_key` holds the last reference to that
+    /// a live file outside the store (a hardlink or clone in a target
+    /// directory) holds as well, as [`Self::held_by_live_files`] counts
+    /// them. Not zero means evicting it frees nothing: the check
     /// `remove_entry_guarded` makes under the write lock, read without it.
-    /// False under `gc_evict_shared` and for an entry with no blob rows.
-    fn held_by_live_file(&self, cache_key: &str) -> Result<bool> {
+    /// Zero under `gc_evict_shared` and for an entry with no blob rows.
+    fn held_by_live_file(&self, cache_key: &str) -> Result<u64> {
         if self.config.gc_evict_shared {
-            return Ok(false);
+            return Ok(0);
         }
         // Read every row first, as in held_by_live_files: no read statement
         // stays open across the filesystem probes.
         let last_refs = {
             let mut stmt = self.db.prepare_cached(
-                "SELECT b.hash, b.refcount, eb.refs
+                "SELECT b.hash, b.size, b.refcount, eb.refs
                  FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
                  WHERE eb.cache_key = ?1",
             )?;
@@ -7362,14 +7404,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        Ok(last_refs.into_iter().any(|(hash, refcount, refs)| {
-            holds_last_reference(refcount, refs)
-                && crate::filesystem::blob_has_external_retainer(&self.blob_path(&hash))
-        }))
+        Ok(last_refs
+            .into_iter()
+            .filter(|(hash, _, refcount, refs)| {
+                holds_last_reference(*refcount, *refs)
+                    && crate::filesystem::blob_has_external_retainer(&self.blob_path(hash))
+            })
+            .map(|(_, size, _, _)| size.max(0) as u64)
+            .sum())
     }
 
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
@@ -7408,6 +7455,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// goes on evicting while it is. The target counts only the bytes the
     /// sweep freed, not those builds wrote meanwhile: on 2026-10-26 a
     /// sweep reached it while the disk fell from 91 to 15 GiB free.
+    ///
+    /// A sweep that starts short of space removes at once: it checks each
+    /// entry for a target directory's hold as it reaches it instead of
+    /// probing every candidate first, which took about three minutes
+    /// before the first removal on a 12 GB index. It asks
+    /// `short_of_space` at each entry until the space is back, then
+    /// probes the entries it has not reached and stops at the target a
+    /// sweep with the up-front probe stops at.
     pub fn evict_for_free_space(
         &self,
         origin: SweepOrigin,
@@ -7419,10 +7474,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
             return Ok(GcStats::default());
         }
+        let held_probe = if short_of_space() {
+            HeldProbe::PerEntry
+        } else {
+            HeldProbe::Upfront
+        };
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
-            HeldProbe::Upfront,
+            held_probe,
             origin,
             &mut |_| false,
             &mut short_of_space,
@@ -7496,7 +7556,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             None,
             &durable_upload_keys,
-            &std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
             false,
             &mut |_| false,
             &mut || false,
@@ -8865,7 +8925,8 @@ enum HeldProbe {
     /// (the size pass).
     Upfront,
     /// Each entry probed as the walk reaches it, before the write lock:
-    /// disk recovery, which cannot wait for a probe of the whole store.
+    /// disk recovery and a size pass on a low disk, which cannot wait for a
+    /// probe of the whole store.
     PerEntry,
 }
 

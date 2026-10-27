@@ -5050,6 +5050,65 @@ fn a_sweep_reaching_its_target_goes_on_while_the_disk_is_short() {
     assert!(store.contains("newest"), "space came back: {stats:?}");
 }
 
+/// On a low disk a sweep starts removing at once: it checks each entry
+/// for a target directory's hardlink as it reaches it, instead of
+/// probing the whole store first (about three minutes on a 12 GB index,
+/// with the disk filling at 3 GiB a minute). Here the hardlink goes
+/// away after the first removal, as a build's target directory might:
+/// a probe made before that removal would have kept the entry.
+#[test]
+fn a_sweep_on_a_low_disk_checks_hardlinks_as_it_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 300;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "plain", 200);
+    store.set_last_accessed_for_test("plain", "-2 hours");
+    let blob = put_idle_entry(&store, dir.path(), "linked", 200);
+    let retainer = dir.path().join("target-copy.rlib");
+    std::fs::hard_link(&blob, &retainer).unwrap();
+
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || {
+            if !store.contains("plain") && retainer.exists() {
+                std::fs::remove_file(&retainer).unwrap();
+            }
+            true
+        })
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 2, "{stats:?}");
+    assert!(!store.contains("plain") && !store.contains("linked"));
+}
+
+/// Once the space is back, a sweep that started on a low disk stops at
+/// the byte target a sweep on a roomy disk stops at: the bytes target
+/// directories hold among the entries it never reached count apart
+/// (#1206), instead of being evicted for (a quarter of the store here).
+#[test]
+fn a_low_disk_sweep_stops_at_the_usual_target_once_space_is_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 500;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "first", 200);
+    store.set_last_accessed_for_test("first", "-4 hours");
+    put_idle_entry(&store, dir.path(), "second", 200);
+    store.set_last_accessed_for_test("second", "-3 hours");
+    let blob = put_idle_entry(&store, dir.path(), "linked", 400);
+    std::fs::hard_link(&blob, dir.path().join("target-copy.rlib")).unwrap();
+
+    // 800 bytes, 400 of them linked: 400 of its own against a 450-byte
+    // target. The disk is short until "first" goes.
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || store.contains("first"))
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(store.contains("second") && store.contains("linked"));
+    assert_eq!(stats.bytes_held, 400, "{stats:?}");
+}
+
 #[test]
 fn shared_entry_retention_requires_the_last_positive_reference() {
     assert!(holds_last_reference(1, 1));
@@ -14611,7 +14670,12 @@ fn a_shared_blob_held_outside_is_no_entrys_held_bytes() {
     let candidates = store
         .eviction_candidates_for(SweepOrigin::Requested)
         .unwrap();
-    assert!(store.held_by_live_files(&candidates).unwrap().is_empty());
+    assert!(
+        store
+            .held_by_live_files(candidates.iter().map(|entry| entry.key.as_str()))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Only a sweep with a byte budget probes: the others remove what their
