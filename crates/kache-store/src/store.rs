@@ -1322,6 +1322,39 @@ pub struct GcStats {
     pub housekeeping: Option<HousekeepingStats>,
 }
 
+impl GcStats {
+    /// Add the counts of `part`, another pass of the same run.
+    pub fn add(&mut self, part: &GcStats) {
+        self.entries_evicted = self.entries_evicted.saturating_add(part.entries_evicted);
+        self.bytes_freed = self.bytes_freed.saturating_add(part.bytes_freed);
+        self.blobs_removed = self.blobs_removed.saturating_add(part.blobs_removed);
+        self.duration_ms = self.duration_ms.saturating_add(part.duration_ms);
+        self.entries_pinned = self.entries_pinned.saturating_add(part.entries_pinned);
+        self.entries_unreclaimable = self
+            .entries_unreclaimable
+            .saturating_add(part.entries_unreclaimable);
+        self.disk_bytes_reclaimed = self
+            .disk_bytes_reclaimed
+            .saturating_add(part.disk_bytes_reclaimed);
+        self.entries_failed = self.entries_failed.saturating_add(part.entries_failed);
+        self.entries_locked = self.entries_locked.saturating_add(part.entries_locked);
+        self.entries_busy_snapshot = self
+            .entries_busy_snapshot
+            .saturating_add(part.entries_busy_snapshot);
+        self.entries_recent_prefiltered = self
+            .entries_recent_prefiltered
+            .saturating_add(part.entries_recent_prefiltered);
+        self.entries_import_pinned = self
+            .entries_import_pinned
+            .saturating_add(part.entries_import_pinned);
+        self.evict_write_ms = self.evict_write_ms.saturating_add(part.evict_write_ms);
+        // A measurement of the store, not work done: two sweeps probing the
+        // same held bytes must not add up to twice as many.
+        self.bytes_held = self.bytes_held.max(part.bytes_held);
+        self.skipped |= part.skipped;
+    }
+}
+
 /// Counts from [`Store::sweep_housekeeping`], recorded with the GC run so
 /// growth in either structure shows up without a shell on the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1549,6 +1582,8 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     /// Write slice and pause for eviction sweeps: [`EVICTION_WRITE_SLICE`]
     /// and [`EVICTION_WRITE_PAUSE`] outside tests.
     eviction_pacing: (Duration, Duration),
+    /// [`RANKING_FRESH_FOR`], shorter in tests.
+    ranking_fresh_for: Duration,
     /// Opened by [`Self::open_read_only`]: lookups and restores only.
     read_only: bool,
     /// Where [`Self::get`] sends a hit's access stamp instead of writing it
@@ -1690,6 +1725,12 @@ pub const EVICTION_WRITE_SLICE: Duration = Duration::from_millis(50);
 /// Longer than the busy handler's 100 ms poll interval, so every waiting
 /// writer polls at least once while the lock is free.
 pub const EVICTION_WRITE_PAUSE: Duration = Duration::from_millis(150);
+
+/// How long a sweep on a low disk walks one ranking of the store before it
+/// ranks again. Entries written after the ranking are not in it, and on a
+/// disk builds fill at 3 GiB a minute those are the ones worth evicting;
+/// ranking again takes 11-73 s of a 12 GB index.
+pub const RANKING_FRESH_FOR: Duration = Duration::from_secs(300);
 
 /// Paces an eviction sweep's writes so build processes waiting on the index
 /// write lock get it between slices.
@@ -2987,6 +3028,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             options,
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
+            ranking_fresh_for: RANKING_FRESH_FOR,
             read_only: false,
             hit_stamps: None,
             pending_pins: None,
@@ -3087,6 +3129,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             options,
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
+            ranking_fresh_for: RANKING_FRESH_FOR,
             read_only: true,
             hit_stamps: None,
             pending_pins: None,
@@ -7057,6 +7100,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         mut probe_held_per_entry: bool,
         stop: &mut dyn FnMut(Duration) -> bool,
         short_of_space: &mut dyn FnMut() -> bool,
+        rank_again: &mut bool,
     ) -> GcStats {
         let walk_started = std::time::Instant::now();
         let mut stats = GcStats::default();
@@ -7071,6 +7115,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Entries a walk without the up-front probe has checked for a live
         // file's hold.
         let mut probed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // When free space was last read only to see whether the ranking
+        // should be made again.
+        let mut space_read: Option<std::time::Instant> = None;
         // The shadow's victims are stamped with the sweep's start, so the
         // sweep's own tombstones are never older than them.
         let swept_at: Option<String> = shadow.and_then(|_| {
@@ -7089,8 +7136,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 // reached yet: free space alone decides until the disk has
                 // room again, and then the probe runs on those entries.
                 let unprobed = probe_held_per_entry;
-                if unprobed || current_size <= target {
+                // On a low disk an aged ranking is made again, once this
+                // walk has removed something (so each walk makes progress).
+                // Free space is read for that alone at most once a second.
+                let aged =
+                    stats.entries_evicted > 0 && walk_started.elapsed() >= self.ranking_fresh_for;
+                let read_for_age =
+                    aged && space_read.is_none_or(|read| read.elapsed() >= Duration::from_secs(1));
+                if unprobed || current_size <= target || read_for_age {
                     let short = short_of_space();
+                    space_read = Some(std::time::Instant::now());
                     if unprobed && !short {
                         probe_held_per_entry = false;
                         match self.held_by_live_files(
@@ -7112,6 +7167,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         }
                     }
                     if !short && current_size <= target {
+                        break;
+                    }
+                    if short && aged {
+                        *rank_again = true;
                         break;
                     }
                 }
@@ -7251,6 +7310,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             origin,
             &mut |_| false,
             &mut || false,
+            &mut false,
         )
     }
 
@@ -7262,6 +7322,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         origin: SweepOrigin,
         stop: &mut dyn FnMut(Duration) -> bool,
         short_of_space: &mut dyn FnMut() -> bool,
+        rank_again: &mut bool,
     ) -> Result<GcStats> {
         let candidates = self.eviction_candidates_for(origin)?;
         let order = policy.select(&candidates);
@@ -7327,6 +7388,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             held_probe == HeldProbe::PerEntry,
             stop,
             short_of_space,
+            rank_again,
         );
         stats.bytes_held += bytes_held;
         stats.entries_unreclaimable += entries_held;
@@ -7463,6 +7525,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// `short_of_space` at each entry until the space is back, then
     /// probes the entries it has not reached and stops at the target a
     /// sweep with the up-front probe stops at.
+    ///
+    /// While the volume is short, a sweep ranks the store again once its
+    /// ranking is [`RANKING_FRESH_FOR`] old and it has removed something:
+    /// the entries builds wrote since the ranking are not in it.
     pub fn evict_for_free_space(
         &self,
         origin: SweepOrigin,
@@ -7470,23 +7536,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ) -> Result<GcStats> {
         self.refuse_write("evict")?;
         let target = crate::eviction::eviction_target(self.config.max_size);
-        let size_before = self.physical_size()?;
-        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
+        let mut size = self.physical_size()?;
+        if !crate::eviction::over_eviction_trigger(size, self.config.max_size) {
             return Ok(GcStats::default());
         }
-        let held_probe = if short_of_space() {
-            HeldProbe::PerEntry
-        } else {
-            HeldProbe::Upfront
-        };
-        self.evict_with_stop(
-            &crate::eviction::SizePressurePolicy,
-            Some((size_before, target)),
-            held_probe,
-            origin,
-            &mut |_| false,
-            &mut short_of_space,
-        )
+        let mut stats = GcStats::default();
+        loop {
+            let held_probe = if short_of_space() {
+                HeldProbe::PerEntry
+            } else {
+                HeldProbe::Upfront
+            };
+            let mut rank_again = false;
+            let pass = self.evict_with_stop(
+                &crate::eviction::SizePressurePolicy,
+                Some((size, target)),
+                held_probe,
+                origin,
+                &mut |_| false,
+                &mut short_of_space,
+                &mut rank_again,
+            )?;
+            stats.add(&pass);
+            if !rank_again {
+                return Ok(stats);
+            }
+            size = self.physical_size()?;
+        }
     }
 
     /// Reclaim eligible entries even below the cache size budget. The caller
@@ -7511,6 +7587,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             SweepOrigin::Automatic,
             &mut stop,
             &mut || false,
+            &mut false,
         )
     }
 
@@ -7560,6 +7637,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             false,
             &mut |_| false,
             &mut || false,
+            &mut false,
         ))
     }
 
