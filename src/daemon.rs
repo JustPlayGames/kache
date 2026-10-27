@@ -343,6 +343,71 @@ impl SocketCleanupGuard {
     }
 }
 
+/// The socket file this daemon bound, by its filesystem identity.
+///
+/// Clients find a daemon only through that path. Once the path is gone or
+/// names another socket, nothing can reach this daemon again and the next
+/// build starts another: a removed runtime directory (a test's temporary
+/// directory, a cleaned `/tmp`, a logout's `XDG_RUNTIME_DIR`) left the old
+/// one running for good, holding its store open and writing its state file
+/// back into the removed directory every heartbeat.
+#[derive(Clone, Debug)]
+struct BoundSocket {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl BoundSocket {
+    /// Capture right after binding, before anyone else can take the path.
+    fn capture(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::symlink_metadata(path)?;
+            Ok(Self {
+                path: path.to_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                path: path.to_owned(),
+            })
+        }
+    }
+
+    /// Whether the path no longer leads to this daemon: removed, or replaced
+    /// by another file or socket. A lookup that fails for another reason
+    /// (permissions, I/O) proves nothing, so it keeps the daemon running. A
+    /// Windows named pipe is not a file and goes away only with the daemon.
+    fn is_lost(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(metadata) => {
+                    !(metadata.file_type().is_socket()
+                        && metadata.dev() == self.device
+                        && metadata.ino() == self.inode)
+                }
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
 impl DaemonCoordGuard {
     fn new(path: PathBuf) -> Self {
         Self { path }
@@ -7015,6 +7080,7 @@ async fn server_main(
         return Ok(());
     };
     let _socket_guard = SocketCleanupGuard::new(&socket_path)?;
+    let bound_socket = BoundSocket::capture(&socket_path)?;
 
     let lifecycle = Arc::new(Lifecycle::default());
     let mut control = lifecycle_control::serve(config, Arc::clone(&lifecycle)).await?;
@@ -7311,12 +7377,24 @@ async fn server_main(
         let _ = notifier.ready();
     }
     let heartbeat_coord = coord.clone();
+    let heartbeat_lifecycle = Arc::clone(&lifecycle);
     let heartbeat_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_COORD_HEARTBEAT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Before the state write, which would recreate a removed runtime
+            // directory.
+            if bound_socket.is_lost() {
+                tracing::warn!(
+                    "daemon socket {} was removed or replaced, so nothing can reach this \
+                     daemon; shutting down",
+                    bound_socket.path.display()
+                );
+                heartbeat_lifecycle.start_drain();
+                break;
+            }
             if let Err(e) = heartbeat_coord.write_phase(DaemonPhase::Ready) {
                 tracing::debug!("daemon coordinator heartbeat failed: {e}");
             }
