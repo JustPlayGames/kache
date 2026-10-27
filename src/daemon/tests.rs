@@ -1867,6 +1867,102 @@ async fn server_main_binds_socket_and_handles_shutdown() {
     );
 }
 
+/// A daemon nobody can reach any more stops instead of running for good: the
+/// suite's leaked daemons were ones whose test removed the temporary runtime
+/// directory without stopping them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.daemon_idle_timeout_secs = 0;
+        config.prefetch_enabled = false;
+        let socket_path = config.socket_path();
+        let coord = DaemonCoordFile::for_socket(&socket_path);
+        let server_config = config.clone();
+        let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
+        let server = tokio::spawn(async move {
+            server_main(
+                &server_config,
+                &provenance,
+                coord,
+                None,
+                PathBuf::from("Cargo.lock"),
+            )
+            .await
+        });
+        let ready_socket = socket_path.clone();
+        let ready = tokio::task::spawn_blocking(move || {
+            kunobi_daemon::readiness::wait_until(
+                Instant::now() + Duration::from_secs(5),
+                |deadline| lifecycle_client::current_socket(&ready_socket, deadline),
+            )
+            .map(|proof| proof.is_some())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(ready, "server_main must bind its configured socket");
+
+        fs::remove_file(&socket_path).unwrap();
+        let _successor =
+            replace.then(|| std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
+
+        let result = tokio::time::timeout(Duration::from_secs(20), server)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("a daemon whose socket was removed (replaced: {replace}) kept running")
+            })
+            .expect("server_main task should not panic");
+        assert!(
+            result.is_ok(),
+            "server_main should exit cleanly: {result:?}"
+        );
+        assert_eq!(
+            socket_path.exists(),
+            replace,
+            "the exiting daemon leaves a successor's socket alone"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bound_socket_is_lost_only_when_its_path_leads_elsewhere() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    let path = runtime.join("daemon.sock");
+    let _listener = UnixListener::bind(&path).unwrap();
+    let bound = BoundSocket::capture(&path).unwrap();
+    assert!(!bound.is_lost(), "its own socket");
+
+    // A lookup that fails without an answer keeps the daemon (unless root,
+    // whom permissions do not stop).
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = fs::symlink_metadata(&path).is_err();
+    let lost_when_unreadable = bound.is_lost();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    if unreadable {
+        assert!(!lost_when_unreadable, "a permission error proves nothing");
+    }
+
+    fs::remove_file(&path).unwrap();
+    assert!(bound.is_lost(), "removed");
+    fs::write(&path, b"").unwrap();
+    assert!(bound.is_lost(), "a file in its place");
+    fs::remove_file(&path).unwrap();
+    let _successor = UnixListener::bind(&path).unwrap();
+    assert!(bound.is_lost(), "another socket in its place");
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(&runtime).unwrap();
+    fs::write(&runtime, b"").unwrap();
+    assert!(bound.is_lost(), "its directory replaced by a file");
+}
+
 // ── Protocol serde round-trips ───────────────────────────────
 
 #[test]
