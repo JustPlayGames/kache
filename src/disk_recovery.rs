@@ -53,6 +53,32 @@ fn below_floor(floor: u64, usage: Option<VolumeUsage>) -> bool {
     usage.is_some_and(|usage| floor <= usage.total && usage.free < floor)
 }
 
+/// Free space under which a volume counts as running low: twice the floor,
+/// or 2.5 % of the volume when that is more (46 GiB of 1.8 TiB with the
+/// default floor). Builds that fill a disk at 3 GiB a minute cross it a
+/// quarter of an hour before the floor. `0`, never low, without a floor.
+fn low_band(floor: u64, total: u64) -> u64 {
+    if floor == 0 {
+        return 0;
+    }
+    floor.saturating_mul(2).max(total / 40)
+}
+
+fn below_low_band(floor: u64, usage: Option<VolumeUsage>) -> bool {
+    usage.is_some_and(|usage| floor <= usage.total && usage.free < low_band(floor, usage.total))
+}
+
+/// Whether the volume of the store of `config` is running low on free
+/// space (see [`low_band`]). Automatic eviction then starts without waiting
+/// out the backoff a sweep left. Off with automatic GC or the floor.
+pub(crate) fn low_on_disk(config: &Config) -> bool {
+    config.auto_gc
+        && below_low_band(
+            config.auto_recover_min_free_bytes,
+            kache_fs::volume_usage(&config.cache_dir),
+        )
+}
+
 /// Whether a pass that has spent `walked` removing entries goes on: under
 /// `cap`, with free space short of [`GOAL_FLOORS`] floors.
 fn keep_recovering(
@@ -172,6 +198,46 @@ mod tests {
             })
         ));
         assert!(!below_floor(11, None));
+    }
+
+    #[test]
+    fn the_low_band_is_two_floors_or_a_fortieth_of_the_volume() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(low_band(10 * GIB, 100 * GIB), 20 * GIB);
+        assert_eq!(low_band(10 * GIB, 1843 * GIB), 1843 * GIB / 40);
+        assert_eq!(low_band(10, 800), 20);
+        assert_eq!(low_band(10, 801), 20);
+        assert_eq!(low_band(10, 840), 21);
+        assert_eq!(low_band(0, 1843 * GIB), 0);
+        let free = |free| Some(VolumeUsage { total: 1000, free });
+        assert!(below_low_band(10, free(24)));
+        assert!(!below_low_band(10, free(25)));
+        assert!(below_low_band(20, free(39)));
+        assert!(!below_low_band(20, free(40)));
+        assert!(!below_low_band(0, free(0)));
+        assert!(!below_low_band(1001, free(0)));
+        assert!(!below_low_band(10, None));
+    }
+
+    #[test]
+    fn low_on_disk_needs_automatic_gc_and_a_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::test_support::test_config(dir.path().join("cache"));
+        let _volume = kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(VolumeUsage {
+                total: 1000,
+                free: 199,
+            }),
+        );
+        config.auto_recover_min_free_bytes = 100;
+        config.auto_gc = true;
+        assert!(low_on_disk(&config));
+        config.auto_recover_min_free_bytes = 99;
+        assert!(!low_on_disk(&config));
+        config.auto_recover_min_free_bytes = 100;
+        config.auto_gc = false;
+        assert!(!low_on_disk(&config));
     }
 
     #[test]

@@ -1384,17 +1384,18 @@ fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
     assert_eq!(recent_held_bytes(Some(record), 50 + ttl - 1), 3900);
     assert_eq!(recent_held_bytes(Some(record), 50 + ttl), 0);
 
-    assert!(!auto_gc_due_at(Some(record), 60, 5000, 1000));
+    let healthy = || false;
+    assert!(!auto_gc_due_at(Some(record), 60, 5000, 1000, healthy));
     assert!(
-        auto_gc_due_at(Some(record), 60, 5001, 1000),
+        auto_gc_due_at(Some(record), 60, 5001, 1000, healthy),
         "new bytes past the trigger"
     );
     assert!(
-        auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000),
+        auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000, healthy),
         "the figure expired"
     );
-    assert!(auto_gc_due_at(None, 60, 1101, 1000));
-    assert!(!auto_gc_due_at(None, 60, 1100, 1000));
+    assert!(auto_gc_due_at(None, 60, 1101, 1000, healthy));
+    assert!(!auto_gc_due_at(None, 60, 1100, 1000, healthy));
 }
 
 #[test]
@@ -1412,6 +1413,35 @@ fn auto_gc_sweep_due_starts_above_the_trigger_and_honours_the_backoff() {
     assert!(auto_gc_sweep_due(&cfg, 1202), "growth past the slack");
     expire_auto_gc_backoff_for_test(&cfg.cache_dir);
     assert!(auto_gc_sweep_due(&cfg, 1101));
+}
+
+/// 2026-10-26: a sweep ended over the trigger at 19:04Z and its 600 s
+/// backoff held while builds took free space from 15 GiB to ENOSPC.
+#[test]
+fn a_disk_running_low_starts_the_sweep_through_the_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().join("cache"));
+    std::fs::create_dir_all(&cfg.cache_dir).unwrap();
+    cfg.max_size = 1000;
+    cfg.auto_recover_min_free_bytes = 10;
+    let usage = |free| {
+        kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(kache_fs::VolumeUsage { total: 1000, free }),
+        )
+    };
+    record_auto_gc_outcome(&cfg, 1101, 0);
+    {
+        let _healthy = usage(25);
+        assert!(!auto_gc_sweep_due(&cfg, 1101), "the backoff holds");
+    }
+    {
+        let _low = usage(24);
+        assert!(auto_gc_sweep_due(&cfg, 1101), "low disk ends the backoff");
+        assert!(!auto_gc_sweep_due(&cfg, 1100), "but not the trigger");
+        cfg.auto_recover_min_free_bytes = 0;
+        assert!(!auto_gc_sweep_due(&cfg, 1101), "no floor, no low band");
+    }
 }
 
 #[test]
