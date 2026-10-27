@@ -157,6 +157,12 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 /// A test that wants a host file calls `.env("KACHE_HOST_CONFIG", path)` on
 /// the returned command.
 ///
+/// A daemon the child starts gets a one-minute idle timeout (the default is
+/// none) unless the caller sets its own. A backstop, not the cleanup: a
+/// fixture's [`DaemonGuard`] stops the daemon, and a daemon stops by itself
+/// once the test's temporary runtime directory is removed, on a panic too.
+/// This bounds the one left when a test is killed (a timeout) and neither ran.
+///
 /// Not every test binary spawns children, so the rest see it as dead.
 #[allow(dead_code)]
 pub fn hermetic_command(
@@ -187,6 +193,7 @@ pub fn hermetic_command(
         // build script). A child compile would inherit it and look like a
         // unit with an OUT_DIR.
         .env_remove("OUT_DIR")
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
         .env("KACHE_HOST_CONFIG", "");
     match config {
         Some(path) => command.env("KACHE_CONFIG", path),
