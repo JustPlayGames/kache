@@ -4251,7 +4251,11 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         print!("Running eviction...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
-    let evict_stats = store.evict_for(mode.sweep_origin())?;
+    // An automatic sweep goes on past its byte target while builds keep
+    // the disk low; a requested one stops there.
+    let evict_stats = store.evict_for_free_space(mode.sweep_origin(), || {
+        mode == GcMode::Background && crate::disk_recovery::low_on_disk(config)
+    })?;
     add_gc_stats(&mut combined, &evict_stats);
     if verbose {
         let over_limit = store_over_limit(
