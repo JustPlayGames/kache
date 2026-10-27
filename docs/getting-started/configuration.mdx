@@ -20,6 +20,23 @@ Open the editor:
 kache config
 ```
 
+For scripts, use the file commands:
+
+```bash
+kache config path
+kache config list --json
+kache config set --project cache.local_only true
+kache config get --project cache.local_only
+kache config unset --project cache.local_only
+kache config set --global cache.local_max_size 50GiB
+```
+
+`get` and `list` report values written in the selected file, before environment overrides, host settings or defaults. `get` and `unset` fail when the key is absent. `set` accepts known keys with matching TOML types; quote array values for the shell, for example `kache config set paths.base_dirs '["/work", "/sources"]'`. Workspace declarations and entire tables are edited directly in TOML.
+
+`--project` uses the nearest existing `.kache.toml`, or creates one in the current directory on `set`. `--global` chooses the user config even when `KACHE_CONFIG` or a project file exists. `--file PATH` selects another file. These selectors are mutually exclusive and follow the subcommand. Without a selector, the commands use the same file selection as the editor. All five subcommands support `--json`.
+
+The commands change the file only. A daemon setting takes effect when the daemon next loads it; restart the daemon when you need a running instance to use the changed value.
+
 Or edit TOML directly. Kache chooses the first file in this order:
 
 1. `KACHE_CONFIG`
@@ -32,7 +49,7 @@ Each process walks up from its own current directory. Cargo compiles packages un
 
 If the chosen file is not valid TOML, or a key has the wrong type, Kache ignores the whole file, and the host config with it, and runs on environment variables and defaults without a warning. Size keys (`local_max_size`, `event_log_max_size`, `prefetch_max_bytes`) take quoted strings such as `"50GiB"`.
 
-The editor covers common fields and keeps the other settings Kache knows. Saving rewrites the whole file: comments and keys Kache does not recognize are dropped, and a file that does not parse is replaced. The editor asks before it first overwrites an existing file.
+The editor covers common fields and updates changed keys while keeping comments and other settings. It asks before its first save to an existing file and refuses a file it cannot read or parse. The file subcommands also preserve comments and unrelated settings; `unset` can remove an unknown key.
 
 ```toml title="~/.config/kache/config.toml"
 [cache]
@@ -118,6 +135,7 @@ local_max_size = "200GiB"
 | `KACHE_DISABLED` | none | `false` | Pass all compiler work through when set to `1` or `true` |
 | `KACHE_LOCAL_ONLY` | `cache.local_only` | `false` | Ignore all remote and planner configuration while keeping local caching |
 | `KACHE_REMOTE_READONLY` | `cache.remote_readonly` | `false` | Allow remote reads but suppress remote writes. On GitHub Actions and GitLab CI, every job except a push to a protected branch is also forced read-only, and `=0` does not turn that off. A pull request job with `pull_request_prefix` set writes under that prefix instead, unless this setting is on or the remote is OCI. See [Who may write](/docs/remote-cache/ci#who-may-write). |
+| `KACHE_DAEMON_EXECUTION_CONCURRENCY` | `cache.daemon_execution_concurrency` | automatic | Concurrent daemon pipeline requests: four per available CPU, at least 32. A positive integer overrides that default; `0` selects automatic sizing. On Unix, the daemon can lower the count to fit its open-file limit and logs the reduction. RPC and blocking-thread capacity grow with this setting. It does not change compiler scheduler permits. Restart the daemon after changing it; an installed service reads its own environment and config. |
 | `KACHE_SCHEDULER` | `cache.scheduler` | `true` | Pace real compiler processes across concurrent builds after a miss. Hits and passthroughs never wait. `0` or `false` turns it off. With the [test runner](#test-runner), it paces test binaries too. |
 | `KACHE_SCHEDULER_MEMORY_PRESSURE` | `cache.scheduler_memory_pressure` | `true` | Under memory pressure, run compiles one after another. See [Limits](/docs/how-it-works/limits). |
 
@@ -547,6 +565,8 @@ Workspace rules are accepted only from the `.kache.toml` beside the active Cargo
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; wrapper demand remains capped at three seconds |
 | `KACHE_REMOTE_NEGATIVE_TTL_SECS` | `cache.remote_negative_ttl_secs` | `60` | Cache definitive remote 404 results |
 
+Prediction-row fetches wait at most two seconds, or less when `remote_restore_timeout_secs` is shorter. Setting it to `0` keeps the two-second prediction cap. While the read circuit breaker is degraded, prediction fetches return immediately and leave recovery probes to artifact restores.
+
 Credentials resolve from explicit `KACHE_S3_ACCESS_KEY` and `KACHE_S3_SECRET_KEY`, standard AWS variables, then the AWS profile. Web identity, container credentials and instance credentials follow only when no profile is selected. A selected profile that cannot supply credentials makes S3 requests fail; see [Selected profile](/docs/remote-cache/s3-setup#selected-profile).
 
 The `KACHE_S3_*` connection settings apply to S3. GCS and OCI require an explicit
@@ -643,7 +663,7 @@ Every GC driver (the daemon's sweep and its eviction after an upload, the auto-G
 | `KACHE_DAEMON_IDLE_TIMEOUT` | `cache.daemon_idle_timeout_secs` | `0` | Stop after idle seconds; `0` keeps it running |
 | `KACHE_DAEMON_PUBLISH` | `cache.daemon_publish` | `true` | Let a running daemon store completed C/C++ compiles. The wrapper stores locally when the daemon cannot accept the work. |
 | `KACHE_DAEMON_PUBLISH_RUSTC` | `cache.daemon_publish_rustc` | `true` | Let a running daemon finish a rustc store when the index is busy. The wrapper stages and hashes the outputs itself and registers the entry when the index's write lock comes within a few milliseconds; when another writer holds it longer, it hands the staged entry to the daemon and returns to Cargo, and the daemon registers it, refusing any output rewritten since. Unix only; the wrapper waits for the lock itself when the daemon cannot accept the work, when this is off, and on Windows. |
-| `KACHE_TRUST_DAEMON_EXECUTION` | `cache.trust_daemon_execution` | `false` | Linux: allow a trusted daemon pipeline under Seccomp/NoNewPrivs when both peers opt in. Compiler children and artifact restoration run in the client; input discovery and other pipeline accesses retain the daemon's restrictions. See [Linux process restrictions](/docs/how-it-works/architecture#linux-process-restrictions). |
+| `KACHE_TRUST_DAEMON_EXECUTION` | `cache.trust_daemon_execution` | `false` | Both peers must opt in. Allows a trusted daemon pipeline under Linux Seccomp/NoNewPrivs, macOS sandboxes, or Windows process-identity token differences. Compiler children and artifact restoration run in the client; input discovery and other pipeline accesses retain the daemon's restrictions. See [Process restrictions](/docs/how-it-works/architecture#process-restrictions). |
 | `KACHE_HEARTBEAT_SECS` | `cache.heartbeat_secs` | `30` | Event heartbeat cadence for long miss compiles; `0` disables it |
 | `KACHE_EXPLAIN_MISS` | `cache.explain_miss` | `false` | Record changed key groups on repeat misses |
 | `KACHE_RECORD_SESSIONS` | `cache.record_sessions` | `false` | Make every `kache stats --full` append its session line, as `--record` does, and every GC run append to `telemetry/gc-runs.jsonl` |
