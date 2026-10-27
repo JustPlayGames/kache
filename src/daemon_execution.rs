@@ -449,7 +449,20 @@ pub(super) async fn handle(
             message: format!("compiler worker failed: {error}"),
         },
     };
-    write_reply(stream, &reply).await
+    match write_reply(stream, &reply).await {
+        // The client is gone. Its compiler ran under the client's broker, so
+        // the broker channel closed with it and the worker can finish before
+        // the read above sees the disconnect: the same end as that branch,
+        // with nobody left to answer.
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(super::is_client_disconnect) =>
+        {
+            Ok(())
+        }
+        written => written,
+    }
 }
 
 #[cfg(test)]
