@@ -1614,6 +1614,27 @@ pub struct MemoRow {
 /// them, as a busy index did before there was anywhere to send them.
 pub type MemoRowSink = Box<dyn Fn(&[MemoRow]) -> bool + Send + Sync>;
 
+/// The rows worth persisting of `verified` and `redated` ones: a smaller
+/// file is hashed again faster than its row is read.
+fn memo_rows(
+    verified: &[(crate::file_hash::FileFingerprint, &str)],
+    redated: &[(crate::file_hash::FileFingerprint, &str)],
+) -> Vec<MemoRow> {
+    verified
+        .iter()
+        .map(|row| (row, false))
+        .chain(redated.iter().map(|row| (row, true)))
+        .filter(|((fingerprint, _), _)| {
+            fingerprint.size >= crate::file_hash::MIN_PERSISTED_HASH_BYTES
+        })
+        .map(|((fingerprint, hash), redated)| MemoRow {
+            fingerprint: fingerprint.clone(),
+            hash: (*hash).to_string(),
+            redated,
+        })
+        .collect()
+}
+
 /// How long a store with a [`MemoRowSink`] waits for the index's write lock
 /// before it hands its memo rows over: a restore that waited the full
 /// [`MEMO_ROW_WAIT`] stalled its hit for that long and often lost the rows
@@ -3284,19 +3305,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if self.read_only {
             return;
         }
-        let rows: Vec<MemoRow> = verified
-            .iter()
-            .map(|row| (row, false))
-            .chain(redated.iter().map(|row| (row, true)))
-            .filter(|((fingerprint, _), _)| {
-                fingerprint.size >= crate::file_hash::MIN_PERSISTED_HASH_BYTES
-            })
-            .map(|((fingerprint, hash), redated)| MemoRow {
-                fingerprint: fingerprint.clone(),
-                hash: (*hash).to_string(),
-                redated,
-            })
-            .collect();
+        let rows = memo_rows(verified, redated);
         if rows.is_empty() {
             return;
         }
@@ -3326,6 +3335,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             rows = rows.len(),
             "memo rows not written (index busy): {error}"
         );
+    }
+
+    /// [`Self::record_verified_file_hashes`] for rows the caller's caller is
+    /// waiting on: handed to the [`MemoRowSink`] first, whatever the index,
+    /// and written here only when nothing takes them. A seeding memoises
+    /// what it placed while Cargo waits for its target-info probe; on a busy
+    /// journal that commit alone took 0.3-0.6 s, which the daemon's next
+    /// flush pays instead.
+    pub fn hand_off_verified_file_hashes(
+        &self,
+        verified: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        if self.read_only {
+            return;
+        }
+        let rows = memo_rows(verified, &[]);
+        if rows.is_empty() || self.hand_busy_memo_rows(&rows) {
+            return;
+        }
+        self.record_verified_file_hashes(verified);
     }
 
     /// Write rows a [`MemoRowSink`] took, in one transaction with a short

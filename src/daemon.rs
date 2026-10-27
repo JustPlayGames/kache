@@ -9327,7 +9327,16 @@ pub(crate) fn seed_new_target(
     let started = std::time::Instant::now();
     let since_ns = kache_store::file_hash::stamp_clock_ns();
     let deadline = started + crate::target_seed::SEED_DEADLINE;
-    let store = Store::open(config).context("reading tracked targets")?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut store = Store::open(config).context("reading tracked targets")?;
+    #[cfg(unix)]
+    {
+        let socket = config.socket_path();
+        let cache_dir = config.cache_dir.clone();
+        store.send_busy_memo_rows_to(Box::new(move |rows| {
+            send_memo_rows(&socket, &cache_dir, rows)
+        }));
+    }
     let tracked = store
         .tracked_target_roots(0)
         .context("reading tracked targets")?;
@@ -9371,6 +9380,9 @@ pub(crate) fn seed_new_target(
 /// Memoise the hashes of the files a seeding placed, from the donors' rows
 /// ([`crate::target_seed::PlacedFile::memo_rows`]), so the new target's first
 /// build does not read them again, and the donors' links keep their rows.
+/// A running daemon takes the rows and writes them in its next flush
+/// ([`Store::hand_off_verified_file_hashes`]): Cargo waits for the probe
+/// until this returns.
 fn memoise_seeded_files(store: &Store, placed: &[crate::target_seed::PlacedFile], since_ns: i64) {
     if placed.is_empty() {
         return;
@@ -9389,7 +9401,7 @@ fn memoise_seeded_files(store: &Store, placed: &[crate::target_seed::PlacedFile]
         .iter()
         .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
         .collect();
-    store.record_verified_file_hashes(&rows);
+    store.hand_off_verified_file_hashes(&rows);
 }
 
 /// Hint the daemon to stage `target_dir`'s recorded executables.

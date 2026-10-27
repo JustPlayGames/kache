@@ -16289,3 +16289,70 @@ fn running_compiles_leave_the_base_connection_limit_to_other_requests() {
         assert_eq!(connection_limit(workers) - workers, BASE_CONNECTION_LIMIT);
     }
 }
+
+/// Cargo waits for the target-info probe until a seeding has memoised what
+/// it placed. On a busy journal the index's commit took 0.3-0.6 s of that
+/// wait, so a store that can hand rows to the daemon hands them over at
+/// once, and the daemon writes them in its next flush.
+#[test]
+fn a_seeding_hands_its_memo_rows_over_rather_than_waiting_for_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let mut store = Store::open(&config).unwrap();
+    let donor = dir.path().join("donor/libdep.rlib");
+    let placed = dir.path().join("new/libdep.rlib");
+    fs::create_dir_all(donor.parent().unwrap()).unwrap();
+    fs::create_dir_all(placed.parent().unwrap()).unwrap();
+    fs::write(&donor, vec![b'r'; 128 * 1024]).unwrap();
+    let before = crate::cache_key::FileFingerprint::from_path(&donor).unwrap();
+    let hash = kache_store::file_hash::hash_file(&donor).unwrap();
+    store.record_verified_file_hashes(&[(before.clone(), hash.as_str())]);
+    let since_ns = kache_store::file_hash::stamp_clock_ns();
+    fs::copy(&donor, &placed).unwrap();
+    filetime::set_file_mtime(
+        &placed,
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&donor).unwrap()),
+    )
+    .unwrap();
+    let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&handed);
+    store.send_busy_memo_rows_to(Box::new(move |rows| {
+        sink.lock().unwrap().extend_from_slice(rows);
+        true
+    }));
+    let file = crate::target_seed::PlacedFile {
+        from: donor.clone(),
+        before,
+        at: placed.clone(),
+    };
+
+    memoise_seeded_files(&store, std::slice::from_ref(&file), since_ns);
+
+    let at = crate::cache_key::FileFingerprint::from_path(&placed).unwrap();
+    let handed = handed.lock().unwrap().clone();
+    assert_eq!(
+        handed,
+        vec![crate::store::MemoRow {
+            fingerprint: at.clone(),
+            hash: hash.clone(),
+            redated: false,
+        }]
+    );
+    assert_eq!(store.file_hash_at(&at), None, "written by the daemon later");
+    assert_eq!(store.write_handed_memo_rows(&handed).unwrap(), 1);
+    assert_eq!(store.file_hash_at(&at), Some(hash.clone()));
+
+    // With no daemon to take them, the seeding writes them itself.
+    let mut alone = Store::open(&config).unwrap();
+    alone.send_busy_memo_rows_to(Box::new(|_| false));
+    fs::remove_file(&placed).unwrap();
+    fs::copy(&donor, &placed).unwrap();
+    filetime::set_file_mtime(
+        &placed,
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&donor).unwrap()),
+    )
+    .unwrap();
+    memoise_seeded_files(&alone, std::slice::from_ref(&file), since_ns);
+    let again = crate::cache_key::FileFingerprint::from_path(&placed).unwrap();
+    assert_eq!(alone.file_hash_at(&again), Some(hash));
+}
