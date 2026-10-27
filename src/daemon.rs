@@ -6426,7 +6426,11 @@ impl Daemon {
             config.max_size
         );
         let started = Instant::now();
-        let mut stats = store.evict_for(crate::store::SweepOrigin::Automatic)?;
+        // Builds keep writing while it runs: it goes on past its byte
+        // target while the disk is low.
+        let mut stats = store.evict_for_free_space(crate::store::SweepOrigin::Automatic, || {
+            crate::disk_recovery::low_on_disk(config)
+        })?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
         if let Ok(after) = store.physical_size() {
             crate::wrapper::record_auto_gc_outcome(config, after, stats.bytes_held);

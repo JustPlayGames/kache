@@ -5020,6 +5020,36 @@ fn disk_pressure_skips_a_hardlinked_entry_without_the_write_lock() {
     assert!(store.contains("held") && retainer.is_file());
 }
 
+/// Builds keep writing while a sweep runs: on 2026-10-26 one reached its
+/// byte target while the disk fell from 91 to 15 GiB free. A sweep that
+/// reaches its target on a disk still short of space keeps evicting, and
+/// stops once the space is back.
+#[test]
+fn a_sweep_reaching_its_target_goes_on_while_the_disk_is_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 500;
+    let store = Store::open(&config).unwrap();
+    for (key, idle) in [
+        ("oldest", "-3 hours"),
+        ("older", "-2 hours"),
+        ("newest", "-1 hour"),
+    ] {
+        put_idle_entry(&store, dir.path(), key, 200);
+        store.set_last_accessed_for_test(key, idle);
+    }
+
+    // 600 bytes over a 500-byte limit: removing "oldest" reaches the
+    // 450-byte target. The disk stays short until "older" goes too.
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || store.contains("older"))
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 2, "{stats:?}");
+    assert!(!store.contains("oldest") && !store.contains("older"));
+    assert!(store.contains("newest"), "space came back: {stats:?}");
+}
+
 #[test]
 fn shared_entry_retention_requires_the_last_positive_reference() {
     assert!(holds_last_reference(1, 1));

@@ -7056,6 +7056,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         held: &std::collections::HashMap<String, u64>,
         probe_held_per_entry: bool,
         stop: &mut dyn FnMut(Duration) -> bool,
+        short_of_space: &mut dyn FnMut() -> bool,
     ) -> GcStats {
         let walk_started = std::time::Instant::now();
         let mut stats = GcStats::default();
@@ -7081,6 +7082,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             if let Some(target) = target
                 && current_size <= target
+                && !short_of_space()
             {
                 break;
             }
@@ -7206,7 +7208,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         } else {
             HeldProbe::AtRemoval
         };
-        self.evict_with_stop(policy, stop_at, held_probe, origin, &mut |_| false)
+        self.evict_with_stop(
+            policy,
+            stop_at,
+            held_probe,
+            origin,
+            &mut |_| false,
+            &mut || false,
+        )
     }
 
     fn evict_with_stop(
@@ -7216,6 +7225,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         held_probe: HeldProbe,
         origin: SweepOrigin,
         stop: &mut dyn FnMut(Duration) -> bool,
+        short_of_space: &mut dyn FnMut() -> bool,
     ) -> Result<GcStats> {
         let candidates = self.eviction_candidates_for(origin)?;
         let order = policy.select(&candidates);
@@ -7274,6 +7284,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             &held,
             held_probe == HeldProbe::PerEntry,
             stop,
+            short_of_space,
         );
         stats.bytes_held = bytes_held;
         stats.entries_unreclaimable += held.len();
@@ -7375,18 +7386,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// [`Self::evict`] for a sweep started by `origin`.
     pub fn evict_for(&self, origin: SweepOrigin) -> Result<GcStats> {
-        self.refuse_write("evict")?;
-        let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
         // dedup-heavy store the logical figure over-reports by exactly the
         // dedup savings, firing GC while the disk is comfortable and
         // destroying rebuild value without reclaiming space (#608).
-        let size_before = self.physical_size()?;
-        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
-            return Ok(GcStats::default());
-        }
-
+        //
         // The ranking is computed once and walked while deleting: each entry's
         // score is independent of the others, so the order stays valid as rows
         // disappear. The walk subtracts the bytes each removal actually freed
@@ -7394,11 +7399,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // store without re-querying. A removal that frees less than its
         // ranked `reclaimable_bytes` promised (a twin evicted earlier in the
         // same sweep) only makes the sweep continue longer — never stop early.
-        self.evict_with(
+        self.evict_for_free_space(origin, || false)
+    }
+
+    /// [`Self::evict_for`] on a volume builds keep filling while it runs.
+    /// `short_of_space` says whether the volume is short of free space
+    /// now; the sweep asks it each time it reaches its byte target and
+    /// goes on evicting while it is. The target counts only the bytes the
+    /// sweep freed, not those builds wrote meanwhile: on 2026-10-26 a
+    /// sweep reached it while the disk fell from 91 to 15 GiB free.
+    pub fn evict_for_free_space(
+        &self,
+        origin: SweepOrigin,
+        mut short_of_space: impl FnMut() -> bool,
+    ) -> Result<GcStats> {
+        self.refuse_write("evict")?;
+        let target = crate::eviction::eviction_target(self.config.max_size);
+        let size_before = self.physical_size()?;
+        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
+            return Ok(GcStats::default());
+        }
+        self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             Some((size_before, target)),
-            true,
+            HeldProbe::Upfront,
             origin,
+            &mut |_| false,
+            &mut short_of_space,
         )
     }
 
@@ -7423,6 +7450,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             HeldProbe::PerEntry,
             SweepOrigin::Automatic,
             &mut stop,
+            &mut || false,
         )
     }
 
@@ -7471,6 +7499,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             &std::collections::HashMap::new(),
             false,
             &mut |_| false,
+            &mut || false,
         ))
     }
 
