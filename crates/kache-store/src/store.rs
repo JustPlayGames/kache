@@ -1402,6 +1402,10 @@ pub fn is_sqlite_contention(err: &anyhow::Error) -> bool {
 /// 5 s timeout every store connection sets.
 const STORE_LOCK_ATTEMPTS: u32 = 4;
 
+/// How long a writable index connection waits for a lock held elsewhere
+/// ([`initialize_db`]).
+const INDEX_BUSY_WAIT: Duration = Duration::from_millis(5000);
+
 /// Whether `err` is SQLite's busy or locked answer.
 fn is_sqlite_busy(err: &SqlError) -> bool {
     matches!(
@@ -1596,6 +1600,9 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     /// Where memo rows go that this store's index was too busy to take
     /// ([`Self::send_busy_memo_rows_to`]).
     busy_memo_rows: Option<MemoRowSink>,
+    /// How long this connection waits for a lock held elsewhere: what a call
+    /// that waits with a timeout of its own gives back afterwards.
+    busy_wait: std::cell::Cell<Duration>,
 }
 
 /// A file-hash memo row: `hash` is the content of the file at exactly
@@ -2369,7 +2376,7 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     db.pragma_update(None, "synchronous", "NORMAL")?;
     // Let concurrent writers retry for up to 5 s instead of failing immediately
     // with SQLITE_BUSY -- critical when 300+ wrapper processes hit the DB in parallel.
-    db.pragma_update(None, "busy_timeout", "5000")?;
+    db.busy_timeout(INDEX_BUSY_WAIT)?;
 
     // Every statement below is a no-op on a current index, yet each one still
     // opens a write transaction, so every wrapper process queued behind
@@ -3054,6 +3061,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             hit_stamps: None,
             pending_pins: None,
             busy_memo_rows: None,
+            busy_wait: std::cell::Cell::new(INDEX_BUSY_WAIT),
         };
 
         // A quarantined index comes back empty, but the blobs and every entry's
@@ -3139,7 +3147,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         let db = open_index_db_readonly(&db_path)?;
-        db.busy_timeout(Duration::from_secs(2))?;
+        let busy_wait = Duration::from_secs(2);
+        db.busy_timeout(busy_wait)?;
         // An index that cannot be read fails here, once, not as a miss per unit.
         db.query_row("SELECT 1 FROM entries LIMIT 1", [], |_| Ok(()))
             .optional()
@@ -3155,6 +3164,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             hit_stamps: None,
             pending_pins: None,
             busy_memo_rows: None,
+            busy_wait: std::cell::Cell::new(busy_wait),
         })
     }
 
@@ -3400,6 +3410,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             && self.file_hash_at(&current).is_none()
     }
 
+    /// Give the connection back its own busy timeout after a call that
+    /// waited with another.
+    fn give_back_busy_timeout(&self) {
+        let _ = self.db.busy_timeout(self.busy_wait.get());
+    }
+
     /// One transaction for `rows`, waiting at most `wait` for the write lock.
     fn write_memo_rows(&self, rows: &[MemoRow], wait: Duration) -> rusqlite::Result<()> {
         let _ = self.db.busy_timeout(wait);
@@ -3419,7 +3435,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             self.db.execute_batch("COMMIT")
         })();
-        let _ = self.db.busy_timeout(Duration::from_millis(5000));
+        self.give_back_busy_timeout();
         if written.is_err() && !self.db.is_autocommit() {
             let _ = self.db.execute_batch("ROLLBACK");
         }
@@ -3625,7 +3641,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                  WHERE cache_key = ?1",
                 params![cache_key],
             );
-            let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
+            self.give_back_busy_timeout();
             if let Err(error) = stamped {
                 tracing::debug!(
                     "hit on {} not stamped (index busy): {error}",
@@ -4774,7 +4790,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             &self.db,
             rusqlite::TransactionBehavior::Immediate,
         );
-        let _ = self.db.busy_timeout(Duration::from_millis(5000));
+        self.give_back_busy_timeout();
         started
     }
 
@@ -6649,7 +6665,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             let begun = self.db.execute_batch("BEGIN IMMEDIATE");
             if wait.is_some() {
-                let _ = self.db.busy_timeout(Duration::from_millis(5000));
+                self.give_back_busy_timeout();
             }
             begun?;
         }
@@ -8664,6 +8680,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     #[doc(hidden)]
     pub fn set_busy_timeout_for_test(&self, wait: Duration) {
         self.db.busy_timeout(wait).unwrap();
+        self.busy_wait.set(wait);
     }
 
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
