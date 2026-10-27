@@ -53,6 +53,28 @@ fn automatic_identity_publish_reports_when_work_was_attempted() {
     assert!(daemon.maybe_publish_identity_manifest(Some("id/test"), "session"));
 }
 
+/// A daemon a build started stops after an hour without work unless an idle
+/// timeout is configured (0 included); a service's or a person's
+/// `kache daemon run` keeps the configured one, 0 by default.
+#[test]
+fn only_an_unconfigured_auto_started_daemon_stops_after_an_idle_hour() {
+    // (configured value, explicitly configured, auto-started) -> seconds
+    for (configured, explicit, auto, expected) in [
+        (0, false, true, AUTO_STARTED_IDLE_TIMEOUT_SECS),
+        (0, true, true, 0),
+        (600, true, true, 600),
+        (0, false, false, 0),
+        (600, true, false, 600),
+    ] {
+        assert_eq!(
+            effective_idle_timeout_secs(configured, explicit, auto),
+            expected,
+            "configured {configured}, explicit {explicit}, auto-started {auto}"
+        );
+    }
+    assert_eq!(AUTO_STARTED_IDLE_TIMEOUT_SECS, 3600);
+}
+
 /// kunobi-ninja/kache#706: an auto-spawned daemon must not inherit the
 /// remote of whichever build started it, or its remote becomes a lottery
 /// decided by the startup race — the reported case logged 2,330
@@ -237,6 +259,11 @@ fn detached_daemon_survives_sigint_to_the_callers_group() {
             "{name} leaked into the daemon's environment"
         );
     }
+    let auto_started = format!("{AUTO_STARTED_ENV}=1");
+    assert!(
+        env.lines().any(|line| line == auto_started),
+        "the daemon must know a build started it, for its idle timeout: {env}"
+    );
     let log = std::fs::read_to_string(root.join("daemon.log")).unwrap();
     assert_eq!(log, "daemon-stderr\n", "stderr must go to the daemon log");
 }

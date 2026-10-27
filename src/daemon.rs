@@ -7027,6 +7027,44 @@ fn daemon_idle_timeout(seconds: u64) -> Option<Duration> {
     std::num::NonZeroU64::new(seconds).map(|seconds| Duration::from_secs(seconds.get()))
 }
 
+/// Set on a daemon a build starts by itself ([`spawn_detached_daemon`]), never
+/// on one a login service (systemd, launchd, Task Scheduler) or a person runs
+/// with `kache daemon run`.
+pub(crate) const AUTO_STARTED_ENV: &str = "KACHE_DAEMON_AUTO_STARTED";
+
+/// How long an auto-started daemon waits without work before it stops, when
+/// no idle timeout is configured. Nothing supervises such a daemon, so with no
+/// timeout it held its memory and store open until the next reboot on every
+/// machine without the service; the next build starts it again.
+pub(crate) const AUTO_STARTED_IDLE_TIMEOUT_SECS: u64 = 3600;
+
+/// The idle timeout this daemon runs with: the configured one, except that an
+/// auto-started daemon whose timeout nobody configured stops after
+/// [`AUTO_STARTED_IDLE_TIMEOUT_SECS`]. A configured 0 keeps it running.
+fn effective_idle_timeout_secs(
+    configured: u64,
+    explicitly_configured: bool,
+    auto_started: bool,
+) -> u64 {
+    if auto_started && !explicitly_configured {
+        AUTO_STARTED_IDLE_TIMEOUT_SECS
+    } else {
+        configured
+    }
+}
+
+/// Whether `KACHE_DAEMON_IDLE_TIMEOUT` or the config file's
+/// `cache.daemon_idle_timeout_secs` sets the idle timeout (as the config
+/// resolves it: a value that is not a number is ignored there too).
+fn idle_timeout_is_configured() -> bool {
+    std::env::var("KACHE_DAEMON_IDLE_TIMEOUT").is_ok_and(|value| value.parse::<u64>().is_ok())
+        || Config::load_file_config()
+            .ok()
+            .and_then(|file| file.cache)
+            .and_then(|cache| cache.daemon_idle_timeout_secs)
+            .is_some()
+}
+
 /// The shutdown warning for `unpublished` hand-offs the publish worker never
 /// stored, or `None` when it stored them all.
 fn publish_drain_warning(unpublished: usize) -> Option<String> {
@@ -7453,7 +7491,21 @@ async fn server_main(
     // Prevents zombie daemons from accumulating when the user isn't building.
     // The daemon will be auto-started again on the next build.
     // Configurable via KACHE_DAEMON_IDLE_TIMEOUT or config.toml; 0 = disabled.
-    let idle_timeout = daemon_idle_timeout(config.daemon_idle_timeout_secs);
+    // Unconfigured, an auto-started daemon stops after an hour and a service's
+    // daemon runs on.
+    let auto_started = std::env::var_os(AUTO_STARTED_ENV).is_some();
+    let idle_secs = effective_idle_timeout_secs(
+        config.daemon_idle_timeout_secs,
+        idle_timeout_is_configured(),
+        auto_started,
+    );
+    if auto_started && idle_secs != 0 {
+        tracing::info!(
+            idle_secs,
+            "auto-started daemon: stops after this long without work"
+        );
+    }
+    let idle_timeout = daemon_idle_timeout(idle_secs);
 
     accept_loop(
         &listener,
@@ -10295,6 +10347,7 @@ fn spawn_detached_daemon(
 ) -> Result<kunobi_daemon::launch::DaemonChild> {
     let mut command = daemon_run_command(exe);
     strip_ambient_remote_env(&mut command);
+    command.env(AUTO_STARTED_ENV, "1");
     let mut daemon = detached_command(&command);
     daemon.stderr(stderr_target).readiness_channel();
     let child = {
