@@ -16,8 +16,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 mod deadline_io;
-#[cfg(any(windows, test))]
-mod windows_security_attributes;
 pub use deadline_io::finish_by;
 
 pub use interprocess::local_socket::ListenerOptions;
@@ -724,11 +722,9 @@ pub mod jobserver;
 
 #[cfg(any(unix, windows))]
 pub mod execution;
-#[cfg(any(windows, test))]
-mod token_attributes;
 #[cfg(windows)]
 pub mod windows_msvc;
 #[cfg(windows)]
 pub mod windows_process;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod windows_security;
