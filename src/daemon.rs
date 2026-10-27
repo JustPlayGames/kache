@@ -9346,6 +9346,7 @@ pub(crate) fn seed_new_target(
         rustc_version,
         &donors,
         &config.cache_dir,
+        &|paths| store.recorded_file_hashes(paths),
         deadline,
         check_lane,
     );

@@ -526,39 +526,149 @@ fn unit_hashes(name: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// The store's memo rows for a donor's artifacts, by path, each with the
+/// stamp it was recorded under
+/// ([`kache_store::file_hash::FileHashCache::recorded_at`]).
+pub(crate) type RecordedHashes = HashMap<String, (kache_store::file_hash::FileFingerprint, String)>;
+
+/// Reads the memo rows for the paths it is given; [`no_recorded_hashes`]
+/// when there is no store to ask.
+pub(crate) type RecordedLookup<'a> = &'a dyn Fn(&[&str]) -> RecordedHashes;
+
+/// A [`RecordedLookup`] that knows no hashes: every artifact is read.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn no_recorded_hashes(_: &[&str]) -> RecordedHashes {
+    RecordedHashes::new()
+}
+
+/// Whether `file` is an artifact a dependent's `--extern` reads.
+fn is_artifact(file: &Path) -> bool {
+    file.extension().is_some_and(|ext| {
+        ["rlib", "rmeta", "dylib", "so", "dll"].contains(&&*ext.to_string_lossy())
+    })
+}
+
+/// The unit's artifacts ([`is_artifact`]), or `None` once `deadline` passes.
+fn unit_artifacts(
+    from: &Path,
+    layout: Layout,
+    unit: &Unit,
+    deps: &HashMap<String, Vec<PathBuf>>,
+    deadline: Instant,
+) -> Option<Vec<PathBuf>> {
+    let mut files = match layout {
+        Layout::PerUnit => vec![from.join("build").join(&unit.package).join(&unit.hash)],
+        Layout::Shared => deps.get(&unit.hash).cloned().unwrap_or_default(),
+    };
+    let mut artifacts = Vec::new();
+    while let Some(file) = files.pop() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
+            files.extend(entries(&file));
+        } else if is_artifact(&file) {
+            artifacts.push(file);
+        }
+    }
+    Some(artifacts)
+}
+
+/// The memo rows for every artifact of `units`, read in one lookup before
+/// the copy threads start.
+fn recorded_for_units(
+    from: &Path,
+    layout: Layout,
+    units: &[Unit],
+    deps: &HashMap<String, Vec<PathBuf>>,
+    recorded: RecordedLookup,
+    deadline: Instant,
+) -> RecordedHashes {
+    let paths: Vec<String> = units
+        .iter()
+        .filter_map(|unit| unit_artifacts(from, layout, unit, deps, deadline))
+        .flatten()
+        .map(|file| {
+            kache_store::file_hash::absolute_path(&file)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    if paths.is_empty() || Instant::now() >= deadline {
+        return RecordedHashes::new();
+    }
+    recorded(&paths.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// Whether the donor file `file` is byte for byte a blob in `store`, read
+/// only when the store cannot vouch for it. The memo's row for its path
+/// vouches when the file's whole stamp (size, modification and change times,
+/// inode) is the one the row was recorded under, as a dependent's key takes
+/// it for the same file. Or the file is the blob the row names: the same
+/// inode, which nobody may write ([`is_blob_inode`]). Links come and go on
+/// such an inode with every target that restores or seeds it, and each one
+/// moves its change time, so only this second check lasts on a busy store.
+fn is_stored_blob(file: &Path, recorded: &RecordedHashes, store: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(file) else {
+        return false;
+    };
+    let now = kache_store::file_hash::FileFingerprint::from_metadata(file, &metadata);
+    if let Some((stamp, hash)) = recorded.get(&now.path) {
+        let blob = kache_store::blob_path_in_store_dir(store, hash);
+        if *stamp == now {
+            return blob.is_file();
+        }
+        if is_blob_inode(&metadata, &blob) {
+            return true;
+        }
+    }
+    kache_store::file_hash::hash_file(file)
+        .is_ok_and(|hash| kache_store::blob_path_in_store_dir(store, &hash).is_file())
+}
+
+/// Whether `metadata` is of the inode at `blob`, and nobody may write it.
+/// The store names a blob by the hash of its bytes and keeps it without
+/// write permission, so a link to it holds those bytes, as every restore
+/// and every seeded link ([`shares_inode`]) already relies on.
+#[cfg(unix)]
+fn is_blob_inode(metadata: &std::fs::Metadata, blob: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    metadata.is_file()
+        && metadata.permissions().mode() & 0o222 == 0
+        && std::fs::metadata(blob).is_ok_and(|blob| {
+            blob.is_file() && blob.dev() == metadata.dev() && blob.ino() == metadata.ino()
+        })
+}
+
+/// Without inode numbers, a blob's link is known only by its stamp.
+#[cfg(not(unix))]
+fn is_blob_inode(_: &std::fs::Metadata, _: &Path) -> bool {
+    false
+}
+
 /// Whether every artifact of the unit, what a dependent's `--extern` reads,
 /// is byte for byte a blob in this cache. A dependent's key hashes those
 /// bytes, and another kache or a build without kache writes different ones
 /// for the same Cargo unit; such a unit is left for Cargo to build through
-/// the cache.
+/// the cache. A file the store vouches for ([`is_stored_blob`]) is not read
+/// again: under load, reading every donor rlib back (0.7-1.2 GB a seeding)
+/// left hundreds of units past the deadline.
 fn artifacts_stored(
     from: &Path,
     layout: Layout,
     unit: &Unit,
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
+    recorded: &RecordedHashes,
     deadline: Instant,
 ) -> bool {
-    let mut files = match layout {
-        Layout::PerUnit => vec![from.join("build").join(&unit.package).join(&unit.hash)],
-        Layout::Shared => deps.get(&unit.hash).cloned().unwrap_or_default(),
+    let Some(files) = unit_artifacts(from, layout, unit, deps, deadline) else {
+        return false;
     };
     let store = cache_dir.join("store");
-    while let Some(file) = files.pop() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        if std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
-            files.extend(entries(&file));
-        } else if file.extension().is_some_and(|ext| {
-            ["rlib", "rmeta", "dylib", "so", "dll"].contains(&&*ext.to_string_lossy())
-        }) && !kache_store::file_hash::hash_file(&file)
-            .is_ok_and(|hash| kache_store::blob_path_in_store_dir(&store, &hash).is_file())
-        {
-            return false;
-        }
-    }
-    true
+    files
+        .iter()
+        .all(|file| Instant::now() < deadline && is_stored_blob(file, recorded, &store))
 }
 
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
@@ -962,17 +1072,27 @@ pub(crate) fn seed(
     cache_dir: &Path,
     deadline: Instant,
 ) -> Seeded {
-    seed_for_lane(target, rustc_version, donors, cache_dir, deadline, false)
+    seed_for_lane(
+        target,
+        rustc_version,
+        donors,
+        cache_dir,
+        &no_recorded_hashes,
+        deadline,
+        false,
+    )
 }
 
 /// [`seed`], and for a build that only checks (`check_lane`), only the units
 /// a check of the donor's workspace used ([`check_demand`]). Without such a
-/// record in the donor, every unit, as [`seed`].
+/// record in the donor, every unit, as [`seed`]. `recorded` reads the
+/// store's memo rows for the donor's artifacts ([`artifacts_stored`]).
 pub(crate) fn seed_for_lane(
     target: &NewTarget,
     rustc_version: &str,
     donors: &[Donor],
     cache_dir: &Path,
+    recorded: RecordedLookup,
     deadline: Instant,
     check_lane: bool,
 ) -> Seeded {
@@ -1022,6 +1142,7 @@ pub(crate) fn seed_for_lane(
                 units.len()
             );
         }
+        let recorded = recorded_for_units(&from, layout, &units, &deps, recorded, deadline);
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
         let files = FileCounts::default();
@@ -1029,8 +1150,8 @@ pub(crate) fn seed_for_lane(
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
                 let cancellation = cancellation.clone();
-                let (units, next, copied, from, to, deps, files) =
-                    (&units, &next, &copied, &from, &to, &deps, &files);
+                let (units, next, copied, from, to, deps, files, recorded) =
+                    (&units, &next, &copied, &from, &to, &deps, &files, &recorded);
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
@@ -1043,7 +1164,9 @@ pub(crate) fn seed_for_lane(
                         if marker(to, layout, unit).exists()
                             || names_the_donor(from, layout, unit, donor)
                             || out_dir_names_the_donor(from, layout, unit, donor, deadline)
-                            || !artifacts_stored(from, layout, unit, deps, cache_dir, deadline)
+                            || !artifacts_stored(
+                                from, layout, unit, deps, cache_dir, recorded, deadline,
+                            )
                         {
                             continue;
                         }
@@ -2455,6 +2578,80 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    /// A donor artifact whose memo row holds for its whole current stamp, or
+    /// that is a read-only link to the blob its row names, is taken as that
+    /// blob without being read; anything else reads it. The donor's bytes
+    /// here differ from the stored blob the row names, so only an artifact
+    /// that was not read passes.
+    #[test]
+    fn the_store_vouches_for_a_donor_artifact_by_its_stamp_or_its_blobs_inode() {
+        use kache_store::file_hash::FileFingerprint;
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let profile = donor.target_dir.join(PROFILE);
+            let rlib = match layout {
+                Layout::PerUnit => profile.join("build/dep").join(HASH).join("out/lib.rlib"),
+                Layout::Shared => profile.join("deps").join(format!("libdep-{HASH}.rlib")),
+            };
+            write(&rlib, "RLIB");
+            let deps = deps_by_hash(&profile.join("deps"));
+            let cache = cache_storing(&dir.path().join("cache"), &["rlib"]);
+            let stored = blake3::hash(b"rlib").to_hex().to_string();
+            let stamp = FileFingerprint::from_path(&rlib).unwrap();
+            let stored_at = |stamp: FileFingerprint, hash: &str| {
+                let recorded = RecordedHashes::from([(stamp.path.clone(), (stamp, hash.into()))]);
+                artifacts_stored(
+                    &profile,
+                    layout,
+                    &unit("dep", HASH),
+                    &deps,
+                    &cache,
+                    &recorded,
+                    later(),
+                )
+            };
+            assert!(stored_at(stamp.clone(), &stored), "{layout:?}");
+            let unstored = blake3::hash(b"other").to_hex().to_string();
+            assert!(!stored_at(stamp.clone(), &unstored), "{layout:?}");
+            type Change = fn(&mut FileFingerprint);
+            let changes: [(&str, Change); 4] = [
+                ("size", |stamp| stamp.size += 1),
+                ("mtime", |stamp| stamp.mtime_ns -= 1),
+                ("ctime", |stamp| stamp.ctime_ns -= 1),
+                ("inode", |stamp| stamp.inode += 1),
+            ];
+            for (field, change) in changes {
+                let mut stale = stamp.clone();
+                change(&mut stale);
+                assert!(!stored_at(stale, &stored), "{layout:?} {field}");
+            }
+            // A link to the blob the row names is that blob at any stamp,
+            // while nobody may write the inode. The blob's bytes here are not
+            // the ones its name says, so again only an unread link passes.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let blob = kache_store::blob_path_in_store_dir(&cache.join("store"), &stored);
+                std::fs::write(&blob, "RLIB").unwrap();
+                std::fs::remove_file(&rlib).unwrap();
+                std::fs::hard_link(&blob, &rlib).unwrap();
+                let mode = |mode| {
+                    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(mode)).unwrap()
+                };
+                mode(0o444);
+                let mut stale = FileFingerprint::from_path(&rlib).unwrap();
+                stale.ctime_ns -= 1;
+                assert!(stored_at(stale.clone(), &stored), "{layout:?} link");
+                cache_storing(&dir.path().join("cache"), &["other"]);
+                let other = blake3::hash(b"other").to_hex().to_string();
+                assert!(!stored_at(stale.clone(), &other), "{layout:?} another blob");
+                mode(0o644);
+                assert!(!stored_at(stale, &stored), "{layout:?} writable link");
+            }
+        }
+    }
+
     #[test]
     fn stored_artifact_validation_stops_at_the_seed_deadline() {
         for layout in [Layout::PerUnit, Layout::Shared] {
@@ -2470,6 +2667,7 @@ source = "git+https://example.com/gitdep#abc"
                 &unit,
                 &deps,
                 &cache,
+                &RecordedHashes::new(),
                 later()
             ));
             assert!(!artifacts_stored(
@@ -2478,6 +2676,7 @@ source = "git+https://example.com/gitdep#abc"
                 &unit,
                 &deps,
                 &cache,
+                &RecordedHashes::new(),
                 Instant::now(),
             ));
         }
@@ -4277,7 +4476,15 @@ source = "git+https://example.com/gitdep#abc"
         let stored = cache_storing(&dir.path().join("cache"), &["x"]);
         let check = checkout(dir.path(), "check");
         assert_eq!(
-            seed_for_lane(&check, VERSION, &donors, &stored, later(), true),
+            seed_for_lane(
+                &check,
+                VERSION,
+                &donors,
+                &stored,
+                &no_recorded_hashes,
+                later(),
+                true
+            ),
             Seeded {
                 units: 2,
                 donor: Some(checks.workspace_root.clone()),
@@ -4287,7 +4494,15 @@ source = "git+https://example.com/gitdep#abc"
         // A build still takes the donor holding the most.
         let build = checkout(dir.path(), "build");
         assert_eq!(
-            seed_for_lane(&build, VERSION, &donors, &stored, later(), false),
+            seed_for_lane(
+                &build,
+                VERSION,
+                &donors,
+                &stored,
+                &no_recorded_hashes,
+                later(),
+                false
+            ),
             Seeded {
                 units: 3,
                 donor: Some(tests.workspace_root.clone()),

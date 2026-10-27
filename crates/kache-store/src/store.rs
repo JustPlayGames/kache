@@ -3402,6 +3402,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.file_hash_cache().get(fingerprint).ok().flatten()
     }
 
+    /// The memo's rows for `paths`, each with the stamp it was recorded
+    /// under ([`crate::file_hash::FileHashCache::recorded_at`]), read-only.
+    /// A failed read reads as no rows.
+    pub fn recorded_file_hashes(
+        &self,
+        paths: &[&str],
+    ) -> std::collections::HashMap<String, (crate::file_hash::FileFingerprint, String)> {
+        self.file_hash_cache()
+            .recorded_at(paths)
+            .unwrap_or_else(|error| {
+                tracing::debug!("file hash memo lookup failed: {error}");
+                std::collections::HashMap::new()
+            })
+    }
+
     /// Associate a stable file with its already-known content hash, avoiding a
     /// redundant read when it becomes a compiler input. Call this only after
     /// every store-side operation that may change the file's fingerprint and

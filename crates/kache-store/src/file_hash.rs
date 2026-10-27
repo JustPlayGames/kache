@@ -274,35 +274,48 @@ impl<'db> FileHashCache<'db> {
         &self,
         fingerprints: &[&FileFingerprint],
     ) -> rusqlite::Result<std::collections::HashMap<String, String>> {
+        let wanted: std::collections::HashSet<&FileFingerprint> =
+            fingerprints.iter().copied().collect();
+        let paths: Vec<&str> = fingerprints.iter().map(|f| f.path.as_str()).collect();
+        Ok(self
+            .recorded_at(&paths)?
+            .into_values()
+            .filter(|(stamp, _)| wanted.contains(stamp))
+            .map(|(stamp, hash)| (stamp.path, hash))
+            .collect())
+    }
+
+    /// The memo's row for each of `paths` that has one, keyed by path: the
+    /// stamp it was recorded under and the hash, under [`FILE_HASH_RULE`] or
+    /// a later rule. A row stands for the file's bytes only while the file's
+    /// whole stamp is the recorded one; the caller compares the two, as
+    /// [`get`](Self::get) does.
+    pub fn recorded_at(
+        &self,
+        paths: &[&str],
+    ) -> rusqlite::Result<std::collections::HashMap<String, (FileFingerprint, String)>> {
         let mut found = std::collections::HashMap::new();
-        for chunk in fingerprints.chunks(FILE_HASH_LOOKUP_CHUNK) {
-            let wanted: std::collections::HashSet<&FileFingerprint> =
-                chunk.iter().copied().collect();
+        for chunk in paths.chunks(FILE_HASH_LOOKUP_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let mut stmt = self.db().prepare_cached(&format!(
                 "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
                  WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}"
             ))?;
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(chunk.iter().map(|f| f.path.as_str())),
-                |row| {
-                    Ok((
-                        FileFingerprint {
-                            path: row.get(0)?,
-                            size: row.get(1)?,
-                            mtime_ns: row.get(2)?,
-                            ctime_ns: row.get(3)?,
-                            inode: row.get(4)?,
-                        },
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    FileFingerprint {
+                        path: row.get(0)?,
+                        size: row.get(1)?,
+                        mtime_ns: row.get(2)?,
+                        ctime_ns: row.get(3)?,
+                        inode: row.get(4)?,
+                    },
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
             for row in rows {
                 let (stamp, hash) = row?;
-                if wanted.contains(&stamp) {
-                    found.insert(stamp.path, hash);
-                }
+                found.insert(stamp.path.clone(), (stamp, hash));
             }
         }
         Ok(found)
