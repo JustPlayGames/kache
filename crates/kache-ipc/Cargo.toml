@@ -36,5 +36,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+# The AppContainer refusal test creates a profile.
+windows-sys = { version = "0.61", features = ["Win32_Security_Isolation"] }
+
 [lints.rust]
 warnings = "deny"

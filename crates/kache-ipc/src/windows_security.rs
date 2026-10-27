@@ -319,8 +319,7 @@ mod tests {
     #[test]
     fn a_child_of_the_same_user_has_the_same_context() {
         use std::os::windows::io::AsHandle;
-        // Windows 11 gives the child a ModifiedId and TSA://ProcUnique values
-        // of its own; nothing else about its token differs.
+        // The child's token has TSA://ProcUnique values of its own.
         let mut child = std::process::Command::new("cmd.exe")
             .args(["/d", "/q", "/k"])
             .stdin(std::process::Stdio::piped())
@@ -332,6 +331,192 @@ mod tests {
         let _ = child.kill();
         child.wait().unwrap();
         assert!(matches.unwrap());
+    }
+
+    #[test]
+    fn a_token_of_another_generation_differing_only_by_the_nonce_matches() {
+        // Two processes the same user starts apart (a terminal, and the
+        // daemon from kache's logon task or another terminal) carry tokens
+        // of different generations (ModifiedId), each with its own
+        // TSA://ProcUnique: a modified copy of this process's token whose
+        // privileges end as they began stands for the other one.
+        let token = token(
+            unsafe { GetCurrentProcess() },
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+        )
+        .unwrap();
+        let mut copy = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                DuplicateTokenEx(
+                    token.as_raw_handle(),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenPrimary,
+                    &mut copy,
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        let copy = unsafe { OwnedHandle::from_raw_handle(copy) };
+        let before = privileges(copy.as_raw_handle()).unwrap();
+        let mut change_notify = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: unsafe { std::mem::zeroed() },
+                Attributes: 0,
+            }],
+        };
+        let name = "SeChangeNotifyPrivilege"
+            .encode_utf16()
+            .chain([0])
+            .collect::<Vec<u16>>();
+        assert_ne!(
+            unsafe {
+                LookupPrivilegeValueW(
+                    std::ptr::null(),
+                    name.as_ptr(),
+                    &mut change_notify.Privileges[0].Luid,
+                )
+            },
+            0
+        );
+        for attributes in [0, SE_PRIVILEGE_ENABLED] {
+            change_notify.Privileges[0].Attributes = attributes;
+            assert_ne!(
+                unsafe {
+                    AdjustTokenPrivileges(
+                        copy.as_raw_handle(),
+                        0,
+                        &change_notify,
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+        }
+        assert_eq!(privileges(copy.as_raw_handle()).unwrap(), before);
+        let generation = |token: HANDLE| {
+            let statistics = Information::read(token, TokenStatistics)
+                .unwrap()
+                .value::<TOKEN_STATISTICS>()
+                .unwrap();
+            (statistics.ModifiedId.HighPart, statistics.ModifiedId.LowPart)
+        };
+        assert_ne!(
+            generation(token.as_raw_handle()),
+            generation(copy.as_raw_handle())
+        );
+        assert!(equivalent(token.as_raw_handle(), copy.as_raw_handle()).unwrap());
+        assert!(equivalent(copy.as_raw_handle(), token.as_raw_handle()).unwrap());
+    }
+
+    #[test]
+    fn an_appcontainer_child_of_the_same_user_is_refused() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::Isolation::{
+            CreateAppContainerProfile, DeleteAppContainerProfile,
+            DeriveAppContainerSidFromAppContainerName,
+        };
+        use windows_sys::Win32::System::Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
+            EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+            LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            PROCESS_INFORMATION, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+        };
+        let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+        // The same user and logon session as the daemon, with an AppContainer
+        // token (its own SID, package attributes): the pipeline stays local.
+        let name = wide(&format!("kache-test-{}", std::process::id()));
+        let mut sid: PSID = std::ptr::null_mut();
+        let created = unsafe {
+            CreateAppContainerProfile(
+                name.as_ptr(),
+                name.as_ptr(),
+                name.as_ptr(),
+                std::ptr::null(),
+                0,
+                &mut sid,
+            )
+        };
+        if created < 0 {
+            assert_eq!(
+                unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) },
+                0,
+                "CreateAppContainerProfile {created:#x}"
+            );
+        }
+        let mut capabilities = SECURITY_CAPABILITIES {
+            AppContainerSid: sid,
+            Capabilities: std::ptr::null_mut(),
+            CapabilityCount: 0,
+            Reserved: 0,
+        };
+        let mut size = 0;
+        unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+        let mut list = vec![0usize; size.div_ceil(size_of::<usize>())];
+        let attributes: LPPROC_THREAD_ATTRIBUTE_LIST = list.as_mut_ptr().cast();
+        assert_ne!(
+            unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &mut size) },
+            0
+        );
+        assert_ne!(
+            unsafe {
+                UpdateProcThreadAttribute(
+                    attributes,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    (&raw mut capabilities).cast(),
+                    size_of::<SECURITY_CAPABILITIES>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attributes;
+        let mut command = wide(r"C:\Windows\System32\cmd.exe /d /q /c exit");
+        let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let spawned = unsafe {
+            CreateProcessW(
+                std::ptr::null(),
+                command.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                std::ptr::null(),
+                std::ptr::null(),
+                &startup.StartupInfo,
+                &mut process,
+            )
+        };
+        let spawn_error = io::Error::last_os_error();
+        unsafe { DeleteProcThreadAttributeList(attributes) };
+        let matches = (spawned != 0).then(|| {
+            let child = unsafe { BorrowedHandle::borrow_raw(process.hProcess) };
+            let matches = matches_daemon(child);
+            unsafe {
+                TerminateProcess(process.hProcess, 1);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+            }
+            matches
+        });
+        unsafe {
+            FreeSid(sid);
+            DeleteAppContainerProfile(name.as_ptr());
+        }
+        let matches = matches.unwrap_or_else(|| panic!("CreateProcessW: {spawn_error}"));
+        // The daemon declines on an error as on a mismatch.
+        assert!(!matches.unwrap_or(false));
     }
 
     #[test]
