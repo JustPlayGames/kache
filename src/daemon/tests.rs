@@ -3,6 +3,44 @@ use super::*;
 use std::fs;
 use std::sync::mpsc;
 
+#[cfg(any(unix, windows))]
+#[test]
+fn compiler_request_capacity_handles_bursts_and_recovers_after_drop() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = test_config(root.path());
+    config.daemon_execution_concurrency = Some(32);
+    let daemon = Daemon::new(config);
+    let workers = daemon.execution_workers.clone();
+    let mut requests = Vec::new();
+
+    // A cache-hit burst must fit even on a host with fewer than 32 CPUs.
+    for _ in 0..32 {
+        requests.push(
+            workers
+                .clone()
+                .try_acquire_owned()
+                .expect("pipeline request rejected before the burst limit"),
+        );
+    }
+    assert!(workers.clone().try_acquire_owned().is_err());
+
+    drop(requests.pop());
+    let replacement = workers
+        .clone()
+        .try_acquire_owned()
+        .expect("a finished request must release its slot");
+    assert!(workers.clone().try_acquire_owned().is_err());
+
+    drop(replacement);
+    drop(requests);
+    let next_burst = workers
+        .clone()
+        .try_acquire_many_owned(32)
+        .expect("all slots must be reusable after the burst finishes");
+    assert!(workers.try_acquire_owned().is_err());
+    drop(next_burst);
+}
+
 #[test]
 fn identity_publish_context_requires_both_nonempty_values() {
     assert_eq!(identity_publish_context(None, "session", true, false), None);
@@ -930,6 +968,7 @@ fn compile_started_wire_tags_and_stats_default() {
             eta_s: None,
         }],
         effective_config: Some(EffectiveConfig {
+            process: None,
             max_size: 1,
             cache_dir: "/c".into(),
             runtime_dir: "/c".into(),
@@ -1329,6 +1368,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         daemon_publish: false,
         daemon_publish_rustc: false,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,
@@ -1803,6 +1843,7 @@ async fn server_main_binds_socket_and_handles_shutdown() {
             coord,
             None,
             PathBuf::from("Cargo.lock"),
+            DaemonCapacity::discover(server_config.daemon_execution_concurrency),
         )
         .await
     });
@@ -1889,6 +1930,7 @@ async fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
                 coord,
                 None,
                 PathBuf::from("Cargo.lock"),
+                DaemonCapacity::discover(server_config.daemon_execution_concurrency),
             )
             .await
         });
@@ -4778,7 +4820,8 @@ fn daemon_keeps_the_load_time_config_provenance_after_a_file_edit() {
     config.max_size = 10 * 1024 * 1024;
     std::fs::write(&config_path, "[cache]\nlocal_max_size = \"20MiB\"\n").unwrap();
 
-    let daemon = Daemon::new_with_provenance(config, &provenance);
+    let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
+    let daemon = Daemon::new_with_provenance(config, &provenance, capacity);
     assert_eq!(daemon.effective_config.max_size, 10 * 1024 * 1024);
     assert_eq!(
         daemon.effective_config.config_path,
@@ -6380,6 +6423,171 @@ async fn a_malformed_prediction_row_or_identity_is_refused() {
         .await;
     assert!(reply.ok);
     assert_eq!(reply.prediction, None);
+}
+
+#[tokio::test]
+async fn prediction_fetch_skips_a_degraded_read_direction() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+    for _ in 0..3 {
+        daemon
+            .remote_breaker
+            .note_failure("GET", "remote unavailable");
+    }
+    let response = daemon
+        .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+        .await;
+    assert!(response.ok);
+    assert_eq!(response.prediction, None);
+    assert!(daemon.remote_breaker.is_degraded());
+}
+
+#[tokio::test]
+async fn prediction_fetch_preserves_the_half_open_demand_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
+    daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::ZERO));
+    daemon
+        .remote_breaker
+        .try_acquire(RemoteOperation::DemandGet)
+        .unwrap()
+        .failure(RemoteErrorClass::Timeout, "open read direction");
+    let response = daemon
+        .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+        .await;
+    assert!(response.ok);
+    assert_eq!(response.prediction, None);
+    let probe = daemon
+        .remote_breaker
+        .try_acquire(RemoteOperation::DemandGet)
+        .expect("optional prediction fetch must leave recovery to a demand restore");
+    probe.success();
+    assert!(!daemon.remote_breaker.is_degraded());
+}
+
+#[tokio::test]
+async fn prediction_fetch_failures_open_the_read_breaker_and_stop_later_gets() {
+    for timeout in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(FailingGetBackend {
+            timeout,
+            calls: AtomicU64::new(0),
+        });
+        let mut daemon = resilience_test_daemon(dir.path(), backend.clone());
+        daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(2, Duration::from_secs(60)));
+        for _ in 0..2 {
+            let response = daemon
+                .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+                .await;
+            assert!(response.ok);
+            assert_eq!(response.prediction, None);
+        }
+        assert!(daemon.remote_breaker.is_degraded(), "timeout={timeout}");
+        let response = daemon
+            .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+            .await;
+        assert!(response.ok);
+        assert_eq!(response.prediction, None);
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 2);
+        assert!(
+            daemon
+                .remote_breaker
+                .try_acquire(RemoteOperation::UploadPut)
+                .is_some(),
+            "failed prediction reads must not suppress uploads"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prediction_fetch_answers_clear_prior_read_failures() {
+    for body in [
+        None,
+        Some(b"not a prediction row".to_vec()),
+        crate::prediction_share::encode(ROW_IDENTITY, &test_prediction_row()),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = test_remote_backend();
+        let has_row = body
+            .as_ref()
+            .is_some_and(|body| crate::prediction_share::decode(body, ROW_IDENTITY).is_some());
+        if let Some(body) = body {
+            let key = crate::config::join_remote_key(
+                &test_remote_config().prefix,
+                &format!(
+                    "v3/predictions/{}",
+                    crate::prediction_share::object_name(ROW_IDENTITY)
+                ),
+            );
+            backend
+                .put(&key, body, Some("application/json"))
+                .await
+                .unwrap();
+        }
+        let mut daemon = resilience_test_daemon(dir.path(), backend);
+        daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(2, Duration::from_secs(60)));
+        daemon
+            .remote_breaker
+            .note_failure("GET", "first backend failure");
+        let response = daemon
+            .handle_prediction_fetch(&fetch_request(ROW_IDENTITY))
+            .await;
+        assert!(response.ok);
+        assert_eq!(response.prediction, has_row.then(test_prediction_row));
+        daemon
+            .remote_breaker
+            .note_failure("GET", "first failure after answered fetch");
+        assert!(
+            !daemon.remote_breaker.is_degraded(),
+            "an answered GET resets prior failures"
+        );
+        daemon
+            .remote_breaker
+            .note_failure("GET", "second failure after answered fetch");
+        assert!(daemon.remote_breaker.is_degraded());
+    }
+}
+
+#[test]
+fn prediction_fetch_deadline_uses_the_shorter_enabled_budget() {
+    let started_at = Instant::now();
+    for (configured, seconds) in [(0, 2), (1, 1), (2, 2), (3, 2), (300, 2), (u64::MAX, 2)] {
+        assert_eq!(
+            prediction_fetch_deadline(started_at, configured).at(),
+            Some(started_at + Duration::from_secs(seconds)),
+            "configured={configured}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prediction_fetch_deadline_cancels_stalled_get_and_degrades_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut daemon = resilience_test_daemon(dir.path(), Arc::new(StallingGetBackend));
+    daemon.config.remote_restore_timeout_secs = 1;
+    daemon.remote_breaker = Arc::new(RemoteBreaker::with_policy(1, Duration::from_secs(60)));
+    let request = fetch_request(ROW_IDENTITY);
+    let fetch = daemon.handle_prediction_fetch(&request);
+    tokio::pin!(fetch);
+    // Establish the handler's deadline before starting the test's guard.
+    assert!(futures::poll!(&mut fetch).is_pending());
+    let response = tokio::time::timeout(Duration::from_millis(1_500), fetch)
+        .await
+        .expect("the configured one-second deadline must beat the two-second row cap");
+    assert!(response.ok);
+    assert_eq!(response.prediction, None);
+    assert!(
+        daemon.remote_breaker.is_degraded(),
+        "the cancelled GET must count as a failure"
+    );
+    let request = fetch_request(ROW_IDENTITY);
+    let next = daemon.handle_prediction_fetch(&request);
+    tokio::pin!(next);
+    assert!(
+        matches!(futures::poll!(&mut next), std::task::Poll::Ready(response)
+        if response.ok && response.prediction.is_none()),
+        "later requests must answer immediately"
+    );
 }
 
 #[test]
@@ -16356,34 +16564,6 @@ fn a_started_daemon_sweeps_when_the_last_sweep_is_due_and_never_at_once() {
         first_periodic_gc_delay(Some(now + Duration::from_secs(3600)), now),
         STARTUP_GC_DELAY
     );
-}
-
-#[test]
-fn the_daemon_runs_four_compiler_requests_per_hardware_thread() {
-    // A 192-thread build machine starts up to 192 units per build, and
-    // concurrent worktree builds several times that; past the limit each unit
-    // pays a whole engine start in its client.
-    assert_eq!(execution_worker_count(192), 768);
-    assert_eq!(execution_worker_count(32), 128);
-    // A small machine still runs several builds at once.
-    assert_eq!(execution_worker_count(16), MIN_EXECUTION_WORKERS);
-    assert_eq!(execution_worker_count(4), MIN_EXECUTION_WORKERS);
-    assert_eq!(execution_worker_count(0), MIN_EXECUTION_WORKERS);
-    assert_eq!(execution_worker_count(4096), MAX_EXECUTION_WORKERS);
-}
-
-#[test]
-fn compiler_requests_leave_the_default_blocking_pool_to_offloaded_work() {
-    for workers in [1, 32, 768, MAX_EXECUTION_WORKERS] {
-        assert_eq!(blocking_thread_limit(workers) - workers, OFFLOAD_BLOCKING_THREADS);
-    }
-}
-
-#[test]
-fn running_compiles_leave_the_base_connection_limit_to_other_requests() {
-    for workers in [1, 32, 192, MAX_EXECUTION_WORKERS] {
-        assert_eq!(connection_limit(workers) - workers, BASE_CONNECTION_LIMIT);
-    }
 }
 
 /// Cargo waits for the target-info probe until a seeding has memoised what

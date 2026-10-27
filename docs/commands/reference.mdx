@@ -182,6 +182,7 @@ The links point at a path that survives upgrades when one reaches the running bi
 
 ```bash
 kache doctor
+kache doctor --probe
 kache doctor --fix
 kache doctor --verify
 kache doctor --checksums
@@ -191,12 +192,23 @@ kache doctor --repair
 - `--fix` migrates from sccache: it stops a running sccache server, replaces `sccache` with `kache` in `$CARGO_HOME/config.toml`, and prints the lines to change in your shell startup files. It does not set up other missing pieces such as `rustc-wrapper` or the shims; run `kache init` for those.
 - `--purge-sccache` also deletes the sccache cache directory (`~/Library/Caches/Mozilla.sccache` on macOS, `~/.cache/sccache` on Linux) and runs `cargo uninstall sccache` when sccache was installed with Cargo. It requires `--fix`.
 - `--verify` checks entries, blobs, and metadata. It exits 1 while corrupted entries or index mismatches remain, so a scheduled job can gate on it. Orphan blobs do not count.
+- `--probe` compiles a small Rust library, removes its output, then checks that the second invocation restores identical bytes without running the compiler. It uses an isolated temporary cache and configuration, never accesses the remote, and removes its files afterwards. Each wrapped invocation has a 30-second deadline. It can also run with `--json`; findings appear in `checks` and `issues`.
 - `--checksums` also hashes blob contents and implies `--verify`.
 - `--repair` removes corrupted entries, reconciles the index with the entries on disk, reclaims orphan blobs, prunes stale C/C++ memos, input predictions and old file hashes, and compacts a large, sparse index when disk space allows. It implies `--verify`.
 
 `--purge-sccache` and `--repair` delete data. Check what they will remove before running them.
 
 Doctor reports issues and still exits 0; scripts read them from `kache doctor --json`. Only `--verify`, and the options that imply it, exit 1 for what they find.
+
+Doctor checks cache-directory write access and read/write access to existing index, WAL and SHM files. On Unix it also shows this process's soft and hard open-file limits. Run it as the same user and in the same environment as the failing build.
+
+Where volume information is available, doctor checks free space for the cache, Cargo outputs and temporary files, using existing ancestor directories for paths not created yet. The cache warning uses `cache.auto_recover_min_free_bytes`, with a minimum working reserve of 1 GiB even when automatic recovery is off. Cargo output and temporary volumes use the 1 GiB reserve.
+
+Storage rows include the volume identity when reported. Unix rows show available and total inode counts; exhausted inodes are an issue even when bytes remain free. Unreported inode capacity stays unavailable. Windows reports available bytes and a volume GUID, without inode counts. Distinct volume identities can share capacity through an APFS container, so their free-space figures are not independent. These checks do not remove anything; `kache clean --dry-run` previews tracked build directories.
+
+When a daemon answers, doctor compares its reported configuration with this process's snapshot and names differences in store paths, remote state and other reported settings. New daemons also report their PID, effective user and open-file limits captured after startup raised the limit. Older daemons show an informational notice when those fields are unavailable. The temporary cache probe checks the local Rust pipeline separately from the configured store and project-specific flags.
+
+If a build emitted a store-open warning in the last 24 hours, doctor reports that history even when the database opens now. The history is informational and depends on the warning marker remaining in the same temporary directory. To capture the full error, rerun the failing Cargo command with `KACHE_LOG_FILE=kache=debug,kache_store=debug` and inspect `kache.log` (see [diagnostic logs](/docs/daemon/lifecycle)).
 
 Doctor also reports, for information, how many misses in the latest build differ from the same crates built in another checkout ("Other checkouts"); `kache explain` says what to set. It reports where the running binary is installed ("Install path"), whether the C/C++ shims are active, broken, not first on `PATH` or not installed, and whether the login service runs a binary that no longer exists, is not executable, or is a different file from the running Kache. Run `kache daemon install` to fix the last one.
 
@@ -519,9 +531,18 @@ do not include setup or an explicit warm step.
 
 ```bash
 kache config
+kache config path
+kache config list --json
+kache config get cache.local_only
+kache config set --project cache.local_only true
+kache config unset --project cache.local_only
 ```
 
-This command can open even when the current config file is invalid. See [Configuration](/docs/getting-started/configuration).
+Without a subcommand, opens the interactive editor. The subcommands read or edit the selected TOML file without starting a daemon. `get` and `list` show explicit file values, excluding environment overrides, host settings and defaults. A missing key makes `get` or `unset` fail.
+
+Each subcommand accepts `--project`, `--global`, or `--file PATH`. Without one, it uses Kache's normal config-file selection. `--project` selects the nearest existing `.kache.toml`, or creates it in the current directory when setting a value. `--global` selects the user config and ignores `KACHE_CONFIG` and project files. `--file` selects an explicit path. These selectors cannot be combined.
+
+`set` validates known keys and their TOML types. Boolean, number and array values use TOML syntax; strings such as `50GiB` can be unquoted. Workspace declarations and entire tables are edited directly in TOML. Edits preserve comments and other keys, follow existing file symlinks, and replace the file atomically under a writer lock. Invalid TOML is refused. All subcommands support `--json`; the interactive editor does not. See [Configuration](/docs/getting-started/configuration).
 
 ## `kache login`
 
@@ -551,6 +572,8 @@ runner = ["kache", "test-runner"]
 Cargo runs each test binary as `kache test-runner <binary> <args>`. A test binary waits for slots in the scheduler's pool, then runs with its arguments, stdin, exit code and signals unchanged. Binaries without Cargo's hash suffix (`cargo run` targets, doctests), `--list` and `--bench` runs start at once, as does everything when the scheduler is off. Cargo is the caller, so the command is not listed in `kache --help`. See [Test runner](/docs/getting-started/configuration#test-runner).
 
 ## `kache completions`
+
+`kache init` installs and refreshes completions for Bash, Zsh, and Fish on Unix. This command prints a script for manual setup:
 
 ```bash
 kache completions zsh > ~/.zfunc/_kache

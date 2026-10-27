@@ -945,6 +945,280 @@ fn a_fresh_client_can_seed_itself_from_the_shared_folder() {
 }
 
 #[test]
+fn filtered_sync_resolves_renamed_dependency_targets_on_a_fresh_client() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nexclude = [\"dependency\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    for (directory, manifest, source) in [
+        (
+            "dependency",
+            "[package]\nname = \"dash-dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nname = \"custom_library\"\n",
+            "pub fn value() -> u32 { 19 }\n",
+        ),
+        (
+            "app",
+            "[package]\nname = \"hyphen-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndash-dependency = { path = \"../dependency\" }\n",
+            "pub fn value() -> u32 { custom_library::value() }\n",
+        ),
+    ] {
+        let package = project.path().join(directory);
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::write(package.join("Cargo.toml"), manifest).unwrap();
+        std::fs::write(package.join("src").join("lib.rs"), source).unwrap();
+    }
+    let alpha = Client::new(shared.path());
+    let beta = Client::new(shared.path());
+    let cargo_home = TempDir::new().unwrap();
+    let fresh_cargo_home = TempDir::new().unwrap();
+    let outputs = TempDir::new().unwrap();
+    let build = |client: &Client| {
+        let output = client.run_within_at_env(
+            Some(project.path()),
+            &[
+                "cargo",
+                "build",
+                "--offline",
+                "--config",
+                "build.incremental=false",
+                "--target-dir",
+                outputs.path().to_str().unwrap(),
+            ],
+            &[
+                ("CARGO_HOME", cargo_home.path()),
+                ("RUSTC_WRAPPER", &kache_binary()),
+            ],
+            Duration::from_secs(90),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        client.stop_daemon_and_wait();
+    };
+    build(&alpha);
+    let unrelated_source = project.path().join("unrelated.rs");
+    std::fs::write(&unrelated_source, "pub fn unrelated() {}\n").unwrap();
+    let unrelated_output = TempDir::new().unwrap();
+    alpha.compile(&unrelated_source, unrelated_output.path());
+    alpha.stop_daemon_and_wait();
+    // Publish outside the workspace so the explicit push includes dependencies.
+    let pushed = alpha.run_within_at(
+        Some(shared.path()),
+        &["sync", "--push"],
+        Duration::from_secs(90),
+    );
+    assert!(
+        pushed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    let cold = alpha.report();
+    let unrelated_key = crate_event(&cold, "fsremote")["cache_key"]
+        .as_str()
+        .unwrap();
+    // --all broadens pull discovery; its push must still respect membership.
+    let scoped_remote = TempDir::new().unwrap();
+    let publisher = Client::for_shared_store(scoped_remote.path(), &alpha.cache_dir);
+    let published = publisher.run_within_at_env(
+        Some(project.path()),
+        &["sync", "--all"],
+        &[("CARGO_HOME", fresh_cargo_home.path())],
+        Duration::from_secs(90),
+    );
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    for (name, expected) in [
+        ("hyphen_app", true),
+        ("custom_library", false),
+        ("fsremote", false),
+    ] {
+        let key = crate_event(&cold, name)["cache_key"].as_str().unwrap();
+        let manifest = scoped_remote
+            .path()
+            .join("artifacts")
+            .join("v3")
+            .join("manifests")
+            .join(name)
+            .join(format!("{key}.json"));
+        assert_eq!(manifest.is_file(), expected, "--all push scope for {name}");
+    }
+    let lock_before = std::fs::read(project.path().join("Cargo.lock")).unwrap();
+    let pulled = beta.run_within_at_env(
+        Some(project.path()),
+        &["sync", "--pull"],
+        &[("CARGO_HOME", fresh_cargo_home.path())],
+        Duration::from_secs(90),
+    );
+    assert!(
+        pulled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pulled.stderr)
+    );
+    for name in ["custom_library", "hyphen_app"] {
+        let key = crate_event(&cold, name)["cache_key"].as_str().unwrap();
+        assert!(
+            beta.cache_dir
+                .join("store")
+                .join(key)
+                .join("meta.json")
+                .is_file(),
+            "filtered pull missed {name}: {}",
+            String::from_utf8_lossy(&pulled.stdout)
+        );
+    }
+    assert!(
+        !beta.cache_dir.join("store").join(unrelated_key).exists(),
+        "default pull must not import unrelated remote crates"
+    );
+    // The workspace's lockfile also governs calls from a member subdirectory
+    // and explicit manifests invoked beside an unrelated lockfile.
+    let unrelated = TempDir::new().unwrap();
+    std::fs::write(
+        unrelated.path().join("Cargo.lock"),
+        "version = 3\n[[package]]\nname = \"decoy\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let member_manifest = project.path().join("app").join("Cargo.toml");
+    let nested = project.path().join("app").join("src");
+    for (cwd, args) in [
+        (
+            unrelated.path(),
+            vec![
+                "sync",
+                "--pull",
+                "--manifest-path",
+                member_manifest.to_str().unwrap(),
+            ],
+        ),
+        (nested.as_path(), vec!["sync", "--pull"]),
+    ] {
+        let client = Client::new(shared.path());
+        let pulled = client.run_within_at_env(
+            Some(cwd),
+            &args,
+            &[("CARGO_HOME", fresh_cargo_home.path())],
+            Duration::from_secs(90),
+        );
+        assert!(
+            pulled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pulled.stderr)
+        );
+        for name in ["custom_library", "hyphen_app"] {
+            let key = crate_event(&cold, name)["cache_key"].as_str().unwrap();
+            assert!(
+                client
+                    .cache_dir
+                    .join("store")
+                    .join(key)
+                    .join("meta.json")
+                    .is_file(),
+                "{name}: {}",
+                String::from_utf8_lossy(&pulled.stdout)
+            );
+        }
+        assert!(
+            !client.cache_dir.join("store").join(unrelated_key).exists(),
+            "manifest selection must preserve filtered pulls"
+        );
+    }
+    assert_eq!(
+        std::fs::read(project.path().join("Cargo.lock")).unwrap(),
+        lock_before
+    );
+    let expected = std::fs::read(outputs.path().join("debug").join("libhyphen_app.rlib")).unwrap();
+    std::fs::remove_dir_all(outputs.path()).unwrap();
+    build(&beta);
+    let warm = beta.report();
+    for name in ["custom_library", "hyphen_app"] {
+        assert_eq!(crate_event(&warm, name)["result"], "local_hit", "{warm}");
+        assert_eq!(
+            crate_event(&warm, name)["cache_key"],
+            crate_event(&cold, name)["cache_key"]
+        );
+    }
+    assert_eq!(
+        std::fs::read(outputs.path().join("debug").join("libhyphen_app.rlib")).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn full_pull_does_not_require_a_valid_cargo_project() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    std::fs::write(project.path().join("Cargo.toml"), "this is not TOML [[[").unwrap();
+    let client = Client::new(shared.path());
+    let output = client.run_within_at(
+        Some(project.path()),
+        &["sync", "--pull", "--all"],
+        Duration::from_secs(90),
+    );
+    assert!(
+        output.status.success(),
+        "full pull must not depend on Cargo metadata: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn unfiltered_and_workspace_sync_do_not_resolve_unavailable_dependencies() {
+    build_kache();
+    let shared = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+    let cargo_home = TempDir::new().unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::fs::create_dir(project.path().join(".cargo")).unwrap();
+    std::fs::write(project.path().join("src").join("lib.rs"), "").unwrap();
+    std::fs::write(
+        project.path().join(".cargo").join("config.toml"),
+        "[net]\noffline = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("Cargo.toml"),
+        "[package]\nname = \"sync-mode-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nintentionally-missing-sync-dependency = \"=0.0.0\"\n",
+    )
+    .unwrap();
+    let lock = "version = 3\n[[package]]\nname = \"sync-mode-fixture\"\nversion = \"0.1.0\"\n";
+    std::fs::write(project.path().join("Cargo.lock"), lock).unwrap();
+    let client = Client::new(shared.path());
+    for args in [
+        vec!["sync", "--pull", "--all"],
+        vec!["sync", "--pull", "--workspace"],
+        vec!["sync", "--push"],
+    ] {
+        let output = client.run_within_at_env(
+            Some(project.path()),
+            &args,
+            &[("CARGO_HOME", cargo_home.path())],
+            Duration::from_secs(90),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("cannot resolve dependency target names"),
+            "{args:?} unexpectedly resolved dependencies: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("Cargo.lock")).unwrap(),
+            lock
+        );
+    }
+}
+
+#[test]
 fn concurrent_bulk_sync_clients_hydrate_shared_store_without_errors() {
     build_kache();
     let shared = TempDir::new().unwrap();
