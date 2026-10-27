@@ -57,12 +57,33 @@ pub fn build_kache() {
 }
 
 /// Path to the `kache` binary under test, building it on first call.
+///
+/// Every test that starts a kache process asks for this path first, as the
+/// program or as the `RUSTC_WRAPPER` it hands cargo. So this is also where the
+/// test process claims the daemons its children start: the first call names
+/// this process in [`DAEMON_OWNER_PID_ENV`], which every child inherits, and a
+/// daemon started anywhere below drains within seconds of this process
+/// ending, a test killed by a timeout too, whatever folder it leaves behind.
 pub fn kache_binary() -> PathBuf {
-    match KACHE_BIN.get_or_init(bootstrap_kache) {
+    let path = match KACHE_BIN.get_or_init(bootstrap_kache) {
         Ok(path) => path.clone(),
         Err(message) => panic!("{message}"),
-    }
+    };
+    OWNS_DAEMONS.call_once(|| {
+        // SAFETY: written once per process, after the bootstrap build and
+        // before this process starts its first kache child. std's own
+        // environment reads (Command, env::var) take the same lock; only a
+        // C library reading the environment on another thread at this
+        // moment could race, and no test starts one before this call.
+        unsafe { std::env::set_var(DAEMON_OWNER_PID_ENV, std::process::id().to_string()) };
+    });
+    path
 }
+
+/// The variable that ties a daemon to the process that (indirectly) started
+/// it: kache's `KACHE_DAEMON_OWNER_PID`.
+pub const DAEMON_OWNER_PID_ENV: &str = "KACHE_DAEMON_OWNER_PID";
+static OWNS_DAEMONS: std::sync::Once = std::sync::Once::new();
 
 fn bootstrap_kache() -> Result<PathBuf, String> {
     if reuse_outer_build() {
@@ -157,11 +178,13 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 /// A test that wants a host file calls `.env("KACHE_HOST_CONFIG", path)` on
 /// the returned command.
 ///
-/// A daemon the child starts gets a one-minute idle timeout (the default is
-/// none) unless the caller sets its own. A backstop, not the cleanup: a
-/// fixture's [`DaemonGuard`] stops the daemon, and a daemon stops by itself
-/// once the test's temporary runtime directory is removed, on a panic too.
-/// This bounds the one left when a test is killed (a timeout) and neither ran.
+/// A daemon the child starts belongs to this test process
+/// ([`DAEMON_OWNER_PID_ENV`]) and drains within seconds of it ending, killed
+/// or not, whatever runtime directory it leaves. It also gets a one-minute
+/// idle timeout (the default is none) unless the caller sets its own. Both
+/// are backstops, not the cleanup: a fixture's [`DaemonGuard`] stops the
+/// daemon, and a daemon stops by itself once the test's temporary runtime
+/// directory is removed, on a panic too.
 ///
 /// Not every test binary spawns children, so the rest see it as dead.
 #[allow(dead_code)]
@@ -194,6 +217,7 @@ pub fn hermetic_command(
         // unit with an OUT_DIR.
         .env_remove("OUT_DIR")
         .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .env(DAEMON_OWNER_PID_ENV, std::process::id().to_string())
         .env("KACHE_HOST_CONFIG", "");
     match config {
         Some(path) => command.env("KACHE_CONFIG", path),

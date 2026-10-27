@@ -30,6 +30,9 @@ mod execution;
 mod execution;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
+#[path = "daemon_owner.rs"]
+mod owner;
+pub(crate) use owner::OWNER_PID_ENV;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -7081,6 +7084,13 @@ async fn server_main(
     };
     let _socket_guard = SocketCleanupGuard::new(&socket_path)?;
     let bound_socket = BoundSocket::capture(&socket_path)?;
+    let daemon_owner = owner::DaemonOwner::from_env();
+    if let Some(owner) = &daemon_owner {
+        tracing::info!(
+            "this daemon belongs to process {} and stops once it ends",
+            owner.pid()
+        );
+    }
 
     let lifecycle = Arc::new(Lifecycle::default());
     let mut control = lifecycle_control::serve(config, Arc::clone(&lifecycle)).await?;
@@ -7391,6 +7401,15 @@ async fn server_main(
                     "daemon socket {} was removed or replaced, so nothing can reach this \
                      daemon; shutting down",
                     bound_socket.path.display()
+                );
+                heartbeat_lifecycle.start_drain();
+                break;
+            }
+            if let Some(owner) = daemon_owner.as_ref().filter(|owner| owner.is_gone()) {
+                tracing::warn!(
+                    "process {} that owns this daemon ({}) has ended; shutting down",
+                    owner.pid(),
+                    OWNER_PID_ENV
                 );
                 heartbeat_lifecycle.start_drain();
                 break;
