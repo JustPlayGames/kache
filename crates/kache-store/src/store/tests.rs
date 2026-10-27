@@ -16795,3 +16795,43 @@ fn a_handed_memo_row_of_a_small_file_is_written() {
     );
     assert_eq!(store.file_hash_at(&row.fingerprint), Some(row.hash));
 }
+
+/// A call that waits for the index lock with a timeout of its own gives the
+/// connection back the timeout it had, not a fixed one: a connection given
+/// longer (test_concurrent_put_remove_never_dangles' 60 s) kept it only
+/// until its first hit stamp, then failed busy after 5 s under load.
+#[test]
+fn store_calls_give_back_the_connections_own_busy_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    store.set_busy_timeout_for_test(Duration::from_secs(60));
+    let busy_ms = |store: &Store| -> i64 {
+        store
+            .db
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    let src = dir.path().join("out.rlib");
+    std::fs::write(&src, b"kept wait").unwrap();
+    store
+        .put(
+            "k",
+            "c",
+            &["lib".into()],
+            &[],
+            "tgt",
+            "dev",
+            &[(src, "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    assert_eq!(busy_ms(&store), 60_000, "after a put");
+    store.set_last_accessed_for_test("k", "-1 day");
+    assert!(store.get("k").unwrap().is_some());
+    assert_eq!(busy_ms(&store), 60_000, "after a hit that stamps the entry");
+    store.remove_entry("k").unwrap();
+    assert_eq!(busy_ms(&store), 60_000, "after a removal");
+}
