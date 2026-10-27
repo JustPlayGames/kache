@@ -476,6 +476,98 @@ pub fn run_at_client_priority(client_class: u32) -> ThreadPriority {
     )
 }
 
+/// Linux: the nice value the daemon's background work runs at, at least:
+/// the build machine's service and `cargo xtask`'s builds already run at
+/// 10, so there it changes nothing; on a PC whose build started the daemon
+/// at 0 it puts sweeps and maintenance behind the builds and the desktop.
+#[cfg(target_os = "linux")]
+pub(crate) const BACKGROUND_NICE: i32 = 10;
+
+/// The daemon's background work (GC sweeps, disk recovery, store walks,
+/// maintenance), which no compile waits for: run `job` below normal
+/// priority and return what it returns.
+///
+/// Windows runs it on this thread below normal ([`run_below_normal`]).
+/// Linux runs it on a thread of its own at [`BACKGROUND_NICE`] or the
+/// daemon's own nice when that is lower already, because an unprivileged
+/// thread cannot raise its priority back, and the blocking pool reuses
+/// threads for compiles. Elsewhere it runs as it is.
+pub fn below_normal<R: Send>(job: impl FnOnce() -> R + Send) -> R {
+    #[cfg(windows)]
+    {
+        let _low = run_below_normal();
+        job()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        at_nice_at_least(BACKGROUND_NICE, job)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        job()
+    }
+}
+
+/// Linux: run `job` on a scoped thread whose nice is at least `floor`,
+/// inside this thread's tokio runtime when it has one. A refused nice
+/// leaves the job at the inherited one; a refused thread runs it here.
+#[cfg(target_os = "linux")]
+fn at_nice_at_least<R: Send>(floor: i32, job: impl FnOnce() -> R + Send) -> R {
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    let job = std::sync::Mutex::new(Some(job));
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("kache-background".into())
+            .spawn_scoped(scope, || {
+                let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
+                let nice = thread_nice();
+                if nice < floor {
+                    // SAFETY: plain syscalls on this thread's own id.
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
+                    if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, floor) } != 0 {
+                        tracing::debug!(
+                            "could not lower a background thread's priority: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                }
+                let job = job.lock().ok().and_then(|mut job| job.take());
+                job.map(|job| job())
+            });
+        match spawned.map(std::thread::ScopedJoinHandle::join) {
+            Ok(Ok(Some(result))) => result,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            // The thread was refused (or never took the job): run it here.
+            Ok(Ok(None)) | Err(_) => {
+                let job = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("a background job that did not run is still here");
+                job()
+            }
+        }
+    })
+}
+
+/// Linux: the calling thread's nice value.
+#[cfg(target_os = "linux")]
+fn thread_nice() -> i32 {
+    // SAFETY: plain syscalls on this thread's own id. getpriority's -1 is
+    // a valid answer too; errno tells a failure apart, and a failure reads
+    // as 0, the default.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        *libc::__errno_location() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS, tid);
+        if nice == -1 && *libc::__errno_location() != 0 {
+            0
+        } else {
+            nice
+        }
+    }
+}
+
 /// Resolve when the OS asks the daemon to stop. SIGTERM/SIGINT on Unix,
 /// Ctrl+C / console-close on Windows.
 pub async fn wait_for_shutdown() {
@@ -572,6 +664,29 @@ pub fn is_self_spawn(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> b
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_work_runs_at_the_floor_and_leaves_the_caller_alone() {
+        let before = super::thread_nice();
+        // 19, the lowest priority, is above whatever nice the suite runs at.
+        let (inside, value) = super::at_nice_at_least(19, || (super::thread_nice(), 7));
+        assert_eq!((inside, value), (19, 7));
+        assert_eq!(super::thread_nice(), before, "the caller's thread keeps its nice");
+        // A floor under the thread's nice changes nothing.
+        let inside = super::at_nice_at_least(-20, super::thread_nice);
+        assert_eq!(inside, before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_work_keeps_the_runtime_and_its_panics() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _entered = runtime.enter();
+        assert!(super::below_normal(|| tokio::runtime::Handle::try_current().is_ok()));
+        let panic = std::panic::catch_unwind(|| super::below_normal(|| panic!("swept")));
+        assert!(panic.is_err(), "a panic in the job reaches the caller");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn host_utilities_capture_bytes_without_request_cancellation() {

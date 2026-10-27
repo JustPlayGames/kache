@@ -6401,9 +6401,9 @@ impl Daemon {
                 }
             }
             let _release = Release(&daemon, &config.cache_dir);
-            #[cfg(windows)]
-            let _low = crate::platform::run_below_normal();
-            if let Err(error) = daemon.sweep_invocation_under_size_pressure(&config) {
+            if let Err(error) = crate::platform::below_normal(|| {
+                daemon.sweep_invocation_under_size_pressure(&config)
+            }) {
                 tracing::warn!("invocation GC sweep failed: {error:#}");
             }
         });
@@ -6435,9 +6435,7 @@ impl Daemon {
             }
         }
         let _release = Release(&self.gc_hint_pending);
-        #[cfg(windows)]
-        let _low = crate::platform::run_below_normal();
-        if let Err(e) = self.sweep_under_size_pressure() {
+        if let Err(e) = crate::platform::below_normal(|| self.sweep_under_size_pressure()) {
             tracing::warn!("hinted GC sweep failed: {e:#}");
         }
     }
@@ -7353,10 +7351,9 @@ async fn server_main(
             interval.tick().await;
             let cache_dir = sweep_cache_dir.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                #[cfg(windows)]
-                let _low = crate::platform::run_below_normal();
-                let removed =
-                    crate::prestage::sweep_staged(&cache_dir, std::time::SystemTime::now());
+                let removed = crate::platform::below_normal(|| {
+                    crate::prestage::sweep_staged(&cache_dir, std::time::SystemTime::now())
+                });
                 if removed > 0 {
                     tracing::info!(removed, "prestage: swept untaken copies");
                 }
@@ -7382,14 +7379,14 @@ async fn server_main(
             // the accept loop and in-flight RemoteCheck stay responsive (#281).
             let gc = gc_daemon.clone();
             match tokio::task::spawn_blocking(move || {
-                #[cfg(windows)]
-                let _low = crate::platform::run_below_normal();
-                gc.run_gc(
-                    GcPolicy::Automatic {
-                        max_age_hours: gc.config.gc_max_age_hours,
-                    },
-                    GcDriver::Periodic,
-                )
+                crate::platform::below_normal(|| {
+                    gc.run_gc(
+                        GcPolicy::Automatic {
+                            max_age_hours: gc.config.gc_max_age_hours,
+                        },
+                        GcDriver::Periodic,
+                    )
+                })
             })
             .await
             {
@@ -7445,13 +7442,13 @@ async fn server_main(
     let migration_config = config.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            #[cfg(windows)]
-            let _low = crate::platform::run_below_normal();
-            if let Ok(store) = Store::open(&migration_config) {
-                store.migrate_to_blobs(|_, _| {})
-            } else {
-                Err(anyhow::anyhow!("failed to open store for migration"))
-            }
+            crate::platform::below_normal(|| {
+                if let Ok(store) = Store::open(&migration_config) {
+                    store.migrate_to_blobs(|_, _| {})
+                } else {
+                    Err(anyhow::anyhow!("failed to open store for migration"))
+                }
+            })
         })
         .await;
 
