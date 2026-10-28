@@ -409,6 +409,29 @@ fn hold_index_lock(
     Arc<std::sync::atomic::AtomicBool>,
     std::thread::JoinHandle<()>,
 ) {
+    hold_index_lock_while(config, move || std::thread::sleep(hold))
+}
+
+/// [`hold_index_lock`] until the test lets go: when it sends on the sender,
+/// or drops it (a failed assertion lets go too).
+fn hold_index_lock_until_let_go(
+    config: &Config,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let (let_go, wait) = std::sync::mpsc::channel::<()>();
+    let (_, thread) = hold_index_lock_while(config, move || {
+        let _ = wait.recv();
+    });
+    (let_go, thread)
+}
+
+/// Hold the index's write lock from another connection while `hold` runs.
+fn hold_index_lock_while(
+    config: &Config,
+    hold: impl FnOnce() + Send + 'static,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
     drop(Store::open(config).unwrap());
     let index = config.cache_dir.join("index.db");
     let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -419,7 +442,7 @@ fn hold_index_lock(
             let writer = rusqlite::Connection::open(index).unwrap();
             writer.execute_batch("BEGIN IMMEDIATE").unwrap();
             ready.send(()).unwrap();
-            std::thread::sleep(hold);
+            hold();
             released.store(true, std::sync::atomic::Ordering::SeqCst);
             writer.execute_batch("ROLLBACK").unwrap();
         })
@@ -613,6 +636,10 @@ fn raw_events(config: &Config) -> Vec<serde_json::Value> {
 /// them, so a lock that is free only now and then is taken once, not once
 /// per entry. Each entry is the compiler's bytes, and each event says how
 /// many entries its transaction committed.
+///
+/// The test lets go of the lock itself once it has seen every hand-off
+/// queued and started the worker, not after a fixed time: a loaded machine
+/// took longer than any such time for the hand-offs alone.
 #[test]
 fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
     const COUNT: usize = 12;
@@ -623,17 +650,20 @@ fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
             let config = &compiled[0].config;
             let mut daemon = PendingDaemon::listen_queueing(config, 64);
 
-            let (released, holder) = hold_index_lock(config, BUSY);
+            let (let_go, holder) = hold_index_lock_until_let_go(config);
             for one in &compiled {
                 let (outcome, lock, _) = hand_off_now(one);
                 assert!(matches!(outcome, RustcStore::HandedOff));
                 assert!(lock.is_none());
             }
-            let worker = daemon.start_worker();
-            assert!(
-                !released.load(std::sync::atomic::Ordering::SeqCst),
+            let progress = daemon.daemon.publish_queue().progress();
+            assert_eq!(
+                (progress.pending(), progress.done()),
+                (COUNT, 0),
                 "every hand-off queued while the index was held"
             );
+            let worker = daemon.start_worker();
+            let_go.send(()).unwrap();
             tokio::task::block_in_place(|| holder.join().unwrap());
             daemon.drain(worker).await;
 
