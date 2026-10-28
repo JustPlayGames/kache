@@ -16123,9 +16123,13 @@ fn a_shared_test_binary_blob_read_once_is_vouched_for_by_the_memo() {
     let fingerprint = crate::file_hash::FileFingerprint::from_path(&blob).unwrap();
     assert_eq!(store.file_hash_at(&fingerprint), None);
 
-    // Unsettled (changed just now): read, but not recorded.
+    // Unsettled (changed just now): read, but not recorded. A loaded machine
+    // can take the whole settle window to get here; the read is then settled
+    // and may be recorded, so only a read that ended inside it is checked.
     assert!(store.get("vouched-entry").unwrap().is_some());
-    assert_eq!(store.file_hash_at(&fingerprint), None);
+    if !crate::file_hash::stamp_is_settled(&fingerprint, crate::file_hash::wall_clock_ns()) {
+        assert_eq!(store.file_hash_at(&fingerprint), None);
+    }
 
     std::thread::sleep(std::time::Duration::from_nanos(
         crate::file_hash::HASH_SETTLE_NS as u64 + 100_000_000,
