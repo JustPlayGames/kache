@@ -43,6 +43,14 @@ impl LockHolder {
             _stdout: stdout,
         }
     }
+
+    /// The holder still runs, so its lock was held the whole time.
+    fn assert_held(&mut self) {
+        assert!(
+            self.child.try_wait().unwrap().is_none(),
+            "the lock holder exited early: the lock was not held throughout"
+        );
+    }
 }
 
 impl Drop for LockHolder {
@@ -74,7 +82,25 @@ fn hold_log_lock_in_child() {
     let _ = std::io::stdin().read_exact(&mut [0]);
 }
 
-fn run_bounded(mut command: Command) -> (bool, Output) {
+/// How long a wrapper may take to return while a lock is held.
+///
+/// Not a performance budget: the wrapper either gives the held lock up
+/// (its own wait is bounded at a few milliseconds, which the unit tests of
+/// `events::build_path` and `savings` own) or blocks until the holder lets
+/// go, which it does only after this returns. So any return before the
+/// deadline proves the first, and the deadline is only how long a blocked
+/// wrapper takes to fail the test. It is generous because a cold start is
+/// slow and has nothing to do with the lock: a Windows VM's first launch of
+/// the freshly built kache and rustc (antivirus scan, cold disk) took more
+/// than the 5 s this used to allow, while the same test passed warm in 1.7 s.
+const HANG_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Runs `command` while `holder` (if any) holds its lock, and says whether
+/// it returned before [`HANG_DEADLINE`], the lock still held. The holder
+/// lets go before the output is read: a compile the daemon runs keeps the
+/// wrapper's stdout and stderr, so a daemon blocked on the lock would keep
+/// a killed wrapper's output open and hang the test instead of failing it.
+fn run_bounded(mut command: Command, mut holder: Option<LockHolder>) -> (bool, Output) {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -83,14 +109,18 @@ fn run_bounded(mut command: Command) -> (bool, Output) {
     let started = Instant::now();
     let returned = loop {
         if child.try_wait().unwrap().is_some() {
+            if let Some(holder) = holder.as_mut() {
+                holder.assert_held();
+            }
             break true;
         }
-        if started.elapsed() >= Duration::from_secs(5) {
+        if started.elapsed() >= HANG_DEADLINE {
             child.kill().unwrap();
             break false;
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    drop(holder);
     (returned, child.wait_with_output().unwrap())
 }
 
@@ -121,8 +151,7 @@ fn version_probe_returns_while_another_process_holds_the_event_lock() {
         let holder = LockHolder::start(&lock_path, shared);
         let mut command = wrapper(&cache);
         command.args(["rustc", "-vV"]);
-        let (returned, output) = run_bounded(command);
-        drop(holder);
+        let (returned, output) = run_bounded(command, Some(holder));
         assert!(returned, "version probe waited on optional telemetry");
         assert!(
             output.status.success(),
@@ -159,8 +188,7 @@ fn completed_compile_returns_while_another_process_holds_the_event_lock() {
         .arg(&source)
         .arg("-o")
         .arg(&output_path);
-    let (returned, output) = run_bounded(command);
-    drop(holder);
+    let (returned, output) = run_bounded(command, Some(holder));
     assert!(returned, "completed compiler waited on optional telemetry");
     assert!(
         output.status.success(),
@@ -179,8 +207,7 @@ fn version_probe_defers_rotation_while_the_ledger_is_locked() {
     let holder = LockHolder::start(&cache.join("savings.json.lock"), false);
     let mut command = wrapper(&cache);
     command.args(["rustc", "-vV"]);
-    let (returned, output) = run_bounded(command);
-    drop(holder);
+    let (returned, output) = run_bounded(command, Some(holder));
     assert!(returned, "rotation waited for telemetry bookkeeping");
     assert!(
         output.status.success(),
@@ -190,7 +217,7 @@ fn version_probe_defers_rotation_while_the_ledger_is_locked() {
     assert!(cache.join("events.jsonl").metadata().unwrap().len() > 1);
     let mut command = wrapper(&cache);
     command.args(["rustc", "-vV"]);
-    let (returned, output) = run_bounded(command);
+    let (returned, output) = run_bounded(command, None);
     assert!(returned && output.status.success());
     assert!(cache.join("savings.json").is_file());
 }
