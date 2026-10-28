@@ -1893,14 +1893,22 @@ pub fn dep_info_provided() -> bool {
 /// The files of the closure [`provide_dep_info`] left for the next key,
 /// spelled as [`FileFingerprint`] records their paths.
 pub(crate) fn provided_dep_info_sources_for(
-    env: &InvocationEnv,
+    file_hasher: &FileHasher<'_>,
 ) -> Option<std::collections::HashSet<String>> {
     PROVIDED_DEP_INFO.with(|cell| {
         cell.borrow().as_ref().and_then(|(dep_info, _)| {
             dep_info
                 .source_files
                 .iter()
-                .map(|path| Some(env.resolve(path)?.to_string_lossy().into_owned()))
+                .map(|path| {
+                    Some(
+                        file_hasher
+                            .resolve_path(path)
+                            .ok()?
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
                 .collect::<Option<_>>()
         })
     })
@@ -5771,6 +5779,32 @@ fn lexically_resolve_path(input: &str) -> String {
     }
 }
 
+/// Collapse `.`, `..`, and repeated separators without asking the filesystem.
+/// Components follow the platform: on Unix `\` is a filename character, so
+/// `a\b.rs` stays one file. `..` that would climb past the root is dropped.
+fn collapse_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut collapsed = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    collapsed.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    collapsed.pop();
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                collapsed.push(component.as_os_str());
+            }
+        }
+    }
+    collapsed
+}
+
 /// Resolve a `-l` spec to a `static` archive in one of `search_dirs` and
 /// return `(path, content_hash)`, or `None` when it is not a `static` kind, no
 /// candidate is found, or the unit neither links (`links`) nor bundles it
@@ -9350,10 +9384,37 @@ impl<'db> FileHasher<'db> {
     }
 
     fn resolve_path(&self, path: &Path) -> Result<PathBuf> {
-        self.invocation_env
+        let resolved = self
+            .invocation_env
             .resolve(path)
             .filter(|path| path.is_absolute())
-            .context("relative input requires the invocation working directory")
+            .context("relative input requires the invocation working directory")?;
+        Ok(self.collapse_out_dir_spelling(resolved))
+    }
+
+    /// One stored path for every spelling of a file under this invocation's
+    /// `OUT_DIR`. `Path` already equates `/out/./file` with `/out/file`, so the
+    /// recent-hash map has one entry and its fingerprint string is whichever
+    /// spelling was hashed. A later relocate then misses the other spelling.
+    /// Collapse `.`, `..`, and repeated separators by path component, and only
+    /// when the result is still under `OUT_DIR`. On Unix a backslash stays
+    /// part of the filename. A crate-relative `src/./init.js` is outside that
+    /// directory and stays spelled as rustc recorded it. This does not resolve
+    /// symlinks.
+    fn collapse_out_dir_spelling(&self, path: PathBuf) -> PathBuf {
+        let Some(out_dir) = self.invocation_env.var_os("OUT_DIR") else {
+            return path;
+        };
+        let Some(out_dir) = self.invocation_env.resolve(Path::new(&out_dir)) else {
+            return path;
+        };
+        let collapsed = collapse_lexical(&path);
+        let out = collapse_lexical(&out_dir);
+        if collapsed.starts_with(&out) {
+            collapsed
+        } else {
+            path
+        }
     }
 
     /// Let key computation derive its input set from a recorded closure
@@ -10056,8 +10117,9 @@ impl<'db> FileHasher<'db> {
         let mut known = std::collections::HashMap::new();
         for path in paths {
             let selected = {
+                let resolved = self.resolve_path(path)?;
                 let recent = self.recent_hashes.borrow();
-                recent.get(&absolute_path(path)).and_then(|recent| {
+                recent.get(&resolved).and_then(|recent| {
                     recent
                         .fingerprint
                         .as_ref()
@@ -10281,6 +10343,10 @@ impl<'db> FileHasher<'db> {
 
     /// Hash a file's contents, using the persistent cache when available.
     pub fn hash(&self, path: &Path) -> Result<String> {
+        self.hash_and_record(path).map(|recent| recent.hash)
+    }
+
+    fn hash_and_record(&self, path: &Path) -> Result<RecentHash> {
         let _trace = crate::phase_trace::phase("input_hash");
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
@@ -10288,15 +10354,15 @@ impl<'db> FileHasher<'db> {
         if let Some(observed) = &observed {
             self.guard_input(observed);
         }
-        self.recent_hashes.borrow_mut().insert(
-            resolved.clone(),
-            RecentHash {
-                hash: hash.clone(),
-                fingerprint: observed.map(|observed| observed.fingerprint),
-                header_scan: None,
-            },
-        );
-        Ok(hash)
+        let recent = RecentHash {
+            hash,
+            fingerprint: observed.map(|observed| observed.fingerprint),
+            header_scan: None,
+        };
+        self.recent_hashes
+            .borrow_mut()
+            .insert(resolved, recent.clone());
+        Ok(recent)
     }
 
     /// Validate and hash a compiled resource from one open file. Whole-file
@@ -10572,22 +10638,14 @@ impl<'db> FileHasher<'db> {
     /// Decisions are keyed by the already-computed content hash, so warm key
     /// construction can reuse them without opening the source again (#557).
     fn env_dep_use(&self, path: &Path, var: &str) -> Result<SourceEnvDepUse> {
-        let absolute = self.resolve_path(path)?;
-        let path = absolute.as_path();
-        let recent = self.recent_hashes.borrow().get(&absolute).cloned();
+        let path = self.resolve_path(path)?;
+        let recent = self.recent_hashes.borrow().get(&path).cloned();
         let recent = match recent {
             Some(recent) => recent,
-            None => {
-                self.hash(path)?;
-                self.recent_hashes
-                    .borrow()
-                    .get(&absolute)
-                    .cloned()
-                    .expect("a successful hash records its fingerprint")
-            }
+            None => self.hash_and_record(&path)?,
         };
         if let Some(expected) = recent.fingerprint {
-            let current = FileFingerprint::from_path(path)
+            let current = FileFingerprint::from_path(&path)
                 .with_context(|| format!("revalidating {} before env-use scan", path.display()))?;
             if current != expected {
                 anyhow::bail!(
@@ -10595,12 +10653,12 @@ impl<'db> FileHasher<'db> {
                     path.display()
                 );
             }
-            return self.env_dep_use_for_hash(path, var, &recent.hash);
+            return self.env_dep_use_for_hash(&path, var, &recent.hash);
         }
 
         // Without a trustworthy fingerprint, bypass memo lookup. The scan
         // still verifies the content hash before recording a reusable result.
-        self.scan_env_dep_use(path, var, &recent.hash)
+        self.scan_env_dep_use(&path, var, &recent.hash)
     }
 
     fn env_dep_use_for_hash(
