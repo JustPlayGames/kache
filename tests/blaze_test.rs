@@ -16,6 +16,9 @@ fn script(path: &Path, text: &str) {
 }
 
 struct Fixture {
+    // Stops the daemon a compile starts in `cache` before `root` goes:
+    // shutting down, it writes the cache folder back into a removed root.
+    _daemon: common::DaemonGuard,
     root: tempfile::TempDir,
     cache: PathBuf,
     config: PathBuf,
@@ -41,6 +44,7 @@ impl Fixture {
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$REAL_LOG\"\nexit 0\n",
         );
         let f = Self {
+            _daemon: common::DaemonGuard::new(KACHE, &cache),
             root,
             cache,
             config,
