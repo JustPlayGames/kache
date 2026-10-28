@@ -4,6 +4,12 @@ use std::fs;
 use std::sync::mpsc;
 
 use crate::test_support::{Flavor, on_a_runtime_of_its_own};
+
+/// How long a wait the tests below end themselves may last before it fails
+/// the test: it only turns a hang into a failure, never decides a result. A
+/// loaded machine (the suite beside other builds) stretches a step that takes
+/// milliseconds alone past several seconds.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 #[cfg(any(unix, windows))]
 #[test]
 fn compiler_request_capacity_handles_bursts_and_recovers_after_drop() {
@@ -2038,10 +2044,9 @@ fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
             });
             let ready_socket = socket_path.clone();
             let ready = tokio::task::spawn_blocking(move || {
-                kunobi_daemon::readiness::wait_until(
-                    Instant::now() + Duration::from_secs(5),
-                    |deadline| lifecycle_client::current_socket(&ready_socket, deadline),
-                )
+                kunobi_daemon::readiness::wait_until(Instant::now() + HANG_GUARD, |deadline| {
+                    lifecycle_client::current_socket(&ready_socket, deadline)
+                })
                 .map(|proof| proof.is_some())
             })
             .await
@@ -2053,7 +2058,7 @@ fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
             let _successor =
                 replace.then(|| std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
 
-            let result = tokio::time::timeout(Duration::from_secs(20), server)
+            let result = tokio::time::timeout(HANG_GUARD, server)
                 .await
                 .unwrap_or_else(|_| {
                     panic!("a daemon whose socket was removed (replaced: {replace}) kept running")
