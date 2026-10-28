@@ -248,6 +248,52 @@ pub fn raise_open_file_limit() -> std::io::Result<Option<(libc::rlim_t, libc::rl
     Ok(Some((before, target)))
 }
 
+/// How many malloc arenas the daemon lets glibc keep.
+///
+/// glibc gives each thread an arena of its own on its first allocation, up
+/// to eight per core (1,536 on a 192-thread machine), and keeps what a
+/// thread frees for that arena. The daemon runs hundreds of threads, and a
+/// sweep's ranking or a housekeeping pass leaves its peak in whichever
+/// arena its thread had: the build machine's service grew from 5.3 to
+/// 10.9 GB (RSS and swap) in 2.5 hours, in about 1,100 arena heaps. A
+/// private daemon serving 30 rounds of builds grew to 3.2 GB holding 43 MB,
+/// still growing; with eight arenas it stayed at 0.63 GB from round 20 on.
+/// Each thread keeps a cache in front of the arenas (tcache), so a few
+/// arenas cost little contention.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub const DAEMON_MALLOC_ARENAS: libc::c_int = 8;
+
+/// Cap glibc's malloc arenas at [`DAEMON_MALLOC_ARENAS`], unless the
+/// environment sets `MALLOC_ARENA_MAX` (glibc then applies that itself).
+/// Returns the cap set. Arenas already made stay.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn limit_malloc_arenas() -> Option<libc::c_int> {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return None;
+    }
+    cap_malloc_arenas(DAEMON_MALLOC_ARENAS).then_some(DAEMON_MALLOC_ARENAS)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cap_malloc_arenas(arenas: libc::c_int) -> bool {
+    // SAFETY: mallopt only changes glibc's allocator tuning.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, arenas) == 1 }
+}
+
+/// Give the heap's free pages back to the system. glibc returns only the
+/// top of each arena on its own; after a sweep freed hundreds of megabytes
+/// in the middle of one, those pages stayed resident until reused.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn release_free_heap() {
+    // SAFETY: malloc_trim takes the arenas' own locks; 0 keeps no padding.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn release_free_heap() {}
+
 /// The soft limit to ask for: the hard limit, capped by what the kernel lets
 /// one process open. `None` when that is no higher than `soft`.
 #[cfg(unix)]
@@ -627,6 +673,60 @@ pub fn is_self_spawn(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> b
 
 #[cfg(test)]
 mod tests {
+    /// The arenas glibc has, read from malloc_info's XML.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn malloc_arena_count() -> usize {
+        let mut buffer: *mut libc::c_char = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        // SAFETY: open_memstream owns `buffer` until fclose, which leaves it
+        // NUL-terminated for us to read and free.
+        let xml = unsafe {
+            let stream = libc::open_memstream(&mut buffer, &mut size);
+            assert!(!stream.is_null());
+            assert_eq!(libc::malloc_info(0, stream), 0);
+            libc::fclose(stream);
+            let xml = std::ffi::CStr::from_ptr(buffer)
+                .to_string_lossy()
+                .into_owned();
+            libc::free(buffer.cast());
+            xml
+        };
+        xml.matches("<heap nr=").count()
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn capped_malloc_arenas_stop_many_threads_making_one_each() {
+        use std::sync::{Arc, Barrier};
+        assert!(super::cap_malloc_arenas(super::DAEMON_MALLOC_ARENAS));
+        let before = malloc_arena_count();
+        // A thread takes an arena of its own on its first allocation while
+        // the count is under the cap: 32 threads alive at once would make 32.
+        let barrier = Arc::new(Barrier::new(33));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let block = std::hint::black_box(vec![1u8; 4096]);
+                    barrier.wait();
+                    barrier.wait();
+                    drop(block);
+                })
+            })
+            .collect();
+        barrier.wait();
+        let during = malloc_arena_count();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let cap = super::DAEMON_MALLOC_ARENAS as usize;
+        assert!(
+            during <= before.max(cap),
+            "{before} arenas became {during} with the cap at {cap}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn background_work_runs_at_the_floor_and_leaves_the_caller_alone() {
