@@ -14665,7 +14665,10 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("idx.sqlite");
     let digest = "e".repeat(64);
-    let record = |file: &str, observed_later_ns: i64| {
+    // Each stamp is observed a set time after its file changed, not when the
+    // test happens to get there: on a loaded machine the write and the
+    // stat could be a whole settle window apart.
+    let record = |file: &str, observed_after_change_ns: i64| {
         let path = dir.path().join(file);
         std::fs::write(&path, "#define H 1\n").unwrap();
         let hasher = FileHasher::persistent(&db);
@@ -14676,7 +14679,11 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
                 &no_mapping,
             )
             .unwrap();
-        inputs[0].observed_ns += observed_later_ns;
+        let changed = inputs[0]
+            .fingerprint
+            .mtime_ns
+            .max(inputs[0].fingerprint.ctime_ns);
+        inputs[0].observed_ns = changed + observed_after_change_ns;
         hasher.cc_preprocess_memo_record_if_unchanged(file, &digest, &inputs, &no_mapping);
         let recorded = hasher
             .cache
