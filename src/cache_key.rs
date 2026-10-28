@@ -689,12 +689,6 @@ pub(crate) fn fold_labeled(base: String, label: &str, value: &str) -> String {
 /// contains the old `\n`/`=` delimiter (build-script cfgs, env-dep values,
 /// codegen flag arguments) can no longer be confused with an adjacent field
 /// (kunobi-ninja/kache#324).
-/// Whether a parsed diagnostic flag (`--flag=value`) is `--diagnostic-width`,
-/// which the key leaves out (see the `diagnostics` group).
-fn is_diagnostic_width(flag: &str) -> bool {
-    flag == "--diagnostic-width" || flag.starts_with("--diagnostic-width=")
-}
-
 fn fold_field<H: KeyFold>(hasher: &mut H, label: &[u8], value: &[u8]) {
     hasher.update(label);
     hasher.update(&(value.len() as u64).to_le_bytes());
@@ -5302,11 +5296,7 @@ fn compute_key_into(
     // width; nothing else differs.
     hasher.set_group("diagnostics");
     fold_field(&mut hasher, b"diagnostics.v1:", b"");
-    for flag in args
-        .diagnostic_flags
-        .iter()
-        .filter(|flag| !is_diagnostic_width(flag))
-    {
+    for flag in args.cache_key_diagnostic_flags() {
         fold_field(&mut hasher, b"diagnostic_arg:", flag.as_bytes());
     }
 

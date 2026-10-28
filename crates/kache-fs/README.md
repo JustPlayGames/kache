@@ -13,6 +13,9 @@ Filesystem measurements, file identity, and native cloning and copying. Built fo
   On Windows it block-clones on ReFS and Dev Drive (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`), asks each pair of volumes once per process, and fails at once where they cannot clone; `KACHE_WINDOWS_BLOCK_CLONE=0` turns it off (read once per process, so the daemon's own environment decides for the compiles it runs).
 - `copy_writable` copies bytes with an explicit writable mode.
 - `file_identity` and `directory_identity` return the device and inode (the volume serial and file index on Windows).
+- `volume_stats` reads filesystem identity, available bytes and optional inode counts without walking directories. Unix uses `statvfs`; Windows reports bytes and a volume GUID, with inode counts unavailable. A missing identity or inode capacity stays `None`.
+
+Volume identities describe the current host and observation. They can be reused after an unmount, and distinct volumes can share free space through an APFS container. Do not sum their capacities as independent disks. `VolumeUsage` and `volume_usage` keep their existing interface.
 
 ## Features
 

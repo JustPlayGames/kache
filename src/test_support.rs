@@ -100,6 +100,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         daemon_publish: true,
         daemon_publish_rustc: true,
         trust_daemon_execution: false,
+        daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
         auto_gc: true,
         index_auto_compact: true,

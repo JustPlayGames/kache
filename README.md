@@ -84,8 +84,14 @@ to see the workload, platform, and validation behind each result.
 kache monitor             # live build and cache activity
 kache stats --last-build  # latest recorded build session
 kache explain             # why the latest build missed
+kache explain --all       # all recorded skips and passthroughs, by reason
 kache doctor              # check your setup
 ```
+
+Reports describe recorded builds. `Details missing` means those builds did
+not record enough information to explain a miss. Enable detailed recording
+before the next build with `kache config set cache.explain_miss true`;
+this cannot reconstruct details from earlier builds.
 
 <picture>
   <source media="(prefers-reduced-motion: reduce)" srcset="assets/monitor-9dd7cee8.png">
