@@ -6362,6 +6362,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 verified.push(blob);
             }
         }
+        // The metadata and its directory are flushed before the writer lock
+        // too. Each fsync waits for the filesystem's journal, which a busy
+        // disk takes seconds to commit, and every build's index write waited
+        // behind them: these two were most of the daemon's write-lock time
+        // in a build with fsyncs slowed to 150 ms. The handle stays open, so
+        // the identity check under the lock proves the file flushed is still
+        // the one published (meta.json is only ever replaced, never written
+        // in place).
+        let mut metadata_file = match open_published_file(&meta_path) {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        let mut current_meta = Vec::new();
+        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
+        if current_meta != meta_bytes {
+            return Ok(false);
+        }
+        sync_file(&metadata_file).context("flushing entry metadata")?;
+        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         before_promotion();
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
@@ -6376,15 +6395,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )
             .optional()?;
         if current_hash.as_deref() != Some(content_hash.as_str()) {
-            return Ok(false);
-        }
-        let mut metadata_file = match open_published_file(&meta_path) {
-            Ok(file) => file,
-            Err(_) => return Ok(false),
-        };
-        let mut current_meta = Vec::new();
-        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
-        if current_meta != meta_bytes {
             return Ok(false);
         }
         if sequential {
@@ -6405,8 +6415,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        sync_file(&metadata_file).context("flushing entry metadata")?;
-        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         if kache_fs::file_identity(&meta_path).ok()
             != Some(kache_fs::handle_identity(&metadata_file)?)
         {

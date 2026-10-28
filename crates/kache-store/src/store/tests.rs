@@ -3003,15 +3003,19 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                 .unwrap()
         };
         put();
+        let meta_path = store.entry_dir("many-artifacts").join("meta.json");
         let mut calls = 0;
         assert!(
             store
                 .flush_entry_durability_with(
                     "many-artifacts",
                     |file| {
-                        let metadata_sync = calls == count;
                         calls += 1;
-                        let must_hold_writer = count == 65 || metadata_sync;
+                        // A metadata flush under the lock kept every build's
+                        // index write waiting for the journal.
+                        let metadata_sync = kache_fs::file_identity(&meta_path).ok()
+                            == kache_fs::handle_identity(file).ok();
+                        let must_hold_writer = count == 65 && !metadata_sync;
                         let competing = rusqlite::Transaction::new_unchecked(
                             &peer.db,
                             rusqlite::TransactionBehavior::Immediate,
@@ -3029,7 +3033,8 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                             {
                                 assert!(
                                     must_hold_writer,
-                                    "ordinary blob IO must run outside the writer lock"
+                                    "ordinary blob IO and the metadata flush must run outside \
+                                     the writer lock"
                                 );
                             }
                             Err(error) => panic!("unexpected writer probe: {error}"),
