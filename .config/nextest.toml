@@ -4,6 +4,29 @@
 # `cargo test` stays the local default; these settings only apply under
 # `cargo nextest run`.
 
+# Every test process runs with a temporary folder of its own (TMPDIR, TMP and
+# TEMP), removed once it ends: kache's warn-once markers live in the
+# temporary folder, and on Windows a TempDir cannot remove a folder that a
+# daemon the test started still holds, or files the store made read-only.
+# scripts/nextest-own-temp.{sh,cmd} say how.
+experimental = ["wrapper-scripts"]
+
+[scripts.wrapper.own-temp-unix]
+command = { command-line = "scripts/nextest-own-temp.sh", relative-to = "workspace-root" }
+
+[scripts.wrapper.own-temp-windows]
+command = { command-line = "scripts/nextest-own-temp.cmd", relative-to = "workspace-root" }
+
+[[profile.default.scripts]]
+platform = 'cfg(unix)'
+filter = 'all()'
+run-wrapper = 'own-temp-unix'
+
+[[profile.default.scripts]]
+platform = 'cfg(windows)'
+filter = 'all()'
+run-wrapper = 'own-temp-windows'
+
 [profile.default]
 # Report any test past a minute so the slow ones are visible in the log.
 slow-timeout = { period = "60s" }
