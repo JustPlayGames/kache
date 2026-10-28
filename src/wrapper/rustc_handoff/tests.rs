@@ -172,9 +172,11 @@ impl PendingDaemon {
     }
 
     /// Close the queue and wait until the worker has stored all of it.
+    /// The bound only catches a worker that never finishes: on a machine at
+    /// load 225, twelve entries took more than 30 s.
     async fn drain(&self, worker: tokio::sync::oneshot::Receiver<()>) {
         self.daemon.publish_queue().close();
-        tokio::time::timeout(Duration::from_secs(30), worker)
+        tokio::time::timeout(Duration::from_secs(120), worker)
             .await
             .expect("the worker drains the queue")
             .unwrap();
