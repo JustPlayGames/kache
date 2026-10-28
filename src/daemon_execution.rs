@@ -470,6 +470,12 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// How long a wait for something the test itself brings about may last
+    /// before it fails the test: only a guard against a hang. On a loaded
+    /// machine (the suite beside other builds) a step that takes milliseconds
+    /// alone can take seconds, and a fixture that takes one second ten.
+    const HANG_GUARD: Duration = Duration::from_secs(120);
+
     #[test]
     fn descriptor_channel_waits_for_readiness_and_validates_the_ticket() {
         isolated_test("descriptor_channel_waits_for_readiness_and_validates_the_ticket");
@@ -536,7 +542,9 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // Past the fixture's own guards, so a fixture that waits too long
+        // fails with what it waited for.
+        let deadline = Instant::now() + 2 * HANG_GUARD;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -601,7 +609,10 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let program = root.join("rustc");
-        std::fs::write(&program, b"#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nprintf '%s|%s\\n' \"$CLIENT\" \"$PWD\" >> \"$RECORD\"\nprintf 'metadata-%s\\n' \"$CLIENT\"\nprintf 'diagnostic-%s\\n' \"$CLIENT\" >&2\nprintf ready > \"$READY\"\ni=0\nwhile [ ! -e \"$RELEASE\" ] && [ $i -lt 400 ]; do sleep .01; i=$((i+1)); done\nexit 7\n").unwrap();
+        // The fake compiler runs until the test releases it, however loaded
+        // the machine. A test that fails first removes its folder, and the
+        // compiler stops; the count of naps (two minutes) is the backstop.
+        std::fs::write(&program, b"#!/bin/sh\nprintf '%s' \"$$\" > \"$PIDFILE\"\nprintf '%s|%s\\n' \"$CLIENT\" \"$PWD\" >> \"$RECORD\"\nprintf 'metadata-%s\\n' \"$CLIENT\"\nprintf 'diagnostic-%s\\n' \"$CLIENT\" >&2\nprintf ready > \"$READY\"\ni=0\nwhile [ ! -e \"$RELEASE\" ] && [ -e \"$READY\" ] && [ $i -lt 12000 ]; do sleep .01; i=$((i+1)); done\nexit 7\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(root.join("config.toml"), "").unwrap();
         std::fs::write(root.join("stdin"), b"input\n").unwrap();
@@ -646,7 +657,29 @@ mod tests {
         let start = Instant::now();
         while !path.exists() {
             assert!(
-                start.elapsed() < Duration::from_secs(3),
+                start.elapsed() < HANG_GUARD,
+                "compiler did not become ready: {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// [`ready`], failing at once when the client returns first: the daemon
+    /// did not prepare its compiler within the client's own preparation
+    /// timeout, so the client went on without it, as it does on a starved
+    /// machine. Waiting out the guard would only hide why.
+    async fn ready_unless_returned<T>(path: &Path, client: &tokio::task::JoinHandle<T>) {
+        let start = Instant::now();
+        while !path.exists() {
+            assert!(
+                !client.is_finished(),
+                "the client returned before its compiler started (the daemon did not \
+                 prepare it within the client's preparation timeout): {}",
+                path.display()
+            );
+            assert!(
+                start.elapsed() < HANG_GUARD,
                 "compiler did not become ready: {}",
                 path.display()
             );
@@ -695,7 +728,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut handlers = tokio::task::JoinSet::new();
             for _ in 0..connections {
-                let stream = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                let stream = tokio::time::timeout(HANG_GUARD, listener.accept())
                     .await
                     .expect("execution client did not connect")
                     .unwrap();
@@ -703,7 +736,7 @@ mod tests {
                 let l = l.clone();
                 handlers.spawn(async move {
                     tokio::time::timeout(
-                        Duration::from_secs(30),
+                        HANG_GUARD,
                         super::super::handle_connection(stream, &d, &l),
                     )
                     .await
@@ -743,8 +776,12 @@ mod tests {
             }));
         }
         if available {
-            for (name, path) in ["broker-left", "broker-right"].into_iter().zip(&paths) {
-                ready(&path.join("ready")).await;
+            for ((name, path), client) in ["broker-left", "broker-right"]
+                .into_iter()
+                .zip(&paths)
+                .zip(&clients)
+            {
+                ready_unless_returned(&path.join("ready"), client).await;
                 assert_eq!(
                     std::fs::read_to_string(path.join("stdout")).unwrap(),
                     format!("metadata-{name}\n")
@@ -774,13 +811,8 @@ mod tests {
         for client in clients {
             assert_eq!(client.await.unwrap().unwrap(), available.then_some(7));
         }
-        assert!(
-            server
-                .await
-                .unwrap()
-                .into_iter()
-                .all(|result| result.is_ok())
-        );
+        let served = server.await.unwrap();
+        assert!(served.iter().all(Result::is_ok), "{served:?}");
         assert_eq!(daemon.execution_workers.available_permits(), 2);
         if !available {
             for path in paths {
