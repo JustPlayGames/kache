@@ -69,8 +69,12 @@ pub fn run(version: &str) -> Result<i32> {
                 #[cfg(windows)]
                 if attempt == kache_ipc::execution::Attempt::Unavailable
                     && !kache_ipc::execution::daemon_unresponsive(&socket)
-                    && let Some(exit) =
-                        windows::try_bootstrap(&execution, &socket, config.disabled)?
+                    && let Some(exit) = windows::try_bootstrap(
+                        &execution,
+                        &socket,
+                        config.disabled,
+                        config.trust_daemon_execution,
+                    )?
                 {
                     return Ok(exit);
                 }

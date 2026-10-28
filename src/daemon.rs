@@ -72,6 +72,9 @@ const REMOTE_CHECK_SINGLEFLIGHT_MAX_KEYS: usize = 4096;
 const REMOTE_CHECK_LEGACY_BUDGET_MS: u64 = 3_000;
 const UPLOAD_SPOOL_MAX_BYTES: u64 = 65_536;
 const UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(5);
+#[path = "daemon_capacity.rs"]
+mod capacity;
+use capacity::DaemonCapacity;
 
 fn remote_check_budget_ms(configured_secs: u64, client_ms: Option<u64>) -> NonZeroU64 {
     let configured_ms = if configured_secs == 0 {
@@ -534,6 +537,14 @@ fn wait_for_run_lock_release(socket_path: &Path, timeout: Duration) -> Result<bo
 /// How long the daemon spends fetching one prediction row. A row saves one
 /// pre-pass, so waiting longer than a pre-pass takes would be a loss.
 const PREDICTION_FETCH_BUDGET: Duration = Duration::from_secs(2);
+
+/// Prediction lookup is optional work with a short cap, even when the
+/// configured daemon deadline is disabled or longer than the row budget.
+fn prediction_fetch_deadline(started_at: Instant, restore_timeout_secs: u64) -> RemoteDeadline {
+    RemoteDeadline::from_instant(started_at.checked_add(PREDICTION_FETCH_BUDGET)).min(
+        RemoteDeadline::from_secs_at(started_at, restore_timeout_secs),
+    )
+}
 
 /// How long a wrapper waits for a prediction row: the daemon's own budget
 /// plus the socket round trip.
@@ -1050,6 +1061,7 @@ fn effective_config(
     provenance: &crate::config::ConfigFileProvenance,
 ) -> EffectiveConfig {
     EffectiveConfig {
+        process: Some(crate::platform::process_context()),
         max_size: config.max_size,
         cache_dir: config.cache_dir.display().to_string(),
         runtime_dir: config.runtime_dir.display().to_string(),
@@ -1577,7 +1589,9 @@ impl ActivePlan {
                 self.used.insert(key.to_string());
             }
         }
-        if self.cancelled {
+        // `none` is the placeholder installed before candidates exist. Keep the
+        // demand, but do not treat that empty plan as a reason to cancel.
+        if self.cancelled || self.plan_source == "none" {
             return false;
         }
         let downloaded_not_demanded = self
@@ -1941,10 +1955,11 @@ pub(crate) struct Daemon {
     /// When this read-only daemon last warned that it skipped a writable
     /// build's upload.
     readonly_skip_warned: Mutex<Option<Instant>>,
-    /// Keep compile workers below the connection cap, leaving RPC capacity
-    /// for their own remote checks and publication requests.
+    /// Bound pipeline requests, leaving RPC capacity for their remote checks
+    /// and publication requests. Compiler scheduling has its own permits.
     #[cfg(any(unix, windows))]
     execution_workers: Arc<tokio::sync::Semaphore>,
+    capacity: DaemonCapacity,
 }
 
 /// Whether a rate-limited warning may fire at `now`. Records `now` when it may.
@@ -2034,12 +2049,14 @@ impl Daemon {
     #[cfg(test)]
     pub fn new(config: Config) -> Self {
         let provenance = crate::config::ConfigFileProvenance::current();
-        Self::new_with_provenance(config, &provenance)
+        let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
+        Self::new_with_provenance(config, &provenance, capacity)
     }
 
     fn new_with_provenance(
         config: Config,
         provenance: &crate::config::ConfigFileProvenance,
+        capacity: DaemonCapacity,
     ) -> Self {
         let permits = config.s3_concurrency.max(1) as usize;
         let (warming_tx, _) = tokio::sync::watch::channel(false);
@@ -2095,9 +2112,8 @@ impl Daemon {
             invocation_gc_pending: Mutex::new(HashSet::new()),
             readonly_skip_warned: Mutex::new(None),
             #[cfg(any(unix, windows))]
-            execution_workers: Arc::new(tokio::sync::Semaphore::new(execution_worker_count(
-                hardware_threads(),
-            ))),
+            execution_workers: Arc::new(tokio::sync::Semaphore::new(capacity.executions)),
+            capacity,
             config,
         }
     }
@@ -4043,16 +4059,32 @@ impl Daemon {
         if !prediction_identity_is_acceptable(&req.identity) {
             return Response::err("invalid prediction identity");
         }
+        // A row only saves a dependency pre-pass. Leave recovery probes to
+        // demand restores rather than retrying optional work while degraded.
+        let Some(breaker) = self
+            .remote_breaker
+            .try_acquire_speculative(RemoteOperation::PredictionGet)
+        else {
+            return response;
+        };
+        let deadline =
+            prediction_fetch_deadline(Instant::now(), self.config.remote_restore_timeout_secs);
         let fetch = async {
             let backend = self.get_remote_backend().await?;
             crate::remote_layout::RemoteLayout::new(backend.as_ref(), remote)
                 .download_prediction(&req.identity)
                 .await
         };
-        match tokio::time::timeout(PREDICTION_FETCH_BUDGET, fetch).await {
-            Ok(Ok(row)) => response.prediction = row,
-            Ok(Err(error)) => tracing::debug!("prediction row fetch failed: {error:#}"),
-            Err(_) => tracing::debug!("prediction row fetch timed out"),
+        match deadline.run("prediction row fetch", fetch).await {
+            Ok(row) => {
+                breaker.success();
+                response.prediction = row;
+            }
+            Err(error) => {
+                let class = classify_remote_error(&error);
+                breaker.failure(class, &format!("{error:#}"));
+                tracing::debug!("prediction row fetch failed: {error:#}");
+            }
         }
         response
     }
@@ -5871,6 +5903,13 @@ impl Daemon {
                 existing.plan_id = plan.plan_id;
                 existing.plan_source = plan.plan_source;
                 existing.candidates = plan.candidates;
+                // Demands recorded against the previous candidate set, including
+                // the empty placeholder, count only where they match this plan.
+                existing.demanded_candidates = existing
+                    .demanded
+                    .intersection(&existing.candidates)
+                    .cloned()
+                    .collect();
                 existing.cancelled = false;
                 existing.last_activity_ms = plan.last_activity_ms;
                 if plan.identity_key.is_some() {
@@ -6932,16 +6971,28 @@ pub fn run_server(
     let manifest_path = crate::platform::release_daemon_working_directory(&config.runtime_dir)
         .context("releasing the build working directory")?;
 
+    let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
+    tracing::info!(
+        pipeline_requests = capacity.executions,
+        rpc_handlers = capacity.connections,
+        blocking_threads = capacity.blocking_threads,
+        "daemon request capacity"
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .max_blocking_threads(capacity.blocking_threads)
         .enable_all()
-        .max_blocking_threads(blocking_thread_limit(execution_worker_count(
-            hardware_threads(),
-        )))
         .build()?;
 
     run_daemon_runtime(
         rt,
-        server_main(config, provenance, coord, readiness, manifest_path),
+        server_main(
+            config,
+            provenance,
+            coord,
+            readiness,
+            manifest_path,
+            capacity,
+        ),
     )
 }
 
@@ -7125,6 +7176,7 @@ async fn server_main(
     mut coord: DaemonCoordFile,
     readiness: Option<kunobi_daemon::readiness::channel::Notifier>,
     manifest_path: PathBuf,
+    capacity: DaemonCapacity,
 ) -> Result<()> {
     let socket_path = config.socket_path();
     std::fs::create_dir_all(socket_path.parent().unwrap())?;
@@ -7148,7 +7200,11 @@ async fn server_main(
     coord.control_version = Some(kunobi_daemon::wire::VERSION);
     coord.write_phase(DaemonPhase::Starting)?;
 
-    let daemon = Arc::new(Daemon::new_with_provenance(config.clone(), provenance));
+    let daemon = Arc::new(Daemon::new_with_provenance(
+        config.clone(),
+        provenance,
+        capacity,
+    ));
 
     tracing::info!("daemon listening on {}", socket_path.display());
 
@@ -7897,14 +7953,6 @@ impl Drop for DownloadingGuard {
     }
 }
 
-/// Connection handlers that may do work at once besides the compiler requests
-/// the daemon runs: short requests (lookups, hit stamps, publishes) keep this
-/// many handlers however many compiles hold theirs.
-const BASE_CONNECTION_LIMIT: usize = 128;
-
-/// The most compiler requests one daemon runs at once.
-const MAX_EXECUTION_WORKERS: usize = 1024;
-
 /// How often the daemon sweeps the store (age, housekeeping, size).
 const PERIODIC_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 
@@ -7952,52 +8000,6 @@ fn first_periodic_gc_delay(
     due.max(STARTUP_GC_DELAY)
 }
 
-/// The fewest: a small machine still runs several builds at once (an
-/// editor's checks beside a build, a few checkouts), each starting as many
-/// units as Cargo's jobs, and a request mostly waits for its compiler.
-const MIN_EXECUTION_WORKERS: usize = 64;
-
-/// Threads of the daemon's blocking pool besides the compiler requests' own:
-/// tokio's default size, for the requests the daemon offloads there (hashing,
-/// GC, seeding, stats), which compiles must not queue behind.
-const OFFLOAD_BLOCKING_THREADS: usize = 512;
-
-fn hardware_threads() -> usize {
-    std::thread::available_parallelism().map_or(1, usize::from)
-}
-
-/// How many compiler requests the daemon runs at once: four per hardware
-/// thread, room for four builds that each start as many units as Cargo does
-/// by default. A request past the limit is declined, and its client then
-/// starts the whole engine itself: an exec of `kache-engine` and its startup,
-/// which cost 0.5-2 s each when hundreds of units start at once (concurrent
-/// builds of fresh worktrees), against milliseconds for a request the daemon
-/// runs. A compile holds its request for as long as rustc runs, so cold
-/// builds beside warm ones keep many requests open: on a 192-thread machine
-/// the earlier limit of 32 sent 12-30 % of such a burst's units through that
-/// start, and one request per hardware thread still a third of them. Four per
-/// thread is too few on a small machine: on a 4-thread Windows machine eight
-/// builds at once had 60 % of their requests declined at 16.
-fn execution_worker_count(hardware_threads: usize) -> usize {
-    hardware_threads
-        .saturating_mul(4)
-        .clamp(MIN_EXECUTION_WORKERS, MAX_EXECUTION_WORKERS)
-}
-
-/// The daemon's blocking pool: a thread for each compiler request it runs at
-/// once, and tokio's default size for everything else it offloads.
-fn blocking_thread_limit(execution_workers: usize) -> usize {
-    execution_workers + OFFLOAD_BLOCKING_THREADS
-}
-
-/// Connection handlers allowed at once. A compiler request holds its handler
-/// (and its place here) until the compile ends, so the limit grows with the
-/// workers: running compiles must not leave other requests parked here, where a
-/// client waits out its whole handshake timeout and then skips the daemon.
-fn connection_limit(execution_workers: usize) -> usize {
-    BASE_CONNECTION_LIMIT + execution_workers
-}
-
 /// Accept until the shared lifecycle closes admission, an idle budget expires,
 /// or the OS requests shutdown. Per-request guards include response delivery.
 async fn accept_loop(
@@ -8015,9 +8017,7 @@ async fn accept_loop(
     // Bound the number of connection handlers doing work at once. Excess
     // connections park on `acquire_owned` (cheap) instead of all running
     // concurrently, so a burst of local clients can't pile up active handlers.
-    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(connection_limit(
-        execution_worker_count(hardware_threads()),
-    )));
+    let conn_limiter = Arc::new(tokio::sync::Semaphore::new(daemon.capacity.connections));
 
     // Accept errors in a row, for the backoff and the log's rate.
     let mut accept_failures: u32 = 0;

@@ -570,6 +570,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires the unavailable security-label fault injector"]
+    fn fixture_unavailable_security_labels() {
+        let error = std::fs::read("/proc/self/attr/current").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert!(!trusted_execution_available());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_execution_available() -> bool {
+        linux::permits_delegation_with_trust(Path::new("/proc"), std::process::id(), true)
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn trusting_the_pipeline_requires_both_peers() {
         for (client, daemon, expected) in [
             (false, false, false),
@@ -716,6 +731,7 @@ mod tests {
     async fn fixture_trusted_linux_clients_stream_concurrently_and_release_worker_permits() {
         let root = tempfile::tempdir().unwrap();
         let (socket, daemon, _, server) = server_with_trust(root.path(), 3, 2, true).await;
+        let available = trusted_execution_available();
         let mut clients = Vec::new();
         let mut paths = Vec::new();
         for name in ["broker-left", "broker-right"] {
@@ -726,19 +742,21 @@ mod tests {
                 crate::invocation::execution::try_execute_with_trust(&socket, &args, &context, true)
             }));
         }
-        for (name, path) in ["broker-left", "broker-right"].into_iter().zip(&paths) {
-            ready(&path.join("ready")).await;
-            assert_eq!(
-                std::fs::read_to_string(path.join("stdout")).unwrap(),
-                format!("metadata-{name}\n")
-            );
-            assert_eq!(
-                std::fs::read_to_string(path.join("stderr")).unwrap(),
-                format!("diagnostic-{name}\n")
-            );
+        if available {
+            for (name, path) in ["broker-left", "broker-right"].into_iter().zip(&paths) {
+                ready(&path.join("ready")).await;
+                assert_eq!(
+                    std::fs::read_to_string(path.join("stdout")).unwrap(),
+                    format!("metadata-{name}\n")
+                );
+                assert_eq!(
+                    std::fs::read_to_string(path.join("stderr")).unwrap(),
+                    format!("diagnostic-{name}\n")
+                );
+            }
+            assert!(clients.iter().all(|client| !client.is_finished()));
+            assert_eq!(daemon.execution_workers.available_permits(), 0);
         }
-        assert!(clients.iter().all(|client| !client.is_finished()));
-        assert_eq!(daemon.execution_workers.available_permits(), 0);
         let (args, context) = fixture(root.path(), "untrusted-client");
         let third = socket.clone();
         assert_eq!(
@@ -754,7 +772,7 @@ mod tests {
             std::fs::write(path.join("release"), b"go").unwrap();
         }
         for client in clients {
-            assert_eq!(client.await.unwrap().unwrap(), Some(7));
+            assert_eq!(client.await.unwrap().unwrap(), available.then_some(7));
         }
         assert!(
             server
@@ -764,6 +782,12 @@ mod tests {
                 .all(|result| result.is_ok())
         );
         assert_eq!(daemon.execution_workers.available_permits(), 2);
+        if !available {
+            for path in paths {
+                assert!(!path.join("record").exists());
+                assert!(!path.join("ready").exists());
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -778,6 +802,7 @@ mod tests {
     async fn fixture_filtered_execution_requires_both_peers_to_trust_the_pipeline() {
         let filtered =
             !linux::permits_delegation(Path::new("/proc"), std::process::id()).unwrap_or(false);
+        let trusted_available = trusted_execution_available();
         for (client_trust, daemon_trust) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
@@ -797,7 +822,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            let accepted = !filtered || (client_trust && daemon_trust);
+            let accepted = !filtered || (client_trust && daemon_trust && trusted_available);
             assert_eq!(outcome, accepted.then_some(7));
             assert_eq!(path.join("record").exists(), accepted);
             assert!(
@@ -823,7 +848,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (socket, daemon, _, server) = server_with_trust(root.path(), 3, 2, true).await;
         for (pid, version, accepted) in [
-            (std::process::id(), crate::VERSION, true),
+            (
+                std::process::id(),
+                crate::VERSION,
+                trusted_execution_available(),
+            ),
             (std::process::id() + 1, crate::VERSION, false),
             (std::process::id(), "different-release", false),
         ] {
@@ -1036,12 +1065,15 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let capacity = DaemonCapacity::discover(config.daemon_execution_concurrency);
         let daemon = Arc::new(Daemon::new_with_provenance(
-            super::super::tests::test_config(root.path()),
+            config,
             &crate::config::ConfigFileProvenance {
                 path: root.path().join("config.toml"),
                 fingerprint: "fixture".to_owned(),
             },
+            capacity,
         ));
         for terminal in [false, true] {
             for with_jobserver in [false, true] {
@@ -1390,6 +1422,7 @@ mod tests {
                     stdout: 2,
                     stderr: 3,
                     process_broker: false,
+                    trusted_pipeline: false,
                 }
             }),
             ("argv", |r| r.argv.clear()),
@@ -1568,7 +1601,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(results[0].is_ok());
+        // The final reply can race the disconnect reader after the client dies.
+        // Either path must reap the compiler and release its worker below.
+        if let Err(error) = &results[0] {
+            assert!(
+                error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    )
+                }),
+                "{error:#}"
+            );
+        }
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(
             std::fs::read_to_string(path.join("record"))

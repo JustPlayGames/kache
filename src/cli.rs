@@ -16,8 +16,12 @@ use crate::machine::{PathIdentity, directory_identity};
 use crate::since::SinceWindow;
 use crate::store::{STAGING_SWEEP_GRACE, Store, StoreLock};
 
+mod doctor_daemon;
+mod doctor_probe;
+mod doctor_storage;
 pub mod login;
 mod miss_diagnosis;
+mod sync_scope;
 use miss_diagnosis::{Cause, MissDiagnosis};
 
 // ── Stats snapshot (daemon-first, fallback to direct) ──────────────────────
@@ -1801,6 +1805,22 @@ pub(crate) fn config_mismatch_warnings(
              installed service takes the setting from its own environment and config"
         ));
     }
+    if let Some(floor) = eff.auto_recover_min_free_bytes
+        && floor != config.auto_recover_min_free_bytes
+    {
+        warnings.push(format!(
+            "warning: {daemon_side} has auto_recover_min_free_bytes={floor}; {client_side} says {} — {remedy}",
+            config.auto_recover_min_free_bytes
+        ));
+    }
+    if let Some(targets) = eff.auto_recover_targets
+        && targets != config.auto_recover_targets
+    {
+        warnings.push(format!(
+            "warning: {daemon_side} has auto_recover_targets={targets}; {client_side} says {} — {remedy}",
+            config.auto_recover_targets
+        ));
+    }
     warnings
 }
 
@@ -2130,7 +2150,20 @@ pub fn why_miss(config: &Config, crate_name: &str, json: bool) -> Result<()> {
                 "explain",
                 Body {
                     crate_name,
-                    diagnosis: "all_hits",
+                    diagnosis: if latest_uncached.is_some() {
+                        "not_cached"
+                    } else if crate_events.iter().any(|event| {
+                        matches!(
+                            event.result,
+                            events::EventResult::LocalHit
+                                | events::EventResult::RemoteHit
+                                | events::EventResult::PrefetchHit
+                        )
+                    }) {
+                        "all_hits"
+                    } else {
+                        "no_cache_lookups"
+                    },
                     stored_entries: stored.len(),
                     store_dirs: stored
                         .iter()
@@ -7365,7 +7398,12 @@ fn doctor_config_file_check(
 /// Labels of the daemon-related checks that become informational when the
 /// daemon is optional. Kept in sync with the check constructions in
 /// [`doctor`]; module-level so the disposition logic below is unit-testable.
-const DAEMON_CHECK_LABELS: [&str; 3] = ["Daemon version", "Daemon service", "Service exe"];
+const DAEMON_CHECK_LABELS: [&str; 4] = [
+    "Daemon version",
+    "Daemon service",
+    "Service exe",
+    "Daemon config",
+];
 
 /// The host config path `kache stats` names, only when the host file is
 /// actually merged in: absent, disabled or unusable files are not in effect.
@@ -7422,6 +7460,10 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || label == "Install path"
         || label == "Compiler execution"
         || label == OTHER_CHECKOUTS
+        || label == "Store build warning"
+        || label == "Store file limits"
+        || label == "Store volume probe"
+        || label == "Daemon process"
 }
 
 const OTHER_CHECKOUTS: &str = "Other checkouts";
@@ -7922,10 +7964,14 @@ pub fn doctor(
     verify: bool,
     checksums: bool,
     repair: bool,
+    probe: bool,
     json: bool,
 ) -> Result<()> {
     let home = dirs::home_dir().unwrap_or_default();
-    let config = crate::config::Config::load().ok();
+    let (config, provenance) = crate::config::Config::load_with_provenance()
+        .map_or((None, None), |(config, provenance)| {
+            (Some(config), Some(provenance))
+        });
     let sccache_is_fallback = fallback_is_sccache(config.as_ref());
 
     // The daemon only matters when remote work is configured (cache remote or a
@@ -8105,7 +8151,7 @@ pub fn doctor(
             Err(e) => checks.push(Check {
                 label: "Store DB",
                 pass: false,
-                detail: format!("{} ({e})", cfg.index_db_path().display()),
+                detail: format!("{} ({e:#})", cfg.index_db_path().display()),
                 fix: Some(format!(
                     "ensure {} is writable; if builds run in a sandboxed or ephemeral env, move `cache.local_store`/`KACHE_CACHE_DIR` to a stable local directory",
                     cfg.cache_dir.display()
@@ -8113,6 +8159,12 @@ pub fn doctor(
             }),
         }
 
+        checks.extend(doctor_storage::checks(cfg));
+        checks.extend(doctor_storage::disk_checks(
+            cfg,
+            cargo_output_dir().as_deref(),
+            &std::env::temp_dir(),
+        ));
         checks.push(doctor_index_quarantines(cfg));
 
         if let Ok(view) = crate::store_view::read(cfg, false, "name") {
@@ -8271,6 +8323,13 @@ pub fn doctor(
         }
 
         healthy_daemon_reachable = stats.is_some();
+        if let Some(stats) = &stats {
+            checks.extend(doctor_daemon::checks(
+                cfg,
+                provenance.as_ref().expect("loaded config has provenance"),
+                stats.effective_config.as_ref(),
+            ));
+        }
 
         let (pass, detail, fix_hint) = daemon_version_check(
             stats.as_ref().map(|s| s.version.as_str()),
@@ -8425,6 +8484,10 @@ pub fn doctor(
         checks.push(native_linker_check(
             &crate::invocation::InvocationEnv::capture(),
         ));
+    }
+
+    if probe {
+        checks.push(doctor_probe::check());
     }
 
     // Print
@@ -8866,15 +8929,13 @@ pub fn sync(
     let sync_lock_path = config.cache_dir.join("sync.lock");
     let _sync_lock = StoreLock::acquire(&sync_lock_path).context("locking cache sync")?;
     let store = Store::open(config)?;
-    let workspace_crates = workspace_filter(manifest_path);
-
-    // For the default filtered pull: parse Cargo.lock for every dependency crate
-    // name. Skipped under --workspace, which scopes the pull to workspace members
-    // only (the deps are expected to be provided some other way).
-    let lock_crates = if !pull_all && !pull_workspace && !push_only {
-        parse_cargo_lock_crate_names()
+    let scope = if pull_only && pull_all {
+        sync_scope::Scope {
+            workspace: None,
+            pull: None,
+        }
     } else {
-        None
+        sync_scope::resolve(manifest_path, !pull_all && !pull_workspace && !push_only)?
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -8886,12 +8947,12 @@ pub fn sync(
         config,
         &store,
         remote,
-        workspace_crates.as_ref(),
+        scope.workspace.as_ref(),
         pull_only,
         push_only,
         dry_run,
         pull_all,
-        lock_crates.as_ref(),
+        scope.pull.as_ref(),
         pull_workspace,
         allow_partial,
     ))
@@ -9657,100 +9718,6 @@ async fn upload_shards(
 
 /// Build a workspace crate name filter from Cargo.toml metadata.
 /// Returns None if no manifest is found (= no filtering, include everything).
-fn workspace_filter(manifest_path: Option<&str>) -> Option<std::collections::HashSet<String>> {
-    manifest_path
-        .map(|mp| match get_workspace_crate_names(mp) {
-            Ok(names) => names.into_iter().collect(),
-            Err(e) => {
-                eprintln!("warning: cargo metadata failed for {mp}: {e}");
-                std::collections::HashSet::new()
-            }
-        })
-        .or_else(|| {
-            if std::path::Path::new("Cargo.toml").exists() {
-                match get_workspace_crate_names("Cargo.toml") {
-                    Ok(names) => Some(names.into_iter().collect()),
-                    Err(e) => {
-                        eprintln!("warning: cargo metadata failed: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        })
-}
-
-/// Parse `cargo metadata` to get workspace package names.
-fn get_workspace_crate_names(manifest_path: &str) -> Result<Vec<String>> {
-    let output = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
-        .arg("--manifest-path")
-        .arg(manifest_path)
-        .output()
-        .context("running cargo metadata")?;
-
-    if !output.status.success() {
-        anyhow::bail!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("parsing cargo metadata")?;
-
-    Ok(workspace_crate_names(&metadata))
-}
-
-/// Events use compiler crate names, including explicitly named Cargo targets.
-fn workspace_crate_names(metadata: &serde_json::Value) -> Vec<String> {
-    metadata
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .flat_map(|package| {
-            package
-                .get("targets")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|target| target.get("name").and_then(serde_json::Value::as_str))
-        .map(|name| name.replace('-', "_"))
-        .collect()
-}
-
-#[cfg(test)]
-#[test]
-fn workspace_sync_matches_hyphenated_and_custom_compiler_target_names() {
-    let metadata = serde_json::json!({"packages": [
-        {"name":"package-label", "targets":[
-            {"name":"warm-dep"}, {"name":"custom_library"}, {"name":"tool-app"},
-            {}, {"name":1}
-        ]},
-        {"name":"no-targets"}
-    ]});
-    assert_eq!(
-        workspace_crate_names(&metadata),
-        ["warm_dep", "custom_library", "tool_app"]
-    );
-    for malformed in [
-        serde_json::json!({}),
-        serde_json::json!({"packages":null}),
-        serde_json::json!({"packages":[{"targets":null}]}),
-    ] {
-        assert!(workspace_crate_names(&malformed).is_empty());
-    }
-}
-
-/// Parse Cargo.lock to extract all crate names (direct + transitive dependencies).
-/// Returns None if no Cargo.lock is found in the current directory.
-fn parse_cargo_lock_crate_names() -> Option<std::collections::HashSet<String>> {
-    parse_cargo_lock_crate_names_from(std::path::Path::new("Cargo.lock"))
-}
-
 fn parse_cargo_lock_crate_names_from(
     lock_path: &std::path::Path,
 ) -> Option<std::collections::HashSet<String>> {
@@ -9762,7 +9729,7 @@ fn parse_cargo_lock_crate_names_from(
     let packages = lock.get("package")?.as_array()?;
     let names: std::collections::HashSet<String> = packages
         .iter()
-        .filter_map(|p| p.get("name")?.as_str().map(String::from))
+        .filter_map(|p| p.get("name")?.as_str().map(|name| name.replace('-', "_")))
         .collect();
     Some(names)
 }
@@ -10797,6 +10764,8 @@ struct SetupFacts {
     rustdoc: Option<&'static str>,
     test_runner: Option<SetupStep>,
     test_changes: Vec<(std::path::PathBuf, bool)>,
+    completions: Option<SetupStep>,
+    completion_changes: Vec<(std::path::PathBuf, bool)>,
     /// The `free_space_recovery` step's action.
     recovery: &'static str,
     recovery_path: std::path::PathBuf,
@@ -10841,6 +10810,10 @@ fn setup_steps(facts: &SetupFacts) -> Vec<SetupStep> {
     for (path, exists) in &facts.test_changes {
         steps.extend(backup_step(&mut created, path, *exists));
     }
+    steps.extend(facts.completions);
+    for (path, exists) in &facts.completion_changes {
+        steps.extend(backup_step(&mut created, path, *exists));
+    }
     steps.push(SetupStep::new(
         "free_space_recovery",
         facts.recovery,
@@ -10875,6 +10848,8 @@ struct RunOutcome {
     /// have written the same startup files.
     test_runner: Option<SetupStep>,
     test_changes: Vec<(std::path::PathBuf, bool)>,
+    completions: Option<SetupStep>,
+    completion_changes: Vec<(std::path::PathBuf, bool)>,
     recovery: &'static str,
     /// Whether the login service was installed or updated now.
     service_installed_now: bool,
@@ -10896,6 +10871,8 @@ fn run_facts(plan: &SetupFacts, outcome: RunOutcome) -> SetupFacts {
         rustdoc: outcome.rustdoc,
         test_runner: outcome.test_runner,
         test_changes: outcome.test_changes,
+        completions: outcome.completions,
+        completion_changes: outcome.completion_changes,
         recovery: outcome.recovery,
         service,
         ..plan.clone()
@@ -11194,6 +11171,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     #[cfg(unix)]
     let tests = plan_test_runner(no_shell)?;
     #[cfg(unix)]
+    let completions = plan_completions(no_shell)?;
+    #[cfg(unix)]
     let shell_facts = (
         compiler.step(),
         existing_paths(compiler.changed_paths()),
@@ -11210,6 +11189,15 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         (None, Vec::new(), None, None, Vec::new())
     };
     let (shell, shell_changes, rustdoc, test_runner, test_changes) = shell_facts;
+    #[cfg(unix)]
+    let completion_facts = (
+        completions.step(),
+        existing_paths(completions.changed_paths()),
+        completions.activation_required(),
+    );
+    #[cfg(not(unix))]
+    let completion_facts = (None, Vec::new(), false);
+    let (completion_step, completion_changes, completion_activation) = completion_facts;
     let (recovery, recovery_path, _) = target_recovery_offer(yes)?;
     // Asking runs the service manager, which --no-service must not touch.
     let service_available = !no_service && crate::service::login_service_available();
@@ -11228,6 +11216,8 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
         rustdoc,
         test_runner,
         test_changes,
+        completions: completion_step,
+        completion_changes,
         recovery: recovery_action(&recovery),
         recovery_path,
         service: service_action(
@@ -11259,6 +11249,11 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
             ("Config", term::home_path(&cargo_path), String::new()),
         ];
         if !no_shell && shell_supported {
+            plan_rows.push((
+                "Completions",
+                "tab completion".into(),
+                "kache commands and flags".into(),
+            ));
             plan_rows.push((
                 "Shell",
                 "new terminals".into(),
@@ -11382,6 +11377,24 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     let (shell_pending, tests_pending, rustdoc_done, tests_done, tests_changes) =
         (false, false, None, None, Vec::new());
 
+    #[cfg(unix)]
+    let (completions_pending, completions_done, completion_changes) = {
+        let completions = if check {
+            completions
+        } else {
+            plan_completions(no_shell)?
+        };
+        let step = completions.step();
+        let changes = existing_paths(completions.changed_paths());
+        (
+            init_completions(completions, check, &mut created)?,
+            step,
+            changes,
+        )
+    };
+    #[cfg(not(unix))]
+    let (completions_pending, completions_done, completion_changes) = (false, None, Vec::new());
+
     let recovery_done = offer_target_recovery(yes, check)?;
 
     // ── Step 2: daemon service ───────────────────────────────────
@@ -11424,7 +11437,7 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                     preview: true,
                     steps,
                     cargo_configured: cargo_ready,
-                    shell_activation_required: shell_activation,
+                    shell_activation_required: shell_activation || completion_activation,
                     test_activation_required: test_activation,
                     service_installed,
                     daemon_running: None,
@@ -11446,14 +11459,14 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if is_daemon_reachable(&config) {
         println!("  \x1b[32m✓\x1b[0m Background cache: running");
     } else if service_action_taken {
-        // Service install typically starts the daemon. Give it a moment and re-check.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if is_daemon_reachable(&config) {
+        // Registration is not readiness. Wait through the same coordinator
+        // used by `daemon start`, including a service still opening its store.
+        let cfg = config.as_ref().context("loading daemon configuration")?;
+        if crate::daemon::start(cfg)?.is_ready() {
             println!("  \x1b[32m✓\x1b[0m Background cache: started");
         } else {
-            println!(
-                "  \x1b[33m→\x1b[0m Background cache: still starting; check with kache doctor"
-            );
+            println!("  \x1b[31m✗\x1b[0m daemon did not start within timeout");
+            daemon_step_failed = true;
         }
     } else if service_installed {
         // Service is installed (from a previous run) but daemon isn't reachable.
@@ -11501,6 +11514,9 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
     if tests_pending {
         println!("  Open a new terminal to pace test binaries.");
     }
+    if completions_pending {
+        println!("  Open a new terminal to activate shell completions.");
+    }
     println!("  Run kache doctor to check this terminal.\n");
     if crate::machine::is_json() {
         crate::machine::emit(
@@ -11514,12 +11530,14 @@ pub fn init(yes: bool, no_service: bool, no_shell: bool, check: bool) -> Result<
                         rustdoc: rustdoc_done,
                         test_runner: tests_done,
                         test_changes: tests_changes,
+                        completions: completions_done,
+                        completion_changes,
                         recovery: recovery_done,
                         service_installed_now: service_action_taken,
                     },
                 )),
                 cargo_configured: cargo_ready,
-                shell_activation_required: shell_pending,
+                shell_activation_required: shell_pending || completions_pending,
                 test_activation_required: tests_pending,
                 service_installed: login_service_configured(
                     service_installed,
@@ -11791,6 +11809,113 @@ fn shell_startup_files() -> Result<Option<(crate::init_shell::Shell, Vec<std::pa
         .map(std::path::PathBuf::from);
     let paths = shell.paths(&home, zdotdir.as_deref(), xdg.as_deref())?;
     Ok(Some((shell, paths)))
+}
+
+#[cfg(unix)]
+enum CompletionsPlan {
+    Skipped,
+    Unsupported,
+    Manual(String),
+    Ready(crate::init_completions::Plan),
+}
+
+#[cfg(unix)]
+impl CompletionsPlan {
+    fn step(&self) -> Option<SetupStep> {
+        let (action, paths) = match self {
+            Self::Skipped => return None,
+            Self::Unsupported => ("unsupported", Vec::new()),
+            Self::Manual(_) => ("manual", Vec::new()),
+            Self::Ready(plan) => (
+                edit_action(self.activation_required(), false),
+                plan.edits.iter().map(|edit| edit.path.clone()).collect(),
+            ),
+        };
+        Some(SetupStep::new("completions", action, paths))
+    }
+
+    fn changed_paths(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            Self::Ready(plan) => plan
+                .edits
+                .iter()
+                .filter(|edit| edit.changed())
+                .map(|edit| edit.path.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn activation_required(&self) -> bool {
+        matches!(self, Self::Ready(plan) if plan.edits.iter().any(|edit| edit.changed()))
+    }
+}
+
+#[cfg(unix)]
+fn plan_completions(no_shell: bool) -> Result<CompletionsPlan> {
+    if no_shell {
+        return Ok(CompletionsPlan::Skipped);
+    }
+    let Some((shell, paths)) = shell_startup_files()? else {
+        return Ok(CompletionsPlan::Unsupported);
+    };
+    let home = dirs::home_dir().context("could not find your home directory")?;
+    let path_var = |name| {
+        std::env::var_os(name)
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    let config = path_var("XDG_CONFIG_HOME");
+    let data = path_var("XDG_DATA_HOME");
+    Ok(
+        match crate::init_completions::plan(shell, paths, &home, config.as_deref(), data.as_deref())
+        {
+            Ok(plan) => CompletionsPlan::Ready(plan),
+            Err(error) => CompletionsPlan::Manual(error.to_string()),
+        },
+    )
+}
+
+#[cfg(unix)]
+fn init_completions(
+    plan: CompletionsPlan,
+    check: bool,
+    created: &mut Vec<std::path::PathBuf>,
+) -> Result<bool> {
+    let plan = match plan {
+        CompletionsPlan::Skipped => {
+            println!("  • Shell completions: skipped (--no-shell)");
+            return Ok(false);
+        }
+        CompletionsPlan::Unsupported => {
+            println!("  • Shell completions: run kache completions <shell> for manual setup");
+            return Ok(false);
+        }
+        CompletionsPlan::Manual(error) => {
+            println!("  • Shell completions need manual setup: {error}");
+            return Ok(false);
+        }
+        CompletionsPlan::Ready(plan) => plan,
+    };
+    let changed = plan.edits.iter().any(|edit| edit.changed());
+    if check {
+        println!(
+            "  Shell completions: {} ({})",
+            if changed {
+                "would configure"
+            } else {
+                "configured"
+            },
+            crate::wrapper_config::display_path(&plan.script)
+        );
+        return Ok(false);
+    }
+    apply_shell_edits(&plan.edits, created)?;
+    println!(
+        "  ✓ Shell completions: configured ({})",
+        crate::wrapper_config::display_path(&plan.script)
+    );
+    Ok(changed)
 }
 
 /// What `kache init` sets as Cargo's runner for the host target.

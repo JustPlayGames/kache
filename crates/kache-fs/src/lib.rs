@@ -16,6 +16,9 @@ pub mod paths;
 pub mod process_state_test;
 pub mod volume;
 
+mod capacity;
+pub use capacity::{InodeUsage, VolumeId, VolumeStats, volume_stats};
+
 #[cfg(feature = "staging")]
 mod clock;
 #[cfg(feature = "staging")]
@@ -472,57 +475,24 @@ pub fn volume_usage(path: &Path) -> Option<VolumeUsage> {
     }
 }
 
-/// Windows: `GetDiskFreeSpaceExW` on `path`, which must be a directory that
-/// exists. Free is what the caller may use (quotas included), as `f_bavail`
-/// is on Unix. Without this, disk recovery, the low-disk sweep and the
-/// daemon's free-space check never ran on Windows.
+/// Windows: [`capacity::volume_space`] (`GetDiskFreeSpaceExW`) on `path`,
+/// which must be a directory that exists. Without this, disk recovery, the
+/// low-disk sweep and the daemon's free-space check never ran on Windows.
 #[cfg(windows)]
 fn volume_usage_windows(path: &Path) -> Option<VolumeUsage> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     // An empty name, or one cut short by a NUL, would ask about the
     // current directory's disk instead.
-    if wide.is_empty() || wide.contains(&0) {
+    let mut wide = path.as_os_str().encode_wide();
+    if path.as_os_str().is_empty() || wide.any(|unit| unit == 0) {
         return None;
     }
-    wide.push(0);
-    let mut free = 0u64;
-    let mut total = 0u64;
-    // SAFETY: `wide` is NUL-terminated and both counters are valid out-params.
-    let ok = unsafe {
-        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut())
-    };
-    windows_volume_usage(ok, total, free)
-}
-
-/// A `GetDiskFreeSpaceExW` answer: nonzero `ok` is success, and a zero total
-/// is a failed probe, not a zero-byte disk.
-#[cfg(any(windows, test))]
-fn windows_volume_usage(ok: i32, total: u64, free: u64) -> Option<VolumeUsage> {
-    (ok != 0 && total != 0).then_some(VolumeUsage { total, free })
+    capacity::volume_space(path)
 }
 
 #[cfg(unix)]
 fn volume_usage_unix(path: &Path) -> Option<VolumeUsage> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path and `s` is a valid out-param.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return None;
-    }
-    // f_frsize is the fragment size; f_bavail is what a non-root user can use,
-    // which is the number a human recognises as "free".
-    Some(volume_bytes(
-        s.f_blocks as u64,
-        s.f_bavail as u64,
-        s.f_frsize as u64,
-        s.f_bsize as u64,
-    ))
+    volume_stats(path).map(|stats| stats.usage)
 }
 
 #[cfg(any(unix, test))]
@@ -933,19 +903,6 @@ mod tests {
         assert!(usage.free <= usage.total);
         assert!(volume_usage(&dir.path().join("missing")).is_none());
         assert!(volume_usage(Path::new("\0")).is_none());
-    }
-
-    #[test]
-    fn a_windows_probe_needs_success_and_a_total() {
-        assert_eq!(
-            windows_volume_usage(1, 100, 40),
-            Some(VolumeUsage {
-                total: 100,
-                free: 40
-            })
-        );
-        assert_eq!(windows_volume_usage(0, 100, 40), None);
-        assert_eq!(windows_volume_usage(1, 0, 0), None);
     }
 
     #[test]
