@@ -15,6 +15,9 @@
 # (KACHE_DAEMON_OWNER_PID), so the removal is tried again for up to two
 # minutes; a folder still there after that is named on stderr and kept.
 #
+# With NEXTEST_OWN_TEMP_LOG set, every folder that took a retry or was left
+# gets a line in that file: the seconds waited, the outcome and the test.
+#
 # The test's exit status is passed on unchanged, a signal as the same signal.
 set -u
 base=${TMPDIR:-/tmp}
@@ -24,14 +27,22 @@ fi
 export TMPDIR="$dir" TMP="$dir" TEMP="$dir"
 "$@"
 status=$?
-for _ in $(seq 120); do
+waited=0
+while :; do
     chmod -R u+rwX "$dir" 2>/dev/null
     rm -rf "$dir" 2>/dev/null
     [ -e "$dir" ] || break
+    [ "$waited" -ge 120 ] && break
     sleep 1
+    waited=$((waited + 1))
 done
+outcome=removed
 if [ -e "$dir" ]; then
+    outcome=left
     echo "nextest-own-temp: $dir is still in use after the test; left in place" >&2
+fi
+if [ -n "${NEXTEST_OWN_TEMP_LOG:-}" ] && { [ "$waited" -gt 0 ] || [ "$outcome" = left ]; }; then
+    printf '%s\t%ss\t%s\t%s\n' "$dir" "$waited" "$outcome" "$*" >> "$NEXTEST_OWN_TEMP_LOG"
 fi
 if [ "$status" -gt 128 ] && [ "$status" -lt 160 ]; then
     signal=$((status - 128))

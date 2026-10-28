@@ -10,6 +10,10 @@ rem cleared everywhere first, and the removal is tried again for up to two
 rem minutes while the test's daemons drain (KACHE_DAEMON_OWNER_PID); a folder
 rem still there after that is named on stderr and kept.
 rem
+rem With NEXTEST_OWN_TEMP_LOG set, every folder that took a retry or was
+rem left gets a line in that file: the seconds waited, the outcome and the
+rem test.
+rem
 rem The test's exit status is passed on unchanged.
 setlocal EnableExtensions DisableDelayedExpansion
 set "KT_BASE=%TEMP%"
@@ -39,5 +43,8 @@ ping -n 2 127.0.0.1 >nul
 goto clean
 :stuck
 echo nextest-own-temp: %KT_DIR% is still in use after the test; left in place 1>&2
+if defined NEXTEST_OWN_TEMP_LOG echo %KT_DIR%	%KT_WAIT%s	left	%*>> "%NEXTEST_OWN_TEMP_LOG%"
+exit /b %KT_STATUS%
 :done
+if %KT_WAIT% gtr 0 if defined NEXTEST_OWN_TEMP_LOG echo %KT_DIR%	%KT_WAIT%s	removed	%*>> "%NEXTEST_OWN_TEMP_LOG%"
 exit /b %KT_STATUS%
