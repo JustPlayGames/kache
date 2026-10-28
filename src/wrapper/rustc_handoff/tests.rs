@@ -611,42 +611,47 @@ fn raw_events(config: &Config) -> Vec<serde_json::Value> {
 /// them, so a lock that is free only now and then is taken once, not once
 /// per entry. Each entry is the compiler's bytes, and each event says how
 /// many entries its transaction committed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
+#[test]
+fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
     const COUNT: usize = 12;
     let (_root, compiled) = compiled_many(COUNT);
-    let config = &compiled[0].config;
-    let mut daemon = PendingDaemon::listen_queueing(config, 64);
+    crate::test_support::on_a_runtime_of_its_own(
+        crate::test_support::Flavor::MultiThread(4),
+        async {
+            let config = &compiled[0].config;
+            let mut daemon = PendingDaemon::listen_queueing(config, 64);
 
-    let (released, holder) = hold_index_lock(config, BUSY);
-    for one in &compiled {
-        let (outcome, lock, _) = hand_off_now(one);
-        assert!(matches!(outcome, RustcStore::HandedOff));
-        assert!(lock.is_none());
-    }
-    let worker = daemon.start_worker();
-    assert!(
-        !released.load(std::sync::atomic::Ordering::SeqCst),
-        "every hand-off queued while the index was held"
+            let (released, holder) = hold_index_lock(config, BUSY);
+            for one in &compiled {
+                let (outcome, lock, _) = hand_off_now(one);
+                assert!(matches!(outcome, RustcStore::HandedOff));
+                assert!(lock.is_none());
+            }
+            let worker = daemon.start_worker();
+            assert!(
+                !released.load(std::sync::atomic::Ordering::SeqCst),
+                "every hand-off queued while the index was held"
+            );
+            tokio::task::block_in_place(|| holder.join().unwrap());
+            daemon.drain(worker).await;
+
+            let store = Store::open(config).unwrap();
+            for one in &compiled {
+                let meta = store.get(&one.key).unwrap().expect("committed");
+                assert_eq!(
+                    std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+                    std::fs::read(&one.rlib).unwrap()
+                );
+            }
+            let events = raw_events(config);
+            assert_eq!(events.len(), COUNT);
+            for event in &events {
+                assert_eq!(event["store_error"], serde_json::Value::Null, "{event}");
+                assert_eq!(event["daemon_store_batch"], COUNT, "{event}");
+            }
+            assert_eq!(handoff_requests(config), 0, "no snapshot is left");
+        },
     );
-    tokio::task::block_in_place(|| holder.join().unwrap());
-    daemon.drain(worker).await;
-
-    let store = Store::open(config).unwrap();
-    for one in &compiled {
-        let meta = store.get(&one.key).unwrap().expect("committed");
-        assert_eq!(
-            std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
-            std::fs::read(&one.rlib).unwrap()
-        );
-    }
-    let events = raw_events(config);
-    assert_eq!(events.len(), COUNT);
-    for event in &events {
-        assert_eq!(event["store_error"], serde_json::Value::Null, "{event}");
-        assert_eq!(event["daemon_store_batch"], COUNT, "{event}");
-    }
-    assert_eq!(handoff_requests(config), 0, "no snapshot is left");
 }
 
 /// An output rewritten in place after its wrapper returned costs its own
