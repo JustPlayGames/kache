@@ -3,6 +3,8 @@ use super::*;
 use std::fs;
 use std::sync::mpsc;
 
+use crate::test_support::{Flavor, on_a_runtime_of_its_own};
+
 #[test]
 fn identity_publish_context_requires_both_nonempty_values() {
     assert_eq!(identity_publish_context(None, "session", true, false), None);
@@ -1804,107 +1806,22 @@ fn foreground_startup_rejects_a_file_in_place_of_the_runtime_directory() {
     assert!(run_server(&config, &provenance, None).is_err());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn server_main_binds_socket_and_handles_shutdown() {
+#[test]
+fn server_main_binds_socket_and_handles_shutdown() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.daemon_idle_timeout_secs = 0;
-    config.prefetch_enabled = false;
-    config.remote = Some(crate::config::RemoteConfig {
-        prefix: "artifacts".into(),
-        backend: crate::config::RemoteBackendConfig::Filesystem(
-            crate::config::FilesystemRemoteConfig {
-                root: dir.path().join("remote"),
-                atomic_write_dir: dir.path().join("remote-staging"),
-            },
-        ),
-    });
-    let socket_path = config.socket_path();
-    let coord = DaemonCoordFile::for_socket(&socket_path);
-    let server_config = config.clone();
-    let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
-    let server = tokio::spawn(async move {
-        server_main(
-            &server_config,
-            &provenance,
-            coord,
-            None,
-            PathBuf::from("Cargo.lock"),
-        )
-        .await
-    });
-
-    let ready_socket = socket_path.clone();
-    let ready = tokio::task::spawn_blocking(move || {
-        kunobi_daemon::readiness::wait_until(Instant::now() + Duration::from_secs(5), |deadline| {
-            lifecycle_client::current_socket(&ready_socket, deadline)
-        })
-        .map(|proof| proof.is_some())
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(ready, "server_main must bind its configured socket");
-
-    assert_eq!(
-        read_daemon_state(&socket_path).unwrap().control_version,
-        Some(kunobi_daemon::wire::VERSION),
-        "stop must use the advertised binary DRAIN endpoint"
-    );
-    let response = client_roundtrip(
-        &socket_path,
-        &Request::BuildStarted(BuildStartedRequest {
-            intent: kache_core::BuildIntent::default(),
-            client_epoch: 0,
-            client_version: None,
-            session_id: "binary-drain-session".into(),
-        }),
-    )
-    .await;
-    assert!(response.ok, "build session must be accepted: {response:?}");
-    assert!(!config.summary_log_path().exists());
-
-    let shutdown_config = config.clone();
-    tokio::task::spawn_blocking(move || send_shutdown_request(&shutdown_config))
-        .await
-        .unwrap()
-        .unwrap();
-
-    let result = tokio::time::timeout(Duration::from_secs(10), server)
-        .await
-        .expect("server_main should stop after a shutdown request")
-        .expect("server_main task should not panic");
-    assert!(
-        result.is_ok(),
-        "server_main should exit cleanly: {result:?}"
-    );
-    let summaries = events::read_summaries(&config.summary_log_path()).unwrap();
-    assert_eq!(
-        summaries.len(),
-        1,
-        "shutdown must finalize the session once"
-    );
-    assert_eq!(summaries[0].session_id, "binary-drain-session");
-    assert_eq!(summaries[0].closure_reason, "shutdown");
-    assert!(!summaries[0].incomplete);
-    assert!(!summaries[0].cancelled);
-    assert!(
-        !socket_path.exists(),
-        "server_main should remove its socket during shutdown"
-    );
-}
-
-/// A daemon nobody can reach any more stops instead of running for good: the
-/// suite's leaked daemons were ones whose test removed the temporary runtime
-/// directory without stopping them.
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
-    for replace in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
+    on_a_runtime_of_its_own(Flavor::MultiThread(2), async {
         let mut config = test_config(dir.path());
         config.daemon_idle_timeout_secs = 0;
         config.prefetch_enabled = false;
+        config.remote = Some(crate::config::RemoteConfig {
+            prefix: "artifacts".into(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: dir.path().join("remote"),
+                    atomic_write_dir: dir.path().join("remote-staging"),
+                },
+            ),
+        });
         let socket_path = config.socket_path();
         let coord = DaemonCoordFile::for_socket(&socket_path);
         let server_config = config.clone();
@@ -1919,6 +1836,7 @@ async fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
             )
             .await
         });
+
         let ready_socket = socket_path.clone();
         let ready = tokio::task::spawn_blocking(move || {
             kunobi_daemon::readiness::wait_until(
@@ -1932,25 +1850,115 @@ async fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
         .unwrap();
         assert!(ready, "server_main must bind its configured socket");
 
-        fs::remove_file(&socket_path).unwrap();
-        let _successor =
-            replace.then(|| std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
+        assert_eq!(
+            read_daemon_state(&socket_path).unwrap().control_version,
+            Some(kunobi_daemon::wire::VERSION),
+            "stop must use the advertised binary DRAIN endpoint"
+        );
+        let response = client_roundtrip(
+            &socket_path,
+            &Request::BuildStarted(BuildStartedRequest {
+                intent: kache_core::BuildIntent::default(),
+                client_epoch: 0,
+                client_version: None,
+                session_id: "binary-drain-session".into(),
+            }),
+        )
+        .await;
+        assert!(response.ok, "build session must be accepted: {response:?}");
+        assert!(!config.summary_log_path().exists());
 
-        let result = tokio::time::timeout(Duration::from_secs(20), server)
+        let shutdown_config = config.clone();
+        tokio::task::spawn_blocking(move || send_shutdown_request(&shutdown_config))
             .await
-            .unwrap_or_else(|_| {
-                panic!("a daemon whose socket was removed (replaced: {replace}) kept running")
-            })
+            .unwrap()
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server_main should stop after a shutdown request")
             .expect("server_main task should not panic");
         assert!(
             result.is_ok(),
             "server_main should exit cleanly: {result:?}"
         );
+        let summaries = events::read_summaries(&config.summary_log_path()).unwrap();
         assert_eq!(
-            socket_path.exists(),
-            replace,
-            "the exiting daemon leaves a successor's socket alone"
+            summaries.len(),
+            1,
+            "shutdown must finalize the session once"
         );
+        assert_eq!(summaries[0].session_id, "binary-drain-session");
+        assert_eq!(summaries[0].closure_reason, "shutdown");
+        assert!(!summaries[0].incomplete);
+        assert!(!summaries[0].cancelled);
+        assert!(
+            !socket_path.exists(),
+            "server_main should remove its socket during shutdown"
+        );
+    });
+}
+
+/// A daemon nobody can reach any more stops instead of running for good: the
+/// suite's leaked daemons were ones whose test removed the temporary runtime
+/// directory without stopping them.
+#[cfg(unix)]
+#[test]
+fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        on_a_runtime_of_its_own(Flavor::MultiThread(2), async {
+            let mut config = test_config(dir.path());
+            config.daemon_idle_timeout_secs = 0;
+            config.prefetch_enabled = false;
+            let socket_path = config.socket_path();
+            let coord = DaemonCoordFile::for_socket(&socket_path);
+            let server_config = config.clone();
+            let provenance =
+                crate::config::config_file_provenance_at(dir.path().join("config.toml"));
+            let server = tokio::spawn(async move {
+                server_main(
+                    &server_config,
+                    &provenance,
+                    coord,
+                    None,
+                    PathBuf::from("Cargo.lock"),
+                )
+                .await
+            });
+            let ready_socket = socket_path.clone();
+            let ready = tokio::task::spawn_blocking(move || {
+                kunobi_daemon::readiness::wait_until(
+                    Instant::now() + Duration::from_secs(5),
+                    |deadline| lifecycle_client::current_socket(&ready_socket, deadline),
+                )
+                .map(|proof| proof.is_some())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(ready, "server_main must bind its configured socket");
+
+            fs::remove_file(&socket_path).unwrap();
+            let _successor =
+                replace.then(|| std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
+
+            let result = tokio::time::timeout(Duration::from_secs(20), server)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("a daemon whose socket was removed (replaced: {replace}) kept running")
+                })
+                .expect("server_main task should not panic");
+            assert!(
+                result.is_ok(),
+                "server_main should exit cleanly: {result:?}"
+            );
+            assert_eq!(
+                socket_path.exists(),
+                replace,
+                "the exiting daemon leaves a successor's socket alone"
+            );
+        });
     }
 }
 
@@ -6922,51 +6930,53 @@ async fn test_do_upload_skips_when_entry_already_in_remote() {
     );
 }
 
-#[tokio::test]
-async fn test_do_upload_uploads_when_not_in_remote_records_v3_transfer_timestamps() {
+#[test]
+fn test_do_upload_uploads_when_not_in_remote_records_v3_transfer_timestamps() {
     // Injected mock 404s the HEAD then 200s the pack + manifest PUTs, so
     // do_upload packs the local entry and uploads it end-to-end. Covers the
     // full upload path: exists_entry(miss) -> upload_entry(pack+manifest) ->
     // transfer-event + key-cache update -> ok.
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.remote = Some(test_remote_config());
-    config.prefetch_enabled = false;
-    let key = test_cache_key("new-upload");
-    seed_store_entry(&config, &key, "serde", dir.path());
-    let entry_dir = config.store_dir().join(&key);
+    on_a_runtime_of_its_own(Flavor::CurrentThread, async {
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("new-upload");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let entry_dir = config.store_dir().join(&key);
 
-    let client = test_remote_backend();
-    let daemon = Arc::new(Daemon::new(config));
-    assert!(
-        daemon.remote_backend.set(client.clone()).is_ok(),
-        "inject mock backend"
-    );
+        let client = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(
+            daemon.remote_backend.set(client.clone()).is_ok(),
+            "inject mock backend"
+        );
 
-    let resp = daemon
-        .do_upload(&UploadJob {
-            key: key.clone(),
-            entry_dir: entry_dir.to_string_lossy().into_owned(),
-            crate_name: "serde".into(),
-            client_epoch: 0,
-            client_version: None,
-        })
-        .await;
+        let resp = daemon
+            .do_upload(&UploadJob {
+                key: key.clone(),
+                entry_dir: entry_dir.to_string_lossy().into_owned(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+                client_version: None,
+            })
+            .await;
 
-    assert!(resp.ok, "upload of a new entry should succeed: {resp:?}");
-    assert!(
-        client
-            .head(&test_pack_object_key(&key, "serde"))
-            .await
-            .unwrap()
-    );
-    assert!(
-        client
-            .head(&test_manifest_object_key(&key, "serde"))
-            .await
-            .unwrap()
-    );
-    assert_v3_transfer_timestamps(&latest_transfer(&daemon));
+        assert!(resp.ok, "upload of a new entry should succeed: {resp:?}");
+        assert!(
+            client
+                .head(&test_pack_object_key(&key, "serde"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            client
+                .head(&test_manifest_object_key(&key, "serde"))
+                .await
+                .unwrap()
+        );
+        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
+    });
 }
 
 #[tokio::test]
@@ -8375,72 +8385,75 @@ async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
     );
 }
 
-#[tokio::test]
-async fn packed_prefetch_response_returns_before_blocked_pack_get() {
+#[test]
+fn packed_prefetch_response_returns_before_blocked_pack_get() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    // Catalog discovery is a LIST.
-    config.remote_key_listing = true;
-    config.remote = Some(test_remote_config());
-    let inner = test_remote_backend();
-    let context = PackPrefetchContext::from_deps(
-        crate::identity::host_target_triple(),
-        "linux/toolchain/release",
-        &[("serde".to_string(), "1.0.0".to_string())],
-    )
-    .unwrap();
-    let key = test_cache_key("nonblocking-prefetch-pack");
-    let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
-    seed_packed_catalog(
-        &inner,
-        &context,
-        vec![crate::remote_pack::PackInputEntry {
-            cache_key: key.clone(),
-            crate_name: "serde".into(),
-            meta_digest,
-            payload,
-        }],
-        None,
-    )
-    .await;
+    on_a_runtime_of_its_own(Flavor::CurrentThread, async {
+        let mut config = test_config(dir.path());
+        // Catalog discovery is a LIST.
+        config.remote_key_listing = true;
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("nonblocking-prefetch-pack");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &inner,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
 
-    let pack_started = Arc::new(Notify::new());
-    let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
-    let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(BlockingPackBackend {
-        inner,
-        pack_started: pack_started.clone(),
-        release_pack: release_pack.clone(),
-        v3_get_started: None,
-    });
-    let daemon = Arc::new(Daemon::new(config));
-    assert!(daemon.remote_backend.set(backend).is_ok());
+        let pack_started = Arc::new(Notify::new());
+        let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(BlockingPackBackend {
+                inner,
+                pack_started: pack_started.clone(),
+                release_pack: release_pack.clone(),
+                v3_get_started: None,
+            });
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
 
-    let started = pack_started.notified();
-    tokio::pin!(started);
-    started.as_mut().enable();
-    let response = tokio::time::timeout(
-        Duration::from_secs(10),
-        daemon.handle_prefetch_with_context(
-            &PrefetchRequest {
-                keys: vec![(key.clone(), "serde".into())],
-                warm_all: false,
-                origin: None,
-                candidate_sources: HashMap::new(),
-            },
-            Some(context),
-            Instant::now(),
-        ),
-    )
-    .await
-    .expect("prefetch acknowledgement must not await the pack GET");
-    assert!(response.ok);
-    tokio::time::timeout(Duration::from_secs(10), started)
+        let started = pack_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            daemon.handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
+                },
+                Some(context),
+                Instant::now(),
+            ),
+        )
         .await
-        .expect("background coordinator should start the pack GET");
-    assert!(!daemon.entry_dir_for(&key).exists());
+        .expect("prefetch acknowledgement must not await the pack GET");
+        assert!(response.ok);
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .expect("background coordinator should start the pack GET");
+        assert!(!daemon.entry_dir_for(&key).exists());
 
-    release_pack.add_permits(1);
-    wait_for_store_entry(&daemon, &key).await;
+        release_pack.add_permits(1);
+        wait_for_store_entry(&daemon, &key).await;
+    });
 }
 
 #[tokio::test]
@@ -12126,55 +12139,57 @@ fn test_prefetch_byte_budget_exhausted() {
 
 /// `prefetch_deadline_secs = 0` disables the deadline rather than dropping
 /// the plan immediately (#616).
-#[tokio::test]
-async fn test_prefetch_deadline_stops_the_plan() {
+#[test]
+fn test_prefetch_deadline_stops_the_plan() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.remote = Some(test_remote_config());
-    // The coordinator checks the deadline before starting each candidate,
-    // so a zero-length budget drops the whole plan on the first iteration.
-    config.prefetch_deadline_secs = 0;
+    on_a_runtime_of_its_own(Flavor::CurrentThread, async {
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        // The coordinator checks the deadline before starting each candidate,
+        // so a zero-length budget drops the whole plan on the first iteration.
+        config.prefetch_deadline_secs = 0;
 
-    let key = "4444444444444444".repeat(4);
-    let client = test_remote_backend();
-    put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
-    put_test_object(
-        &client,
-        &test_pack_object_key(&key, "serde"),
-        &build_entry_pack(&key, "serde"),
-    )
-    .await;
-
-    let daemon = Arc::new(Daemon::new(config.clone()));
-    assert!(
-        daemon.remote_backend.set(client).is_ok(),
-        "inject mock backend"
-    );
-
-    let resp = daemon
-        .handle_prefetch(&PrefetchRequest {
-            keys: vec![(key.clone(), "serde".to_string())],
-            warm_all: false,
-            origin: None,
-            candidate_sources: HashMap::new(),
-        })
+        let key = "4444444444444444".repeat(4);
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(
+            &client,
+            &test_pack_object_key(&key, "serde"),
+            &build_entry_pack(&key, "serde"),
+        )
         .await;
-    assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
 
-    // `0` means "no deadline", so the plan must still run.
-    let entry_meta = config.store_dir().join(&key).join("meta.json");
-    let mut imported = false;
-    for _ in 0..100 {
-        if entry_meta.exists() {
-            imported = true;
-            break;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.clone(), "serde".to_string())],
+                warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
+            })
+            .await;
+        assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
+
+        // `0` means "no deadline", so the plan must still run.
+        let entry_meta = config.store_dir().join(&key).join("meta.json");
+        let mut imported = false;
+        for _ in 0..100 {
+            if entry_meta.exists() {
+                imported = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        imported,
-        "prefetch_deadline_secs = 0 disables the deadline rather than dropping the plan"
-    );
+        assert!(
+            imported,
+            "prefetch_deadline_secs = 0 disables the deadline rather than dropping the plan"
+        );
+    });
 }
 
 /// An empty candidate list must mean "nothing to prefetch", never

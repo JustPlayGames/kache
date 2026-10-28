@@ -220,6 +220,41 @@ pub(crate) fn settle_writes(paths: &[&std::path::Path]) {
     }
 }
 
+/// The runtime [`on_a_runtime_of_its_own`] builds, as `#[tokio::test]`'s
+/// `flavor` and `worker_threads` would.
+pub(crate) enum Flavor {
+    CurrentThread,
+    MultiThread(usize),
+}
+
+/// Runs `test` on a runtime of its own, as `#[tokio::test]` would, and shuts
+/// that runtime down before returning. A daemon's spawned work (its periodic
+/// flushes, durability ticks, migration, a sweep after a store, a prefetch
+/// plan) outlives the call that started it, and under `#[tokio::test]` it
+/// ran on after the test's temporary directory was removed and wrote its
+/// index, store, GC stats or transfer log there again. Create the directory
+/// before calling this, and it goes after the runtime.
+pub(crate) fn on_a_runtime_of_its_own<F: std::future::Future>(
+    flavor: Flavor,
+    test: F,
+) -> F::Output {
+    let runtime = match flavor {
+        Flavor::CurrentThread => tokio::runtime::Builder::new_current_thread(),
+        Flavor::MultiThread(workers) => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(workers);
+            builder
+        }
+    }
+    .enable_all()
+    .build()
+    .unwrap();
+    let output = runtime.block_on(test);
+    // Waits for blocking work in flight, as the end of `#[tokio::test]` did.
+    drop(runtime);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cwd_dir, process_state_test_lock};
