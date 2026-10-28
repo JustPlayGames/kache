@@ -788,6 +788,29 @@ fn link_search_in(stdout: &str, shared: &Path, cargo_out_dir: &Path) -> String {
 pub(crate) mod test_support {
     use super::*;
 
+    /// A temporary directory for tests that seal runs. A sealed run is
+    /// read-only, which `TempDir` cannot remove: this one makes what it
+    /// holds writable first, so the run goes with it.
+    pub(crate) struct ScratchDir(tempfile::TempDir);
+
+    pub(crate) fn tempdir() -> ScratchDir {
+        ScratchDir(tempfile::tempdir().unwrap())
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = tempfile::TempDir;
+
+        fn deref(&self) -> &tempfile::TempDir {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = writable(self.0.path());
+        }
+    }
+
     /// A sealed run for the `OUT_DIR` at `below_target` holding `gen.rs`;
     /// its shared `OUT_DIR`.
     pub(crate) fn sealed_run(cache_dir: &Path, key: &str, below_target: &Path) -> PathBuf {
@@ -822,8 +845,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_scratch_dir_removes_the_sealed_runs_it_holds() {
+        let dir = test_support::tempdir();
+        let root = dir.path().to_owned();
+        let shared =
+            test_support::sealed_run(&root, &"ab".repeat(32), Path::new("debug/build/z-1/out"));
+        assert!(shared.join("gen.rs").is_file());
+        drop(dir);
+        assert!(!root.exists(), "the sealed run kept {}", root.display());
+    }
+
+    #[test]
     fn hermetic_records_refuse_sibling_units_before_linking_output() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir();
         let target = directory.path().join("target");
         let out_dir = target.join("debug/build/pkg-1/out");
         std::fs::create_dir_all(&out_dir).unwrap();
@@ -886,7 +920,7 @@ mod tests {
                 ("dep-0123456789abcdef", "dep-fedcba9876543210"),
                 ("dep/0123456789abcdef", "dep/fedcba9876543210"),
             ] {
-                let directory = tempfile::tempdir().unwrap();
+                let directory = test_support::tempdir();
                 let target = directory.path().join("target");
                 let below = PathBuf::from(target_name).join("debug/build/own-0123456789abcdef/out");
                 let out_dir = target.join(&below);
@@ -955,7 +989,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn hermetic_guard_keeps_canonical_profile_siblings_out_of_a_sealed_run() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = test_support::tempdir();
         let target = directory.path().join("target");
         let physical = directory.path().join("physical/debug");
         std::fs::create_dir_all(&physical).unwrap();
@@ -1049,7 +1083,7 @@ mod tests {
                 "debug/build/z/fedcba9876543210/out",
             ),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = test_support::tempdir();
             let below = Path::new(below);
             let cache = dir.path().join("cache");
             let shared = test_support::sealed_run(&cache, &"ab".repeat(32), below);
@@ -1182,7 +1216,7 @@ mod tests {
 
     #[test]
     fn a_released_run_is_free_while_a_fork_holds_a_duplicate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let below = Path::new("debug/build/z-0123456789abcdef/out");
         let cache = dir.path().join("cache");
         let key = "ab".repeat(32);
@@ -1264,7 +1298,7 @@ mod tests {
 
     #[test]
     fn escape_finds_writes_outside_out_dir_and_symlinks_in_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let sandbox = sandbox_in(dir.path());
         std::fs::create_dir(sandbox.out_dir.join("lib")).unwrap();
         std::fs::write(sandbox.out_dir.join("lib/libz.a"), b"a").unwrap();
@@ -1302,7 +1336,7 @@ mod tests {
 
     #[test]
     fn a_sealed_run_is_read_only_and_found_again() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let sandbox = sandbox_in(dir.path());
         std::fs::write(sandbox.out_dir.join("gen.rs"), b"pub const N: u8 = 1;").unwrap();
         assert_eq!(sealed(&sandbox).unwrap(), None);
@@ -1333,7 +1367,7 @@ mod tests {
     #[test]
     fn sealing_leaves_a_link_and_its_target_as_they_were() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let sandbox = sandbox_in(dir.path());
         let library = sandbox.out_dir.join("libz.so.1");
         std::fs::write(&library, b"so").unwrap();
@@ -1369,7 +1403,7 @@ mod tests {
 
     #[test]
     fn linking_replaces_a_directory_or_a_link_and_detaching_undoes_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let shared = dir.path().join("shared");
         std::fs::create_dir(&shared).unwrap();
         std::fs::write(shared.join("gen.rs"), b"shared").unwrap();
@@ -1403,7 +1437,7 @@ mod tests {
 
     #[test]
     fn only_a_sandbox_with_a_sealed_record_counts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let cache = dir.path().join("cache");
         let sandbox = Sandbox::new(&cache, &"cd".repeat(32), Path::new("debug/build/z-1/out"));
         std::fs::create_dir_all(&sandbox.out_dir).unwrap();
@@ -1425,7 +1459,7 @@ mod tests {
 
     #[test]
     fn a_refused_or_foreign_sealed_key_is_not_attempted() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let sandbox = Sandbox::new(dir.path(), &"ab".repeat(32), Path::new("out"));
         std::fs::create_dir_all(sandbox.root.parent().unwrap()).unwrap();
         assert!(!not_to_attempt(&sandbox));
@@ -1439,7 +1473,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_record_is_an_error_not_an_absence() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let sandbox = sandbox_in(dir.path());
         std::fs::create_dir(sandbox.root.join(SEALED)).unwrap();
         assert!(sealed(&sandbox).is_err());
@@ -1498,7 +1532,7 @@ mod tests {
 
     #[test]
     fn a_sweep_keeps_linked_and_recent_runs_and_removes_the_rest() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let cache = dir.path().join("cache");
         let week = std::time::Duration::from_secs(7 * 24 * 3600);
         let later = std::time::SystemTime::now() + week + week;
@@ -1566,7 +1600,7 @@ mod tests {
 
     #[test]
     fn a_sweep_skips_what_is_not_a_sandbox_and_fails_on_an_unreadable_root() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let cache = dir.path().join("cache");
         let root = cache.join(ROOT);
         std::fs::create_dir_all(root.join("scratch")).unwrap();
@@ -1595,7 +1629,7 @@ mod tests {
 
     #[test]
     fn live_referrers_are_links_into_the_sandbox_once_each() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = test_support::tempdir();
         let cache = dir.path().join("cache");
         let target = dir.path().join("target/debug/build");
         let out = target.join("z-1/out");
