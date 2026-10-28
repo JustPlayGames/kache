@@ -16,13 +16,20 @@ rem With NEXTEST_OWN_TEMP_LOG set, every folder that took a retry or was
 rem left gets a line in that file: the seconds waited, the outcome and the
 rem test.
 rem
+rem The folder's name starts with the test's nextest slot
+rem (NEXTEST_TEST_GLOBAL_SLOT), which no other running test has until this
+rem script exits: %RANDOM% alone repeats in every cmd started in the same
+rem second, so a test could take the name of a folder another test's clean-up
+rem was still retrying, and that retry then removed the new test's folder
+rem while it ran (16 unit tests failed so on one Windows run).
+rem
 rem The test's exit status is passed on unchanged.
 setlocal EnableExtensions DisableDelayedExpansion
 set "KT_BASE=%TEMP%"
 if not defined KT_BASE set "KT_BASE=%TMP%"
 set /a KT_TRIES=0
 :pick
-set "KT_DIR=%KT_BASE%\kt%RANDOM%%RANDOM%"
+set "KT_DIR=%KT_BASE%\kt%NEXTEST_TEST_GLOBAL_SLOT%_%RANDOM%%RANDOM%"
 mkdir "%KT_DIR%" 2>nul && goto run
 set /a KT_TRIES+=1
 if %KT_TRIES% lss 100 goto pick
