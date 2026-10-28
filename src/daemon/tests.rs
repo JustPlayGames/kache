@@ -15917,13 +15917,14 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     let starter_calls = calls.clone();
     let (server_tx, server_rx) = std::sync::mpsc::channel();
     let outcome = tokio::task::spawn_blocking(move || {
-        send_gc_request_with_timeout(&config, Some(17), Duration::from_secs(2), || {
+        send_gc_request_with_timeout(&config, Some(17), HANG_GUARD, || {
             starter_calls.fetch_add(1, Ordering::SeqCst);
-            closed_rx.recv_timeout(Duration::from_secs(2))?;
+            // Restart once the first daemon is gone, however long that takes.
+            closed_rx.recv_timeout(HANG_GUARD)?;
             // Windows may still hold the old named-pipe instance while its
             // asynchronous close finishes. The old handler has exited above.
             #[cfg(windows)]
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + HANG_GUARD;
             #[cfg(windows)]
             let listener = loop {
                 match ListenerOptions::new()
@@ -15963,13 +15964,10 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     assert!(!outcome.skipped);
     assert_eq!(outcome.breakdown.unwrap().mode, GcRequestMode::ExplicitAge);
     first_server.await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        server_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout(HANG_GUARD, server_rx.recv_timeout(HANG_GUARD).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 fn put_aged_entry(config: &Config, dir: &Path, key: &str) {
