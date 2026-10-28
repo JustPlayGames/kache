@@ -3933,7 +3933,7 @@ pub fn probe_memo_dir_for(invocation: &InvocationEnv) -> Result<PathBuf> {
 }
 
 pub fn default_cache_dir() -> PathBuf {
-    dirs::cache_dir()
+    crate::invocation::user_cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("kache")
 }

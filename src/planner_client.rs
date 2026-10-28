@@ -203,14 +203,16 @@ mod tests {
     async fn test_resolve_prefetch_plan_with_config_errors_on_bad_status() {
         let endpoint = spawn_response_server(
             "{\"error\":\"nope\"}".to_string(),
-            None,
+            Some("token-123"),
             "HTTP/1.1 503 Service Unavailable",
         )
         .await;
+        // A token of its own: without one the bearer lookup reads the
+        // user's Kunobi session store, which creates ~/.config/kunobi.
         let config = PlannerConfig {
             endpoint,
             timeout_ms: 1000,
-            token: None,
+            token: Some("token-123".into()),
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],
@@ -235,11 +237,13 @@ mod tests {
             candidates: vec![],
         })
         .unwrap();
-        let endpoint = spawn_response_server(body, None, "HTTP/1.1 200 OK").await;
+        let endpoint = spawn_response_server(body, Some("token-123"), "HTTP/1.1 200 OK").await;
+        // A token of its own: without one the bearer lookup reads the
+        // user's Kunobi session store, which creates ~/.config/kunobi.
         let config = PlannerConfig {
             endpoint,
             timeout_ms: 1000,
-            token: None,
+            token: Some("token-123".into()),
         };
         let req = BuildIntent {
             crate_names: vec!["serde".into()],

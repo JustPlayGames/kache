@@ -646,6 +646,10 @@ mod tests {
         TofuStore::with_path(directory.path().join("known.json"))
     }
 
+    #[cfg_attr(
+        windows,
+        ignore = "kunobi-auth locks under the real AppData\\Roaming\\kunobi; nothing moves it on Windows"
+    )]
     #[tokio::test]
     async fn only_a_planner_pinned_by_kache_login_offers_its_session() {
         let _config = crate::test_support::KunobiConfigGuard::new();

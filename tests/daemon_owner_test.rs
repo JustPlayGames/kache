@@ -92,3 +92,36 @@ fn a_killed_test_leaves_no_daemon() {
         )
     });
 }
+
+/// A test's daemon logs into the test's user cache folder, never the
+/// developer's. The bootstrap build is a test build, which keeps the default
+/// cache folder where `KACHE_TEST_USER_CACHE_DIR` says (else in the temporary
+/// directory). Test runs appended thousands of daemon log lines to
+/// `~/.cache/kache/kache.log`, and wrote `AppData\Local\kache` on Windows,
+/// where no HOME or XDG variable moves that folder. macOS logs under
+/// `~/Library/Logs` instead.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_test_daemon_logs_into_the_test_s_user_cache_folder() {
+    build_kache();
+    let dir = tempfile::TempDir::new().unwrap();
+    let folder = dir.path().join("user-cache");
+    let guard = DaemonGuard::new(kache_binary(), dir.path());
+    let status = hermetic_command(
+        kache_binary(),
+        dir.path(),
+        Some(&isolated_config_path(dir.path())),
+    )
+    .args(["daemon", "start"])
+    .env("KACHE_TEST_USER_CACHE_DIR", &folder)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .expect("running kache daemon start");
+    assert!(status.success(), "kache daemon start failed: {status}");
+    // Stopped first, so the log is complete.
+    drop(guard);
+    let log = std::fs::read_to_string(folder.join("kache").join("kache.log")).unwrap();
+    assert!(log.contains("daemon listening"), "{log}");
+}

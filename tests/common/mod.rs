@@ -99,6 +99,11 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
             "kache-engine",
             "--target-dir",
             target_dir.to_str().expect("bootstrap target dir is utf-8"),
+            // A test build, as the outer one is through the dev-dependencies:
+            // it keeps the default cache folder (kache.log, probe memos) out
+            // of the developer's own (`KACHE_TEST_USER_CACHE_DIR`).
+            "--features",
+            "kache-config/test-support",
             "--config",
             "build.rustc-wrapper=\"\"",
         ])
