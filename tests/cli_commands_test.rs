@@ -5712,13 +5712,28 @@ fn doctor_probe_restores_a_rust_library_without_touching_the_configured_store() 
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap().join(".rustup"));
+    let temp = e.home.join("tmp");
+    std::fs::create_dir_all(&temp).unwrap();
     let output = e
         .cmd()
         .env("RUSTUP_HOME", rustup_home)
+        .env("TMPDIR", &temp)
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
         .args(["--json", "doctor", "--probe"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
+    // The probe's daemon is gone with its fixture, and nothing put the
+    // fixture back while it shut down.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Test builds keep the user's cache folder there instead (by design).
+    let left: Vec<_> = std::fs::read_dir(&temp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "kache-test-user-cache")
+        .collect();
+    assert!(left.is_empty(), "the probe left {left:?} in its temporary folder");
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let check = body["checks"]
         .as_array()

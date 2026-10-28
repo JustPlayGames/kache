@@ -24,12 +24,54 @@ pub(super) fn check() -> Check {
 fn probe() -> Result<()> {
     let fixture = tempfile::Builder::new().prefix("kache-doctor-").tempdir()?;
     let root = fixture.path();
+    let config = root.join("config.toml");
+    let result = probe_in(root, &config);
+    // The first compilation starts a daemon in the fixture's cache. Stop it
+    // before the fixture goes: shutting down, it writes the cache folder
+    // (index, bind locks, store) back into the removed fixture.
+    stop_daemon(root, &config);
+    result
+}
+
+/// `kache daemon stop` for the probe's configuration, within a deadline;
+/// nothing to do when no daemon holds the probe's run lock.
+fn stop_daemon(root: &Path, config: &Path) {
+    let run_lock = root.join("cache").join("daemon.run.lock");
+    let held = fs::OpenOptions::new()
+        .write(true)
+        .open(&run_lock)
+        .is_ok_and(|file| match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(_) => true,
+        });
+    if !held {
+        return;
+    }
+    let Some(exe) = crate::platform::frontend_executable().ok() else {
+        return;
+    };
+    let mut command = crate::platform::self_command(&exe, "daemon");
+    command
+        .arg("stop")
+        .current_dir(root)
+        .env("KACHE_CONFIG", config)
+        .env("KACHE_HOST_CONFIG", "")
+        .env("KACHE_LOG", "off")
+        .env_remove("KACHE_LOG_FILE")
+        .env_remove("KACHE_ACTIVE")
+        .env_remove("KACHE_SOCKET_PATH");
+    let _ = run(&mut command, &root.join("daemon-stop.log"), Duration::from_secs(10));
+}
+
+fn probe_in(root: &Path, config: &Path) -> Result<()> {
     let cache = root.join("cache");
     let output = root.join("target/debug/deps");
     fs::create_dir_all(&output)?;
-    let config = root.join("config.toml");
     fs::write(
-        &config,
+        config,
         toml::to_string(&serde_json::json!({"cache": {
             "ignore_env": true,
             "local_only": true,
@@ -56,7 +98,7 @@ fn probe() -> Result<()> {
         .arg(&output)
         .arg(&source)
         .current_dir(root)
-        .env("KACHE_CONFIG", &config)
+        .env("KACHE_CONFIG", config)
         .env("KACHE_HOST_CONFIG", "")
         .env("KACHE_LOG", "off")
         .env("KACHE_LOG_FILE_PATH", root.join("probe.log"))
