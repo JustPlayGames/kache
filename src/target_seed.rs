@@ -4134,10 +4134,10 @@ source = "git+https://example.com/gitdep#abc"
     #[cfg(unix)]
     #[test]
     fn a_link_to_a_sealed_hermetic_run_is_linked_again_and_recorded() {
-        use crate::build_script::hermetic_test_support::{linked_to, sealed_run};
+        use crate::build_script::hermetic_test_support::{linked_to, sealed_run, tempdir};
         const RUN: &str = "1111222233334444";
         for layout in [Layout::PerUnit, Layout::Shared] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempdir();
             let donor = donor(dir.path(), "a", layout);
             let from = donor.target_dir.join(PROFILE);
             let run = match layout {

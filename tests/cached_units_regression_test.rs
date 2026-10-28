@@ -227,6 +227,15 @@ struct Fixture {
     targets: TempDir,
 }
 
+impl Drop for Fixture {
+    /// Sealed hermetic runs are read-only, and `TempDir` cannot remove what
+    /// they hold: make them writable before the directories go.
+    fn drop(&mut self) {
+        make_writable(&self.cache);
+        make_writable(self.targets.path());
+    }
+}
+
 fn fixture() -> Fixture {
     fixture_from(write_workspace)
 }
@@ -256,15 +265,24 @@ fn target(fixture: &Fixture, name: &str) -> PathBuf {
 
 #[test]
 fn fixture_target_directories_are_removed_when_the_fixture_drops() {
-    let dir = {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, cache) = {
         let fixture = fixture();
         let dir = target(&fixture, "cold");
         assert!(!dir.starts_with(&fixture.workspace));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("artifact"), b"compiled").unwrap();
-        dir
+        // A sealed hermetic run: a read-only directory and file.
+        let sealed = fixture.cache.join("sealed/out");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("gen.rs"), b"").unwrap();
+        for path in [sealed.join("gen.rs"), sealed] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        (dir, fixture.cache.clone())
     };
     assert!(!dir.exists());
+    assert!(!cache.exists(), "a sealed run kept the cache directory");
 }
 
 /// Two `cargo check`s of the same workspace at once, each with its own
@@ -1890,18 +1908,25 @@ fn main() {
         out_dir.display()
     );
     assert_eq!(std::fs::read(shared.join("derived.rs")).unwrap(), sealed);
-    make_writable(&fx.cache);
 }
 
 /// Sealed hermetic directories are read-only; let the temporary directory go.
-fn make_writable(root: &Path) {
+/// Never panics: the fixture's `Drop` runs it, on a failed test too.
+fn make_writable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    for path in walkdir(root) {
-        if let Ok(meta) = std::fs::symlink_metadata(&path)
-            && !meta.file_type().is_symlink()
-        {
-            let mode = meta.permissions().mode() | 0o200;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    let mode = meta.permissions().mode() | 0o200;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    if meta.is_dir()
+        && let Ok(entries) = std::fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            make_writable(&entry.path());
         }
     }
 }
