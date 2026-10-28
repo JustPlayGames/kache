@@ -308,6 +308,7 @@ fn rustc_corrupt_entry_recompiles_with_the_normal_path_remap() {
 }
 
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
+    common::wait_for_daemon_publishes(cache_dir);
     let output = hermetic_command(
         kache_binary(),
         cache_dir,
@@ -3256,6 +3257,7 @@ cache_executables = true
     println!("STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
 
     // Connect to SQLite to check initial size and age the entries
+    common::wait_for_daemon_publishes(cache_dir.path());
     let db_path = cache_dir.path().join("index.db");
     assert!(db_path.exists(), "index.db should exist");
 

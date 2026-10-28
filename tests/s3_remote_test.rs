@@ -373,6 +373,7 @@ impl Client {
     }
 
     fn report(&mut self, project: &Path) -> serde_json::Value {
+        common::wait_for_daemon_publishes(&self.cache_dir);
         let output = self.run(
             project,
             &[

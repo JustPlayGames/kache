@@ -37,7 +37,7 @@ fn compile(project: &Path, cache: &Path, verify: bool, expected_result: &str) ->
             "{stderr}"
         );
     }
-    let events = fs::read_to_string(cache.join("events.jsonl")).unwrap();
+    let events = common::settled_events(cache);
     let event: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
     assert_eq!(event["result"], expected_result);
     stderr
@@ -204,8 +204,7 @@ fn changing_diagnostic_format_preserves_requested_output_and_reuse() {
             .iter()
             .any(|message| message["code"]["code"] == "unused_variables")
     );
-    let events: Vec<Value> = fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap()
+    let events: Vec<Value> = common::settled_events(&cache)
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
@@ -298,8 +297,7 @@ fn explicit_metadata_destinations_are_materialized_without_cache_replay() {
     fs::create_dir(&out).unwrap();
     run(true, "metadata", true);
     assert!(out.join("libemit_fixture.rmeta").is_file());
-    let events: Vec<Value> = fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap()
+    let events: Vec<Value> = common::settled_events(&cache)
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();

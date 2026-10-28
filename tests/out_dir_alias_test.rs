@@ -299,8 +299,7 @@ fn printed_paths(binary: &Path) -> Vec<PathBuf> {
 }
 
 fn events(cache: &Path) -> Vec<Value> {
-    std::fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap_or_default()
+    common::settled_events(cache)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect()

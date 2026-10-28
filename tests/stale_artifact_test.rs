@@ -644,6 +644,7 @@ fn unrestorable_cache_entry_falls_back_to_recompile() {
     );
     assert_eq!(out1, "v1.helper-v1.default.debug.plain");
 
+    common::wait_for_daemon_publishes(cache_dir.path());
     let broken = make_depinfo_blobs_unreadable(cache_dir.path());
     assert!(
         broken > 0,

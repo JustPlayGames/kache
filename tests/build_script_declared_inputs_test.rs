@@ -450,7 +450,7 @@ fn what_cargo_writes_in_a_home_inside_the_package_is_not_one_of_its_files() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let log = std::fs::read_to_string(cache.join("events.jsonl")).unwrap();
+        let log = common::settled_events(&cache);
         let event = log
             .lines()
             .rev()

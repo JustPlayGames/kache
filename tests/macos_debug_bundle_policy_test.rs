@@ -56,8 +56,7 @@ fn check_debug_bundle_policy(split: &str, expected_bundle: bool) {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
-            .unwrap()
+        let events: Vec<serde_json::Value> = common::settled_events(&cache)
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .filter(|event: &serde_json::Value| event["crate_name"] == "debug_bundle_policy")

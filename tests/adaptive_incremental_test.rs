@@ -22,8 +22,7 @@ fn kache_binary() -> &'static str {
 }
 
 fn fixture_events(cache_dir: &Path) -> Vec<Value> {
-    fs::read_to_string(cache_dir.join("events.jsonl"))
-        .unwrap_or_default()
+    common::settled_events(cache_dir)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["crate_name"] == "adaptive_fixture")

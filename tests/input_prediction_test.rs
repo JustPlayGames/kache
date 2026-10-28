@@ -219,8 +219,10 @@ struct LastEvent {
     prediction_mismatches: u64,
 }
 
-/// `local_hits` from the report summary.
+/// `local_hits` from the report summary, once the daemon logged every
+/// compile handed to it.
 fn summary_local_hits(cache_dir: &Path) -> u64 {
+    common::wait_for_daemon_publishes(cache_dir);
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -246,6 +248,12 @@ fn last_event(cache_dir: &Path) -> LastEvent {
 
 /// [`last_event`], with `env` set for the report as it was for the build.
 fn last_event_with(cache_dir: &Path, env: &[(&str, std::ffi::OsString)]) -> LastEvent {
+    // Under a trust domain the cache and the daemon's runtime live in the
+    // domain's folder.
+    match env.iter().find(|(name, _)| *name == "KACHE_TRUST_DOMAIN") {
+        Some((_, domain)) => common::wait_for_daemon_publishes(&cache_dir.join(domain)),
+        None => common::wait_for_daemon_publishes(cache_dir),
+    }
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -391,8 +399,7 @@ fn a_stale_record_is_re_derived_from_the_running_compile() {
 
 /// The latest raw `kt` event. `kache report` leaves out skipped compiles.
 fn last_raw_event(cache_dir: &Path) -> serde_json::Value {
-    std::fs::read_to_string(cache_dir.join("events.jsonl"))
-        .expect("events.jsonl")
+    common::settled_events(cache_dir)
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
