@@ -48,6 +48,19 @@ for page in pages:
             errors.append(f"{page}: broken internal route {match.group(1)}")
 
 all_prose = "\n".join([root.joinpath("README.md").read_text(), *(p.read_text() for p in pages)])
+manifest = root.joinpath("Cargo.toml").read_text()
+version = re.search(r'^version = "([^"]+)"', manifest, re.MULTILINE).group(1)
+install_pins = [
+    re.compile(r"\bcargo (?:install|binstall) kache\b[^\n]*?--version\s+([^\s`]+)"),
+    re.compile(r"github:kunobi-ninja/kache/v([0-9][^\s`]+)"),
+    re.compile(r"\bversion:\s+v([0-9][^\s`]+)"),
+]
+for page in [root / "README.md", *pages]:
+    for pattern in install_pins:
+        for pin in pattern.findall(page.read_text()):
+            if pin != version:
+                errors.append(f"{page.relative_to(root)}: install pin {pin} differs from workspace version {version}")
+
 for obsolete in ["](/getting-started", "](/daemon", "](/remote-cache", "kache status", "install-shims --dir"]:
     if obsolete in all_prose:
         errors.append(f"obsolete documentation spelling remains: {obsolete!r}")

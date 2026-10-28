@@ -8,11 +8,11 @@ executes and coordinates compiler work; it does not add a `kache build` command.
 
 ## Choose the version
 
-These docs track v2 on `main`. The published `v2.0.0-rc.2` preview can be installed
+These docs track v2 on `main`. The `v2.0.0-rc.4` preview can be installed
 explicitly:
 
 ```bash
-cargo install kache --locked --version 2.0.0-rc.2
+cargo install kache --locked --version 2.0.0-rc.4
 ```
 
 Unversioned Cargo and stable package-manager commands select the stable channel.
@@ -26,7 +26,8 @@ and building `main`.
 | Private incremental state and compatible seeds between worktrees | v2 release candidates; seed import needs supported rustc 1.98+ |
 | Init-managed shell completions and the responsive Now build view | `v2.0.0-rc.2` |
 | Scriptable configuration, history-wide `explain --all`, volume/inode diagnostics | `v2.0.0-rc.2` |
-| Optional local Blaze routing | **main**, after `v2.0.0-rc.2`; off by default |
+| Optional local Blaze routing | `v2.0.0-rc.3`; off by default |
+| Producer versions in explanations and a separate section for recognized older bugs | `v2.0.0-rc.4` |
 
 ## Upgrade the complete installation
 
@@ -61,6 +62,17 @@ script was built. Restarting the daemon does not rebuild Cargo Fresh units. If
 an affected script still shows old behavior, rebuild that package's outputs;
 see [Build scripts](/docs/how-it-works/build-scripts). A blanket cache delete is
 not required.
+
+## Older prediction metadata
+
+RC.2 can bypass build-script caching when an inherited index still has the older
+prediction-table layout. RC.3 and later discard those incompatible predictions
+and learn them again from source. Compiled entries stay in the store; no manual
+cache deletion is needed.
+
+Historical errors remain in `explain --all`. From RC.4, recognized failures from
+older versions appear under "Earlier Kache bugs". The report also shows the
+versions that recorded a build and the version currently installed.
 
 ## Expect some cold state
 

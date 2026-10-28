@@ -5663,6 +5663,9 @@ fn doctor_reports_recent_store_warning_when_database_is_healthy() {
     let file = std::fs::File::create(&marker).unwrap();
     kache_store::markers::write_marker_timestamp(&file);
     drop(file);
+    let marker_content = std::fs::read_to_string(&marker).unwrap();
+    let timestamp = marker_content.trim().parse::<i64>().unwrap();
+    let recorded_at = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
 
     let output = e
         .cmd()
@@ -5681,11 +5684,24 @@ fn doctor_reports_recent_store_warning_when_database_is_healthy() {
     }
     let warning = checks
         .iter()
-        .find(|check| check["label"] == "Store build warning")
+        .find(|check| check["label"] == "Store warning history")
         .expect("doctor preserves the warning despite its successful database open");
     assert_eq!(warning["pass"], false);
     assert_eq!(warning["optional"], true);
+    assert!(
+        warning["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&recorded_at.to_rfc3339())
+    );
+    assert!(
+        warning["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no error details or Kache version")
+    );
     assert!(warning["fix"].as_str().unwrap().contains("KACHE_LOG_FILE"));
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), marker_content);
 }
 
 #[test]
@@ -5918,4 +5934,80 @@ fn explain_all_includes_rotated_history() {
         .assert()
         .success()
         .stdout(predicates::str::contains("no recorded build to explain"));
+}
+
+#[test]
+fn explain_all_labels_fixed_bugs_by_producer_version_and_preserves_the_records() {
+    let e = env();
+    let reason = "refused|build-script cache bypassed: no such column: prediction_json in SELECT schema, prediction_json, last_used FROM input_predictions WHERE identity = ?1";
+    let events = ["2.0.0-rc.2", "2.0.0-rc.3"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, version)| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "ts": format!("2026-01-01T00:00:0{index}Z"),
+                    "crate_name": "build_script_run",
+                    "root": e.home.to_str().unwrap(),
+                    "result": "passthrough",
+                    "version": version,
+                    "passthrough_reason": reason,
+                    "elapsed_ms": index + 1,
+                    "size": 0,
+                    "cache_key": "",
+                    "schema": 26
+                })
+            )
+        })
+        .collect::<String>();
+    let path = e.cache.join("events.jsonl");
+    std::fs::write(&path, &events).unwrap();
+    let output = e
+        .cmd()
+        .args(["--json", "explain", "--all"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["passthroughs"], 2);
+    let reasons = value["reasons"].as_array().unwrap();
+    assert_eq!(reasons.len(), 2);
+    let fixed = reasons
+        .iter()
+        .find(|row| row["fixed_in"].is_string())
+        .unwrap();
+    assert_eq!(fixed["fixed_in"], "2.0.0-rc.3");
+    assert_eq!(fixed["reason"], reason);
+    assert_eq!(fixed["count"], 1);
+    let current = reasons
+        .iter()
+        .find(|row| row["fixed_in"].is_null())
+        .unwrap();
+    assert_eq!(current["reason"], reason);
+    assert_eq!(current["count"], 1);
+    assert_eq!(value["entries"][0]["version"], "2.0.0-rc.3");
+    assert_eq!(value["entries"][1]["version"], "2.0.0-rc.2");
+    let output = e.cmd().args(["explain", "--all"]).output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Earlier Kache bugs"), "{text}");
+    assert!(text.contains("fixed in Kache 2.0.0-rc.3"), "{text}");
+    assert!(text.contains("incompatible prediction metadata"), "{text}");
+    assert!(text.contains("2.0.0-rc.2"), "{text}");
+    assert!(!text.contains("SELECT"), "{text}");
+    let summary = text
+        .split_once("Reasons")
+        .unwrap()
+        .1
+        .split_once("Earlier Kache bugs")
+        .unwrap()
+        .0;
+    assert_eq!(
+        summary.matches("incompatible prediction metadata").count(),
+        1,
+        "{text}"
+    );
+    assert!(!summary.contains("fixed in Kache"), "{text}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), events);
 }

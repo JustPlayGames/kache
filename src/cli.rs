@@ -7393,7 +7393,7 @@ fn doctor_check_is_optional(label: &str, daemon_optional: bool, probe_no_compile
         || label == "Install path"
         || label == "Compiler execution"
         || label == OTHER_CHECKOUTS
-        || label == "Store build warning"
+        || label == "Store warning history"
         || label == "Store file limits"
         || label == "Store volume probe"
         || label == "Daemon process"
