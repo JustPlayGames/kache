@@ -19,6 +19,27 @@ use std::time::Duration;
 /// Longest a saturated waiter sleeps before scanning again.
 pub(super) const SATURATED_SLICE: Duration = Duration::from_millis(200);
 
+// A slice a test sets for its own thread, so a wake it expects cannot be
+// mistaken for the slice running out on a loaded machine.
+#[cfg(test)]
+thread_local! {
+    static FORCED_SLICE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn force_slice(slice: Option<Duration>) {
+    FORCED_SLICE.with(|forced| forced.set(slice));
+}
+
+/// [`SATURATED_SLICE`], or the slice this thread's test set.
+pub(super) fn saturated_slice() -> Duration {
+    #[cfg(test)]
+    if let Some(slice) = FORCED_SLICE.with(std::cell::Cell::get) {
+        return slice;
+    }
+    SATURATED_SLICE
+}
+
 /// A macOS watch on the busy slot files. Empty on other systems: nothing
 /// there can report an unlock except the Linux counter.
 #[cfg(target_os = "macos")]

@@ -781,7 +781,7 @@ impl Scheduler {
                                 &self.root,
                                 armed,
                                 seen,
-                                permit_wait::SATURATED_SLICE.min(remaining),
+                                permit_wait::saturated_slice().min(remaining),
                             );
                         }
                     }
@@ -2983,32 +2983,85 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropping_a_permit_wakes_the_waiter() {
+        // Long enough that a missed wake fails the test, however loaded the
+        // machine: the waiter would sleep its whole slice.
+        const SLICE: Duration = Duration::from_secs(120);
         let dir = temp_cache();
         let holder = test_scheduler(dir.path(), 1);
         let permit = holder
             .acquire_permit(1)
             .expect("holder takes the only slot");
         let root = dir.path().to_path_buf();
-        let waiter =
-            std::thread::spawn(move || test_scheduler(&root, 1).acquire_permit(1).is_some());
-        // Inside the wait, and early enough that a 200 ms slice is still running
-        // when the permit is dropped.
-        std::thread::sleep(Duration::from_millis(50));
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            permit_wait::force_slice(Some(SLICE));
+            pressure::force(Some(false));
+            let waiter = Scheduler::open_with(&root, 1, SLICE, Duration::from_millis(10)).unwrap();
+            tid_tx.send(current_tid()).unwrap();
+            let started = std::time::Instant::now();
+            let taken = waiter.acquire_permit(1).is_some();
+            (taken, started.elapsed())
+        });
+        wait_until_parked(tid_rx.recv().unwrap(), &waiter, SLICE);
         assert!(
             !waiter.is_finished(),
             "the waiter must still be blocked on the held slot"
         );
-        let started = std::time::Instant::now();
         drop(permit);
+        let (taken, waited) = waiter.join().unwrap();
+        assert!(taken, "the waiter must take the slot after it is released");
         assert!(
-            waiter.join().unwrap(),
-            "the waiter must take the slot after it is released"
+            waited < SLICE / 2,
+            "woke after {waited:?}; releasing a permit has to interrupt the {SLICE:?} slice"
         );
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "woke after {:?}; releasing a permit has to interrupt the wait",
-            started.elapsed()
-        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_tid() -> libc::pid_t {
+        // SAFETY: gettid takes no arguments and cannot fail.
+        unsafe { libc::gettid() }
+    }
+
+    /// No thread id is needed off Linux: see [`wait_until_parked`].
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn current_tid() -> u32 {
+        0
+    }
+
+    /// Wait until the waiter thread sleeps on the wake word (Linux: in
+    /// `futex`), so the release below is one that has to wake it. Elsewhere
+    /// there is no per-thread view of that; a short pause gets it into the
+    /// wait, and a release that comes first only makes the test easier.
+    #[cfg(target_os = "linux")]
+    fn wait_until_parked<T>(
+        tid: libc::pid_t,
+        waiter: &std::thread::JoinHandle<T>,
+        limit: Duration,
+    ) {
+        let syscall = format!("/proc/self/task/{tid}/syscall");
+        let futex = format!("{} ", libc::SYS_futex);
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            // The wait loop's own locks are futexes too: a sleep there is
+            // brief, so require the futex call to last.
+            let parked = (0..5).all(|_| {
+                std::thread::sleep(Duration::from_millis(2));
+                fs::read_to_string(&syscall).is_ok_and(|call| call.starts_with(&futex))
+            });
+            if parked || waiter.is_finished() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never parked on the held slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn wait_until_parked<T>(_: u32, _: &std::thread::JoinHandle<T>, _: Duration) {
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     #[cfg(target_os = "linux")]
