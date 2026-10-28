@@ -4763,6 +4763,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// queued past one timeout, and the entry is worth more than the wait
     /// (its next build would compile it again).
     fn begin_entry_registration(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.begin_write_waiting("registering an entry")
+    }
+
+    /// A write transaction with the lock taken at once, asked for again up
+    /// to [`STORE_LOCK_ATTEMPTS`] times while it stays busy past the busy
+    /// timeout. `doing` names the write in the log.
+    fn begin_write_waiting(&self, doing: &str) -> rusqlite::Result<rusqlite::Transaction<'_>> {
         let mut attempt = 1;
         loop {
             match rusqlite::Transaction::new_unchecked(
@@ -4770,7 +4777,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 rusqlite::TransactionBehavior::Immediate,
             ) {
                 Err(error) if attempt < STORE_LOCK_ATTEMPTS && is_sqlite_busy(&error) => {
-                    tracing::debug!(attempt, "index busy registering an entry; asking again");
+                    tracing::debug!(attempt, doing, "index busy; asking again");
                     attempt += 1;
                 }
                 started => return started,
@@ -8274,10 +8281,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         after_meta_read: impl FnOnce(),
         before_dir_cleanup: impl FnOnce(),
     ) -> Result<GuardedRemoval> {
+        self.remove_entry_guarded_with_all_hooks(
+            cache_key,
+            skip_if_idle_lt,
+            after_meta_read,
+            || {},
+            before_dir_cleanup,
+        )
+    }
+
+    /// [`Self::remove_entry_guarded_with_hooks`] with a third seam:
+    /// `after_logical_commit` runs once the row's removal has committed and
+    /// before the cleanup pass asks for the write lock again.
+    fn remove_entry_guarded_with_all_hooks(
+        &self,
+        cache_key: &str,
+        skip_if_idle_lt: Option<Duration>,
+        after_meta_read: impl FnOnce(),
+        after_logical_commit: impl FnOnce(),
+        before_dir_cleanup: impl FnOnce(),
+    ) -> Result<GuardedRemoval> {
         self.refuse_write("remove an entry")?;
         // Boxed so the republication-retry loop below stays non-generic; the
         // production closures are zero-sized, so no allocation happens.
         let mut after_meta_read: Option<Box<dyn FnOnce() + '_>> = Some(Box::new(after_meta_read));
+        let mut after_logical_commit: Option<Box<dyn FnOnce() + '_>> =
+            Some(Box::new(after_logical_commit));
         let mut before_dir_cleanup: Option<Box<dyn FnOnce() + '_>> =
             Some(Box::new(before_dir_cleanup));
         loop {
@@ -8285,6 +8314,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 cache_key,
                 skip_if_idle_lt,
                 after_meta_read.take(),
+                after_logical_commit.take(),
                 before_dir_cleanup.take(),
             )? {
                 RemovalAttempt::Done(Some(reclaim)) => {
@@ -8308,6 +8338,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         cache_key: &str,
         skip_if_idle_lt: Option<Duration>,
         after_meta_read: Option<Box<dyn FnOnce() + '_>>,
+        after_logical_commit: Option<Box<dyn FnOnce() + '_>>,
         before_dir_cleanup: Option<Box<dyn FnOnce() + '_>>,
     ) -> Result<RemovalAttempt> {
         let entry_dir = self.entry_dir(cache_key);
@@ -8569,14 +8600,31 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // reclaims those), never a live row without its files.
         tx.commit()?;
 
+        if let Some(hook) = after_logical_commit {
+            hook();
+        }
+
         // Cleanup pass: a second short transaction whose only purpose is the
         // write lock. Serializing the filesystem deletions against same-key
         // writers is what closes the original #670 window — an unlocked
         // cleanup could delete a meta.json that a publisher materialized
         // (inside its own registration transaction) between our commit above
         // and this pass.
-        let cleanup_tx = self.db.unchecked_transaction()?;
-        cleanup_tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
+        //
+        // The row is gone from here on, so nothing else removes the entry's
+        // directory or the blobs it held last, and no size counts them. The
+        // pass therefore waits for the lock as a registration does instead
+        // of giving up after one busy timeout: a sweep on a busy index used
+        // to log "skipping eviction ... database is locked" here and leave
+        // both on disk.
+        let cleanup_tx = self
+            .begin_write_waiting("removing an evicted entry's files")
+            .with_context(|| {
+                format!(
+                    "entry {cache_key}: removed from the index, but its directory and \
+                     unreferenced blobs stay on disk"
+                )
+            })?;
 
         if let Some(hook) = before_dir_cleanup {
             hook();

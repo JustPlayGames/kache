@@ -10585,6 +10585,71 @@ fn republication_during_removal_cleanup_is_never_stranded() {
     assert_eq!(refcount, 1, "B's refcounts must be intact");
 }
 
+/// Once a removal has committed the row's deletion, its cleanup pass is all
+/// that removes the entry's directory and the blobs it held last: nothing
+/// counts them any more. An index that stays busy past one busy timeout must
+/// delay that pass, not skip it (a sweep under load left 3 of 21 entries'
+/// files behind with "skipping eviction ... database is locked").
+#[test]
+fn a_busy_index_delays_an_evicted_entry_s_file_cleanup_without_skipping_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    store.set_busy_timeout_for_test(Duration::from_secs(1));
+    let src = dir.path().join("a.rlib");
+    std::fs::write(&src, b"bytes only this entry holds").unwrap();
+    store
+        .put(
+            "key",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src, "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    let blob = store.blob_path(&store.get("key").unwrap().unwrap().files[0].hash);
+    assert!(blob.is_file());
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let mut holder = None;
+    let outcome = store.remove_entry_guarded_with_all_hooks(
+        "key",
+        None,
+        || {},
+        || {
+            // Another writer takes the lock between the two transactions and
+            // keeps it past one busy timeout of the cleanup pass.
+            let config = config.clone();
+            let held_tx = held_tx.clone();
+            holder = Some(std::thread::spawn(move || {
+                let other = Store::open(&config).unwrap();
+                other.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1500));
+                other.db.execute_batch("COMMIT").unwrap();
+            }));
+            held_rx.recv().unwrap();
+        },
+        || {},
+    );
+    holder.take().unwrap().join().unwrap();
+
+    assert!(
+        matches!(outcome, Ok(GuardedRemoval::Reclaimed(_))),
+        "the cleanup pass waited for the lock: {outcome:?}"
+    );
+    assert!(!store.contains("key"));
+    assert!(
+        !store.entry_dir("key").exists(),
+        "the evicted entry's directory is removed"
+    );
+    assert!(!blob.exists(), "the blob only that entry held is removed");
+}
+
 /// kunobi-ninja/kache#510: directory-cleanup tolerance is for the
 /// lost-the-race case ONLY — a cleanup failure while the directory still
 /// exists (permissions, open handles) must surface as an error, not be
