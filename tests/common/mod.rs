@@ -364,9 +364,10 @@ pub fn settled_events(cache_dir: &Path) -> String {
     std::fs::read_to_string(cache_dir.join("events.jsonl")).unwrap_or_default()
 }
 
-/// Wait until the daemon serving `cache_dir` (its runtime directory, with
-/// `<cache_dir>/config.toml`) has stored and logged every compile its
-/// wrappers handed it.
+/// Wait until the daemon serving `cache_dir` has stored and logged every
+/// compile its wrappers handed it. The daemon is the one of
+/// `<cache_dir>/config.toml`'s `runtime_dir`, or of `cache_dir` itself when
+/// that file names none (or there is no such file).
 ///
 /// A rustc miss may hand its store to the daemon, which writes the miss's
 /// event once the entry is committed: after the wrapper, and maybe Cargo,
@@ -376,14 +377,16 @@ pub fn settled_events(cache_dir: &Path) -> String {
 /// minutes it fails the test with the daemon's last answer.
 #[allow(dead_code)]
 pub fn wait_for_daemon_publishes(cache_dir: &Path) {
-    let run_lock = daemon_run_lock_path(cache_dir);
     let config = isolated_config_path(cache_dir);
+    let runtime_dir = configured_runtime_dir(&config).unwrap_or_else(|| cache_dir.to_owned());
+    let run_lock = daemon_run_lock_path(&runtime_dir);
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if !daemon_run_lock_is_held(&run_lock) {
             return;
         }
-        let answer = hermetic_command(kache_binary(), cache_dir, Some(&config))
+        let answer = hermetic_command(status_binary(), cache_dir, Some(&config))
+            .env("KACHE_RUNTIME_DIR", &runtime_dir)
             .args(["--json", "daemon", "status"])
             .env("KACHE_LOG", "off")
             .stdin(Stdio::null())
@@ -404,6 +407,27 @@ pub fn wait_for_daemon_publishes(cache_dir: &Path) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// A kache to ask the daemon with: the bootstrap build when this test made
+/// one, else the one Cargo built for the tests. A test that runs Cargo's
+/// build does not pay for a bootstrap build just to wait.
+fn status_binary() -> PathBuf {
+    match KACHE_BIN.get() {
+        Some(Ok(path)) => path.clone(),
+        _ => PathBuf::from(env!("CARGO_BIN_EXE_kache")),
+    }
+}
+
+/// The `[cache] runtime_dir` a test's config file sets, if it sets one.
+fn configured_runtime_dir(config: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(config).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    value
+        .get("cache")?
+        .get("runtime_dir")?
+        .as_str()
+        .map(PathBuf::from)
 }
 
 #[allow(dead_code)]

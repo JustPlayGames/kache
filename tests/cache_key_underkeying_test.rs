@@ -129,12 +129,14 @@ fn kache_rustc_output_from(
     (args, output)
 }
 
-/// `(compiled, local_hits)` from `kache report` over this isolated cache dir.
+/// `(compiled, local_hits)` from `kache report` over this isolated cache dir,
+/// once the daemon has stored and logged every compile handed to it.
 ///
 /// `dup` is still a compiler run: the entry missed, but the output blob was
 /// already present. These tests are about key divergence, so they count
 /// `dups + misses`.
 fn compiled_hit_counts(cache_dir: &Path) -> (u64, u64) {
+    common::wait_for_daemon_publishes(cache_dir);
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -1097,7 +1099,7 @@ fn option_env_presence_changes_cached_behavior() {
                 "cached option_env! must distinguish absent and empty values (predictions={predictions}, value={value:?})"
             );
             assert_eq!(compile_and_observe(value, true), direct);
-            let events = std::fs::read_to_string(cache.path().join("events.jsonl")).unwrap();
+            let events = common::settled_events(cache.path());
             let last: serde_json::Value =
                 serde_json::from_str(events.lines().last().unwrap()).unwrap();
             assert_eq!(
