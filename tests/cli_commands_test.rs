@@ -95,14 +95,15 @@ impl Env {
         self.wrapper_cargo(project, target_dir, &["build", "--lib"])
     }
 
-    /// `cargo <args>` in `project` with kache as `RUSTC_WRAPPER`.
+    /// `cargo <args>` in `project` with kache as `RUSTC_WRAPPER`, returned
+    /// once the daemon stored and logged every compile handed to it.
     fn wrapper_cargo(
         &self,
         project: &Path,
         target_dir: &Path,
         args: &[&str],
     ) -> std::process::Output {
-        hermetic_command(
+        let output = hermetic_command(
             env!("CARGO"),
             &self.cache,
             Some(&self.cache.join("config.toml")),
@@ -116,7 +117,9 @@ impl Env {
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .output()
-        .expect("run cargo build with kache wrapper")
+        .expect("run cargo build with kache wrapper");
+        common::wait_for_daemon_publishes(&self.cache);
+        output
     }
 }
 

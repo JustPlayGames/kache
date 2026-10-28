@@ -20,8 +20,7 @@ fn kache_binary() -> &'static str {
 
 /// Events Kache recorded for `crate_name`.
 fn crate_events(cache_dir: &Path, crate_name: &str) -> Vec<Value> {
-    fs::read_to_string(cache_dir.join("events.jsonl"))
-        .unwrap_or_default()
+    common::settled_events(cache_dir)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["crate_name"] == crate_name)

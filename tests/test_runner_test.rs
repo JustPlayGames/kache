@@ -139,8 +139,7 @@ impl Fixture {
     }
 
     fn events(&self) -> Vec<serde_json::Value> {
-        fs::read_to_string(self.cache().join("events.jsonl"))
-            .unwrap_or_default()
+        common::settled_events(&self.cache())
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
