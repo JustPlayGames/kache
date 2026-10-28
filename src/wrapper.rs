@@ -3102,7 +3102,7 @@ fn cc_depinfo_rewrite_root(parsed: &crate::compiler::cc::CcArgs) -> Option<std::
     cc_depinfo_rewrite_root_from_cwd(parsed, parsed.invocation_env.cwd()?)
 }
 
-fn rustc_event_root(args: &RustcArgs) -> String {
+pub(crate) fn rustc_event_root(args: &RustcArgs) -> String {
     let written_to = args.out_dir.clone().or_else(|| {
         args.output
             .as_deref()
@@ -10107,7 +10107,7 @@ impl<'a> EventInputs<'a> {
         self
     }
 
-    fn exit_code(mut self, exit_code: i32) -> Self {
+    pub(crate) fn exit_code(mut self, exit_code: i32) -> Self {
         self.exit_code = Some(exit_code);
         self
     }

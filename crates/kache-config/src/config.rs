@@ -169,6 +169,9 @@ pub struct Config {
     /// remote surface it through [`Config::require_remote`].
     pub remote_error: Option<String>,
     pub disabled: bool,
+    /// Route eligible local Cargo shim commands through Blaze. Off by default.
+    /// `[cache] blaze` / `KACHE_BLAZE`; CI and explicit profiles stay with Cargo.
+    pub blaze: bool,
     pub cache_executables: bool,
     /// Opt-in C/C++ whole-program link caching (epic #762 / #259). Off by
     /// default until path/repro gates pass. `KACHE_CACHE_CC_LINKS` or
@@ -919,6 +922,8 @@ pub struct CcFileConfig {
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct CacheFileConfig {
+    /// Optional Blaze routing for local development. See [`Config::blaze`].
+    pub blaze: Option<bool>,
     pub local_store: Option<String>,
     /// Job/process-lifetime state, separate from the persistent local store.
     pub runtime_dir: Option<String>,
@@ -1415,6 +1420,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_STORAGE_LAYOUT_ADVICE",
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
+    "KACHE_BLAZE",
     "KACHE_SCHEDULER",
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
@@ -1549,6 +1555,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_STORAGE_LAYOUT_ADVICE", "cache.storage_layout_advice"),
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
     ("KACHE_EXPLAIN_MISS", "cache.explain_miss"),
+    ("KACHE_BLAZE", "cache.blaze"),
     ("KACHE_SCHEDULER", "cache.scheduler"),
     ("KACHE_PLANNER_ENDPOINT", "cache.planner.endpoint"),
     ("KACHE_PLANNER_TIMEOUT_MS", "cache.planner.timeout_ms"),
@@ -2170,6 +2177,16 @@ impl Config {
         }
         let modified_input_guard = Self::modified_input_guard_enabled_for(invocation, &file_config);
         let input_predictions = Self::input_predictions_enabled_for(invocation, &file_config);
+        let blaze = env_or_ignored_for(invocation, "KACHE_BLAZE", ignore_env)
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or_else(|_| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|file| file.cache.as_ref())
+                    .and_then(|cache| cache.blaze)
+                    .unwrap_or(false)
+            });
         let record_sessions = Self::record_sessions_enabled_for(invocation, &file_config);
         let windows_hardlink = Self::windows_hardlink_enabled_for(invocation, &file_config);
         let shared_hardlink_restores =
@@ -2326,6 +2343,7 @@ impl Config {
             remote,
             remote_error,
             disabled,
+            blaze,
             local_only,
             remote_readonly,
             readonly_store,

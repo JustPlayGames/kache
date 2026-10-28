@@ -1028,6 +1028,7 @@ pub(crate) mod tests {
     fn v3_pack_roundtrip_restores_meta_and_files() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
+            blaze: false,
             readonly_store: None,
             fallback: None,
             key_salt: None,
@@ -1148,6 +1149,7 @@ pub(crate) mod tests {
 
         let restore_cache_dir = tmp.path().join("restore-cache");
         let restore_config = Config {
+            blaze: false,
             readonly_store: None,
             fallback: None,
             key_salt: None,
@@ -1351,6 +1353,7 @@ pub(crate) mod tests {
     fn v3_extract_rejects_content_hash_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let config = Config {
+            blaze: false,
             readonly_store: None,
             fallback: None,
             key_salt: None,
@@ -1528,6 +1531,7 @@ pub(crate) mod tests {
 
     fn min_config(cache_dir: std::path::PathBuf) -> Config {
         Config {
+            blaze: false,
             readonly_store: None,
             fallback: None,
             key_salt: None,
