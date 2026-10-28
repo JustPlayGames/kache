@@ -23,6 +23,7 @@ fn client_invocation(cwd: &Path, overrides: &[(&str, Option<&std::ffi::OsStr>)])
         captured.home_dir().map(Path::to_path_buf),
         captured.temp_dir().to_path_buf(),
     )
+    .with_cache_dir(captured.cache_dir().map(Path::to_path_buf))
 }
 
 fn reparse_for_client(args: &RustcArgs, env: &InvocationEnv) -> RustcArgs {
@@ -7497,7 +7498,7 @@ fn cwd_remap_probe_kills_timeouts_and_retries_without_a_cached_rejection() {
             "--nocapture",
         ])
         .env("HOME", dir.path())
-        .env("XDG_CACHE_HOME", dir.path())
+        .env("KACHE_TEST_USER_CACHE_DIR", dir.path())
         .env("KACHE_TEST_CWD_REMAP_ROOT", dir.path())
         .output()
         .expect("spawn isolated cwd-remap probe fixture");
@@ -20546,7 +20547,8 @@ mod build_script_target_paths {
                 Some(self.workspace.clone()),
                 self.invocation.home_dir().map(Path::to_path_buf),
                 self.invocation.temp_dir().to_path_buf(),
-            );
+            )
+            .with_cache_dir(self.invocation.cache_dir().map(Path::to_path_buf));
             let mut argv = vec![
                 "rustc".into(),
                 "--crate-name=mylib".into(),
@@ -20727,7 +20729,8 @@ mod build_script_target_paths {
             Some(no_remap.workspace.clone()),
             no_remap.invocation.home_dir().map(Path::to_path_buf),
             no_remap.invocation.temp_dir().to_path_buf(),
-        );
+        )
+        .with_cache_dir(no_remap.invocation.cache_dir().map(Path::to_path_buf));
         let key = |target: &Path, out: &Path| {
             no_remap.key(Some(target), Some(out), &[native(out)], "rlib", &[], None)
         };

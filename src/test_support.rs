@@ -7,7 +7,9 @@ use std::path::PathBuf;
 /// `dirs::config_dir()/kunobi/locks`. That directory follows `XDG_CONFIG_HOME`
 /// on Linux and `HOME` on macOS, and the Nix sandbox sets `HOME` to a
 /// directory the build cannot write. Hold one of these for any test that
-/// calls `TofuStore::trust` or `check_and_pin`.
+/// calls `TofuStore::trust` or `check_and_pin`. Windows reads the folder from
+/// its Known Folders, which no variable moves, so those tests are ignored
+/// there rather than write into the user's own `AppData\Roaming\kunobi`.
 pub(crate) struct KunobiConfigGuard {
     _lock: ProcessStateTestGuard,
     /// Kept so the directory outlives the tests that pin a service into it.

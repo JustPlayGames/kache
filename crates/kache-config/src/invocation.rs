@@ -27,6 +27,39 @@ impl std::fmt::Debug for InvocationEnv {
     }
 }
 
+/// Where a test build keeps the user cache folder instead
+/// ([`user_cache_dir`]): this variable when it holds an absolute path, else
+/// `kache-test-user-cache` in the temporary directory.
+pub const TEST_USER_CACHE_DIR_ENV: &str = "KACHE_TEST_USER_CACHE_DIR";
+
+/// This user's cache folder, which holds the probe memos, the diagnostic log
+/// and the default store: the platform's (`dirs::cache_dir`, a Known Folder
+/// on Windows).
+///
+/// Test builds never reach the real one. The `test-support` feature is on in
+/// every build of the workspace's tests, and so in the kache binaries they
+/// spawn, and this crate's own tests count too. Unix tests used to redirect
+/// the folder through `HOME` or `XDG_CACHE_HOME`, but Windows reads neither,
+/// and most tests set nothing: a test run wrote kache.log lines and probe
+/// memos into the developer's own cache, and into `AppData\Local\kache` on
+/// a Windows runner. There the folder is [`TEST_USER_CACHE_DIR_ENV`]'s, else
+/// one in the temporary directory.
+pub fn user_cache_dir() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        Some(
+            std::env::var_os(TEST_USER_CACHE_DIR_ENV)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| std::env::temp_dir().join("kache-test-user-cache")),
+        )
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        dirs::cache_dir()
+    }
+}
+
 impl InvocationEnv {
     pub fn capture() -> Self {
         Self::from_parts(
@@ -35,7 +68,7 @@ impl InvocationEnv {
             dirs::home_dir(),
             std::env::temp_dir(),
         )
-        .with_cache_dir(dirs::cache_dir())
+        .with_cache_dir(user_cache_dir())
     }
 
     pub fn with_cache_dir(mut self, cache: Option<PathBuf>) -> Self {

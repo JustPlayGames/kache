@@ -219,9 +219,8 @@ fn help_lists_subcommands() {
 /// Commands that only print leave no trace: no log file in the default cache
 /// folder and no probe memo in the store. `kache --help` once ran the C
 /// compiler probe on kache itself and opened the log before it had a line.
-/// Unix only: the test redirects the default cache folder through HOME and
-/// `XDG_CACHE_HOME`, which Windows does not read.
-#[cfg(unix)]
+/// A test build of kache keeps its default cache folder where
+/// `KACHE_TEST_USER_CACHE_DIR` says, on every platform.
 #[test]
 fn printing_commands_write_nothing() {
     fn files_under(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
@@ -242,7 +241,7 @@ fn printing_commands_write_nothing() {
         &["stats", "--help"],
     ] {
         e.cmd()
-            .env("XDG_CACHE_HOME", e.home.join(".cache"))
+            .env("KACHE_TEST_USER_CACHE_DIR", e.home.join(".cache"))
             .args(args)
             .assert()
             .success();
