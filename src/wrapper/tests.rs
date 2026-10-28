@@ -6866,7 +6866,13 @@ struct RemoteCheckReplyDaemon {
     recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     handle: Option<std::thread::JoinHandle<()>>,
     socket_path: PathBuf,
+    delay: std::time::Duration,
 }
+
+/// How long dropping a [`RemoteCheckReplyDaemon`] waits for its accept
+/// thread, beyond its reply delay, before it fails the test instead of
+/// hanging it.
+const FAKE_DAEMON_STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl RemoteCheckReplyDaemon {
     fn spawn(socket_path: PathBuf, found: bool) -> Self {
@@ -6945,6 +6951,7 @@ impl RemoteCheckReplyDaemon {
             recorded,
             handle: Some(handle),
             socket_path,
+            delay,
         }
     }
 
@@ -6954,12 +6961,35 @@ impl RemoteCheckReplyDaemon {
 }
 
 impl Drop for RemoteCheckReplyDaemon {
+    /// Wakes the accept thread until it ends. One wake-up connection is not
+    /// enough on Windows: a client that connects and closes before the thread
+    /// is back in `ConnectNamedPipe` leaves a dead-on-arrival instance, which
+    /// interprocess's `accept` disconnects and waits on again, so the thread
+    /// would block for good and a plain `join` with it (seen 3 times in 480
+    /// runs, 12 at once, on a loaded VM). The deadline turns any other stuck
+    /// thread into a failure rather than a hang.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = crate::transport::is_reachable(&self.socket_path);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + FAKE_DAEMON_STOP_DEADLINE + self.delay;
+        while !handle.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                // The thread is left behind; the test process ends with it.
+                if !std::thread::panicking() {
+                    panic!(
+                        "fake remote-check daemon at {} did not stop within {:?}",
+                        self.socket_path.display(),
+                        FAKE_DAEMON_STOP_DEADLINE + self.delay
+                    );
+                }
+                return;
+            }
+            let _ = crate::transport::is_reachable(&self.socket_path);
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let _ = handle.join();
     }
 }
 
