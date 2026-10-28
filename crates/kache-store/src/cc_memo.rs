@@ -565,8 +565,12 @@ impl FileHashCache<'_> {
         )
     }
 
+    /// Drop memos unused for 30 days and the inputs and header scans only
+    /// they named. GC runs it on a busy index, so it waits for the write
+    /// lock as an entry's registration does rather than failing after one
+    /// busy timeout.
     pub fn prune_cc_preprocess_memos(&self) -> rusqlite::Result<(usize, usize)> {
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let tx = crate::store::begin_write_waiting(self.db(), "pruning C/C++ memos")?;
         tx.execute(
             "DELETE FROM cc_memo_input_refs WHERE memo_id IN
              (SELECT id FROM cc_preprocess_memos WHERE last_used < unixepoch() - 2592000)",
@@ -1218,6 +1222,43 @@ mod tests {
         );
         assert_eq!(count(&cache, "cc_memo_input_refs"), 1);
         assert_eq!(cache.prune_cc_preprocess_memos().unwrap(), (0, 0));
+    }
+
+    /// GC prunes the memos on a busy index: another writer holding the lock
+    /// past one busy timeout must delay the pruning, as it delays an entry's
+    /// registration, not fail it ("gc: C/C++ memo pruning failed: database
+    /// is locked" in 3 of 4 Windows runs with a lock holder).
+    #[test]
+    fn cc_memo_pruning_waits_out_a_writer_past_one_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        cache
+            .put_cc_preprocess_memo_inputs("old", "a", &[input("a.h", "a")])
+            .unwrap();
+        cache
+            .db()
+            .execute(
+                "UPDATE cc_preprocess_memos SET last_used = unixepoch() - 2678400",
+                [],
+            )
+            .unwrap();
+        cache
+            .db()
+            .busy_timeout(std::time::Duration::from_millis(200))
+            .unwrap();
+
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        let pruned = cache.prune_cc_preprocess_memos();
+        holder.join().unwrap();
+
+        assert_eq!(pruned.unwrap(), (1, 1), "the pruning waited for the lock");
+        assert!(cache.get_cc_preprocess_memo("old").unwrap().is_none());
     }
 
     #[test]

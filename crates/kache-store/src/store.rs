@@ -1415,6 +1415,25 @@ fn is_sqlite_busy(err: &SqlError) -> bool {
     )
 }
 
+/// A write transaction on `db` with the lock taken at once, asked for again
+/// up to [`STORE_LOCK_ATTEMPTS`] times while it stays busy past the busy
+/// timeout. `doing` names the write in the log.
+pub(crate) fn begin_write_waiting<'db>(
+    db: &'db rusqlite::Connection,
+    doing: &str,
+) -> rusqlite::Result<rusqlite::Transaction<'db>> {
+    let mut attempt = 1;
+    loop {
+        match rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate) {
+            Err(error) if attempt < STORE_LOCK_ATTEMPTS && is_sqlite_busy(&error) => {
+                tracing::debug!(attempt, doing, "index busy; asking again");
+                attempt += 1;
+            }
+            started => return started,
+        }
+    }
+}
+
 pub fn is_sqlite_busy_snapshot(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         matches!(
@@ -4766,23 +4785,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.begin_write_waiting("registering an entry")
     }
 
-    /// A write transaction with the lock taken at once, asked for again up
-    /// to [`STORE_LOCK_ATTEMPTS`] times while it stays busy past the busy
-    /// timeout. `doing` names the write in the log.
+    /// [`begin_write_waiting`] on this store's connection.
     fn begin_write_waiting(&self, doing: &str) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        let mut attempt = 1;
-        loop {
-            match rusqlite::Transaction::new_unchecked(
-                &self.db,
-                rusqlite::TransactionBehavior::Immediate,
-            ) {
-                Err(error) if attempt < STORE_LOCK_ATTEMPTS && is_sqlite_busy(&error) => {
-                    tracing::debug!(attempt, doing, "index busy; asking again");
-                    attempt += 1;
-                }
-                started => return started,
-            }
-        }
+        begin_write_waiting(&self.db, doing)
     }
 
     /// [`Self::begin_entry_registration`] in one attempt that waits at most
