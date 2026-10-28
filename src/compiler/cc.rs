@@ -1475,6 +1475,11 @@ fn cc_target_arch(parsed: &CcArgs) -> String {
 /// - `-MMD` / `-MD` / `-MF` / `-MT` / `-MQ` / `-MP` / `-MG` removed —
 ///   dep-info generation is irrelevant to preprocessor *content* and
 ///   `-MF` would redirect output.
+/// - `-g` / `-g0`..`-g3` and `-dD` / `-dM` / `-dN` / `-dI` / `-dU`
+///   removed. GCC treats `-g3` as `-dD` under `-E` and prints every
+///   `#define`; a libc redirect macro then looks like a computed
+///   `asm`. The object does not assemble that text. Debug level stays
+///   in the key, and the real compile keeps the flags (#1751).
 /// - `-E -P` prepended. `-P` suppresses line markers
 ///   (`# 1 "/abs/path/header.h"`), so the hash captures expanded
 ///   *content* without leaking machine-local header paths — that's
@@ -1497,6 +1502,9 @@ fn build_preprocess_args(parsed: &CcArgs) -> Vec<String> {
                         iter.next(); // also drop the flag's value
                     }
                     "-MMD" | "-MD" | "-MP" | "-MG" => {}
+                    // Not a value-taking flag: the following source stays.
+                    "-g" | "-g0" | "-g1" | "-g2" | "-g3" | "-dD" | "-dM" | "-dN" | "-dI"
+                    | "-dU" => {}
                     _ => out.push(arg.clone()),
                 }
             }
@@ -5248,12 +5256,28 @@ fn push_cwd_source_roots(
         // relocate (kunobi-ninja/kache#304, #394). Fall back to `<CC_SOURCE>`
         // only when there is no usable shared root, so a sibling source's
         // absolute path still cannot leak into the key.
+        //
+        // Do not anchor that fallback at `source_parent` when the parent is
+        // nested under the filesystem root (`/obj` + `/src/base/location.cc`).
+        // Mapping `/src/base` drops every directory below the first and
+        // `__FILE__` becomes `<CC_SOURCE>/location.cc`, which fails Chromium's
+        // `base/location.cc` assert (kunobi-ninja/kache#1755). A configured
+        // base dir of `/src` does not win either: the more specific parent map
+        // is applied last. Anchor at the root plus the source's first normal
+        // component (`/src`, or `C:\src` with the Windows prefix kept) so the
+        // relative path below it survives. A file whose parent is already that
+        // anchor (`/src/foo.c`) still maps the anchor. Never map the bare root.
+        // If the canonical paths still share a directory (`/var` and
+        // `/private/var` on macOS), keep `source_parent`: widening to `/var`
+        // would leave the checkout id in the key.
         match common {
             Some(common) if has_normal_component(&common) => {
                 roots.push((common, CC_ROOT_SENTINEL));
             }
             _ => {
-                roots.push((source_parent.to_path_buf(), CC_SOURCE_SENTINEL));
+                if let Some(anchor) = cc_source_anchor_for(cwd_abs, source_parent) {
+                    roots.push((anchor, CC_SOURCE_SENTINEL));
+                }
             }
         }
     }
@@ -5265,6 +5289,41 @@ fn push_cwd_source_roots(
 fn has_normal_component(path: &Path) -> bool {
     path.components()
         .any(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// The filesystem root plus `source_parent`'s first normal component.
+///
+/// `/src/base` is `/src`. A Windows path keeps its prefix (`C:\src\base` is
+/// `C:\src`; a UNC path keeps the server and share). `None` when
+/// `source_parent` is itself a bare root, so that root is never a map source.
+/// Lexical only: the caller passes the absolute parent it already computed.
+fn cc_source_anchor(source_parent: &Path) -> Option<&Path> {
+    source_parent
+        .ancestors()
+        .take_while(|path| has_normal_component(path))
+        .last()
+}
+
+/// Where `<CC_SOURCE>` anchors when the lexical common ancestor is the
+/// filesystem root.
+///
+/// Widen to the first directory only when the canonical paths also fail to
+/// meet. `/obj` and `/src/base` stay apart, so `/src` is the anchor and
+/// `base/location.cc` survives. `/private/var/.../clone-a` and
+/// `/var/.../clone-a/src` are the same directory once the `/var` symlink is
+/// resolved; mapping `/var` there would leave the clone id in the key.
+fn cc_source_anchor_for(cwd: &Path, source_parent: &Path) -> Option<PathBuf> {
+    let widened = cc_source_anchor(source_parent)?;
+    let shares_directory = common_ancestor(
+        &canonicalize_or_self(cwd),
+        &canonicalize_or_self(source_parent),
+    )
+    .is_some_and(|common| has_normal_component(&common));
+    if shares_directory {
+        Some(source_parent.to_path_buf())
+    } else {
+        Some(widened.to_path_buf())
+    }
 }
 
 fn prefix_maps_from_roots<I>(roots: I) -> Vec<CcPrefixMap>

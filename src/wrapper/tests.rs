@@ -5621,6 +5621,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
             &self,
             _binary: &Path,
             _staging_dir: &Path,
+            _split_debuginfo: Option<&str>,
         ) -> Result<Option<PathBuf>> {
             Ok(None)
         }
@@ -5740,6 +5741,7 @@ fn an_unproven_loadability_check_runs_on_every_restore() {
             &self,
             _binary: &Path,
             _staging_dir: &Path,
+            _split_debuginfo: Option<&str>,
         ) -> Result<Option<PathBuf>> {
             Ok(None)
         }
@@ -6074,7 +6076,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
     use crate::compiler::platform::Platform as _;
     let staging = tempfile::tempdir().unwrap();
     let tar_path = crate::compiler::platform::MacOsPlatform::default()
-        .package_debug_bundle(&binary, staging.path())
+        .package_debug_bundle(&binary, staging.path(), Some("unpacked"))
         .unwrap()
         .expect("macOS host must package a bundle for a -g binary");
 
