@@ -7,3 +7,6 @@
 # the text beside it. CRLF from a Windows checkout would put carriage returns
 # in both.
 /scenarios/**/scenario.toml text eol=lf
+
+# cmd.exe finds labels reliably only in a CRLF batch file.
+/scripts/*.cmd text eol=crlf
