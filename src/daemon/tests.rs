@@ -15349,6 +15349,11 @@ async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
     config.remote = Some(remote.clone());
     config.remote_readonly = true;
     config.prefetch_enabled = false;
+    // The remote check has three seconds, and a busy disk took them with
+    // fsyncs: six to create the consumer's index, six more to store the
+    // download under strict durability. A consumer that has built before
+    // has its index, and downloads are stored without an fsync by default.
+    config.deferred_durability = true;
     let key = test_cache_key("readonly-cold-restore");
     let donor_config = test_config(donor.path());
     seed_store_entry(&donor_config, &key, "serde", donor.path());
@@ -15383,6 +15388,7 @@ async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
         inner: backend,
         writes: AtomicU64::new(0),
     });
+    drop(Store::open(&config).unwrap());
     let mut daemon_config = config.clone();
     daemon_config.remote_readonly = daemon_readonly;
     let daemon = Arc::new(Daemon::new(daemon_config));
