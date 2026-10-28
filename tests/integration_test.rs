@@ -3351,12 +3351,11 @@ cache_executables = true
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // The store that triggers auto-GC is the wrapper's, or the daemon's when
+    // the wrapper handed it over (a busy index): then the trigger is logged
+    // by the daemon, not on this build's stderr. The eviction is the proof.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("auto-gc: spawned background `kache gc`")
-            || stderr.contains("auto-gc: handed the sweep to the daemon"),
-        "second build should trigger background auto-GC.\nstderr: {stderr}"
-    );
+    common::wait_for_daemon_publishes(cache_dir.path());
 
     // Poll fresh SQLite connections until the aged first entry is evicted.
     let mut size_after = total_store_size();
@@ -3382,7 +3381,8 @@ cache_executables = true
     }
     assert!(
         size_after <= gc_budget as i64,
-        "auto-GC failed to evict store below budget {gc_budget}, current size: {size_after}"
+        "auto-GC failed to evict store below budget {gc_budget}, current size: {size_after}\n\
+         second build's stderr: {stderr}"
     );
 }
 
