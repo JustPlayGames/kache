@@ -12,7 +12,7 @@
 #![cfg(target_os = "linux")]
 
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -127,11 +127,14 @@ fn assert_built(output: &Output, tree: &str) {
     );
 }
 
+/// The compiles' results in the event log, without the heartbeats a compile
+/// past 30 s writes there (a starved machine's do).
 fn events(cache: &Path) -> Vec<Value> {
     std::fs::read_to_string(cache.join("events.jsonl"))
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event.get("result").is_some())
         .collect()
 }
 
@@ -153,14 +156,31 @@ fn waits(log: &Path) -> bool {
     })
 }
 
-#[test]
-fn a_unit_looked_up_while_its_entry_is_handed_off_waits_for_it() {
-    build_kache();
+/// A cache whose daemon holds `b`'s two entries, handed to it while the test
+/// holds the index's write lock. Dropped in field order: the lock goes with
+/// its connection, then the daemon, then the folder.
+struct InFlight {
+    index: rusqlite::Connection,
+    base: PathBuf,
+    cache: PathBuf,
+    _daemon: common::DaemonGuard,
+    _tmp: TempDir,
+}
+
+/// How many times the test builds `b` for its hand-offs before it fails.
+const ATTEMPTS: usize = 4;
+
+/// Build `b` while the index is held, so that every store of it hands its
+/// entry to the daemon, which holds each key until the index frees. `Err`
+/// says why the daemon does not hold both: one that answers past the
+/// wrapper's hand-off budget, as a CPU-starved one does, leaves the wrapper
+/// to store the entry itself, as designed, and nothing in flight for `c`.
+fn hand_off_b() -> Result<InFlight, String> {
     let tmp = TempDir::new().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
     let cache = base.join("cache");
     std::fs::create_dir_all(&cache).unwrap();
-    let _daemon = common::DaemonGuard::new(kache_binary(), &cache);
+    let daemon = common::DaemonGuard::new(kache_binary(), &cache);
     for name in ["b", "c"] {
         write_fixture(&base.join(name));
     }
@@ -172,23 +192,55 @@ fn a_unit_looked_up_while_its_entry_is_handed_off_waits_for_it() {
     let index = rusqlite::Connection::open(&index_path).unwrap();
     index.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-    // Every store of `b` finds the index busy and hands its entry to the
-    // daemon, which holds each key until the index frees.
     let b = cargo_build(&base.join("b"), &cache, None)
         .output()
         .unwrap();
     assert_built(&b, "b");
-    // The daemon logs a hand-off's event once it is stored (or failed).
+    // A wrapper that stored its entry itself logged its event before it
+    // exited; the daemon logs a hand-off's once it is stored.
     let done: Vec<Value> = events(&cache)
         .into_iter()
         .filter(|event| event["crate_name"] == "pm" || event["crate_name"] == "app")
         .collect();
-    assert!(done.is_empty(), "b's entries did not wait for the index: {done:?}");
+    let held = common::daemon_publishes_pending(&cache);
+    if !done.is_empty() || held.is_none_or(|held| held < 2) {
+        return Err(format!(
+            "the daemon holds {held:?} of b's 2 entries; logged: {done:?}"
+        ));
+    }
+    Ok(InFlight {
+        index,
+        base,
+        cache,
+        _daemon: daemon,
+        _tmp: tmp,
+    })
+}
+
+#[test]
+fn a_unit_looked_up_while_its_entry_is_handed_off_waits_for_it() {
+    build_kache();
+    let mut missed = Vec::new();
+    let flight = loop {
+        match hand_off_b() {
+            Ok(flight) => break flight,
+            Err(why) => {
+                eprintln!("b's hand-offs, attempt {}: {why}", missed.len() + 1);
+                missed.push(why);
+            }
+        }
+        assert!(
+            missed.len() < ATTEMPTS,
+            "b's entries never all waited for the index:\n{}",
+            missed.join("\n")
+        );
+    };
+    let (index, base, cache) = (&flight.index, &flight.base, &flight.cache);
 
     // `c` runs while those hand-offs wait for the index; each unit must wait
     // for its entry instead of compiling it again.
     let log = base.join("c.log");
-    let mut c = cargo_build(&base.join("c"), &cache, Some(&log))
+    let mut c = cargo_build(&base.join("c"), cache, Some(&log))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -206,7 +258,7 @@ fn a_unit_looked_up_while_its_entry_is_handed_off_waits_for_it() {
     let c = c.wait_with_output().unwrap();
     assert_built(&c, "c");
 
-    let events = events(&cache);
+    let events = events(cache);
     for krate in ["pm", "app"] {
         let stored: Vec<&Value> = events
             .iter()

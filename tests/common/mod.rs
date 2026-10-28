@@ -385,15 +385,7 @@ pub fn wait_for_daemon_publishes(cache_dir: &Path) {
         if !daemon_run_lock_is_held(&run_lock) {
             return;
         }
-        let answer = hermetic_command(status_binary(), cache_dir, Some(&config))
-            .env("KACHE_RUNTIME_DIR", &runtime_dir)
-            .args(["--json", "daemon", "status"])
-            .env("KACHE_LOG", "off")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_else(|error| error.to_string());
+        let answer = daemon_status(cache_dir, &config, &runtime_dir);
         if let Ok(status) = serde_json::from_str::<serde_json::Value>(&answer)
             && (status["daemon_running"] == false
                 || status["publishes_pending"].as_u64() == Some(0))
@@ -407,6 +399,33 @@ pub fn wait_for_daemon_publishes(cache_dir: &Path) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// `kache --json daemon status` for the daemon serving `cache_dir` (its
+/// `config` and `runtime_dir`, as [`wait_for_daemon_publishes`] finds
+/// them): the answer, or why there was none.
+fn daemon_status(cache_dir: &Path, config: &Path, runtime_dir: &Path) -> String {
+    hermetic_command(status_binary(), cache_dir, Some(config))
+        .env("KACHE_RUNTIME_DIR", runtime_dir)
+        .args(["--json", "daemon", "status"])
+        .env("KACHE_LOG", "off")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|error| error.to_string())
+}
+
+/// How many compiles the daemon serving `cache_dir` has taken from its
+/// wrappers and not yet stored (`publishes_pending`), or `None` when no
+/// daemon answers.
+#[allow(dead_code)]
+pub fn daemon_publishes_pending(cache_dir: &Path) -> Option<u64> {
+    let config = isolated_config_path(cache_dir);
+    let runtime_dir = configured_runtime_dir(&config).unwrap_or_else(|| cache_dir.to_owned());
+    let answer = daemon_status(cache_dir, &config, &runtime_dir);
+    let status = serde_json::from_str::<serde_json::Value>(&answer).ok()?;
+    status["publishes_pending"].as_u64()
 }
 
 /// A kache to ask the daemon with: the bootstrap build when this test made
