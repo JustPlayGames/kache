@@ -89,7 +89,12 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
             assert_eq!(fs::read_to_string(&log).unwrap(), expected, "{mode}");
         }
     }
-    // Starting the daemon creates its store even for uncached compilers.
+    // An entry would come from a hand-off the daemon stores after the
+    // wrapper returned, so wait until it has stored every one.
+    common::wait_for_daemon_publishes(&cache);
+    // The daemon's background tasks create the index's tables after it
+    // answers, and may not have yet: no index, or no entries table, holds
+    // no entry.
     let index = cache.join("index.db");
     let entries: i64 = if index.is_file() {
         let index = rusqlite::Connection::open_with_flags(
@@ -97,9 +102,21 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .unwrap();
-        index
-            .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
-            .unwrap()
+        let has_table: bool = index
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'entries')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if has_table {
+            index
+                .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+                .unwrap()
+        } else {
+            0
+        }
     } else {
         0
     };
