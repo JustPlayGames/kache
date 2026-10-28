@@ -172,11 +172,9 @@ impl PendingDaemon {
     }
 
     /// Close the queue and wait until the worker has stored all of it.
-    /// The bound only catches a worker that never finishes: on a machine at
-    /// load 225, twelve entries took more than 30 s.
     async fn drain(&self, worker: tokio::sync::oneshot::Receiver<()>) {
         self.daemon.publish_queue().close();
-        tokio::time::timeout(Duration::from_secs(120), worker)
+        tokio::time::timeout(HANG_GUARD, worker)
             .await
             .expect("the worker drains the queue")
             .unwrap();
@@ -198,6 +196,11 @@ fn handoff_requests(config: &Config) -> usize {
 /// that a loaded test machine still reaches the registration while it is
 /// held.
 const BUSY: Duration = Duration::from_secs(3);
+
+/// How long a wait the tests below end themselves may last before it ends on
+/// its own: it only turns a hang into a failure. On a machine at load 225 the
+/// publish worker took more than 30 s for twelve entries.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 
 /// An output rewritten in place after the wrapper returned, its read-only
 /// bit ignored (the staged blob shares its inode), is never stored under the
@@ -415,15 +418,19 @@ fn hold_index_lock(
 }
 
 /// [`hold_index_lock`] until the test lets go: when it sends on the sender,
-/// or drops it (a failed assertion lets go too).
+/// or drops it (a failed assertion lets go too), else after [`HANG_GUARD`].
 fn hold_index_lock_until_let_go(
     config: &Config,
-) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+) -> (
+    std::sync::mpsc::Sender<()>,
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
     let (let_go, wait) = std::sync::mpsc::channel::<()>();
-    let (_, thread) = hold_index_lock_while(config, move || {
-        let _ = wait.recv();
+    let (released, thread) = hold_index_lock_while(config, move || {
+        let _ = wait.recv_timeout(HANG_GUARD);
     });
-    (let_go, thread)
+    (let_go, released, thread)
 }
 
 /// Hold the index's write lock from another connection while `hold` runs.
@@ -652,7 +659,7 @@ fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
             let config = &compiled[0].config;
             let mut daemon = PendingDaemon::listen_queueing(config, 64);
 
-            let (let_go, holder) = hold_index_lock_until_let_go(config);
+            let (let_go, _, holder) = hold_index_lock_until_let_go(config);
             for one in &compiled {
                 let (outcome, lock, _) = hand_off_now(one);
                 assert!(matches!(outcome, RustcStore::HandedOff));
@@ -700,7 +707,7 @@ async fn a_rewritten_output_costs_only_its_own_entry_in_a_batch() {
     let bad = &compiled[2];
     let bad_hash = crate::cache_key::hash_file(&bad.rlib).unwrap();
 
-    let (_, holder) = hold_index_lock(config, BUSY);
+    let (let_go, _, holder) = hold_index_lock_until_let_go(config);
     for one in &compiled {
         assert!(matches!(hand_off_now(one).0, RustcStore::HandedOff));
     }
@@ -715,6 +722,7 @@ async fn a_rewritten_output_costs_only_its_own_entry_in_a_batch() {
         file.write_all(b"post-processed").unwrap();
     }
     let worker = daemon.start_worker();
+    let_go.send(()).unwrap();
     tokio::task::block_in_place(|| holder.join().unwrap());
     daemon.drain(worker).await;
 
@@ -756,22 +764,25 @@ async fn the_daemon_answers_a_hand_off_while_its_worker_and_store_are_busy() {
     let (_root, compiled) = compiled_many(2);
     let config = &compiled[0].config;
     let mut daemon = PendingDaemon::listen_queueing(config, 64);
-    let (released, holder) = hold_index_lock(config, BUSY);
+    let (let_go, released, holder) = hold_index_lock_until_let_go(config);
     assert!(matches!(
         hand_off_now(&compiled[0]).0,
         RustcStore::HandedOff
     ));
     let worker = daemon.start_worker();
-    // Other work holds the daemon's store connection for longer than any
-    // wrapper should wait.
+    // Other work holds the daemon's store connection until the test lets
+    // go: a daemon that waited for it, or for the index, could not answer
+    // within the wrapper's budget, and the wrapper would store the entry
+    // itself.
     let (take, taken) = std::sync::mpsc::channel();
+    let (free_store, store_freed) = std::sync::mpsc::channel::<()>();
     let busy_store = {
         let daemon = Arc::clone(&daemon.daemon);
         std::thread::spawn(move || {
             daemon
                 .with_store(|_| {
                     take.send(()).unwrap();
-                    std::thread::sleep(BUSY);
+                    let _ = store_freed.recv_timeout(HANG_GUARD);
                     Ok(())
                 })
                 .unwrap();
@@ -780,12 +791,16 @@ async fn the_daemon_answers_a_hand_off_while_its_worker_and_store_are_busy() {
     taken.recv().unwrap();
 
     let (outcome, _, took) = hand_off_now(&compiled[1]);
-    assert!(matches!(outcome, RustcStore::HandedOff));
-    assert!(took < Duration::from_secs(1), "the wrapper waited {took:?}");
+    assert!(
+        matches!(outcome, RustcStore::HandedOff),
+        "the wrapper waited {took:?}"
+    );
     assert!(
         !released.load(std::sync::atomic::Ordering::SeqCst),
         "answered while the worker still waited for the index"
     );
+    let_go.send(()).unwrap();
+    free_store.send(()).unwrap();
 
     tokio::task::block_in_place(|| {
         holder.join().unwrap();
