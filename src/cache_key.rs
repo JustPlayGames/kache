@@ -1643,7 +1643,7 @@ fn tree_digest_memo(memo_dir: &Path, root: &TreeRoot<'_>) -> PathBuf {
         if root.skips_build_dirs { b"1" } else { b"0" },
     );
     memo_dir
-        .join("tree-digests")
+        .join(crate::probe_memo::TREE_DIGESTS_DIR)
         .join(&hasher.finalize().to_hex()[..32])
 }
 

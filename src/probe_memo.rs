@@ -91,6 +91,17 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) {
 /// few days. Removing one that is still wanted costs one probe.
 pub(crate) const MEMO_IDLE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
+/// How long a tree digest (`probes/tree-digests`) may go unread. A build
+/// writes one per walked root and set of skipped names, so new checkouts and
+/// worktrees leave most of the memo files and bytes there (145k files and
+/// 575 MB of 226k and 1.2 GB on a shared build machine); one that is still
+/// wanted costs one walk of its tree.
+pub(crate) const TREE_DIGEST_IDLE: std::time::Duration =
+    std::time::Duration::from_secs(2 * 24 * 3600);
+
+/// The subdirectory of `probes/` that holds the tree digests.
+pub(crate) const TREE_DIGESTS_DIR: &str = "tree-digests";
+
 /// Most memos one GC sweep removes, across every directory it looks in. A
 /// removal is a stat and an unlink, so a full batch takes a few seconds in
 /// the daemon's below-normal-priority sweep, and a backlog of a million
@@ -147,7 +158,7 @@ pub(crate) fn memo_sweep_roots(cache_dir: &Path, store_writable: bool) -> Vec<Pa
 }
 
 /// Remove the memos under each of `roots` that nothing has read or written
-/// for [`MEMO_IDLE`], up to [`MEMO_SWEEP_CAP`] per sweep: the files of
+/// for [`MEMO_IDLE`] ([`TREE_DIGEST_IDLE`] for the tree digests), up to [`MEMO_SWEEP_CAP`] per sweep: the files of
 /// `<root>/probes` and of its subdirectories but the session trees, and the
 /// old-layout memos in `<root>` itself. Use is the later of a file's
 /// modification and access times; where a volume records no access times a
@@ -158,6 +169,7 @@ pub(crate) fn sweep_idle_memos(roots: &[PathBuf]) -> MemoSweepStats {
     sweep_idle_memos_at(
         roots,
         MEMO_IDLE,
+        TREE_DIGEST_IDLE,
         MEMO_SWEEP_CAP,
         std::time::SystemTime::now(),
     )
@@ -166,11 +178,11 @@ pub(crate) fn sweep_idle_memos(roots: &[PathBuf]) -> MemoSweepStats {
 fn sweep_idle_memos_at(
     roots: &[PathBuf],
     idle: std::time::Duration,
+    tree_idle: std::time::Duration,
     cap: usize,
     now: std::time::SystemTime,
 ) -> MemoSweepStats {
     let mut sweep = MemoSweep {
-        idle,
         cap,
         now,
         seen: 0,
@@ -183,11 +195,16 @@ fn sweep_idle_memos_at(
             continue;
         }
         swept.push(identity);
-        sweep.dir(root, is_legacy_root_memo, None);
+        sweep.dir(root, idle, is_legacy_root_memo, None);
         let mut subdirs = Vec::new();
-        sweep.dir(&root.join(PROBES_DIR), |_| true, Some(&mut subdirs));
+        sweep.dir(&root.join(PROBES_DIR), idle, |_| true, Some(&mut subdirs));
         for subdir in subdirs {
-            sweep.dir(&subdir, |_| true, None);
+            let idle = if subdir.file_name() == Some(TREE_DIGESTS_DIR.as_ref()) {
+                tree_idle
+            } else {
+                idle
+            };
+            sweep.dir(&subdir, idle, |_| true, None);
         }
     }
     MemoSweepStats {
@@ -204,7 +221,6 @@ fn is_legacy_root_memo(name: &str) -> bool {
 }
 
 struct MemoSweep {
-    idle: std::time::Duration,
     cap: usize,
     now: std::time::SystemTime,
     seen: usize,
@@ -212,11 +228,13 @@ struct MemoSweep {
 }
 
 impl MemoSweep {
-    /// Sweep the regular files of `dir` that `accept` names, and collect its
-    /// subdirectories but the session trees into `subdirs`.
+    /// Sweep the regular files of `dir` that `accept` names and nobody used
+    /// for `idle`, and collect its subdirectories but the session trees into
+    /// `subdirs`.
     fn dir(
         &mut self,
         dir: &Path,
+        idle: std::time::Duration,
         accept: impl Fn(&str) -> bool,
         mut subdirs: Option<&mut Vec<PathBuf>>,
     ) {
@@ -246,7 +264,7 @@ impl MemoSweep {
                 continue;
             }
             let path = entry.path();
-            if std::fs::symlink_metadata(&path).is_ok_and(|meta| self.is_idle(&meta))
+            if std::fs::symlink_metadata(&path).is_ok_and(|meta| self.is_idle(&meta, idle))
                 && std::fs::remove_file(&path).is_ok()
             {
                 self.removed += 1;
@@ -254,7 +272,7 @@ impl MemoSweep {
         }
     }
 
-    fn is_idle(&self, meta: &std::fs::Metadata) -> bool {
+    fn is_idle(&self, meta: &std::fs::Metadata, idle: std::time::Duration) -> bool {
         let last_use = [meta.modified(), meta.accessed()]
             .into_iter()
             .filter_map(Result::ok)
@@ -262,7 +280,7 @@ impl MemoSweep {
         last_use.is_some_and(|used| {
             self.now
                 .duration_since(used)
-                .is_ok_and(|age| age >= self.idle)
+                .is_ok_and(|age| age >= idle)
         })
     }
 }
@@ -400,7 +418,7 @@ mod tests {
         // A root named twice is swept once.
         let roots = [a.to_path_buf(), b.to_path_buf(), a.join(".")];
         assert_eq!(
-            sweep_idle_memos_at(&roots, idle, 100, now),
+            sweep_idle_memos_at(&roots, idle, idle, 100, now),
             MemoSweepStats {
                 removed: 5,
                 remaining: 2
@@ -416,14 +434,56 @@ mod tests {
             file(b.join("probes/3.json"), stale, stale),
         ];
         assert_eq!(
-            sweep_idle_memos_at(&roots, idle, 2, now),
+            sweep_idle_memos_at(&roots, idle, idle, 2, now),
             MemoSweepStats {
                 removed: 2,
                 remaining: 3
             }
         );
         assert_eq!(more.iter().filter(|path| path.exists()).count(), 1);
-        assert_eq!(sweep_idle_memos_at(&roots, idle, 2, now).removed, 1);
+        assert_eq!(sweep_idle_memos_at(&roots, idle, idle, 2, now).removed, 1);
+    }
+
+    #[test]
+    fn tree_digests_go_after_two_idle_days_other_memos_after_seven() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let now = std::time::SystemTime::now();
+        let memo = |path: PathBuf, idle_days: u32| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"memo").unwrap();
+            let used = now - day * idle_days;
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(used)
+                        .set_accessed(used),
+                )
+                .unwrap();
+            path
+        };
+        let tree_idle = memo(root.join("probes/tree-digests/0f0f"), 3);
+        let tree_in_use = memo(root.join("probes/tree-digests/1f1f"), 1);
+        let probe_idle_3_days = memo(root.join("probes/rustc-ver-1.txt"), 3);
+        let probe_idle_8_days = memo(root.join("probes/rustc-ver-2.txt"), 8);
+
+        let stats = sweep_idle_memos(&[root.to_path_buf()]);
+
+        assert!(!tree_idle.exists(), "a tree digest unused for 3 days goes");
+        assert!(tree_in_use.exists(), "one used yesterday stays");
+        assert!(probe_idle_3_days.exists(), "other memos keep 7 days");
+        assert!(!probe_idle_8_days.exists());
+        assert_eq!(
+            stats,
+            MemoSweepStats {
+                removed: 2,
+                remaining: 2
+            }
+        );
     }
 
     #[test]
