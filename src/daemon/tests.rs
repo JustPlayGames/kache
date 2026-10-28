@@ -7059,7 +7059,7 @@ impl crate::remote_backend::RemoteBackend for BlockingV3Backend {
 }
 
 async fn wait_for_download_waiter(daemon: &Daemon, key: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             let attached = {
                 let downloading = daemon.downloading.read().await;
@@ -9651,17 +9651,22 @@ async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
         deadline_ms: None,
         shard_dir: None,
     };
+    // Neither request may run out of its deadline on a loaded machine: a
+    // waiter past it gives up as a miss without the retry this test is about.
     let leader = {
         let daemon = daemon.clone();
         let request = request.clone();
         tokio::spawn(async move {
             daemon
-                .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                .handle_remote_check_leader(
+                    &request,
+                    RemoteDeadline::from_secs(HANG_GUARD.as_secs()),
+                )
                 .await
         })
     };
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+        tokio::time::timeout(HANG_GUARD, v3_started_rx.recv())
             .await
             .expect("leader must reach its gated v3 GET"),
         Some(1)
@@ -9671,7 +9676,10 @@ async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
         let daemon = daemon.clone();
         tokio::spawn(async move {
             daemon
-                .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                .handle_remote_check_leader(
+                    &request,
+                    RemoteDeadline::from_secs(HANG_GUARD.as_secs()),
+                )
                 .await
         })
     };
@@ -9682,19 +9690,19 @@ async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
     // start a second GET; returning a hit from stale meta would skip it.
     release_v3_get.add_permits(1);
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+        tokio::time::timeout(HANG_GUARD, v3_started_rx.recv())
             .await
             .expect("waiter must retry rather than report the failed leader as a hit"),
         Some(2)
     );
-    let leader_response = tokio::time::timeout(Duration::from_secs(5), leader)
+    let leader_response = tokio::time::timeout(HANG_GUARD, leader)
         .await
         .expect("leader must finish after its GET is released")
         .expect("leader task must not panic");
     assert_eq!(leader_response.found, Some(false));
 
     release_v3_get.add_permits(1);
-    let waiter_response = tokio::time::timeout(Duration::from_secs(5), waiter)
+    let waiter_response = tokio::time::timeout(HANG_GUARD, waiter)
         .await
         .expect("waiter must finish after its retry is released")
         .expect("waiter task must not panic");
