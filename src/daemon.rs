@@ -6464,7 +6464,11 @@ impl Daemon {
         }
         // Under gc.lock like every driver, so the totals cannot race.
         let store = self.open_sweep_store(config)?;
-        let stats = self.automatic_size_pass(config, &store, size)?;
+        let stats = self.automatic_size_pass(config, &store, size);
+        drop(store);
+        // The ranking of a large store takes hundreds of megabytes.
+        crate::platform::release_free_heap();
+        let stats = stats?;
         if let Err(e) = crate::report::record_gc_run(
             config,
             "daemon",
@@ -6530,11 +6534,16 @@ impl Daemon {
     /// Each store's `gc.lock` is its own: a shard another GC holds is skipped,
     /// and a busy main store does not stop the shards from being swept.
     fn run_gc(&self, policy: GcPolicy, driver: GcDriver) -> Result<GcRunReport> {
-        let report = self.run_gc_store(&self.config, policy, driver)?;
-        crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
-            self.run_gc_store(shard, policy, driver)
-        });
-        Ok(report)
+        let report = (|| {
+            let report = self.run_gc_store(&self.config, policy, driver)?;
+            crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
+                self.run_gc_store(shard, policy, driver)
+            });
+            Ok(report)
+        })();
+        // A sweep's ranking and housekeeping free hundreds of megabytes.
+        crate::platform::release_free_heap();
+        report
     }
 
     /// Core GC logic for the store of `config` with an explicit policy and
@@ -6891,6 +6900,12 @@ pub fn run_server(
     // Every connection this process opens (GC, publishes, the durability
     // tick's) leaves routine checkpoints to that tick's explicit passive one.
     kache_store::defer_wal_checkpoints();
+    // Before the runtime starts its threads, each of which would otherwise
+    // take an arena of its own.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Some(arenas) = crate::platform::limit_malloc_arenas() {
+        tracing::debug!(arenas, "capped glibc's malloc arenas");
+    }
     #[cfg(unix)]
     match crate::platform::raise_open_file_limit() {
         Ok(Some((before, after))) => {
