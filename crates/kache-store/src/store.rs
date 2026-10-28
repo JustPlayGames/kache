@@ -8718,6 +8718,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         cleanup_tx.commit()?;
+
+        // The key's lock file outlives its entry: nothing but the full GC's
+        // capped sweep removed it, and evicted keys left nearly all of a
+        // shared store's lock files without an entry. Remove it here by the
+        // sweep's own rules, outside the index lock: only an idle file
+        // (unclaimed for the sweep's grace), only while holding its lock,
+        // only if it is still the file at the path. A claimant that opened
+        // it before the unlink finds the path changed and reopens.
+        if republished == 0 {
+            let lock_path = self
+                .config
+                .store_dir()
+                .join(cache_key)
+                .with_extension("lock");
+            remove_stale_lock_file(
+                &lock_path,
+                KEY_LOCK_SWEEP_GRACE,
+                std::time::SystemTime::now(),
+                || {},
+            );
+        }
         Ok(RemovalAttempt::Done(Some(reclaim)))
     }
 
