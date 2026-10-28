@@ -28,8 +28,11 @@ filter = 'all()'
 run-wrapper = 'own-temp-windows'
 
 [profile.default]
-# Report any test past a minute so the slow ones are visible in the log.
-slow-timeout = { period = "60s" }
+# Report any test past a minute so the slow ones are visible in the log, and
+# end it after five: a hung test then fails as TIMEOUT instead of holding the
+# run up until someone stops it. The slowest test takes about 35 s on a
+# loaded Windows VM.
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.ci]
 fail-fast = false
