@@ -5,10 +5,12 @@ rem the test has ended. See nextest-own-temp.sh for why.
 rem
 rem Windows keeps what a TempDir could not delete: a folder a daemon the test
 rem started still has open (its index.db, its lock files), and files with the
-rem read-only attribute that the store gives its blobs. So the attribute is
-rem cleared everywhere first, and the removal is tried again for up to two
-rem minutes while the test's daemons drain (KACHE_DAEMON_OWNER_PID); a folder
-rem still there after that is named on stderr and kept.
+rem read-only attribute that the store gives its blobs. When a removal
+rem leaves something, the attribute is cleared everywhere (attrib is a
+rem process of its own, so only then) and the removal is tried again for
+rem up to two minutes while the test's daemons drain
+rem (KACHE_DAEMON_OWNER_PID); a folder still there after that is named on
+rem stderr and kept.
 rem
 rem With NEXTEST_OWN_TEMP_LOG set, every folder that took a retry or was
 rem left gets a line in that file: the seconds waited, the outcome and the
@@ -34,6 +36,8 @@ set "TMPDIR=%KT_DIR%"
 set "KT_STATUS=%ERRORLEVEL%"
 set /a KT_WAIT=0
 :clean
+rd /s /q "%KT_DIR%" >nul 2>&1
+if not exist "%KT_DIR%\" goto done
 attrib -R "%KT_DIR%\*" /S /D >nul 2>&1
 rd /s /q "%KT_DIR%" >nul 2>&1
 if not exist "%KT_DIR%\" goto done
