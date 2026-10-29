@@ -1127,6 +1127,7 @@ pub(crate) fn send_hit_stamps_to_daemon(config: &Config, store: &mut Store) {
         store.send_hit_stamps_to(Box::new(move |key| {
             crate::daemon::send_hit_stamp(&socket, &cache_dir, key)
         }));
+        crate::key_bridge::register_through_daemon(config.socket_path(), config.cache_dir.clone());
         let socket = config.socket_path();
         let cache_dir = config.cache_dir.clone();
         store.send_busy_memo_rows_to(Box::new(move |rows| {

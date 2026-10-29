@@ -2616,8 +2616,39 @@ pub struct Adoption {
     pub verify: Duration,
     /// The new row, its blob references and its meta.json.
     pub register: Duration,
+    pub outcome: AdoptionOutcome,
+}
+
+/// How an adoption ended ([`Adoption::outcome`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionOutcome {
+    /// This process verified and registered the entry.
+    #[default]
+    Adopted,
     /// Another process adopted or stored the key first: nothing was done.
-    pub by_peer: bool,
+    ByPeer,
+    /// Another process holds the key's build lock (adopting or compiling
+    /// it): nothing was hashed, and the caller's claim waits for it.
+    Contended,
+}
+
+/// One verified adoption to register ([`ArtifactStore::register_adoptions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionRequest {
+    pub legacy_key: String,
+    pub legacy_version: u32,
+    pub cache_key: String,
+    pub crate_name: String,
+}
+
+/// What [`ArtifactStore::register_adoptions`] did with one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    Adopted,
+    /// The key was committed already (a peer adopted or stored it).
+    ByPeer,
+    /// The legacy row, its meta.json or a blob is gone or does not bind.
+    Refused,
 }
 
 /// Idle hours added to an entry of an earlier key version when it is ranked
@@ -3726,18 +3757,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Adopt the entry an earlier key version stored under `legacy_key` as
     /// `cache_key`'s, for a release whose key bump left this invocation's
-    /// derivation alone (lane KACHE-W20 prototype: key bridges).
-    ///
-    /// Safe only because the caller computed `legacy_key` with the earlier
-    /// version's derivation for this same invocation. Before anything is
-    /// written the entry must be committed, say it was stored under
-    /// `legacy_key` by `legacy_version`, name `crate_name`, and every blob
-    /// must still hold the bytes its content address names (re-hashed here,
-    /// whatever `verify_restores` says). The new row then references the same
-    /// blobs (refcounts taken in one transaction, no bytes copied); the
-    /// legacy row stays for releases that still read it, and as a stale key
-    /// version it is the first an eviction takes. `None` when there is
-    /// nothing to adopt or any check fails: the caller compiles.
+    /// derivation alone (key bridges, lanes KACHE-W20..W22), registering it
+    /// in this store's index ([`Self::adopt_legacy_entry_with`]).
     pub fn adopt_legacy_entry(
         &self,
         legacy_key: &str,
@@ -3745,26 +3766,57 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         cache_key: &str,
         crate_name: &str,
     ) -> Result<Option<Adoption>> {
+        self.adopt_legacy_entry_with(legacy_key, legacy_version, cache_key, crate_name, |req| {
+            Ok(self.register_adoptions(std::slice::from_ref(req))?[0])
+        })
+    }
+
+    /// [`Self::adopt_legacy_entry`], with `register` writing the new row:
+    /// this store's [`Self::register_adoptions`], or a daemon that batches
+    /// the registrations of many builds into one transaction.
+    ///
+    /// Safe only because the caller computed `legacy_key` with the earlier
+    /// version's derivation for this same invocation. The key's build lock
+    /// is taken first: a peer adopting (or compiling) the same key holds it,
+    /// and this process then leaves the key to it ([`AdoptionOutcome::Contended`]:
+    /// the caller's claim waits for that commit) instead of re-hashing the
+    /// same blobs. Under the lock the entry must be committed, say it was
+    /// stored under `legacy_key` by `legacy_version`, name `crate_name`, and
+    /// every blob must still hold the bytes its content address names
+    /// (re-hashed here, whatever `verify_restores` says). The new row then
+    /// references the same blobs (refcounts taken in one transaction, no
+    /// bytes copied); the legacy row stays for releases that still read it,
+    /// and as a stale key version it is the first an eviction takes. `None`
+    /// when there is nothing to adopt or any check fails: the caller
+    /// compiles.
+    pub fn adopt_legacy_entry_with(
+        &self,
+        legacy_key: &str,
+        legacy_version: u32,
+        cache_key: &str,
+        crate_name: &str,
+        register: impl FnOnce(&AdoptionRequest) -> Result<Registered>,
+    ) -> Result<Option<Adoption>> {
         if self.read_only || legacy_key == cache_key || !self.contains(legacy_key) {
             return Ok(None);
         }
-        let Some(mut meta) = self.stored_meta(legacy_key) else {
+        let Some(mut lock) = self.try_lock(cache_key)? else {
+            return Ok(Some(Adoption {
+                outcome: AdoptionOutcome::Contended,
+                ..Adoption::default()
+            }));
+        };
+        // Peers that missed meanwhile wait for this commit, as for a store.
+        lock.mark_storing();
+        if self.contains(cache_key) {
+            return Ok(Some(Adoption {
+                outcome: AdoptionOutcome::ByPeer,
+                ..Adoption::default()
+            }));
+        }
+        let Some(meta) = self.legacy_meta_for(legacy_key, legacy_version, crate_name) else {
             return Ok(None);
         };
-        if meta.cache_key != legacy_key
-            || meta.key_schema != legacy_version
-            || meta.crate_name != crate_name
-            || meta.files.is_empty()
-        {
-            tracing::info!(
-                "key bridge: refused {} for {crate_name}: meta says key {} v{} crate {}",
-                &legacy_key[..16.min(legacy_key.len())],
-                &meta.cache_key[..16.min(meta.cache_key.len())],
-                meta.key_schema,
-                meta.crate_name
-            );
-            return Ok(None);
-        }
         let verify_started = std::time::Instant::now();
         let mut verified_bytes = 0u64;
         for file in &meta.files {
@@ -3787,63 +3839,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let verify = verify_started.elapsed();
         let register_started = std::time::Instant::now();
-        meta.cache_key = cache_key.to_string();
-        meta.key_schema = kache_format::CACHE_KEY_VERSION;
-        let meta_json = serde_json::to_string_pretty(&meta).context("serializing adopted meta")?;
-        let tx = self.begin_entry_registration()?;
-        let committed: Option<bool> = tx
-            .query_row(
-                "SELECT committed FROM entries WHERE cache_key = ?1",
-                params![cache_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if committed == Some(true) {
-            // A peer adopted or stored it meanwhile.
-            return Ok(Some(Adoption {
-                by_peer: true,
-                ..Adoption::default()
-            }));
-        }
-        release_entry_blob_refs(&tx, cache_key)?;
-        for file in &meta.files {
-            let taken = tx.execute(
-                "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
-                params![file.hash],
-            )?;
-            if taken != 1 {
-                // Rolled back on drop: no reference taken.
-                return Ok(None);
-            }
-        }
-        record_entry_blobs(&tx, cache_key, &meta.files)?;
-        let entry_dir = self.entry_dir(cache_key);
-        fs::create_dir_all(&entry_dir).context("creating adopted entry directory")?;
-        crate::atomic::atomic_replace_deferrable(
-            &entry_dir.join("meta.json"),
-            meta_json.as_bytes(),
-            self.durable_writes(),
-        )
-        .context("writing adopted entry metadata")?;
-        let inserted = tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, \
-                 num_features, size, content_hash, compile_time_ms, key_schema, committed, \
-                 durable, compile_time_backfilled, unit_id) \
-             SELECT ?1, crate_name, crate_type, profile, num_features, size, content_hash, \
-                 compile_time_ms, ?2, 1, durable, compile_time_backfilled, unit_id \
-             FROM entries WHERE cache_key = ?3 AND committed = 1",
-            params![cache_key, kache_format::CACHE_KEY_VERSION, legacy_key],
-        )?;
-        if inserted != 1 {
-            return Ok(None);
-        }
-        tx.commit()?;
+        let request = AdoptionRequest {
+            legacy_key: legacy_key.to_string(),
+            legacy_version,
+            cache_key: cache_key.to_string(),
+            crate_name: crate_name.to_string(),
+        };
+        let outcome = match register(&request)? {
+            Registered::Adopted => AdoptionOutcome::Adopted,
+            Registered::ByPeer => AdoptionOutcome::ByPeer,
+            Registered::Refused => return Ok(None),
+        };
+        drop(lock);
         let adoption = Adoption {
             files: meta.files.len(),
             bytes: verified_bytes,
             verify,
             register: register_started.elapsed(),
-            by_peer: false,
+            outcome,
         };
         tracing::debug!(
             "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}: {adoption:?}",
@@ -3851,6 +3864,129 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             &cache_key[..16.min(cache_key.len())],
         );
         Ok(Some(adoption))
+    }
+
+    /// `legacy_key`'s meta.json, when it binds that key, `legacy_version`
+    /// and `crate_name` and lists files.
+    fn legacy_meta_for(
+        &self,
+        legacy_key: &str,
+        legacy_version: u32,
+        crate_name: &str,
+    ) -> Option<EntryMeta> {
+        let meta = self.stored_meta(legacy_key)?;
+        if meta.cache_key != legacy_key
+            || meta.key_schema != legacy_version
+            || meta.crate_name != crate_name
+            || meta.files.is_empty()
+        {
+            tracing::info!(
+                "key bridge: refused {} for {crate_name}: meta says key {} v{} crate {}",
+                &legacy_key[..16.min(legacy_key.len())],
+                &meta.cache_key[..16.min(meta.cache_key.len())],
+                meta.key_schema,
+                meta.crate_name
+            );
+            return None;
+        }
+        Some(meta)
+    }
+
+    /// Register adoptions whose blobs [`Self::adopt_legacy_entry_with`]
+    /// verified, all in one write transaction (lane KACHE-W22: concurrent
+    /// builds queued for the index's write lock once per adopted entry).
+    /// Metadata is read and serialized before the lock is taken; each entry
+    /// commits or rolls back on its own (a savepoint), and one whose legacy
+    /// row or blobs went meanwhile is [`Registered::Refused`]. The bindings
+    /// are checked again here, the blob bytes are not: the caller re-hashed
+    /// them under the key's build lock.
+    pub fn register_adoptions(&self, requests: &[AdoptionRequest]) -> Result<Vec<Registered>> {
+        self.refuse_write("register adoptions")?;
+        let mut results = vec![Registered::Refused; requests.len()];
+        let mut prepared = Vec::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            if request.legacy_key == request.cache_key {
+                continue;
+            }
+            let Some(mut meta) = self.legacy_meta_for(
+                &request.legacy_key,
+                request.legacy_version,
+                &request.crate_name,
+            ) else {
+                continue;
+            };
+            meta.cache_key = request.cache_key.clone();
+            meta.key_schema = kache_format::CACHE_KEY_VERSION;
+            let meta_json =
+                serde_json::to_string_pretty(&meta).context("serializing adopted meta")?;
+            let entry_dir = self.entry_dir(&request.cache_key);
+            fs::create_dir_all(&entry_dir).context("creating adopted entry directory")?;
+            prepared.push((index, meta, meta_json));
+        }
+        if prepared.is_empty() {
+            return Ok(results);
+        }
+        let mut tx = self.begin_entry_registration()?;
+        for (index, meta, meta_json) in prepared {
+            let request = &requests[index];
+            let sp = tx.savepoint()?;
+            let committed: Option<bool> = sp
+                .query_row(
+                    "SELECT committed FROM entries WHERE cache_key = ?1",
+                    params![request.cache_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if committed == Some(true) {
+                results[index] = Registered::ByPeer;
+                continue;
+            }
+            release_entry_blob_refs(&sp, &request.cache_key)?;
+            let mut taken_all = true;
+            for file in &meta.files {
+                let taken = sp.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![file.hash],
+                )?;
+                if taken != 1 {
+                    taken_all = false;
+                    break;
+                }
+            }
+            if !taken_all {
+                // Rolled back on drop: no reference taken.
+                continue;
+            }
+            record_entry_blobs(&sp, &request.cache_key, &meta.files)?;
+            // Only once the key is known uncommitted: a committed entry's
+            // meta.json is never replaced.
+            crate::atomic::atomic_replace_deferrable(
+                &self.entry_dir(&request.cache_key).join("meta.json"),
+                meta_json.as_bytes(),
+                self.durable_writes(),
+            )
+            .context("writing adopted entry metadata")?;
+            let inserted = sp.execute(
+                "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, \
+                     num_features, size, content_hash, compile_time_ms, key_schema, committed, \
+                     durable, compile_time_backfilled, unit_id) \
+                 SELECT ?1, crate_name, crate_type, profile, num_features, size, content_hash, \
+                     compile_time_ms, ?2, 1, durable, compile_time_backfilled, unit_id \
+                 FROM entries WHERE cache_key = ?3 AND committed = 1",
+                params![
+                    request.cache_key,
+                    kache_format::CACHE_KEY_VERSION,
+                    request.legacy_key
+                ],
+            )?;
+            if inserted != 1 {
+                continue;
+            }
+            sp.commit()?;
+            results[index] = Registered::Adopted;
+        }
+        tx.commit()?;
+        Ok(results)
     }
 
     /// Send the access stamps of this store's hits to `sink` instead of
@@ -8997,6 +9133,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
     /// modifier like `"-1 hour"`) so eviction tests can move an entry past the
     /// active-pin grace without sleeping (kunobi-ninja/kache#326).
+    /// Test-only: make `cache_key`'s entry look stored by key version
+    /// `version` (its row and its meta.json), as a key bridge finds it.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_key_schema_for_test(&self, cache_key: &str, version: u32) {
+        self.db
+            .execute(
+                "UPDATE entries SET key_schema = ?2 WHERE cache_key = ?1",
+                params![cache_key, version],
+            )
+            .unwrap();
+        let mut meta = self.stored_meta(cache_key).unwrap();
+        meta.key_schema = version;
+        fs::write(
+            self.entry_dir(cache_key).join("meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn set_last_accessed_for_test(&self, cache_key: &str, sql_modifier: &str) {

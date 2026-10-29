@@ -107,6 +107,25 @@ pub struct StampHitsRequest {
     pub keys: Vec<String>,
 }
 
+/// Key-bridge adoptions a wrapper verified (`Request::AdoptEntries`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdoptEntriesRequest {
+    /// The cache directory of the store the entries are in. The daemon
+    /// registers only in its own store and refuses any other.
+    pub cache_dir: String,
+    pub entries: Vec<AdoptEntry>,
+}
+
+/// One adoption: `cache_key` takes the entry `legacy_version` stored under
+/// `legacy_key` for `crate_name`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdoptEntry {
+    pub legacy_key: String,
+    pub legacy_version: u32,
+    pub cache_key: String,
+    pub crate_name: String,
+}
+
 /// File-hash memo rows a wrapper's store could not write because its index
 /// was busy. The daemon writes them to its own store when the index lets it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
