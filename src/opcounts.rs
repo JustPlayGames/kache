@@ -631,6 +631,9 @@ mod tests {
 
     #[test]
     fn prediction_outcomes_keep_their_order_and_stay_bounded() {
+        // The process-wide sequence is shared with every other test thread
+        // and stops growing once full; an invocation's own is this test's.
+        let _scope = InvocationScope::enter(Instant::now());
         record_prediction_outcome("validated");
         record_prediction_outcome("disabled");
         let outcomes = prediction_outcomes();
