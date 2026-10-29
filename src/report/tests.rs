@@ -3866,6 +3866,7 @@ fn test_push_bypass_tables_renders_reasons_and_slowest() {
     let bypass = BypassAnalysis {
         passthroughs: 1,
         reasons: vec![BypassReason {
+            fixed_in: None,
             result: "passthrough".to_string(),
             route: "direct".to_string(),
             reason: "linker".to_string(),
@@ -3874,6 +3875,7 @@ fn test_push_bypass_tables_renders_reasons_and_slowest() {
             max_elapsed_ms: 1500,
         }],
         slowest: vec![BypassDetail {
+            version: String::new(),
             fallback_attempt: None,
             crate_name: "foo".to_string(),
             root: String::new(),
@@ -4353,6 +4355,7 @@ fn text_timing_and_bypass_sections_hide_a_zero() {
 
     report.bypass.passthroughs = 1;
     report.bypass.slowest.push(BypassDetail {
+        version: String::new(),
         crate_name: "slow".to_string(),
         root: String::new(),
         package: String::new(),
@@ -4535,6 +4538,7 @@ fn an_edit_rebuild_counts_as_compiled_and_not_cached() {
         uncached_compiles: 2,
         uncached_compile_time_ms: 4_000,
         reasons: vec![BypassReason {
+            fixed_in: None,
             result: "passthrough".into(),
             route: "direct".into(),
             reason: "adaptive seed".into(),

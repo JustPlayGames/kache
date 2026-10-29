@@ -20,13 +20,16 @@ Built by [Kunobi][kunobi-brand].
 This README follows v2 on `main`. To install the published v2 preview:
 
 ```bash
-cargo install kache --locked --version 2.0.0-rc.2
+cargo install kache --locked --version 2.0.0-rc.4
 kache init
 kache doctor --probe
 ```
 
-Unversioned install commands select the stable channel. Features added after
-`v2.0.0-rc.2`, including Blaze, require `main`.
+Unversioned install commands select the stable channel. Optional Blaze routing
+is available from `v2.0.0-rc.3`.
+
+If you use RC.2 with an older cache index, upgrade. RC.3 and later rebuild
+incompatible prediction metadata and keep compiled entries.
 [Choose a version or upgrade an existing installation →](https://kunobi.ninja/docs/kache/getting-started/upgrade-v2)
 
 `kache init` shows the changes before applying them. It configures Cargo's compiler
@@ -103,7 +106,7 @@ to see the workload, platform, and validation behind each result.
 
 ## Optional Blaze builds
 
-On **main**, after `v2.0.0-rc.2`, the Cargo shim can route eligible local commands
+From `v2.0.0-rc.3`, the Cargo shim can route eligible local commands
 through an installed [Blaze](https://github.com/indexable-inc/blaze) client.
 Install Blaze separately and opt in from the project:
 
@@ -150,7 +153,7 @@ Install your Rust toolchain, then add the official action before your build:
 ```yaml
 - uses: kunobi-ninja/kache-action@v1
   with:
-    version: v2.0.0-rc.2
+    version: v2.0.0-rc.4
 - run: cargo build --locked
 ```
 
