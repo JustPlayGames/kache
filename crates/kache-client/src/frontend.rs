@@ -26,7 +26,7 @@ pub fn run(version: &str) -> Result<i32> {
         || std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some()
         || std::env::var_os("KACHE_BUILD_SCRIPT_PATH").is_some()
     {
-        return forward_engine(&executable, version, &args, started_at, false);
+        return forward_engine(&executable, version, &args, started_at, Forward::Plain);
     }
     #[cfg(any(unix, windows))]
     {
@@ -61,7 +61,22 @@ pub fn run(version: &str) -> Result<i32> {
                     return Ok(exit);
                 }
                 if attempt == kache_ipc::execution::Attempt::Declined {
-                    return forward_engine(&executable, version, &args, started_at, true);
+                    return forward_engine(
+                        &executable,
+                        version,
+                        &args,
+                        started_at,
+                        Forward::Declined,
+                    );
+                }
+                if attempt == kache_ipc::execution::Attempt::Lost {
+                    return forward_engine(
+                        &executable,
+                        version,
+                        &args,
+                        started_at,
+                        Forward::DaemonLost,
+                    );
                 }
                 // A daemon that is there but not answering is not started
                 // again, nor one that answered and declined: starting one
@@ -81,7 +96,17 @@ pub fn run(version: &str) -> Result<i32> {
             }
         }
     }
-    forward_engine(&executable, version, &args, started_at, false)
+    forward_engine(&executable, version, &args, started_at, Forward::Plain)
+}
+
+/// What the engine a frontend forwards to is told about the daemon.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Forward {
+    Plain,
+    /// The running daemon declined this compile.
+    Declined,
+    /// The daemon went away after Commit: compile once more, locally.
+    DaemonLost,
 }
 
 fn forward_engine(
@@ -89,11 +114,17 @@ fn forward_engine(
     version: &str,
     args: &[OsString],
     started_at: std::time::Instant,
-    declined: bool,
+    forward: Forward,
 ) -> Result<i32> {
     let mut command = engine_command(executable, version, args, started_at)?;
-    if declined {
-        command.env(crate::FRONTEND_DECLINED_ENV, "1");
+    match forward {
+        Forward::Plain => {}
+        Forward::Declined => {
+            command.env(crate::FRONTEND_DECLINED_ENV, "1");
+        }
+        Forward::DaemonLost => {
+            command.env(crate::FRONTEND_DAEMON_LOST_ENV, "1");
+        }
     }
     #[cfg(unix)]
     {

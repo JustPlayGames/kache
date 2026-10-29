@@ -1,4 +1,5 @@
-//! Synchronous compiler handoff with fallback rights ending at the first Commit write.
+//! Synchronous compiler handoff with fallback rights ending at the first Commit write,
+//! except when the daemon goes away after it (see [`Attempt::Lost`]).
 
 #[cfg(all(test, windows))]
 use crate::prelude::*;
@@ -90,6 +91,47 @@ pub enum Attempt {
     /// No daemon took the request: none listens, it did not answer, or the
     /// request could not be made. A daemon may be worth starting.
     Unavailable,
+    /// The daemon took the compile (Commit was sent) and then went away
+    /// without an answer: its connection closed (it was stopped, restarted
+    /// or killed). Nothing of that attempt is still running: this client's
+    /// own compiler children were killed and reaped before this returns,
+    /// and a daemon keeps the connection open until its worker for the
+    /// compile has returned, so the connection closing means the worker or
+    /// the whole daemon is gone. The caller may run the compiler locally,
+    /// once, instead of failing the build.
+    Lost,
+}
+
+/// The daemon's end of a committed compile closed before its answer: the
+/// connection ended (EOF, reset, broken pipe), not a reply that said the
+/// compile failed.
+#[derive(Debug)]
+struct DaemonLost(String);
+
+impl std::fmt::Display for DaemonLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the daemon went away during the compile: {}", self.0)
+    }
+}
+
+impl std::error::Error for DaemonLost {}
+
+/// Whether a failure after Commit means the daemon went away (its
+/// connection ended) rather than an answer it gave: an end of stream where
+/// a reply should be, or a reset or broken connection on any read or write.
+fn daemon_lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<DaemonLost>().is_some()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                )
+            })
+    })
 }
 
 /// A running daemon's refusal of a request before Commit.
@@ -119,7 +161,7 @@ pub fn try_execute(
             descriptors,
         )? {
             Attempt::Completed(exit) => Some(exit),
-            Attempt::Declined | Attempt::Unavailable => None,
+            Attempt::Declined | Attempt::Unavailable | Attempt::Lost => None,
         },
     )
 }
@@ -175,6 +217,12 @@ pub fn try_execute_attempt(
         Err(error) if !committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
             Ok(Attempt::Unavailable)
+        }
+        // `exchange` has returned, so the client-owned compiler children of
+        // this attempt are killed and reaped (its broker's drop).
+        Err(error) if daemon_lost(&error) => {
+            tracing::warn!(%error, "daemon went away during a committed compile");
+            Ok(Attempt::Lost)
         }
         Err(error) => Err(error.context(
             "daemon compilation did not complete; the compiler will not be run again locally",
@@ -369,10 +417,14 @@ fn write_message(writer: &mut impl Write, message: &impl serde::Serialize) -> Re
 fn read_reply(reader: &mut impl BufRead) -> Result<ExecutionReply> {
     let mut frame = Vec::new();
     reader.take(MAX_REPLY_BYTES).read_until(b'\n', &mut frame)?;
-    ensure!(
-        frame.last() == Some(&b'\n'),
-        "incomplete compiler execution response"
-    );
+    if frame.last() != Some(&b'\n') {
+        ensure!(
+            (frame.len() as u64) < MAX_REPLY_BYTES,
+            "compiler execution response exceeds {MAX_REPLY_BYTES} bytes"
+        );
+        // The stream ended before a whole reply: the daemon's end closed.
+        return Err(DaemonLost("incomplete compiler execution response".into()).into());
+    }
     Ok(serde_json::from_slice(&frame)?)
 }
 
@@ -532,6 +584,8 @@ mod tests {
         AfterPrepared,
         AfterCommit,
         AfterAccepted,
+        FailedAfterAccepted,
+        GarbageAfterAccepted,
     }
 
     struct Fixture {
@@ -577,7 +631,7 @@ mod tests {
     fn disconnected_exchange(stage: Disconnect) -> Result<Option<i32>> {
         Ok(match attempted_exchange(stage)? {
             Attempt::Completed(exit) => Some(exit),
-            Attempt::Declined | Attempt::Unavailable => None,
+            Attempt::Declined | Attempt::Unavailable | Attempt::Lost => None,
         })
     }
 
@@ -676,6 +730,18 @@ mod tests {
                     return;
                 }
                 write_message(&mut stream, &ExecutionReply::Accepted).unwrap();
+                if matches!(stage, Disconnect::FailedAfterAccepted) {
+                    write_message(
+                        &mut stream,
+                        &ExecutionReply::Failed {
+                            message: "compiler worker failed".into(),
+                        },
+                    )
+                    .unwrap();
+                }
+                if matches!(stage, Disconnect::GarbageAfterAccepted) {
+                    std::io::Write::write_all(&mut stream, b"not a reply\n").unwrap();
+                }
             });
             let result = try_execute_attempt(
                 &path,
@@ -731,10 +797,24 @@ mod tests {
         }
     }
 
+    /// A daemon stopped or killed after Commit closes its connection with
+    /// no answer: the build compiles locally instead of failing. An answer
+    /// the daemon did give (a failed compile, a reply that is not one) still
+    /// ends the attempt with an error and no second compile.
     #[test]
-    fn execution_commit_and_completion_failures_never_allow_local_fallback() {
+    fn a_daemon_gone_after_commit_is_lost_and_its_answers_stay_final() {
         for stage in [Disconnect::AfterCommit, Disconnect::AfterAccepted] {
-            let error = disconnected_exchange(stage).unwrap_err();
+            assert_eq!(
+                attempted_exchange(stage).unwrap(),
+                Attempt::Lost,
+                "{stage:?}"
+            );
+        }
+        for stage in [
+            Disconnect::FailedAfterAccepted,
+            Disconnect::GarbageAfterAccepted,
+        ] {
+            let error = attempted_exchange(stage).unwrap_err();
             assert!(
                 error.to_string().contains("will not be run again locally"),
                 "{stage:?}: {error:#}"
@@ -744,12 +824,12 @@ mod tests {
 
     #[test]
     fn execution_disconnect_after_prepared_cannot_report_completion() {
-        // The peer can close before the timeout is cleared (safe fallback),
-        // or after the first Commit write is attempted (final failure).
-        match disconnected_exchange(Disconnect::AfterPrepared) {
-            Ok(None) => {}
-            Err(error) => assert!(error.to_string().contains("will not be run again locally")),
-            Ok(Some(exit)) => panic!("disconnected peer reported completion: {exit}"),
+        // The peer can close before the timeout is cleared (Unavailable), or
+        // after the first Commit write is attempted (Lost): both compile
+        // locally, and neither reports a completion.
+        match attempted_exchange(Disconnect::AfterPrepared) {
+            Ok(Attempt::Unavailable | Attempt::Lost) => {}
+            other => panic!("disconnected peer after Prepared: {other:?}"),
         }
     }
 }

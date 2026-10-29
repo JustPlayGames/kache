@@ -1524,39 +1524,51 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         .var_os(kache_client::FRONTEND_DECLINED_ENV)
         .is_some();
     context.env.remove(kache_client::FRONTEND_DECLINED_ENV);
+    // The frontend handed this compile to a daemon that went away after
+    // taking it: compile it here, once, and ask no daemon again.
+    #[cfg_attr(not(any(unix, windows)), allow(unused_mut))]
+    let mut lost = context
+        .env
+        .var_os(kache_client::FRONTEND_DAEMON_LOST_ENV)
+        .is_some();
+    context.env.remove(kache_client::FRONTEND_DAEMON_LOST_ENV);
     #[cfg(any(unix, windows))]
-    let config = if declined {
+    let config = if declined || lost {
         Some(config::Config::load_for(&context.env)?)
     } else if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
+        use invocation::execution::Attempt;
         let config = config::Config::load_for(&context.env)?;
-        if let Some(exit) = invocation::execution::try_execute_with_trust(
+        match invocation::execution::try_execute_attempt(
             &config.socket_path(),
             args,
             &context,
             config.trust_daemon_execution,
         )? {
-            std::process::exit(exit);
+            Attempt::Completed(exit) => std::process::exit(exit),
+            Attempt::Lost => lost = true,
+            Attempt::Declined | Attempt::Unavailable => {}
         }
         // Upstream #1718 starts the coordinator after every declined request
         // (to replace a daemon of the release just upgraded from); this fork
         // starts it only when no daemon runs, so a busy daemon's decline
         // costs one request, not a health probe and a second request
         // (Windows declines every hand-off). Updates restart the daemon.
-        if !cfg!(test)
+        if !lost
+            && !cfg!(test)
             && !config.disabled
             && daemon::is_running(&config).is_ok_and(|running| !running)
         {
             match daemon::start(&config) {
-                Ok(_) => {
-                    if let Some(exit) = invocation::execution::try_execute_with_trust(
-                        &config.socket_path(),
-                        args,
-                        &context,
-                        config.trust_daemon_execution,
-                    )? {
-                        std::process::exit(exit);
-                    }
-                }
+                Ok(_) => match invocation::execution::try_execute_attempt(
+                    &config.socket_path(),
+                    args,
+                    &context,
+                    config.trust_daemon_execution,
+                )? {
+                    Attempt::Completed(exit) => std::process::exit(exit),
+                    Attempt::Lost => lost = true,
+                    Attempt::Declined | Attempt::Unavailable => {}
+                },
                 Err(error) => tracing::debug!(%error, "compiler daemon did not start"),
             }
         }
@@ -1566,8 +1578,48 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     };
     #[cfg(not(any(unix, windows)))]
     let config = None;
+    if lost {
+        recover_from_lost_handoff(args, &context.env);
+    }
     let exit = run_compiler_invocation_with_config(args, context, config)?;
     std::process::exit(exit);
+}
+
+/// Before compiling again what a daemon took and then lost (it was stopped,
+/// restarted or killed after Commit): say so, and remove the outputs the
+/// lost attempt may have left half written.
+///
+/// Nothing of that attempt still runs (see `Attempt::Lost`). Of a rustc
+/// unit's outputs, every one but the `.rmeta` is removed: Cargo reads none of
+/// them before this compile ends, and this compile writes each again. The
+/// `.rmeta` stays: rustc and kache's restore only ever put a whole one in
+/// place (a rename, a link to a stored blob), and Cargo may already have
+/// started dependent compiles that read it. Other compilers' outputs are
+/// rewritten by the compile itself.
+fn recover_from_lost_handoff(args: &[String], env: &invocation::InvocationEnv) {
+    let parsed = rustc_args_for_direct_preclean_for(args, env)
+        .is_some()
+        .then(|| args::RustcArgs::parse_for(args, env).ok())
+        .flatten();
+    let unit = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.crate_name.as_deref())
+        .unwrap_or("this unit");
+    notice::show(&format!(
+        "kache: the daemon stopped while compiling {unit}; compiling it again here"
+    ));
+    let Some(parsed) = parsed.as_ref() else {
+        return;
+    };
+    let resolve = |path: Option<&std::path::Path>| path.and_then(|path| env.resolve(path));
+    let removed = compile::remove_outputs_except_metadata(
+        resolve(parsed.output.as_deref()).as_deref(),
+        resolve(parsed.out_dir.as_deref()).as_deref(),
+        parsed.crate_name.as_deref(),
+        parsed.extra_filename.as_deref(),
+        &parsed.emit,
+    );
+    tracing::info!(unit, removed, "compiling a unit the daemon lost again");
 }
 
 /// Decide whether raw argv can enter the compiler pipeline without probing a
