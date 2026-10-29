@@ -3640,15 +3640,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // needs no write, and in a contended cell every hit's write would
         // queue behind the misses' store transactions. Hit counts therefore
         // count at most one hit per entry per [`HIT_STAMP_INTERVAL`].
-        let age_seconds: Option<i64> = self
+        //
+        // A row an earlier key version stored is stamped at once, inside the
+        // interval too: until a hit raises its `key_schema`, eviction ranks
+        // it as one no key of this release reaches (lane KACHE-W21).
+        let (age_seconds, earlier_key_version): (Option<i64>, bool) = self
             .db
             .query_row(
-                "SELECT strftime('%s', 'now') - strftime('%s', last_accessed) FROM entries \
+                "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), \
+                        key_schema > 0 AND key_schema < ?2 FROM entries \
                  WHERE cache_key = ?1",
-                params![cache_key],
-                |row| row.get(0),
+                params![cache_key, kache_format::CACHE_KEY_VERSION],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
             )
-            .optional()?;
+            .optional()?
+            .map_or((None, false), |(age, earlier)| (Some(age), earlier));
         //
         // The stamp waits at most [`HIT_STAMP_BUSY_WAIT`] for the index:
         // a writer that holds it while the filesystem commits its journal
@@ -3660,7 +3666,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // With a sink ([`Self::send_hit_stamps_to`]) the stamp leaves the hit
         // path altogether: the sink holds it, pins the entry against its own
         // sweeps until it is written, and writes it in a batch.
-        if age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64)
+        if (earlier_key_version
+            || age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64))
             && !self.hit_stamps.as_ref().is_some_and(|sink| sink(cache_key))
         {
             let _ = self.db.busy_timeout(HIT_STAMP_BUSY_WAIT);
@@ -7187,7 +7194,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let mut stmt = self.db.prepare(
             "SELECT cache_key, size, hit_count, content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0
-                      + CASE WHEN key_schema NOT IN (0, ?3) THEN ?4 ELSE 0 END,
+                      + CASE WHEN key_schema > 0 AND key_schema < ?3 THEN ?4 ELSE 0 END,
                     compile_time_ms,
                     (SELECT COALESCE(SUM(b.size), 0)
                        FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
