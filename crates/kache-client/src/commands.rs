@@ -35,6 +35,17 @@ enum Commands {
         /// Remove entries from old or unrecorded cache-key schemas
         #[arg(long)]
         stale_schema: bool,
+
+        /// List the store data that target directories unused for this
+        /// many days still hardlink (the size limit leaves it out, so no
+        /// eviction frees it). Removes nothing without --apply
+        #[arg(long, value_name = "DAYS", conflicts_with_all = ["max_age", "stale_schema"])]
+        stale_targets: Option<u64>,
+
+        /// With --stale-targets: unlink those hardlinks, and nothing else in
+        /// the targets. A later build there restores them from the cache
+        #[arg(long, requires = "stale_targets")]
+        apply: bool,
     },
 
     /// Remove the whole cache or one crate's entries. Kept for scripts;

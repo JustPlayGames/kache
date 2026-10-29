@@ -90,6 +90,7 @@ mod target_dedup;
 mod target_liveness;
 mod target_seed;
 mod target_use;
+mod stale_target_links;
 mod term;
 mod test_runner;
 #[cfg(test)]
@@ -874,8 +875,14 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             json,
         ),
         Some(Commands::Gc {
+            stale_targets: Some(days),
+            apply,
+            ..
+        }) => cli::gc_stale_targets(&config, days, apply, json),
+        Some(Commands::Gc {
             max_age,
             stale_schema,
+            ..
         }) => {
             let hours = max_age
                 .as_deref()

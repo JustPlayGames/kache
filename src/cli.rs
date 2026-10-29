@@ -4620,6 +4620,19 @@ fn evict_older_than_recorded(
 }
 
 /// Run garbage collection via the daemon.
+/// `kache gc --stale-targets <days> [--apply]`: the store blob hardlinks in
+/// tracked targets no build used for `days` days, unlinked only with `apply`.
+pub fn gc_stale_targets(config: &Config, days: u64, apply: bool, json: bool) -> Result<()> {
+    let report = crate::stale_target_links::run(config, days, apply)?;
+    if json {
+        return crate::machine::emit("gc", &report, Vec::new());
+    }
+    for line in crate::stale_target_links::lines(&report) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 pub fn gc(
     config: &Config,
     max_age_hours: Option<u64>,
