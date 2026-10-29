@@ -87,6 +87,28 @@ fn a_hit_on_an_earlier_key_versions_row_stops_it_ranking_stale_at_once() {
     let store = Store::open(test_config(dir.path())).unwrap();
     legacy_entry(&store, dir.path(), "earlier", current - 1);
     legacy_entry(&store, dir.path(), "newer", current + 1);
+    // Components whose own key version a rustc bump left alone (KACHE-W22):
+    // their rows are what this release's keys reach. One a version before
+    // its own component's is stale like any other.
+    for (key, crate_name, crate_type, version) in [
+        ("cc", "foo.c", "", kache_format::CC_KEY_VERSION),
+        ("cc_earlier", "bar.c", "", kache_format::CC_KEY_VERSION - 1),
+        (
+            "build_script",
+            kache_format::BUILD_SCRIPT_RUN_CRATE_NAME,
+            "build-script",
+            kache_format::BUILD_SCRIPT_KEY_VERSION,
+        ),
+    ] {
+        legacy_entry(&store, dir.path(), key, version);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET crate_name = ?2, crate_type = ?3 WHERE cache_key = ?1",
+                params![key, crate_name, crate_type],
+            )
+            .unwrap();
+    }
     let idle = |key: &str| {
         store
             .eviction_candidates()
@@ -98,6 +120,12 @@ fn a_hit_on_an_earlier_key_versions_row_stops_it_ranking_stale_at_once() {
     };
     assert!(idle("earlier") >= STALE_KEY_SCHEMA_IDLE_HOURS, "not hit yet");
     assert!(idle("newer") < 1.0, "a newer version is not an earlier one");
+    assert!(idle("cc") < 1.0, "a C compile at its own key version");
+    assert!(
+        idle("build_script") < 1.0,
+        "a build-script run at its own key version"
+    );
+    assert!(idle("cc_earlier") >= STALE_KEY_SCHEMA_IDLE_HOURS);
 
     // Just stored, so well inside the stamp interval.
     store.get("earlier").unwrap().expect("a hit");
