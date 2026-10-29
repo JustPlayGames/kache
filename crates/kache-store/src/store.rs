@@ -2607,6 +2607,13 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 /// back, so a newer one runs its DDL once more after such an open.
 const INDEX_SCHEMA_GENERATION: i64 = 12;
 
+/// Idle hours added to an entry of an earlier key version when it is ranked
+/// for eviction (lane KACHE-W20 prototype): every policy ranks by idleness,
+/// so an entry no key bridge adopted goes before any entry of this version,
+/// and an upgrade never keeps two generations side by side over the cap. An
+/// adopted entry's legacy row shares its blobs: removing it frees the row.
+const STALE_KEY_SCHEMA_IDLE_HOURS: f64 = 1.0e6;
+
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
 /// references back.
@@ -3672,6 +3679,120 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
 
         Ok(Some(meta))
+    }
+
+    /// Adopt the entry an earlier key version stored under `legacy_key` as
+    /// `cache_key`'s, for a release whose key bump left this invocation's
+    /// derivation alone (lane KACHE-W20 prototype: key bridges).
+    ///
+    /// Safe only because the caller computed `legacy_key` with the earlier
+    /// version's derivation for this same invocation. Before anything is
+    /// written the entry must be committed, say it was stored under
+    /// `legacy_key` by `legacy_version`, name `crate_name`, and every blob
+    /// must still hold the bytes its content address names (re-hashed here,
+    /// whatever `verify_restores` says). The new row then references the same
+    /// blobs (refcounts taken in one transaction, no bytes copied); the
+    /// legacy row stays for releases that still read it, and as a stale key
+    /// version it is the first an eviction takes. `false` when there is
+    /// nothing to adopt or any check fails: the caller compiles.
+    pub fn adopt_legacy_entry(
+        &self,
+        legacy_key: &str,
+        legacy_version: u32,
+        cache_key: &str,
+        crate_name: &str,
+    ) -> Result<bool> {
+        if self.read_only || legacy_key == cache_key || !self.contains(legacy_key) {
+            return Ok(false);
+        }
+        let Some(mut meta) = self.stored_meta(legacy_key) else {
+            return Ok(false);
+        };
+        if meta.cache_key != legacy_key
+            || meta.key_schema != legacy_version
+            || meta.crate_name != crate_name
+            || meta.files.is_empty()
+        {
+            tracing::info!(
+                "key bridge: refused {} for {crate_name}: meta says key {} v{} crate {}",
+                &legacy_key[..16.min(legacy_key.len())],
+                &meta.cache_key[..16.min(meta.cache_key.len())],
+                meta.key_schema,
+                meta.crate_name
+            );
+            return Ok(false);
+        }
+        for file in &meta.files {
+            let blob = self.blob_path(&file.hash);
+            if validate_blob_metadata(&blob, file.size).is_err() {
+                return Ok(false);
+            }
+            match crate::file_hash::hash_file(&blob) {
+                Ok(actual) if actual == file.hash => {}
+                _ => {
+                    tracing::warn!(
+                        "key bridge: {} file {} does not hold its bytes; not adopted",
+                        &legacy_key[..16.min(legacy_key.len())],
+                        file.name
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+        meta.cache_key = cache_key.to_string();
+        meta.key_schema = kache_format::CACHE_KEY_VERSION;
+        let meta_json = serde_json::to_string_pretty(&meta).context("serializing adopted meta")?;
+        let tx = self.begin_entry_registration()?;
+        let committed: Option<bool> = tx
+            .query_row(
+                "SELECT committed FROM entries WHERE cache_key = ?1",
+                params![cache_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if committed == Some(true) {
+            // A peer adopted or stored it meanwhile.
+            return Ok(true);
+        }
+        release_entry_blob_refs(&tx, cache_key)?;
+        for file in &meta.files {
+            let taken = tx.execute(
+                "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                params![file.hash],
+            )?;
+            if taken != 1 {
+                // Rolled back on drop: no reference taken.
+                return Ok(false);
+            }
+        }
+        record_entry_blobs(&tx, cache_key, &meta.files)?;
+        let entry_dir = self.entry_dir(cache_key);
+        fs::create_dir_all(&entry_dir).context("creating adopted entry directory")?;
+        crate::atomic::atomic_replace_deferrable(
+            &entry_dir.join("meta.json"),
+            meta_json.as_bytes(),
+            self.durable_writes(),
+        )
+        .context("writing adopted entry metadata")?;
+        let inserted = tx.execute(
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, \
+                 num_features, size, content_hash, compile_time_ms, key_schema, committed, \
+                 durable, compile_time_backfilled, unit_id) \
+             SELECT ?1, crate_name, crate_type, profile, num_features, size, content_hash, \
+                 compile_time_ms, ?2, 1, durable, compile_time_backfilled, unit_id \
+             FROM entries WHERE cache_key = ?3 AND committed = 1",
+            params![cache_key, kache_format::CACHE_KEY_VERSION, legacy_key],
+        )?;
+        if inserted != 1 {
+            return Ok(false);
+        }
+        tx.commit()?;
+        tracing::info!(
+            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}",
+            &legacy_key[..16.min(legacy_key.len())],
+            &cache_key[..16.min(cache_key.len())]
+        );
+        Ok(true)
     }
 
     /// Send the access stamps of this store's hits to `sink` instead of
@@ -7062,7 +7183,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         slow_eviction_scan_for_test(&self.config.cache_dir);
         let mut stmt = self.db.prepare(
             "SELECT cache_key, size, hit_count, content_hash, committed,
-                    (julianday('now') - julianday(last_accessed)) * 24.0,
+                    (julianday('now') - julianday(last_accessed)) * 24.0
+                      + CASE WHEN key_schema NOT IN (0, ?3) THEN ?4 ELSE 0 END,
                     compile_time_ms,
                     (SELECT COALESCE(SUM(b.size), 0)
                        FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
@@ -7078,7 +7200,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .query_map(
                 params![
                     format!("-{} seconds", EVICTION_IDLE_GRACE.as_secs()),
-                    origin.import_pin_secs()
+                    origin.import_pin_secs(),
+                    kache_format::CACHE_KEY_VERSION,
+                    STALE_KEY_SCHEMA_IDLE_HOURS
                 ],
                 |row| {
                     // Bytes this entry would actually free: blobs where it holds
