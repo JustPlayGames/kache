@@ -2607,6 +2607,19 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 /// back, so a newer one runs its DDL once more after such an open.
 const INDEX_SCHEMA_GENERATION: i64 = 12;
 
+/// What [`ArtifactStore::adopt_legacy_entry`] did for one entry.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Adoption {
+    /// The entry's files, each re-hashed against its content address.
+    pub files: usize,
+    pub bytes: u64,
+    pub verify: Duration,
+    /// The new row, its blob references and its meta.json.
+    pub register: Duration,
+    /// Another process adopted or stored the key first: nothing was done.
+    pub by_peer: bool,
+}
+
 /// Idle hours added to an entry of an earlier key version when it is ranked
 /// for eviction (lane KACHE-W20 prototype): every policy ranks by idleness,
 /// so an entry no key bridge adopted goes before any entry of this version,
@@ -3703,7 +3716,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// whatever `verify_restores` says). The new row then references the same
     /// blobs (refcounts taken in one transaction, no bytes copied); the
     /// legacy row stays for releases that still read it, and as a stale key
-    /// version it is the first an eviction takes. `false` when there is
+    /// version it is the first an eviction takes. `None` when there is
     /// nothing to adopt or any check fails: the caller compiles.
     pub fn adopt_legacy_entry(
         &self,
@@ -3711,12 +3724,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         legacy_version: u32,
         cache_key: &str,
         crate_name: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<Adoption>> {
         if self.read_only || legacy_key == cache_key || !self.contains(legacy_key) {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(mut meta) = self.stored_meta(legacy_key) else {
-            return Ok(false);
+            return Ok(None);
         };
         if meta.cache_key != legacy_key
             || meta.key_schema != legacy_version
@@ -3730,7 +3743,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 meta.key_schema,
                 meta.crate_name
             );
-            return Ok(false);
+            return Ok(None);
         }
         let verify_started = std::time::Instant::now();
         let mut verified_bytes = 0u64;
@@ -3738,7 +3751,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let blob = self.blob_path(&file.hash);
             verified_bytes += file.size;
             if validate_blob_metadata(&blob, file.size).is_err() {
-                return Ok(false);
+                return Ok(None);
             }
             match crate::file_hash::hash_file(&blob) {
                 Ok(actual) if actual == file.hash => {}
@@ -3748,11 +3761,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         &legacy_key[..16.min(legacy_key.len())],
                         file.name
                     );
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
         }
-        let verify_ms = verify_started.elapsed().as_secs_f64() * 1e3;
+        let verify = verify_started.elapsed();
         let register_started = std::time::Instant::now();
         meta.cache_key = cache_key.to_string();
         meta.key_schema = kache_format::CACHE_KEY_VERSION;
@@ -3767,7 +3780,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .optional()?;
         if committed == Some(true) {
             // A peer adopted or stored it meanwhile.
-            return Ok(true);
+            return Ok(Some(Adoption {
+                by_peer: true,
+                ..Adoption::default()
+            }));
         }
         release_entry_blob_refs(&tx, cache_key)?;
         for file in &meta.files {
@@ -3777,7 +3793,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )?;
             if taken != 1 {
                 // Rolled back on drop: no reference taken.
-                return Ok(false);
+                return Ok(None);
             }
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
@@ -3799,18 +3815,22 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             params![cache_key, kache_format::CACHE_KEY_VERSION, legacy_key],
         )?;
         if inserted != 1 {
-            return Ok(false);
+            return Ok(None);
         }
         tx.commit()?;
-        tracing::info!(
-            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}: {} files, \
-             {verified_bytes} bytes re-hashed in {verify_ms:.1} ms, registered in {:.1} ms",
+        let adoption = Adoption {
+            files: meta.files.len(),
+            bytes: verified_bytes,
+            verify,
+            register: register_started.elapsed(),
+            by_peer: false,
+        };
+        tracing::debug!(
+            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}: {adoption:?}",
             &legacy_key[..16.min(legacy_key.len())],
             &cache_key[..16.min(cache_key.len())],
-            meta.files.len(),
-            register_started.elapsed().as_secs_f64() * 1e3
         );
-        Ok(true)
+        Ok(Some(adoption))
     }
 
     /// Send the access stamps of this store's hits to `sink` instead of
