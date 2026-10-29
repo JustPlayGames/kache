@@ -3664,10 +3664,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             && !self.hit_stamps.as_ref().is_some_and(|sink| sink(cache_key))
         {
             let _ = self.db.busy_timeout(HIT_STAMP_BUSY_WAIT);
+            // A hit proves the entry is one this release's keys reach: it is
+            // no longer an earlier key version's, whatever version stored it
+            // (a component whose key version did not move hits as before).
             let stamped = self.db.execute(
-                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 \
-                 WHERE cache_key = ?1",
-                params![cache_key],
+                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1, \
+                 key_schema = MAX(key_schema, ?2) WHERE cache_key = ?1",
+                params![cache_key, kache_format::CACHE_KEY_VERSION],
             );
             self.give_back_busy_timeout();
             if let Err(error) = stamped {
@@ -3848,11 +3851,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         )?;
         {
             let mut stamp = tx.prepare_cached(
-                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + ?2 \
-                 WHERE cache_key = ?1",
+                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + ?2, \
+                 key_schema = MAX(key_schema, ?3) WHERE cache_key = ?1",
             )?;
             for (key, count) in hits {
-                stamp.execute(params![key, i64::from(*count)])?;
+                stamp.execute(params![key, i64::from(*count), kache_format::CACHE_KEY_VERSION])?;
             }
         }
         tx.commit()?;

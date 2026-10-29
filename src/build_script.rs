@@ -1852,7 +1852,9 @@ impl Run {
         fold(
             &mut hasher,
             "key_version",
-            kache_format::CACHE_KEY_VERSION.to_string().as_bytes(),
+            crate::cache_key::BUILD_SCRIPT_KEY_VERSION
+                .to_string()
+                .as_bytes(),
         );
         fold(&mut hasher, "binary", self.binary_hash.as_bytes());
         fold(&mut hasher, "os", std::env::consts::OS.as_bytes());
