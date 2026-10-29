@@ -18,6 +18,13 @@ static LEGACY: Mutex<Option<HashMap<String, Legacy>>> = Mutex::new(None);
 const MAX_REMEMBERED: usize = 65_536;
 
 pub static ADOPTED: AtomicU64 = AtomicU64::new(0);
+static ADOPTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static VERIFY_US: AtomicU64 = AtomicU64::new(0);
+static REGISTER_US: AtomicU64 = AtomicU64::new(0);
+
+fn micros(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 pub static NOT_FOUND: AtomicU64 = AtomicU64::new(0);
 
 /// Remember that `key`'s invocation keyed `legacy` under an earlier version.
@@ -49,11 +56,35 @@ pub(crate) fn adopt_on_miss(store: &crate::store::Store, cache_key: &str) -> boo
         return false;
     };
     match store.adopt_legacy_entry(&legacy, version, cache_key, &crate_name) {
-        Ok(true) => {
-            ADOPTED.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(adoption)) => {
+            let adopted = ADOPTED.fetch_add(1, Ordering::Relaxed) + 1;
+            let bytes =
+                ADOPTED_BYTES.fetch_add(adoption.bytes, Ordering::Relaxed) + adoption.bytes;
+            let verify_us = VERIFY_US.fetch_add(micros(adoption.verify), Ordering::Relaxed)
+                + micros(adoption.verify);
+            let register_us = REGISTER_US
+                .fetch_add(micros(adoption.register), Ordering::Relaxed)
+                + micros(adoption.register);
+            tracing::debug!(
+                "key bridge: adopted v{version} entry for {crate_name}: {} files, {} bytes \
+                 re-hashed in {:.1} ms, registered in {:.1} ms{}",
+                adoption.files,
+                adoption.bytes,
+                adoption.verify.as_secs_f64() * 1e3,
+                adoption.register.as_secs_f64() * 1e3,
+                if adoption.by_peer { " (by a peer)" } else { "" }
+            );
+            if adopted.is_multiple_of(100) {
+                tracing::info!(
+                    "key bridge: {adopted} entries of an earlier key version adopted, {bytes} \
+                     bytes re-hashed in {:.1} s, {:.1} s registering",
+                    verify_us as f64 / 1e6,
+                    register_us as f64 / 1e6
+                );
+            }
             true
         }
-        Ok(false) => {
+        Ok(None) => {
             NOT_FOUND.fetch_add(1, Ordering::Relaxed);
             false
         }

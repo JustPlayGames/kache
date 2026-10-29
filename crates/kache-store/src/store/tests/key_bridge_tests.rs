@@ -57,7 +57,8 @@ fn a_legacy_entry_is_adopted_only_when_key_version_crate_and_bytes_agree() {
 
         let got = store
             .adopt_legacy_entry("legacy", old, "current", crate_name)
-            .unwrap();
+            .unwrap()
+            .is_some();
 
         assert_eq!(got, adopted, "{case}");
         assert_eq!(store.contains("current"), adopted, "{case}");
