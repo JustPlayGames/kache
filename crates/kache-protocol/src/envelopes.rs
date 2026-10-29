@@ -63,6 +63,12 @@ pub enum Request {
     /// daemons reject the unknown variant and the wrapper drops the events,
     /// as it did before.
     RecordEvents(RecordEventsRequest),
+    /// A wrapper verified an earlier key version's entry for its key (a key
+    /// bridge) and asks the daemon to register it: the daemon writes the
+    /// registrations of all builds that ask at once in one transaction.
+    /// Older daemons reject the unknown variant and the wrapper registers
+    /// the entry itself.
+    AdoptEntries(AdoptEntriesRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),

@@ -1,4 +1,4 @@
-//! Key bridges (lane KACHE-W20 prototype): `adopt_legacy_entry` re-indexes an
+//! Key bridges (lanes KACHE-W20..W22): `adopt_legacy_entry` re-indexes an
 //! earlier key version's entry only when everything it can check agrees.
 
 use super::*;
@@ -140,4 +140,78 @@ fn a_hit_on_an_earlier_key_versions_row_stops_it_ranking_stale_at_once() {
         .unwrap();
     assert_eq!(schema, current);
     assert!(idle("earlier") < 1.0);
+}
+
+/// The key's build lock comes first (KACHE-W22): a process that finds it
+/// held leaves the key to its holder (whose commit its claim waits for)
+/// without re-hashing anything; once the holder adopted it, the next one
+/// finds the entry under its key.
+#[test]
+fn an_adoption_leaves_a_key_another_process_holds_to_it() {
+    let old = kache_format::CACHE_KEY_VERSION - 1;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    legacy_entry(&store, dir.path(), "legacy", old);
+
+    let held = store.try_lock("current").unwrap().expect("free");
+    let got = store
+        .adopt_legacy_entry("legacy", old, "current", "legacy_crate")
+        .unwrap()
+        .expect("an outcome");
+    assert_eq!(got.outcome, AdoptionOutcome::Contended);
+    assert_eq!(got.bytes, 0, "nothing re-hashed");
+    assert!(!store.contains("current"));
+    drop(held);
+
+    let first = store
+        .adopt_legacy_entry("legacy", old, "current", "legacy_crate")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.outcome, AdoptionOutcome::Adopted);
+    let again = store
+        .adopt_legacy_entry("legacy", old, "current", "legacy_crate")
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.outcome, AdoptionOutcome::ByPeer);
+    assert_eq!(again.bytes, 0);
+}
+
+/// One transaction registers many adoptions, each on its own: one whose
+/// legacy row went is refused without undoing the others, and a key already
+/// committed is left as it is.
+#[test]
+fn a_batch_of_adoptions_registers_each_on_its_own() {
+    let old = kache_format::CACHE_KEY_VERSION - 1;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let meta = legacy_entry(&store, dir.path(), "a", old);
+    legacy_entry(&store, dir.path(), "b", old);
+    put_test_entry(&store, dir.path(), "already", 4096);
+    let before = refcount(&store, &meta.files[0].hash);
+    let request = |legacy: &str, key: &str| AdoptionRequest {
+        legacy_key: legacy.to_string(),
+        legacy_version: old,
+        cache_key: key.to_string(),
+        crate_name: format!("{legacy}_crate"),
+    };
+
+    let results = store
+        .register_adoptions(&[
+            request("a", "new_a"),
+            request("gone", "new_gone"),
+            request("b", "already"),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        results,
+        [Registered::Adopted, Registered::Refused, Registered::ByPeer]
+    );
+    assert_eq!(store.get("new_a").unwrap().unwrap().files, meta.files);
+    assert_eq!(refcount(&store, &meta.files[0].hash), before + 1);
+    assert!(!store.contains("new_gone"));
+    assert_eq!(
+        store.get("already").unwrap().unwrap().crate_name,
+        "already_crate"
+    );
 }

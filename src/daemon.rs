@@ -6,7 +6,7 @@ use kache_core::timeline::{
 };
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 pub use kache_protocol::{
-    BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest, CompileStartedRequest,
+    AdoptEntriesRequest, BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest, CompileStartedRequest,
     DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome, HashFileRequest,
     HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest, PrefetchRequest,
     PrefetchStatsSnapshot, PrestageRequest, RecordEventsRequest, RecordFileHashesRequest,
@@ -1944,6 +1944,10 @@ pub(crate) struct Daemon {
     /// The connection [`Daemon::flush_hit_stamps`] writes through: a batch
     /// may wait for the index's write lock, and nobody waits for it.
     stamp_store: OnceLock<Mutex<Store>>,
+    /// Where [`Daemon::handle_adopt_entries`] queues the key-bridge
+    /// adoptions wrappers verified: a thread of their own registers them
+    /// ([`run_adoption_registrar`]), started on the first.
+    adoption_registrar: OnceLock<std::sync::mpsc::Sender<PendingAdoption>>,
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
     request_clock: Arc<crate::maintenance::RequestClock>,
@@ -2113,6 +2117,7 @@ impl Daemon {
             events_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_predictions: Mutex::new(HashMap::new()),
             pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
+            adoption_registrar: OnceLock::new(),
             stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
@@ -2814,6 +2819,7 @@ impl Daemon {
             Request::RecordFileHashes(req) => self.handle_record_file_hashes(req),
             Request::RecordTargetRoots(req) => self.handle_record_target_roots(req),
             Request::RecordPredictions(req) => self.handle_record_predictions(req),
+            Request::AdoptEntries(req) => self.handle_adopt_entries(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
@@ -3267,6 +3273,69 @@ impl Daemon {
             .lock()
             .map_err(|_| anyhow::anyhow!("daemon stamp store mutex poisoned"))?;
         f(&store)
+    }
+
+    /// Register key-bridge adoptions a wrapper verified under their keys'
+    /// build locks (lane KACHE-W22). Group commit: one thread with a
+    /// connection of its own registers everything queued by the time it
+    /// starts a transaction, other builds' adoptions too, so concurrent
+    /// builds take the index's write lock once per batch instead of once per
+    /// entry, and never wait behind the hit stamps' connection (it held them
+    /// past a second in a 3-build burst). Each answer has `found`
+    /// (registered, or a peer's commit was there first) in `batch_results`,
+    /// in the request's order. Refused for another store.
+    pub fn handle_adopt_entries(&self, req: &AdoptEntriesRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("adoptions for another store");
+        }
+        if req.entries.iter().any(|entry| {
+            !kache_format::is_valid_cache_key(&entry.cache_key)
+                || !kache_format::is_valid_cache_key(&entry.legacy_key)
+        }) {
+            return Response::err("adoption with an invalid cache key");
+        }
+        let registrar = self.adoption_registrar.get_or_init(|| {
+            let (queue, queued) = std::sync::mpsc::channel();
+            let config = self.config.clone();
+            let spawned = std::thread::Builder::new()
+                .name("kache-adoptions".into())
+                .spawn(move || run_adoption_registrar(&config, queued));
+            if let Err(error) = spawned {
+                // The receiver went with the closure: every send fails and
+                // the wrappers register their adoptions themselves.
+                tracing::warn!("key bridge: no adoption registrar: {error}");
+            }
+            queue
+        });
+        let mut answers = Vec::with_capacity(req.entries.len());
+        for entry in &req.entries {
+            let (answer, answered) = std::sync::mpsc::channel();
+            let request = crate::store::AdoptionRequest {
+                legacy_key: entry.legacy_key.clone(),
+                legacy_version: entry.legacy_version,
+                cache_key: entry.cache_key.clone(),
+                crate_name: entry.crate_name.clone(),
+            };
+            if registrar.send((request, answer)).is_err() {
+                return Response::err("adoption registrar gone");
+            }
+            answers.push(answered);
+        }
+        let mut results = Vec::with_capacity(answers.len());
+        for answered in answers {
+            match answered.recv_timeout(ADOPTION_HANDOFF_WAIT) {
+                Ok(Some(registered)) => {
+                    let mut one = Response::ok();
+                    one.found = Some(registered != crate::store::Registered::Refused);
+                    one.skipped = registered == crate::store::Registered::ByPeer;
+                    results.push(one);
+                }
+                _ => return Response::err("adoptions not registered"),
+            }
+        }
+        let mut response = Response::ok();
+        response.batch_results = Some(results);
+        response
     }
 
     /// Take target roots a wrapper's index was too busy to record. Refused
@@ -8984,6 +9053,11 @@ async fn handle_connection_started_at(
             Ok(Request::RecordTargetRoots(req)) => daemon.handle_record_target_roots(&req),
             Ok(Request::RecordPredictions(req)) => daemon.handle_record_predictions(&req),
             Ok(Request::RecordEvents(req)) => daemon.handle_record_events(req),
+            Ok(Request::AdoptEntries(req)) => {
+                // Offload: the registration may wait for the index's write lock.
+                let d = Arc::clone(daemon);
+                offload(move || d.handle_adopt_entries(&req)).await
+            }
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
@@ -9423,6 +9497,71 @@ pub fn send_prediction_publish(
 /// Hit stamps the daemon holds before it refuses more ([`Daemon::handle_stamp_hits`]).
 const MAX_PENDING_HIT_STAMPS: usize = 1 << 16;
 
+/// A daemon's answer to one handed-over adoption: what the registration did,
+/// or `None` when its transaction failed.
+type AdoptionAnswer = Option<crate::store::Registered>;
+
+/// One adoption queued for [`run_adoption_registrar`], with where its answer
+/// goes.
+type PendingAdoption = (
+    crate::store::AdoptionRequest,
+    std::sync::mpsc::Sender<AdoptionAnswer>,
+);
+
+/// The most adoptions one registration transaction takes, so a burst's
+/// batch holds the index's write lock for well under a second.
+const MAX_ADOPTION_BATCH: usize = 256;
+
+/// The daemon's adoption registrar ([`Daemon::handle_adopt_entries`]): wait
+/// for one adoption, take every other already queued, register them in one
+/// transaction, answer each; until the daemon drops the queue.
+fn run_adoption_registrar(config: &Config, queued: std::sync::mpsc::Receiver<PendingAdoption>) {
+    let store = match Store::open(config) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!("key bridge: adoption registrar cannot open the store: {error:#}");
+            for (_, answer) in queued {
+                let _ = answer.send(None);
+            }
+            return;
+        }
+    };
+    defer_checkpoints_under_mutex(&store);
+    while let Ok(first) = queued.recv() {
+        let mut batch = vec![first];
+        while batch.len() < MAX_ADOPTION_BATCH {
+            match queued.try_recv() {
+                Ok(next) => batch.push(next),
+                Err(_) => break,
+            }
+        }
+        let requests: Vec<_> = batch.iter().map(|(request, _)| request.clone()).collect();
+        let started = std::time::Instant::now();
+        match store.register_adoptions(&requests) {
+            Ok(results) => {
+                // Only a key bridge's release adopts, once per entry.
+                tracing::info!(
+                    "key bridge: registered {} adoptions in one transaction in {:.1} ms",
+                    results.len(),
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+                for ((_, answer), result) in batch.iter().zip(results) {
+                    let _ = answer.send(Some(result));
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "key bridge: registering {} adoptions failed: {error:#}",
+                    batch.len()
+                );
+                for (_, answer) in &batch {
+                    let _ = answer.send(None);
+                }
+            }
+        }
+    }
+}
+
 /// Memo rows the daemon holds before it refuses more
 /// ([`Daemon::handle_record_file_hashes`]).
 const MAX_PENDING_MEMO_ROWS: usize = 1 << 16;
@@ -9499,6 +9638,42 @@ pub fn send_memo_rows(
             .collect(),
     });
     send_request_fire_and_forget(socket_path, &req).is_ok()
+}
+
+/// How long a wrapper waits for the daemon to register an adoption it
+/// verified ([`send_adoption`]); past it the wrapper registers it itself (a
+/// late daemon then finds it committed).
+const ADOPTION_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hand a verified key-bridge adoption to the daemon to register in a batch
+/// ([`Request::AdoptEntries`]). `Some(registered)` from a daemon that
+/// answered for it (`registered`: the key now has its entry); `None` when no
+/// daemon took it (none runs, an older release, another store, an error or
+/// no answer in time): the wrapper then registers it itself.
+pub fn send_adoption(
+    socket_path: &Path,
+    cache_dir: &Path,
+    request: &crate::store::AdoptionRequest,
+) -> Option<bool> {
+    #[cfg(unix)]
+    if !socket_path.exists() {
+        return None;
+    }
+    let req = Request::AdoptEntries(AdoptEntriesRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        entries: vec![kache_protocol::AdoptEntry {
+            legacy_key: request.legacy_key.clone(),
+            legacy_version: request.legacy_version,
+            cache_key: request.cache_key.clone(),
+            crate_name: request.crate_name.clone(),
+        }],
+    });
+    let line = send_request_with_timeout(socket_path, &req, ADOPTION_HANDOFF_WAIT).ok()?;
+    let response = serde_json::from_str::<Response>(&line).ok()?;
+    if !response.ok {
+        return None;
+    }
+    response.batch_results?.first()?.found
 }
 
 /// Hand a target root the index was too busy to record to the daemon

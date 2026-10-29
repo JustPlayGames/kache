@@ -16808,3 +16808,66 @@ async fn a_fresh_daemon_defers_a_hinted_sweep_to_the_end_of_its_startup_delay() 
     let (gone, after) = swept(settled, "settled").await;
     assert!(gone && after < Duration::from_secs(5), "{after:?}");
 }
+
+/// KACHE-W22: adoptions that concurrent builds hand over are registered in
+/// batches on the stamp connection (whoever holds it registers everything
+/// queued), and each request is answered for its own entries, in order: an
+/// adopted key now has the entry, one with nothing to adopt does not.
+#[test]
+fn handed_adoptions_are_registered_and_each_request_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let old = crate::cache_key::CACHE_KEY_VERSION - 1;
+    let key = |i: usize| format!("{i:064x}");
+    let store = Store::open(&config).unwrap();
+    for i in 0..8 {
+        put_aged_entry(&config, dir.path(), &key(i));
+        store.set_key_schema_for_test(&key(i), old);
+    }
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let request = |i: usize, legacy: String| AdoptEntriesRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        entries: vec![
+            kache_protocol::AdoptEntry {
+                legacy_key: legacy,
+                legacy_version: old,
+                cache_key: key(100 + i),
+                crate_name: "testcrate".into(),
+            },
+            kache_protocol::AdoptEntry {
+                legacy_key: key(50 + i),
+                legacy_version: old,
+                cache_key: key(200 + i),
+                crate_name: "testcrate".into(),
+            },
+        ],
+    };
+    let answers: Vec<Response> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let daemon = Arc::clone(&daemon);
+                let request = request(i, key(i));
+                scope.spawn(move || daemon.handle_adopt_entries(&request))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (i, answer) in answers.iter().enumerate() {
+        assert!(answer.ok, "{:?}", answer.error);
+        let found: Vec<_> = answer
+            .batch_results
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|one| one.found)
+            .collect();
+        assert_eq!(found, [Some(true), Some(false)], "request {i}");
+        assert!(store.contains(&key(100 + i)));
+        assert!(!store.contains(&key(200 + i)));
+    }
+    let foreign = AdoptEntriesRequest {
+        cache_dir: "/elsewhere".into(),
+        ..request(0, key(0))
+    };
+    assert!(!daemon.handle_adopt_entries(&foreign).ok);
+}
