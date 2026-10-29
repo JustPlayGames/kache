@@ -1,6 +1,76 @@
 use super::*;
 use chrono::Utc;
 
+#[test]
+fn reports_distinguish_fixed_prediction_bugs_and_keep_raw_details() {
+    let mut old = BuildEvent::new_for_test("old", EventResult::Passthrough);
+    old.version = "2.0.0-rc.2".into();
+    old.passthrough_reason = "refused|build-script cache bypassed: no such column: prediction_json in SELECT schema FROM input_predictions".into();
+    let mut variant = old.clone();
+    variant.passthrough_reason = old
+        .passthrough_reason
+        .replace("SELECT schema", "INSERT OR REPLACE");
+    variant.exit_code = Some(1);
+    variant.elapsed_ms = 50;
+    let mut current = old.clone();
+    current.version = "2.0.0-rc.3".into();
+    let bypass = build_bypass_analysis(&[old.clone(), variant.clone(), current], 10);
+    assert_eq!(bypass.reasons.len(), 2);
+    assert_eq!(bypass.reasons[0].count, 2);
+    assert_eq!(bypass.reasons[0].failures, 1);
+    assert_eq!(bypass.reasons[0].max_elapsed_ms, 50);
+    assert!(bypass_reason_words(&bypass.reasons[0]).contains("fixed in Kache 2.0.0-rc.3"));
+    assert_eq!(
+        bypass_reason_words(&bypass.reasons[1]),
+        old.passthrough_reason
+    );
+    let mut lines = Vec::new();
+    push_bypass_tables(&mut lines, &bypass);
+    assert!(lines.join("\n").contains("fixed in Kache 2.0.0-rc.3"));
+    assert!(
+        bypass
+            .slowest
+            .iter()
+            .any(|detail| detail.reason == variant.passthrough_reason)
+    );
+    assert!(bypass_detail_reason(&to_bypass_detail(&old)).contains("fixed in Kache 2.0.0-rc.3"));
+    let detail = to_bypass_detail(&old);
+    assert_eq!(detail.fixed_in.as_deref(), Some("2.0.0-rc.3"));
+    let json = serde_json::to_value(&detail).unwrap();
+    assert_eq!(json["fixed_in"], "2.0.0-rc.3");
+    assert_eq!(json["reason"], old.passthrough_reason);
+    let mut legacy = json;
+    legacy.as_object_mut().unwrap().remove("fixed_in");
+    let decoded: BypassDetail = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.fixed_in.is_none());
+    assert!(
+        serde_json::to_value(&decoded)
+            .unwrap()
+            .get("fixed_in")
+            .is_none()
+    );
+    let mut report = blank_report();
+    report.bypass = bypass;
+    assert!(format_text(&report).contains("fixed in Kache 2.0.0-rc.3"));
+}
+
+#[test]
+fn fixed_prediction_variants_use_one_top_reason_slot() {
+    let mut old = BuildEvent::new_for_test("old", EventResult::Passthrough);
+    old.version = "2.0.0-rc.2".into();
+    old.passthrough_reason = "refused|build-script cache bypassed: no such column: prediction_json in SELECT schema FROM input_predictions".into();
+    let mut variant = old.clone();
+    variant.passthrough_reason = old
+        .passthrough_reason
+        .replace("SELECT schema", "INSERT OR REPLACE");
+    let mut other = old.clone();
+    other.passthrough_reason = "unsupported|real compile problem".into();
+    let bypass = build_bypass_analysis(&[old.clone(), old, variant.clone(), variant, other], 2);
+    assert_eq!(bypass.reasons.len(), 2);
+    assert_eq!(bypass.reasons[0].count, 4);
+    assert_eq!(bypass.reasons[1].reason, "unsupported|real compile problem");
+}
+
 fn write_gc_stats(dir: &std::path::Path, last_run: chrono::DateTime<Utc>) {
     let persisted = format!(
         r#"{{"last_run":"{}","entries_evicted":3,"bytes_freed":4096,"blobs_removed":5,"duration_ms":12}}"#,
@@ -3875,6 +3945,7 @@ fn test_push_bypass_tables_renders_reasons_and_slowest() {
             max_elapsed_ms: 1500,
         }],
         slowest: vec![BypassDetail {
+            fixed_in: None,
             version: String::new(),
             fallback_attempt: None,
             crate_name: "foo".to_string(),
@@ -4355,6 +4426,7 @@ fn text_timing_and_bypass_sections_hide_a_zero() {
 
     report.bypass.passthroughs = 1;
     report.bypass.slowest.push(BypassDetail {
+        fixed_in: None,
         version: String::new(),
         crate_name: "slow".to_string(),
         root: String::new(),

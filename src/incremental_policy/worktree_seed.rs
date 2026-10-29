@@ -327,23 +327,21 @@ fn portable_args(args: &[String], source: Option<&Path>, cwd: &Path) -> Option<V
     (remap_count == 1 && saw_source).then_some(result)
 }
 
-/// Whether `profile` is its own canonical path: no symlinked ancestor. On
-/// Windows `canonicalize` answers the verbatim `\\?\C:\...` spelling of a
-/// plain `C:\...` path, which names the same file.
+/// Whether `profile` is its own canonical path: no symlinked ancestor.
 fn canonical_spelling(profile: &Path) -> bool {
-    let Ok(canonical) = fs::canonicalize(profile) else {
-        return false;
-    };
+    fs::canonicalize(profile).is_ok_and(|canonical| same_spelling(&canonical, profile))
+}
+
+/// Whether `canonical` spells `profile`. On Windows `canonicalize` answers
+/// the verbatim `\\?\C:\...` spelling of a plain `C:\...` path, which names
+/// the same file; a canonical path on Unix never has that prefix.
+fn same_spelling(canonical: &Path, profile: &Path) -> bool {
     if canonical == profile {
         return true;
     }
-    cfg!(windows)
-        && canonical
-            .to_str()
-            .zip(profile.to_str())
-            .is_some_and(|(canonical, profile)| {
-                kache_fs::paths::strip_verbatim_prefix(canonical) == profile
-            })
+    canonical
+        .to_str()
+        .is_some_and(|text| Path::new(&*kache_fs::paths::strip_verbatim_prefix(text)) == profile)
 }
 
 pub(super) fn empty_directory(path: &Path) -> bool {
@@ -562,6 +560,7 @@ mod tests {
             Some(text) => PathBuf::from(kache_fs::paths::strip_verbatim_prefix(text).into_owned()),
             None => canonical.clone(),
         };
+        assert!(canonical_spelling(&canonical), "{}", canonical.display());
         assert!(canonical_spelling(&plain), "{}", plain.display());
         assert!(!canonical_spelling(&plain.join("missing")));
         #[cfg(unix)]
@@ -569,6 +568,39 @@ mod tests {
             let link = plain.join("link");
             std::os::unix::fs::symlink(&plain, &link).unwrap();
             assert!(!canonical_spelling(&link));
+        }
+    }
+
+    #[test]
+    fn the_verbatim_prefix_spells_the_same_path() {
+        assert!(same_spelling(Path::new("/work/a"), Path::new("/work/a")));
+        assert!(!same_spelling(Path::new("/work/a"), Path::new("/work/b")));
+        assert!(same_spelling(
+            Path::new(r"\\?\C:\work\a"),
+            Path::new(r"\\?\C:\work\a")
+        ));
+        assert!(same_spelling(
+            Path::new(r"\\?\C:\work\a"),
+            Path::new(r"C:\work\a")
+        ));
+        assert!(!same_spelling(
+            Path::new(r"\\?\C:\work\a"),
+            Path::new(r"C:\work\b")
+        ));
+        assert!(same_spelling(
+            Path::new(r"\\?\UNC\host\share\a"),
+            Path::new(r"\\?\UNC\host\share\a")
+        ));
+        assert!(same_spelling(
+            Path::new(r"\\?\UNC\host\share\a"),
+            Path::new(r"\\host\share\a")
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let raw = Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff"));
+            assert!(same_spelling(raw, raw));
+            assert!(!same_spelling(raw, Path::new("/work/a")));
         }
     }
 
@@ -771,7 +803,7 @@ mod tests {
     fn long_form_lint_flags_seed_like_their_short_forms() {
         let cwd = tempfile::tempdir().unwrap();
         let remap = format!("-Zremap-cwd-prefix={VIRTUAL_PREFIX}");
-        for flag in ["--warn", "--allow", "--deny", "--forbid"] {
+        for flag in ["--warn", "--allow", "--deny", "--forbid", "--force-warn"] {
             for lint in [
                 vec![format!("{flag}=unexpected_cfgs")],
                 vec![flag.to_string(), "unexpected_cfgs".to_string()],

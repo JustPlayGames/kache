@@ -14,15 +14,6 @@ pub fn engine_entry(mut args: Vec<OsString>, version: &str) -> Result<EngineEntr
     let mut frontend = None;
     if args
         .get(1)
-        .is_some_and(|arg| arg == crate::FORWARDED_ARGV_FILE_FLAG)
-    {
-        ensure!(args.len() == 3, "a forwarded argv file comes alone");
-        let path = std::path::PathBuf::from(&args[2]);
-        args.truncate(1);
-        args.extend(crate::argv_file::read(&path)?);
-    }
-    if args
-        .get(1)
         .is_some_and(|arg| arg == crate::FORWARDED_ARGV_FLAG)
     {
         ensure!(
@@ -59,7 +50,7 @@ pub fn engine_entry(mut args: Vec<OsString>, version: &str) -> Result<EngineEntr
             })
         };
         frontend = Some(kache_shims::FrontendImage { path, identity });
-        args = args.into_iter().skip(6).collect();
+        args = crate::argv_file::expand(args.into_iter().skip(6).collect())?;
         ensure!(!args.is_empty(), "missing forwarded Kache argv");
     }
     Ok(EngineEntry {
@@ -110,43 +101,6 @@ mod tests {
             frontend.identity,
             Some(kache_shims::InodeId { dev: 11, ino: 22 })
         );
-    }
-
-    #[test]
-    fn a_forwarded_argv_file_restores_the_envelope_it_holds() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut direct = forwarded("fixture", "250000");
-        direct.extend([OsString::from("rustc"), OsString::from("two words")]);
-        let file = crate::argv_file::ArgvFile::create(
-            directory.path(),
-            direct[1..].iter().map(OsString::as_os_str),
-        )
-        .unwrap();
-        let through = vec![
-            OsString::from("engine"),
-            OsString::from(crate::FORWARDED_ARGV_FILE_FLAG),
-            file.path().as_os_str().to_owned(),
-        ];
-        let restored = engine_entry(through.clone(), "fixture").unwrap();
-        assert_eq!(restored.args, direct[6..]);
-        assert!(restored.started_at.elapsed() >= Duration::from_millis(250));
-        assert_eq!(
-            restored.frontend.unwrap().path,
-            std::env::current_exe().unwrap()
-        );
-        // The file's envelope is checked as a direct one is.
-        assert!(engine_entry(through.clone(), "other").is_err());
-
-        let mut extra = through.clone();
-        extra.push("rustc".into());
-        assert!(engine_entry(extra, "fixture").is_err());
-        assert!(engine_entry(through[..2].to_vec(), "fixture").is_err());
-        let missing = vec![
-            through[0].clone(),
-            through[1].clone(),
-            directory.path().join("missing").into_os_string(),
-        ];
-        assert!(engine_entry(missing, "fixture").is_err());
     }
 
     #[cfg(unix)]

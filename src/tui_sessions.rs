@@ -478,6 +478,15 @@ pub(crate) struct PassthroughGroup {
     pub fixed_in: Option<&'static str>,
 }
 
+impl PassthroughGroup {
+    pub(crate) fn words(&self) -> String {
+        self.fixed_in.map_or_else(
+            || passthrough_words(&format!("{}|{}", self.kind, self.reason)),
+            fixed_bug_words,
+        )
+    }
+}
+
 /// A crate that keeps missing across builds of the same tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Chronic {
@@ -576,8 +585,12 @@ pub(crate) fn analyze_session(
         }
         let (kind, reason) = passthrough_parts(&event.passthrough_reason);
         let fixed_in = passthrough_fixed_in(&event.passthrough_reason, &event.version);
+        let key = match fixed_in {
+            Some(version) => ("", "", Some(version)),
+            None => (kind, reason, None),
+        };
         let group = passes
-            .entry((kind.to_string(), reason.to_string(), fixed_in))
+            .entry((key.0.to_string(), key.1.to_string(), key.2))
             .or_insert_with(|| PassthroughGroup {
                 kind: kind.to_string(),
                 reason: reason.to_string(),
@@ -662,12 +675,7 @@ pub(crate) fn passthrough_parts(reason: &str) -> (&str, &str) {
 /// reason that has no kind.
 pub(crate) fn passthrough_words(reason: &str) -> String {
     let (kind, detail) = passthrough_parts(reason);
-    let detail =
-        if detail.starts_with("build-script cache bypassed: no such column: prediction_json in ") {
-            "build-script cache bypassed: incompatible prediction metadata in the cache index"
-        } else {
-            detail
-        };
+    let detail = known_bug(reason).map_or(detail, |bug| bug.current_words);
     if kind.is_empty() {
         crate::report::uncached_reason_words(detail)
     } else {
@@ -675,16 +683,59 @@ pub(crate) fn passthrough_words(reason: &str) -> String {
     }
 }
 
+struct KnownBug {
+    prefix: &'static str,
+    current_words: &'static str,
+    description: &'static str,
+    recovery: &'static str,
+    fixed_in: &'static str,
+    fixed_version: semver::Version,
+}
+
+static KNOWN_BUGS: std::sync::LazyLock<[KnownBug; 1]> = std::sync::LazyLock::new(|| {
+    let fixed_in = "2.0.0-rc.3";
+    [KnownBug {
+        prefix: "build-script cache bypassed: no such column: prediction_json in ",
+        current_words: "build-script cache bypassed: incompatible prediction metadata in the cache index",
+        description: "prediction metadata migration failed",
+        recovery: "predictions rebuild automatically",
+        fixed_in,
+        fixed_version: semver::Version::parse(fixed_in).unwrap(),
+    }]
+});
+
+fn known_bug(reason: &str) -> Option<&'static KnownBug> {
+    let (_, detail) = passthrough_parts(reason);
+    KNOWN_BUGS.iter().find(|bug| detail.starts_with(bug.prefix))
+}
+
+pub(crate) fn producer_version(version: &str) -> Option<semver::Version> {
+    semver::Version::parse(version)
+        .ok()
+        .filter(|version| *version > semver::Version::new(0, 0, 0))
+}
+
+pub(crate) fn fixed_bug_words(fixed_in: &str) -> String {
+    KNOWN_BUGS
+        .iter()
+        .find(|bug| bug.fixed_in == fixed_in)
+        .map_or_else(
+            || format!("failure fixed in Kache {fixed_in}"),
+            |bug| {
+                format!(
+                    "{} (fixed in Kache {fixed_in}; {})",
+                    bug.description, bug.recovery
+                )
+            },
+        )
+}
+
 /// Recognize the prediction migration bug only in records from before its fix.
 /// Missing or invalid producer versions cannot establish that a failure is old.
 pub(crate) fn passthrough_fixed_in(reason: &str, version: &str) -> Option<&'static str> {
-    let (_, detail) = passthrough_parts(reason);
-    if !detail.starts_with("build-script cache bypassed: no such column: prediction_json in ") {
-        return None;
-    }
-    let version = semver::Version::parse(version).ok()?;
-    let fixed = semver::Version::parse("2.0.0-rc.3").unwrap();
-    (version > semver::Version::new(0, 0, 0) && version < fixed).then_some("2.0.0-rc.3")
+    let bug = known_bug(reason)?;
+    let version = producer_version(version)?;
+    (version < bug.fixed_version).then_some(bug.fixed_in)
 }
 
 /// What the log knew before each event, built in one pass so every miss is
@@ -1333,6 +1384,11 @@ mod tests {
             "edit rebuild: rustc rebuilt the edited crate incrementally (adaptive seed)"
         );
         assert_eq!(passthrough_words("refused: odd flag"), "odd flag");
+        assert_eq!(fixed_bug_words("9.0.0"), "failure fixed in Kache 9.0.0");
+        assert_eq!(
+            fixed_bug_words("2.0.0-rc.3"),
+            "prediction metadata migration failed (fixed in Kache 2.0.0-rc.3; predictions rebuild automatically)"
+        );
     }
 
     #[test]
