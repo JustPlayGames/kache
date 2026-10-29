@@ -2627,6 +2627,27 @@ pub struct Adoption {
 /// adopted entry's legacy row shares its blobs: removing it frees the row.
 const STALE_KEY_SCHEMA_IDLE_HOURS: f64 = 1.0e6;
 
+/// SQL over an `entries` row: an earlier key version than its own
+/// component's ([`kache_format::KeyComponent`]) stored it, so no key of this
+/// release reaches it except through a key bridge. `0` (unrecorded) is not
+/// stale here: only `kache gc --stale-schema` takes those.
+fn stale_key_schema_sql() -> String {
+    format!(
+        "(key_schema > 0 AND key_schema < {})",
+        kache_format::KeyComponent::key_version_sql()
+    )
+}
+
+/// The hit path's read of a row: seconds since its last stamp, and whether
+/// it is stale ([`stale_key_schema_sql`]).
+static HIT_AGE_AND_STALE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), {} FROM entries \
+         WHERE cache_key = ?1",
+        stale_key_schema_sql()
+    )
+});
+
 /// Raise the refcount of every blob `cache_key` maps to at least the
 /// references all mappings hold on it. Run before giving this key's
 /// references back.
@@ -3657,15 +3678,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // A row an earlier key version stored is stamped at once, inside the
         // interval too: until a hit raises its `key_schema`, eviction ranks
         // it as one no key of this release reaches (lane KACHE-W21).
+        // The version compared is the row's own component's
+        // ([`kache_format::KeyComponent`]): a C compile or build-script run
+        // whose recipe the bump left alone is not stale (lane KACHE-W22).
         let (age_seconds, earlier_key_version): (Option<i64>, bool) = self
             .db
-            .query_row(
-                "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), \
-                        key_schema > 0 AND key_schema < ?2 FROM entries \
-                 WHERE cache_key = ?1",
-                params![cache_key, kache_format::CACHE_KEY_VERSION],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
-            )
+            .query_row(&HIT_AGE_AND_STALE_SQL, params![cache_key], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
             .optional()?
             .map_or((None, false), |(age, earlier)| (Some(age), earlier));
         //
@@ -7219,10 +7239,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ) -> Result<Vec<crate::eviction::EntryFeatures>> {
         #[cfg(any(test, feature = "test-support"))]
         slow_eviction_scan_for_test(&self.config.cache_dir);
-        let mut stmt = self.db.prepare(
+        let mut stmt = self.db.prepare(&format!(
             "SELECT cache_key, size, hit_count, content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0
-                      + CASE WHEN key_schema > 0 AND key_schema < ?3 THEN ?4 ELSE 0 END,
+                      + CASE WHEN {stale} THEN ?3 ELSE 0 END,
                     compile_time_ms,
                     (SELECT COALESCE(SUM(b.size), 0)
                        FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
@@ -7233,13 +7253,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     last_accessed >= datetime('now', ?1),
                     COALESCE(imported_at >= unixepoch() - ?2, 0)
              FROM entries",
-        )?;
+            stale = stale_key_schema_sql(),
+        ))?;
         let rows = stmt
             .query_map(
                 params![
                     format!("-{} seconds", EVICTION_IDLE_GRACE.as_secs()),
                     origin.import_pin_secs(),
-                    kache_format::CACHE_KEY_VERSION,
                     STALE_KEY_SCHEMA_IDLE_HOURS
                 ],
                 |row| {
