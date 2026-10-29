@@ -23,13 +23,34 @@ rem second, so a test could take the name of a folder another test's clean-up
 rem was still retrying, and that retry then removed the new test's folder
 rem while it ran (16 unit tests failed so on one Windows run).
 rem
+rem A test that runs past nextest's terminate-after (.config/nextest.toml)
+rem is ended with its whole job object, this script included, so its
+rem clean-up never runs and its folder stays. The name therefore also
+rem carries the run (the start of NEXTEST_RUN_ID), and before it makes its
+rem own folder the script removes the folders an earlier test of the same
+rem run left in its slot: the slot is not given out again until the script
+rem that held it has ended, so nothing still uses them. When the test ended
+rem so is the last of the run in its slot, its folder stays (nextest runs
+rem nothing after the run). Other runs' folders are never touched.
+rem
 rem The test's exit status is passed on unchanged.
 setlocal EnableExtensions DisableDelayedExpansion
 set "KT_BASE=%TEMP%"
 if not defined KT_BASE set "KT_BASE=%TMP%"
+set "KT_RUN=0"
+if defined NEXTEST_RUN_ID set "KT_RUN=%NEXTEST_RUN_ID:~0,8%"
+set "KT_PREFIX=%KT_BASE%\kt%NEXTEST_TEST_GLOBAL_SLOT%_%KT_RUN%_"
+if not defined NEXTEST_TEST_GLOBAL_SLOT goto sweep_done
+if not defined NEXTEST_RUN_ID goto sweep_done
+for /d %%D in ("%KT_PREFIX%*") do (
+    rd /s /q "%%~fD" >nul 2>&1
+    if exist "%%~fD\" attrib -R "%%~fD\*" /S /D >nul 2>&1
+    if exist "%%~fD\" rd /s /q "%%~fD" >nul 2>&1
+)
+:sweep_done
 set /a KT_TRIES=0
 :pick
-set "KT_DIR=%KT_BASE%\kt%NEXTEST_TEST_GLOBAL_SLOT%_%RANDOM%%RANDOM%"
+set "KT_DIR=%KT_PREFIX%%RANDOM%%RANDOM%"
 mkdir "%KT_DIR%" 2>nul && goto run
 set /a KT_TRIES+=1
 if %KT_TRIES% lss 100 goto pick

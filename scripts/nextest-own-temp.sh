@@ -18,6 +18,14 @@
 # With NEXTEST_OWN_TEMP_LOG set, every folder that took a retry or was left
 # gets a line in that file: the seconds waited, the outcome and the test.
 #
+# A test that runs past nextest's terminate-after (.config/nextest.toml), or
+# a run that is interrupted, gets SIGTERM, sent to this script's process
+# group, so to this script as well as to the test. The script outlives it:
+# its traps only note the signal, bash runs them once the test has ended, and
+# the folder is removed as after any other test. Without them the script
+# ended with the test and left the folder behind. Only SIGKILL, which nextest
+# sends once its grace period is over, still ends the script at once.
+#
 # The test's exit status is passed on unchanged, a signal as the same signal.
 set -u
 base=${TMPDIR:-/tmp}
@@ -25,6 +33,7 @@ if ! dir=$(mktemp -d "${base%/}/kt.XXXXXX" 2>/dev/null); then
     exec "$@"
 fi
 export TMPDIR="$dir" TMP="$dir" TEMP="$dir"
+trap : HUP INT TERM
 "$@"
 status=$?
 waited=0
