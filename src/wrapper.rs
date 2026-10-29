@@ -1241,6 +1241,13 @@ fn lookup_local_entry<'a>(
             return Ok(Some((store, meta)));
         }
     }
+    // Key bridge: an earlier key version's entry for this same invocation,
+    // verified and re-indexed under this key in the primary store.
+    if crate::key_bridge::adopt_on_miss(primary, cache_key)
+        && let Some(meta) = primary.get(cache_key)?
+    {
+        return Ok(Some((primary, meta)));
+    }
     Ok(None)
 }
 
@@ -1317,6 +1324,9 @@ fn stored_at_dep_info(
     let stored = store.get(cache_key)?;
     if stored.is_some() {
         return Ok(stored);
+    }
+    if crate::key_bridge::adopt_on_miss(store, cache_key) {
+        return store.get(cache_key);
     }
     if !store.store_in_flight(cache_key) {
         // The store may have committed and let go of the key between the

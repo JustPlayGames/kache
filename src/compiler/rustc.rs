@@ -145,7 +145,22 @@ impl RustcCompiler {
                     .to_string(),
             );
         }
-        (key.map(|key| finish_key(parsed, ctx, key)), outputs)
+        // The legacy key takes the same folds, so it is the whole key the
+        // earlier release computed for this invocation.
+        outputs.legacy_key = outputs
+            .legacy_key
+            .take()
+            .map(|(version, legacy)| (version, finish_key(parsed, ctx, legacy)));
+        let key = key.map(|key| finish_key(parsed, ctx, key));
+        if let (Ok(key), Some((version, legacy))) = (key.as_ref(), outputs.legacy_key.as_ref()) {
+            crate::key_bridge::remember(
+                key,
+                *version,
+                legacy,
+                parsed.crate_name.as_deref().unwrap_or("unknown"),
+            );
+        }
+        (key, outputs)
     }
 
     /// Execute a caller-visible compile, forwarding metadata readiness to Cargo.

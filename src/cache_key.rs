@@ -280,6 +280,10 @@ mod apple_install_name;
 // previous trybuild entry misses and every other key stays valid.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
+/// The key version input predictions fold (see `prediction_identity_in_env`):
+/// fixed at 33, the last version both shared.
+pub(crate) const PREDICTION_KEY_VERSION: u32 = 33;
+
 /// Collapse runs of ASCII whitespace into single spaces and trim
 /// leading / trailing whitespace.
 ///
@@ -731,14 +735,55 @@ pub(crate) const KEY_FIELD_HEX: usize = 16;
 /// sub-hasher just keeps accumulating.
 struct GroupedHasher {
     main: blake3::Hasher,
+    /// The same stream under an earlier key version ([`KEY_BRIDGES`]): every
+    /// byte after the version line goes to both, so this is the key that
+    /// release computed for the same invocation.
+    legacy: Option<blake3::Hasher>,
     groups: std::collections::BTreeMap<&'static str, blake3::Hasher>,
     current: &'static str,
+}
+
+/// An earlier [`CACHE_KEY_VERSION`] whose rustc entries this release adopts
+/// on a miss (lane KACHE-W20 prototype).
+///
+/// A bump lists the version it replaces here, with `applies` true exactly for
+/// the invocations whose key derivation the bump did NOT change: for those,
+/// the earlier release hashed the same bytes after the version line, so its
+/// entry is the one it would have stored for this invocation. `applies` must
+/// be false wherever the bump changed what is hashed (a new input, another
+/// normalisation): there an earlier entry may be wrong, and the unit misses.
+pub(crate) struct KeyBridge {
+    pub from: u32,
+    pub applies: fn(&RustcArgs) -> bool,
+}
+
+fn bridge_all_rustc(_: &RustcArgs) -> bool {
+    true
+}
+
+/// Prototype: the bump to 34 changes no hashed byte, so every rustc entry of
+/// 33 is adoptable.
+pub(crate) const KEY_BRIDGES: &[KeyBridge] = &[KeyBridge {
+    from: 33,
+    applies: bridge_all_rustc,
+}];
+
+/// The bridge this invocation's key also computes a legacy key for, unless
+/// `KACHE_KEY_BRIDGE=0`.
+fn key_bridge_for(args: &RustcArgs) -> Option<&'static KeyBridge> {
+    if std::env::var_os("KACHE_KEY_BRIDGE").is_some_and(|v| v == "0" || v == "off") {
+        return None;
+    }
+    KEY_BRIDGES
+        .iter()
+        .find(|bridge| bridge.from != CACHE_KEY_VERSION && (bridge.applies)(args))
 }
 
 impl GroupedHasher {
     fn new(initial_group: &'static str) -> Self {
         GroupedHasher {
             main: blake3::Hasher::new(),
+            legacy: None,
             groups: std::collections::BTreeMap::new(),
             current: initial_group,
         }
@@ -750,7 +795,31 @@ impl GroupedHasher {
 
     fn update(&mut self, bytes: &[u8]) {
         self.main.update(bytes);
+        if let Some(legacy) = self.legacy.as_mut() {
+            legacy.update(bytes);
+        }
         self.groups.entry(self.current).or_default().update(bytes);
+    }
+
+    /// The version line: `version` in the key, and `legacy` (when bridged) in
+    /// the legacy key, which from here on hashes the same bytes.
+    fn key_version(&mut self, version: u32, legacy: Option<u32>) {
+        let line = |v: u32| format!("key_version:{v}\n");
+        self.main.update(line(version).as_bytes());
+        self.groups
+            .entry(self.current)
+            .or_default()
+            .update(line(version).as_bytes());
+        self.legacy = legacy.map(|v| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(line(v).as_bytes());
+            hasher
+        });
+    }
+
+    /// The legacy key's digest, when bridged.
+    fn legacy_digest(&self) -> Option<blake3::Hash> {
+        self.legacy.as_ref().map(blake3::Hasher::finalize)
     }
 
     /// Final key digest + the per-group hex prefixes for event persistence.
@@ -835,6 +904,9 @@ pub struct KeyOutputs {
     /// slow way before anything reaches the remote, the scheduler or the
     /// store.
     pub used_prediction: bool,
+    /// The same invocation's key under an earlier key version
+    /// ([`KEY_BRIDGES`]), when a bridge applies: `(version, key)`.
+    pub legacy_key: Option<(u32, String)>,
 }
 
 /// The tree guard a key computation took before rustc ran: a digest of the
@@ -4559,9 +4631,10 @@ fn compute_key_into(
     let out_dir = env.var_os("OUT_DIR");
 
     // key version — bump CACHE_KEY_VERSION to invalidate all prior entries
-    hasher.update(b"key_version:");
-    hasher.update(CACHE_KEY_VERSION.to_string().as_bytes());
-    hasher.update(b"\n");
+    // (a bump that leaves a class of invocations alone bridges them:
+    // KEY_BRIDGES).
+    let bridge = key_bridge_for(args);
+    hasher.key_version(CACHE_KEY_VERSION, bridge.map(|bridge| bridge.from));
     tracing::trace!("[key:{}] key_version={}", crate_name, CACHE_KEY_VERSION);
 
     // Older entries can carry arbitrary explicit-emit filenames under a default key.
@@ -5514,11 +5587,16 @@ fn compute_key_into(
     };
     tracing::trace!("[key:{}] remap={}", crate_name, remap);
 
+    let legacy = hasher.legacy_digest();
     let (hash, fields) = hasher.finalize_with_fields();
     out.fields = Some(fields);
     let key = hash.to_hex().to_string();
     tracing::trace!("[key:{}] final={}", crate_name, &key[..16]);
-    complete_key(env, key)
+    let key = complete_key(env, key)?;
+    out.legacy_key = bridge
+        .zip(legacy)
+        .map(|(bridge, digest)| (bridge.from, digest.to_hex().to_string()));
+    Ok(key)
 }
 
 /// `key`, unless key computation read a variable its snapshot does not hold.
@@ -8883,10 +8961,13 @@ fn prediction_identity_in_env(
         b"prediction_schema:",
         PREDICTION_SCHEMA.to_string().as_bytes(),
     );
+    // Predictions are versioned by PREDICTION_SCHEMA. They name the files a
+    // unit read, not how its key hashes them, so a key bump keeps them: the
+    // version they fold stays the one they had when the two were decoupled.
     fold_field(
         &mut hasher,
         b"key_version:",
-        CACHE_KEY_VERSION.to_string().as_bytes(),
+        PREDICTION_KEY_VERSION.to_string().as_bytes(),
     );
     fold_field(
         &mut hasher,

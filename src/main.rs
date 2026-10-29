@@ -36,6 +36,7 @@ mod init_completions;
 #[cfg(unix)]
 mod init_shell;
 mod invocation;
+mod key_bridge;
 mod key_env;
 use kache_store::link;
 mod cache_remote;
