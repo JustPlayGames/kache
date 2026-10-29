@@ -345,7 +345,7 @@ fn forget(store: &Store, path: &Path, identity: crate::machine::PathIdentity) {
 }
 
 /// Still the recorded, derived target directory, and not a source tree.
-fn intact(tracked: &TrackedTargetRoot) -> bool {
+pub(crate) fn intact(tracked: &TrackedTargetRoot) -> bool {
     crate::machine::target_root_is_safe(&tracked.path, &tracked.workspace_root)
         && crate::machine::directory_identity(&tracked.path) == Some(tracked.identity)
         && !looks_like_a_source_root(&tracked.path)
