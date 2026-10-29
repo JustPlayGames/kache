@@ -13167,8 +13167,15 @@ fn a_busy_index_does_not_hold_a_unit_for_its_target_root() {
 /// A unit does not wait out the index's busy timeout to record its input
 /// prediction: the rows a busy index refuses are kept for the daemon, and
 /// written later they read back as the record the unit made.
+///
+/// As in [`a_busy_index_does_not_hold_a_unit_for_its_target_root`], the
+/// writer holds the lock until both records return and lets go by itself
+/// only after `HOLD`, half the index's 5 s busy timeout: a record that waits
+/// for the lock outlasts the hold, takes the lock and writes its row, where
+/// a 100 ms bound on the records' wall time failed on a starved machine.
 #[test]
 fn a_busy_index_keeps_prediction_rows_for_the_daemon_instead_of_waiting() {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(2500);
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
@@ -13181,16 +13188,23 @@ fn a_busy_index_keeps_prediction_rows_for_the_daemon_instead_of_waiting() {
     let hasher = store.file_hasher().with_input_predictions(true);
 
     let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
-    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let started = std::time::Instant::now();
+    let (held, wait_held) = std::sync::mpsc::channel();
+    let (returned, wait_returned) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held.send(()).unwrap();
+        let let_go_by_itself = wait_returned.recv_timeout(HOLD).is_err();
+        writer.execute_batch("COMMIT").unwrap();
+        let_go_by_itself
+    });
+    wait_held.recv().unwrap();
     hasher.record_input_prediction("unit-a", Some("a"), &closure, None);
     hasher.record_input_prediction("unit-b", Some("b"), &closure, None);
-    let waited = started.elapsed();
+    let _ = returned.send(());
     assert!(
-        waited < std::time::Duration::from_millis(100),
-        "the unit waited {waited:?} for its prediction rows"
+        !writer.join().unwrap(),
+        "the unit was still waiting for its prediction rows when the writer let go after {HOLD:?}"
     );
-    writer.execute_batch("COMMIT").unwrap();
     assert!(hasher.input_prediction("unit-a").is_none());
     let rows = hasher.take_busy_predictions();
     assert_eq!(
