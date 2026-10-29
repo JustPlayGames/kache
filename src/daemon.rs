@@ -6592,11 +6592,16 @@ impl Daemon {
         store: &Store,
         size: u64,
     ) -> Result<crate::store::GcStats> {
+        // The size is every blob's, the shared ones too: say how much of it
+        // the last sweep found held by target directories, which the
+        // trigger leaves out and no eviction frees.
         tracing::info!(
-            "store {} size {} over the automatic trigger (max {}), running LRU eviction",
+            "store {} size {} over the automatic trigger (max {}; {} of it held by target \
+             directories at the last sweep), running LRU eviction",
             config.cache_dir.display(),
             size,
-            config.max_size
+            config.max_size,
+            crate::wrapper::recent_auto_gc_held(&config.cache_dir)
         );
         let started = Instant::now();
         // Builds keep writing while it runs: it goes on past its byte
