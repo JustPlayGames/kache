@@ -1,205 +1,255 @@
-//! A forwarded argv written to a file, for a command line Windows refuses.
-//!
-//! The frontend hands the engine the compiler's whole argv after five
-//! envelope fields of its own. A command line Cargo could start the frontend
-//! with can then pass Windows' limit of 32,767 characters by those fields, and
-//! Cargo writes an argfile only when its own start fails, so it never wrote
-//! one. The frontend writes the envelope here instead and passes the engine
-//! [`crate::FORWARDED_ARGV_FILE_FLAG`] and this file's path.
-//!
-//! Each argument is its native form (UTF-16 code units on Windows, bytes
-//! elsewhere) followed by a NUL, which no argument can hold. The frontend
-//! removes the file once the engine has exited; the engine reads it whenever
-//! it asks for its arguments.
-
-use anyhow::{Context, Result};
-use std::ffi::{OsStr, OsString};
+//! Private, native argv transport for Windows engine commands that would overflow.
+use anyhow::{Context, Result, ensure};
+use kache_protocol::execution::NativeString;
+use std::ffi::OsString;
+use std::io::Read;
+#[cfg(any(windows, test))]
+use std::io::Write;
+#[cfg(any(windows, test))]
 use std::path::Path;
 #[cfg(any(windows, test))]
-use std::{io::Write, path::PathBuf};
+use std::process::Command;
 
-/// Windows' `ERROR_FILENAME_EXCED_RANGE`: a command line past 32,767
-/// characters, Cargo's own test for writing an argfile.
-#[cfg(windows)]
-pub(crate) fn command_line_too_long(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(206)
-}
+pub(super) const FLAG: &str = "--kache-argv-file-v1";
+const MAX_BYTES: u64 = 1 << 20;
 
-/// A file holding a forwarded argv, removed when dropped. Only Windows
-/// writes one.
+/// Keep the file open while the engine runs, including repeated argv reads.
+/// Windows also deletes it if the sender is terminated without running Drop.
 #[cfg(any(windows, test))]
-pub(crate) struct ArgvFile {
-    path: PathBuf,
-}
+pub(super) struct ArgvFile(tempfile::NamedTempFile);
+#[cfg(not(any(windows, test)))]
+pub(super) type ArgvFile = ();
 
 #[cfg(any(windows, test))]
 impl ArgvFile {
-    /// Write `args` to a new file in `directory`.
-    pub(crate) fn create<'a>(
-        directory: &Path,
-        args: impl IntoIterator<Item = &'a OsStr>,
-    ) -> Result<Self> {
-        let (path, mut file) = create_new(directory)?;
-        let this = Self { path };
-        file.write_all(&encode(args)?)
-            .and_then(|()| file.sync_all())
-            .with_context(|| format!("writing {}", this.path.display()))?;
-        Ok(this)
+    pub(super) fn new(args: &[OsString]) -> Result<Self> {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("kache-argv-").suffix(".json");
+        #[cfg(not(windows))]
+        let file = builder.tempfile();
+        #[cfg(windows)]
+        let file = builder.make(|path| {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_DELETE_ON_CLOSE,
+            };
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .custom_flags(FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE)
+                .open(path)
+        });
+        let mut file = file.context("creating engine argv file")?;
+        let native: Vec<_> = args.iter().map(|arg| NativeString::capture(arg)).collect();
+        serde_json::to_writer(&mut file, &native).context("writing engine argv file")?;
+        file.flush().context("flushing engine argv file")?;
+        Ok(Self(file))
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    pub(super) fn path(&self) -> &Path {
+        self.0.path()
     }
 }
 
 #[cfg(any(windows, test))]
-impl Drop for ArgvFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+pub(super) fn command_too_long(command: &Command, extra: &[OsString]) -> bool {
+    use kache_protocol::command_line::{WINDOWS_COMMAND_LINE_LIMIT, windows_command_line_bound};
+    windows_command_line_bound(
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .chain(extra.iter().map(OsString::as_os_str)),
+    ) > WINDOWS_COMMAND_LINE_LIMIT
+}
+
+pub(super) fn expand(args: Vec<OsString>) -> Result<Vec<OsString>> {
+    if args.first().is_none_or(|arg| arg != FLAG) {
+        return Ok(args);
     }
-}
-
-#[cfg(any(windows, test))]
-fn create_new(directory: &Path) -> Result<(PathBuf, std::fs::File)> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    for attempt in 0..100u32 {
-        let path = directory.join(format!(
-            "kache-argv-{}-{nanos}-{attempt}",
-            std::process::id()
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("creating {}", path.display()));
-            }
-        }
-    }
-    anyhow::bail!("no free argv file name in {}", directory.display())
-}
-
-/// The arguments a file the frontend wrote holds.
-pub(crate) fn read(path: &Path) -> Result<Vec<OsString>> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading forwarded argv {}", path.display()))?;
-    decode(&bytes).with_context(|| format!("decoding forwarded argv {}", path.display()))
-}
-
-#[cfg(windows)]
-fn encode<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> Result<Vec<u8>> {
-    use std::os::windows::ffi::OsStrExt;
+    ensure!(args.len() == 2, "invalid engine argv file envelope");
+    let file = std::fs::File::open(&args[1]).context("opening engine argv file")?;
     let mut bytes = Vec::new();
-    for arg in args {
-        for unit in arg.encode_wide() {
-            anyhow::ensure!(unit != 0, "an argument holds a NUL");
-            bytes.extend(unit.to_le_bytes());
-        }
-        bytes.extend(0u16.to_le_bytes());
-    }
-    Ok(bytes)
-}
-
-#[cfg(windows)]
-fn decode(bytes: &[u8]) -> Result<Vec<OsString>> {
-    use std::os::windows::ffi::OsStringExt;
-    let (pairs, odd) = bytes.as_chunks::<2>();
-    anyhow::ensure!(odd.is_empty(), "odd length");
-    let units = pairs
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("reading engine argv file")?;
+    ensure!(
+        bytes.len() as u64 <= MAX_BYTES,
+        "engine argv file is too large"
+    );
+    let native: Vec<NativeString> =
+        serde_json::from_slice(&bytes).context("decoding engine argv file")?;
+    native
         .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect::<Vec<_>>();
-    let units = units.strip_suffix(&[0]).context("unterminated argument")?;
-    Ok(units
-        .split(|unit| *unit == 0)
-        .map(OsString::from_wide)
-        .collect())
-}
-
-#[cfg(all(not(windows), test))]
-fn encode<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    for arg in args {
-        let arg = arg.as_encoded_bytes();
-        anyhow::ensure!(!arg.contains(&0), "an argument holds a NUL");
-        bytes.extend_from_slice(arg);
-        bytes.push(0);
-    }
-    Ok(bytes)
-}
-
-#[cfg(not(windows))]
-fn decode(bytes: &[u8]) -> Result<Vec<OsString>> {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = bytes.strip_suffix(&[0]).context("unterminated argument")?;
-    Ok(bytes
-        .split(|byte| *byte == 0)
-        .map(|arg| OsStr::from_bytes(arg).to_owned())
-        .collect())
+        .map(|arg| arg.decode().context("decoding native engine argument"))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn os(args: &[&str]) -> Vec<OsString> {
-        args.iter().map(OsString::from).collect()
-    }
-
+    #[cfg(windows)]
     #[test]
-    fn a_written_argv_reads_back_whole_and_its_file_goes_on_drop() {
-        let directory = tempfile::tempdir().unwrap();
-        let args = os(&["--flag", "", "two words", "C:\\a\\\"b\\", "\u{e9}t\u{e9}"]);
-        let file =
-            ArgvFile::create(directory.path(), args.iter().map(OsString::as_os_str)).unwrap();
-        let path = file.path().to_owned();
-        assert!(path.starts_with(directory.path()));
-        assert_eq!(read(&path).unwrap(), args);
-        drop(file);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn two_files_in_one_folder_get_names_of_their_own() {
-        let directory = tempfile::tempdir().unwrap();
-        let first = ArgvFile::create(directory.path(), [OsStr::new("a")]).unwrap();
-        let second = ArgvFile::create(directory.path(), [OsStr::new("b")]).unwrap();
-        assert_ne!(first.path(), second.path());
-        assert_eq!(read(first.path()).unwrap(), os(&["a"]));
-        assert_eq!(read(second.path()).unwrap(), os(&["b"]));
-    }
-
-    #[test]
-    fn a_file_whose_last_argument_is_cut_off_is_refused() {
-        let directory = tempfile::tempdir().unwrap();
-        let file = ArgvFile::create(directory.path(), [OsStr::new("abc")]).unwrap();
-        let bytes = std::fs::read(file.path()).unwrap();
-        let cut = directory.path().join("cut");
-        std::fs::write(&cut, &bytes[..bytes.len() - 1]).unwrap();
-        assert!(read(&cut).is_err());
-        assert!(read(&directory.path().join("missing")).is_err());
-    }
-
-    #[test]
-    fn an_argument_holding_a_nul_is_refused() {
-        let directory = tempfile::tempdir().unwrap();
-        assert!(ArgvFile::create(directory.path(), [OsStr::new("a\0b")]).is_err());
+    fn terminating_the_sender_removes_its_argv_file_without_running_drop() {
+        struct Sender(std::process::Child);
+        impl Drop for Sender {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("argv-path.json");
+        let mut sender = Sender(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "argv_file::tests::argv_file_sender_fixture",
+                ])
+                .env("KACHE_ARGV_FILE_FIXTURE", &record)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !record.exists() {
+            assert!(
+                sender.0.try_wait().unwrap().is_none(),
+                "argv sender exited before publishing its path"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "argv sender did not publish its path"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let native: NativeString =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        let path = std::path::PathBuf::from(native.decode().unwrap());
+        assert_eq!(
+            expand(vec![FLAG.into(), path.clone().into_os_string()]).unwrap(),
+            [OsString::from("kache")]
+        );
+        sender.0.kill().unwrap();
+        sender.0.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "kernel must delete the argv file after a hard kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[cfg(windows)]
     #[test]
-    fn only_a_command_line_too_long_counts_as_one() {
-        assert!(command_line_too_long(&std::io::Error::from_raw_os_error(
-            206
-        )));
-        assert!(!command_line_too_long(&std::io::Error::from_raw_os_error(
-            2
-        )));
-        assert!(!command_line_too_long(&std::io::Error::other("206")));
+    #[ignore = "isolated argv-file sender for the hard-kill regression"]
+    fn argv_file_sender_fixture() {
+        let Some(record) = std::env::var_os("KACHE_ARGV_FILE_FIXTURE") else {
+            return;
+        };
+        let file = ArgvFile::new(&["kache".into()]).unwrap();
+        let native = NativeString::capture(file.path().as_os_str());
+        let record = std::path::PathBuf::from(record);
+        let pending = record.with_extension("pending");
+        std::fs::write(&pending, serde_json::to_vec(&native).unwrap()).unwrap();
+        std::fs::rename(pending, record).unwrap();
+        let _ = std::io::stdin().read_exact(&mut [0]);
+        drop(file);
+    }
+
+    #[test]
+    fn windows_limit_counts_escaping_unicode_and_the_terminator() {
+        for (length, expected) in [(32_758, false), (32_759, false), (32_760, true)] {
+            assert_eq!(
+                command_too_long(Command::new("x").arg("a".repeat(length)), &[]),
+                expected
+            );
+        }
+        let mut escaped = "a".repeat(32_756);
+        escaped.push_str("\\\"");
+        assert!(command_too_long(Command::new("x").arg(escaped), &[]));
+        assert!(!command_too_long(
+            Command::new("x").arg("🦀".repeat(16_379)),
+            &[]
+        ));
+        assert!(command_too_long(
+            Command::new("x").arg("🦀".repeat(16_380)),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn file_roundtrip_is_repeatable_native_and_lives_until_the_sender_drops() {
+        #[cfg(unix)]
+        let native = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let native = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let args = vec![
+            "kache".into(),
+            "".into(),
+            "quotes\" spaces\\\n\r🦀".into(),
+            native,
+        ];
+        let file = ArgvFile::new(&args).unwrap();
+        let path = file.path().to_owned();
+        let envelope = vec![FLAG.into(), path.clone().into_os_string()];
+        assert_eq!(expand(envelope.clone()).unwrap(), args);
+        assert_eq!(
+            expand(envelope).unwrap(),
+            args,
+            "engine command_args may read again"
+        );
+        drop(file);
+        assert!(!path.exists());
+        assert_eq!(
+            expand(vec!["direct".into()]).unwrap(),
+            [OsString::from("direct")]
+        );
+        assert!(expand(vec![]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_envelope_rejects_missing_extra_malformed_foreign_and_nul_arguments() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let envelope = vec![FLAG.into(), file.path().into()];
+        assert!(expand(vec![FLAG.into()]).is_err());
+        let mut extra = envelope.clone();
+        extra.push("extra".into());
+        assert!(expand(extra).is_err());
+        assert!(expand(vec![FLAG.into(), file.path().join("missing").into()]).is_err());
+        file.write_all(b"not JSON").unwrap();
+        assert!(expand(envelope.clone()).is_err());
+        #[cfg(unix)]
+        let foreign = NativeString::Windows(vec![65]);
+        #[cfg(windows)]
+        let foreign = NativeString::Unix(vec![65]);
+        let nul = NativeString::capture(std::ffi::OsStr::new("\0"));
+        for native in [foreign, nul] {
+            std::fs::write(file.path(), serde_json::to_vec(&vec![native]).unwrap()).unwrap();
+            assert!(expand(envelope.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn file_size_is_bounded_even_when_a_valid_json_prefix_would_parse() {
+        let file = ArgvFile::new(&["kache".into()]).unwrap();
+        let envelope = vec![FLAG.into(), file.path().into()];
+        let mut bytes = std::fs::read(file.path()).unwrap();
+        bytes.resize(1_048_576, b' ');
+        std::fs::write(file.path(), &bytes).unwrap();
+        assert_eq!(expand(envelope.clone()).unwrap(), [OsString::from("kache")]);
+        bytes.push(b' ');
+        std::fs::write(file.path(), bytes).unwrap();
+        assert!(expand(envelope).is_err());
     }
 }

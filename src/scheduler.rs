@@ -788,7 +788,10 @@ impl Scheduler {
                 }
                 WaitStep::Busy(_) => {
                     let remaining = self.wait_timeout.saturating_sub(start.elapsed());
-                    std::thread::sleep(self.poll_interval.min(remaining));
+                    let nap = self.poll_interval.min(remaining);
+                    #[cfg(test)]
+                    PERMIT_POLL_MAX.with(|max| max.set(max.get().max(nap)));
+                    std::thread::sleep(nap);
                 }
             }
             waited = true;
@@ -1011,6 +1014,7 @@ fn tests_dir(root: &Path) -> PathBuf {
 #[cfg(test)]
 thread_local! {
     static PERMIT_SCANS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static PERMIT_POLL_MAX: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 #[cfg(test)]
@@ -1025,6 +1029,7 @@ fn note_permit_scan() {}
 #[cfg(test)]
 fn reset_permit_scans() {
     PERMIT_SCANS.with(|scans| scans.set(0));
+    PERMIT_POLL_MAX.with(|max| max.set(Duration::ZERO));
 }
 
 #[cfg(test)]
@@ -2946,15 +2951,13 @@ mod tests {
         )
         .unwrap();
         reset_permit_scans();
-        let started = std::time::Instant::now();
         assert!(scheduler.wait_for_permit(0..1, |_| 2).is_none());
-        let scans = permit_scans();
-        let elapsed = started.elapsed();
-        // A 200 ms slice fits about five scans into this timeout. The short
-        // poll has to come back often enough that this product exceeds it.
-        assert!(
-            scans >= 4 && u128::from(scans) * 50 > elapsed.as_millis(),
-            "only {scans} scans in {elapsed:?}; a 200 ms slice does that few"
+        // Observe the requested sleep: runner contention can delay a wakeup
+        // regardless of the interval the scheduler selected.
+        assert_eq!(
+            PERMIT_POLL_MAX.with(|max| max.get()),
+            Duration::from_millis(5),
+            "an unsatisfiable need must use the short poll"
         );
     }
 
