@@ -81,7 +81,14 @@ pub(super) fn ensure_outcome(config: &Config, force: bool) -> Result<Ensured> {
         Mode::Exclusive,
         Budgets {
             setup: DAEMON_START_TIMEOUT,
-            drain: Some(Duration::from_secs(35)),
+            // An asked-for restart waits for the compiles the daemon was
+            // handed (its drain lets them finish); a build replacing an
+            // outdated daemon keeps the short budget it waits out.
+            drain: Some(if force {
+                super::SERVICE_STOP_TIMEOUT
+            } else {
+                Duration::from_secs(35)
+            }),
         },
         &mut driver,
     ) {
@@ -124,6 +131,7 @@ fn observe(config: &Config, deadline: Instant) -> Result<ObservedOwner> {
                     version: health.build,
                     build_epoch: health.revision,
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 })
             } else {
                 ObservedOwner::Pending

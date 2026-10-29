@@ -305,6 +305,22 @@ impl DescriptorChannel {
     }
 }
 
+/// Counts a handed-over compile in [`Daemon::compiles_in_flight`] while held.
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InFlight {
+    fn begin(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// Cancels even when a forced drain aborts the async connection task. The
 /// blocking worker retains the token until it has reaped its compiler children.
 struct CancelOnDrop(Cancellation);
@@ -324,12 +340,13 @@ async fn write_reply(stream: &TokioStream, reply: &ExecutionReply) -> Result<()>
 }
 
 pub(super) async fn handle(
-    stream: &TokioStream,
+    connection: &Arc<TokioStream>,
     reader: &mut BufReader<&TokioStream>,
     request: ExecutionRequest,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
 ) -> Result<()> {
+    let stream: &TokioStream = connection;
     let client_pid = request.client_pid;
     let client_trust = matches!(
         request.channels,
@@ -419,7 +436,16 @@ pub(super) async fn handle(
     write_reply(stream, &ExecutionReply::Accepted).await?;
     let activity = daemon.request_clock.begin_activity();
 
+    // From Accepted until the worker returns: shutdown waits for it, and its
+    // client's connection stays open as long as the worker runs, even when a
+    // drain past its bound cancels this task. A client that sees the
+    // connection close after Commit therefore knows nothing of this compile
+    // is still running here, and may run it again itself.
+    let in_flight = InFlight::begin(&daemon.compiles_in_flight);
+    let held_open = Arc::clone(connection);
     let mut worker = tokio::task::spawn_blocking(move || {
+        let _in_flight = in_flight;
+        let _held_open = held_open;
         let _activity = activity;
         let _permit = permit;
         let _client = crate::invocation::ClientScope::enter(client_pid);
@@ -1053,6 +1079,102 @@ mod tests {
             daemon.execution_workers.available_permits(),
             initial_permits
         );
+    }
+
+    #[test]
+    fn a_drain_lets_handed_over_compiles_finish_up_to_their_bound() {
+        isolated_test("a_drain_lets_handed_over_compiles_finish_up_to_their_bound");
+    }
+
+    /// A stop or restart used to cut every handed-over compile once the
+    /// handler drain timed out, failing builds with "incomplete compiler
+    /// execution response". Now they run on to the compile bound: one
+    /// that ends within it answers as usual, and one cut at the bound is
+    /// `Lost` to its client, which compiles locally instead of failing.
+    #[tokio::test]
+    #[ignore = "bounded subprocess fixture"]
+    async fn fixture_a_drain_lets_handed_over_compiles_finish_up_to_their_bound() {
+        if !native_execution_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let config = super::super::tests::test_config(root.path());
+        let socket = config.socket_path();
+        let listener = crate::transport::bind_daemon_listener(&socket)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut daemon = Daemon::new(config);
+        daemon.execution_workers = Arc::new(tokio::sync::Semaphore::new(2));
+        let daemon = Arc::new(daemon);
+        let lifecycle = Arc::new(Lifecycle::default());
+        let (server_daemon, server_lifecycle) = (daemon.clone(), lifecycle.clone());
+        let server = tokio::spawn(async move {
+            super::super::accept_loop_with(
+                &listener,
+                &server_daemon,
+                &server_lifecycle,
+                None,
+                Duration::from_millis(100),
+                // Well past the release below, however loaded the machine.
+                Duration::from_secs(5),
+                std::future::pending::<()>(),
+            )
+            .await
+        });
+        let mut clients = Vec::new();
+        let mut paths = Vec::new();
+        for name in ["finishes", "outlasts"] {
+            let (args, context) = fixture(root.path(), name);
+            paths.push(context.env.cwd().unwrap().to_owned());
+            let socket = socket.clone();
+            clients.push(tokio::task::spawn_blocking(move || {
+                crate::invocation::execution::try_execute(&socket, &args, &context)
+            }));
+        }
+        for (path, client) in paths.iter().zip(&clients) {
+            ready_unless_returned(&path.join("ready"), client).await;
+        }
+        assert_eq!(daemon.compiles_in_flight(), 2);
+        assert_eq!(
+            daemon.handle_health().health.unwrap().compiles_in_flight,
+            Some(2)
+        );
+        lifecycle.start_drain();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            clients.iter().all(|client| !client.is_finished()),
+            "the drain cut a handed-over compile at the handler timeout"
+        );
+        assert!(
+            !server.is_finished(),
+            "the daemon stopped before its compiles"
+        );
+        std::fs::write(paths[0].join("release"), b"go").unwrap();
+        let mut clients = clients.into_iter();
+        assert_eq!(clients.next().unwrap().await.unwrap().unwrap(), Some(7));
+        // The other one is cut at the bound; its client hears the connection
+        // close only once the daemon's worker is done, and reaps its compiler.
+        let outlasting = tokio::time::timeout(HANG_GUARD, clients.next().unwrap())
+            .await
+            .expect("a compile past the bound was never cut")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outlasting, None);
+        let pid: libc::pid_t = std::fs::read_to_string(paths[1].join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "compiler {pid} still runs"
+        );
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the daemon did not stop after its bound")
+            .unwrap();
+        assert_eq!(daemon.compiles_in_flight(), 0);
     }
 
     fn request(args: &[String], context: &InvocationContext) -> ExecutionRequest {

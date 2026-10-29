@@ -2156,6 +2156,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: VERSION.into(),
                     build_epoch: build_epoch(),
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -2167,6 +2168,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: "0.0.1".into(),
                     build_epoch: 1,
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -2178,6 +2180,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: String::new(),
                     build_epoch: 1,
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -2189,6 +2192,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: "999.0.0".into(),
                     build_epoch: 1,
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -5515,6 +5519,7 @@ fn readiness_reply_requires_success_but_allows_missing_release_metadata() {
             version: "v1".into(),
             build_epoch: 7,
             remote_readonly: None,
+            compiles_in_flight: None,
         }
     );
     for response in [

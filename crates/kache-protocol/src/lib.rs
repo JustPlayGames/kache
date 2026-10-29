@@ -315,6 +315,10 @@ pub struct DaemonHealth {
     /// from the lifecycle control endpoint, which does not carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_readonly: Option<bool>,
+    /// Compiles clients handed over (Commit accepted) that are still running.
+    /// `None` from older daemons and from the lifecycle control endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiles_in_flight: Option<u64>,
 }
 
 /// The configuration the daemon loaded at startup, carried in every

@@ -293,11 +293,14 @@ fn launchd_plist_content(
     </dict>
     <key>ThrottleInterval</key>
     <integer>5</integer>
+    <key>ExitTimeOut</key>
+    <integer>{stop_timeout}</integer>
 </dict>
 </plist>
 "#,
         stdout = stdout_log.display(),
         stderr = stderr_log.display(),
+        stop_timeout = crate::daemon::SERVICE_STOP_TIMEOUT.as_secs(),
     )
 }
 
@@ -391,12 +394,16 @@ Type=simple
 ExecStart={exe} daemon run
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec={stop_timeout}
 Environment=KACHE_LOG=kache=info
 
 [Install]
 WantedBy=default.target
 "#,
         exe = exe.display(),
+        // A stop waits for the compiles clients handed over (up to
+        // `COMPILE_DRAIN_BOUND`); systemd's default 90 s would kill it first.
+        stop_timeout = crate::daemon::SERVICE_STOP_TIMEOUT.as_secs(),
     )
 }
 
@@ -1038,6 +1045,16 @@ pub fn status(json: bool) -> Result<()> {
     } else {
         None
     };
+    // From a health request, which answers without the store: a restart
+    // waits for this to read 0 so it cuts no compile (stats can time out on
+    // a busy store).
+    let compiles_in_flight = if running {
+        config
+            .as_ref()
+            .and_then(crate::daemon::daemon_compiles_in_flight)
+    } else {
+        None
+    };
     let exe_problem = installed_service_path
         .as_deref()
         .and_then(service_exe_problem);
@@ -1058,6 +1075,10 @@ pub fn status(json: bool) -> Result<()> {
             service_executable_mismatch: bool,
             /// Handed-off compiles the daemon has not stored and logged yet.
             publishes_pending: Option<u64>,
+            /// Compiles clients handed to the daemon that are still running:
+            /// a restart now would make them wait for its drain. `None` when
+            /// no daemon answers or it predates the field.
+            compiles_in_flight: Option<u64>,
         }
         return crate::machine::emit(
             "daemon-status",
@@ -1081,6 +1102,7 @@ pub fn status(json: bool) -> Result<()> {
                 startup_log: config.as_ref().map(|cfg| startup_log(cfg).to_string()),
                 service_executable_mismatch: exe_problem.is_some(),
                 publishes_pending: daemon_stats.as_ref().map(|stats| stats.publishes_pending),
+                compiles_in_flight,
             },
             if running {
                 Vec::new()
@@ -1099,6 +1121,13 @@ pub fn status(json: bool) -> Result<()> {
         daemon_stats.as_ref().map(|stats| stats.version.as_str()),
         crate::VERSION,
     ));
+    if let Some(compiling) = compiles_in_flight.filter(|compiling| *compiling > 0) {
+        status_rows.push((
+            "Compiling",
+            term::counted(compiling, "compile", "compiles"),
+            "handed over by builds, still running".into(),
+        ));
+    }
     if let Some(pending) = daemon_stats
         .as_ref()
         .map(|stats| stats.publishes_pending)
@@ -1967,6 +1996,10 @@ WantedBy=default.target
         assert!(content.contains("Restart=on-failure"));
         assert!(content.contains("WantedBy=default.target"));
         assert!(content.contains("KACHE_LOG=kache=info"));
+        assert!(content.contains(&format!(
+            "TimeoutStopSec={}",
+            crate::daemon::SERVICE_STOP_TIMEOUT.as_secs()
+        )));
     }
 
     #[test]

@@ -161,6 +161,7 @@ fn wait_with_deadline(child: &mut Child, deadline: Duration) -> std::process::Ex
 /// build with "incomplete compiler execution response". Its client now runs
 /// the compile again itself, once, after removing what the lost attempt left
 /// half written (all but the `.rmeta`, which dependent compiles may read).
+/// While the compile runs, `kache daemon status` counts it in flight.
 #[test]
 fn a_daemon_killed_mid_compile_leaves_the_build_successful() {
     let fixture = Fixture::new();
@@ -184,6 +185,9 @@ fn a_daemon_killed_mid_compile_leaves_the_build_successful() {
 
     let mut compile = fixture.compile();
     wait_for(&fixture.path("state/started"), &mut compile);
+    let status = fixture.json(&["--json", "daemon", "status"]);
+    assert_eq!(status["compiles_in_flight"], 1, "{status}");
+
     let daemon = fixture.daemon_pid();
     assert_eq!(unsafe { libc::kill(daemon, libc::SIGKILL) }, 0);
 
