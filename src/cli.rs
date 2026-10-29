@@ -4633,6 +4633,11 @@ pub fn gc_stale_targets(config: &Config, days: u64, apply: bool, json: bool) -> 
     Ok(())
 }
 
+/// How long `kache gc --stale-schema` keeps a row a key bridge of this
+/// release still adopts, counted from its last use: a cache the upgrade
+/// found is not discarded before the builds that need it ran once.
+const BRIDGED_ROW_GRACE: std::time::Duration = std::time::Duration::from_secs(14 * 86_400);
+
 pub fn gc(
     config: &Config,
     max_age_hours: Option<u64>,
@@ -4652,7 +4657,20 @@ pub fn gc(
             }
         };
         let started = std::time::Instant::now();
-        let mut stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        let bridged = crate::cache_key::bridged_key_versions();
+        let kept_for_bridge = if bridged.is_empty() {
+            0
+        } else {
+            store
+                .stale_key_schema_keys(&bridged, std::time::Duration::ZERO)?
+                .len()
+                .saturating_sub(
+                    store
+                        .stale_key_schema_keys(&bridged, BRIDGED_ROW_GRACE)?
+                        .len(),
+                )
+        };
+        let mut stats = store.evict_stale_key_schemas(&bridged, BRIDGED_ROW_GRACE)?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
         record_manual_gc_run(config, &stats);
         if json {
@@ -4663,6 +4681,18 @@ pub fn gc(
             describe_eviction(&stats, false),
             crate::cache_key::CACHE_KEY_VERSION,
         );
+        if kept_for_bridge > 0 {
+            println!(
+                "Kept {} of key version {} for this release to adopt, until idle {} days.",
+                term::counted(kept_for_bridge as u64, "entry", "entries"),
+                bridged
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                BRIDGED_ROW_GRACE.as_secs() / 86_400
+            );
+        }
         let total_size = store.physical_size()?;
         let entry_count = store.entry_count()?;
         println!(

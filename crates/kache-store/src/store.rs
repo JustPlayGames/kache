@@ -7873,17 +7873,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// created before key-schema recording use `0`, and an upgrade must not
     /// discard a still-reachable cache merely because its metadata predates
     /// this field. `kache gc --stale-schema` is the user's opt-in boundary.
-    pub fn evict_stale_key_schemas(&self, current_schema: u32) -> Result<GcStats> {
+    ///
+    /// The running recipe is each row's own component's
+    /// ([`kache_format::KeyComponent`]): a C compile or build-script run a
+    /// rustc key bump left alone stays. A row of an earlier version in
+    /// `bridged` (one a key bridge of this release adopts on a miss) stays
+    /// until it has been idle for `bridge_grace`: removing it would turn the
+    /// adoption the bridge exists for into a compile (lane KACHE-W22).
+    pub fn evict_stale_key_schemas(
+        &self,
+        bridged: &[u32],
+        bridge_grace: Duration,
+    ) -> Result<GcStats> {
         self.refuse_write("evict")?;
-        let keys = {
-            let mut stmt = self.db.prepare(
-                "SELECT cache_key FROM entries
-                 WHERE committed = 1 AND key_schema != ?1
-                 ORDER BY cache_key",
-            )?;
-            stmt.query_map(params![current_schema], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let keys = self.stale_key_schema_keys(bridged, bridge_grace)?;
         let candidates = self.eviction_candidates()?;
         let by_key = candidates
             .iter()
@@ -7903,6 +7906,48 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             &mut || false,
             &mut false,
         ))
+    }
+
+    /// The rows [`Self::evict_stale_key_schemas`] removes, in key order.
+    pub fn stale_key_schema_keys(
+        &self,
+        bridged: &[u32],
+        bridge_grace: Duration,
+    ) -> Result<Vec<String>> {
+        let bridged = bridged
+            .iter()
+            .filter(|version| **version > 0 && **version < kache_format::CACHE_KEY_VERSION)
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let rustc = kache_format::CACHE_KEY_VERSION;
+        let component = kache_format::KeyComponent::key_version_sql();
+        // Kept within the grace: a rustc row (its component's version is
+        // the current one) of a bridged version.
+        let kept_by_bridge = if bridged.is_empty() {
+            "0".to_string()
+        } else {
+            format!(
+                "({component} = {rustc} AND key_schema IN ({bridged}) \
+                 AND last_accessed >= datetime('now', ?1))"
+            )
+        };
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT cache_key FROM entries
+             WHERE committed = 1
+               AND (key_schema = 0 OR key_schema > {rustc} OR key_schema < {component})
+               AND NOT {kept_by_bridge}
+             ORDER BY cache_key"
+        ))?;
+        let grace = format!("-{} seconds", bridge_grace.as_secs());
+        let keys = if bridged.is_empty() {
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![grace], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(keys)
     }
 
     /// Evict duplicate entries that share the same content_hash.
