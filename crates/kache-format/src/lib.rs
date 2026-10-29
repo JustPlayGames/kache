@@ -3,8 +3,86 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Cache-key recipe version written into entry metadata.
+/// Cache-key recipe version written into entry metadata: rustc's, and the
+/// store's key epoch (every entry a release stores carries it).
+///
+/// A release build keeps 33. The `key-bump-trial` feature plays a bump to
+/// 34 that changes no hashed byte, so a key bridge (`kache`'s
+/// `KEY_BRIDGES`) has an earlier version's entries to adopt (lane
+/// KACHE-W22); it is for trials only, never a release.
+#[cfg(not(feature = "key-bump-trial"))]
+pub const CACHE_KEY_VERSION: u32 = 33;
+#[cfg(feature = "key-bump-trial")]
 pub const CACHE_KEY_VERSION: u32 = 34;
+
+/// Key versions per component (lane KACHE-W20/W22). Each recipe folds its
+/// own, so a bump of one leaves the others' entries where they are. Each is
+/// the [`CACHE_KEY_VERSION`] at which that recipe last changed, so an entry
+/// whose `key_schema` is at least its component's version is one this
+/// release's keys still reach ([`entry_key_is_current`]).
+///
+/// C/C++/asm and nvcc compiles.
+pub const CC_KEY_VERSION: u32 = 33;
+/// Recorded build-script runs (`build_script`'s action key).
+pub const BUILD_SCRIPT_KEY_VERSION: u32 = 33;
+/// Input predictions: they name the files a unit read, not how its key
+/// hashes them.
+pub const PREDICTION_KEY_VERSION: u32 = 33;
+
+/// The crate-name slot of a recorded build-script run's entry.
+pub const BUILD_SCRIPT_RUN_CRATE_NAME: &str = "build_script_run";
+
+/// Which key recipe stored an entry, read from the columns every store row
+/// has: a build-script run names [`BUILD_SCRIPT_RUN_CRATE_NAME`]; a C
+/// compile has no crate types and names its source file, which has an
+/// extension (a Rust crate name never holds a dot); everything else is
+/// rustc's. A row read wrongly only moves in the eviction order: lookups go
+/// by key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyComponent {
+    Rustc,
+    Cc,
+    BuildScript,
+}
+
+impl KeyComponent {
+    pub fn of_entry(crate_name: &str, crate_types: &str) -> Self {
+        if crate_name == BUILD_SCRIPT_RUN_CRATE_NAME {
+            KeyComponent::BuildScript
+        } else if crate_types.is_empty() && crate_name.contains('.') {
+            KeyComponent::Cc
+        } else {
+            KeyComponent::Rustc
+        }
+    }
+
+    /// The [`CACHE_KEY_VERSION`] this component's keys last changed at.
+    pub fn key_version(self) -> u32 {
+        match self {
+            KeyComponent::Rustc => CACHE_KEY_VERSION,
+            KeyComponent::Cc => CC_KEY_VERSION,
+            KeyComponent::BuildScript => BUILD_SCRIPT_KEY_VERSION,
+        }
+    }
+
+    /// [`Self::of_entry`] and [`Self::key_version`] as one SQL expression
+    /// over an `entries` row's `crate_name` and `crate_type` columns, with
+    /// no parameters: the stores rank and sweep by it.
+    pub fn key_version_sql() -> String {
+        format!(
+            "(CASE WHEN crate_name = '{BUILD_SCRIPT_RUN_CRATE_NAME}' THEN {BUILD_SCRIPT_KEY_VERSION} \
+             WHEN crate_type = '' AND instr(crate_name, '.') > 0 THEN {CC_KEY_VERSION} \
+             ELSE {CACHE_KEY_VERSION} END)"
+        )
+    }
+}
+
+/// Whether this release's keys still reach an entry its `key_schema` says a
+/// recipe version stored: `0` (written before versions were recorded) is
+/// unknown and counts as current, as does a later version (a rollback).
+pub fn entry_key_is_current(key_schema: u32, component: KeyComponent) -> bool {
+    key_schema == 0 || key_schema >= component.key_version()
+}
 
 /// Emit kinds represented by the current entry format.
 pub const GATED_EMIT_KINDS: [&str; 8] = [

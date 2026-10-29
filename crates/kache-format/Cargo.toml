@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["build-cache", "cache", "metadata", "compiler-cache"]
 categories = ["development-tools::build-utils", "caching"]
 
+[features]
+# Plays a key bump that changes no hashed byte (lane KACHE-W22 trials only).
+key-bump-trial = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 

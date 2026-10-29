@@ -12,6 +12,11 @@
 //! printed the same keys. Other hosts key the linker and libc differently
 //! and need goldens captured there.
 //!
+//! A release build (no `key-bump-trial`: key version 33, no bridge) must key
+//! each of them exactly as tasty.56 did: its keys are the goldens themselves,
+//! so the machinery ships without invalidating a single entry (lane
+//! KACHE-W22).
+//!
 //! A bump that changes how one of these kinds keys must leave it out of its
 //! bridge (`KeyBridge::applies`), and then its legacy key is `None`; a bump
 //! that changes nothing for it must leave its golden alone. Never update a
@@ -278,6 +283,14 @@ fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
     let dir = tempfile::tempdir().unwrap();
     let keys = golden_keys(dir.path(), None);
     assert_eq!(keys.len(), GOLDENS.len());
+    if CACHE_KEY_VERSION == GOLDEN_VERSION {
+        // A release with the machinery and no bump: every component still
+        // at the goldens' version, nothing bridged.
+        for version in [CC_KEY_VERSION, BUILD_SCRIPT_KEY_VERSION, PREDICTION_KEY_VERSION] {
+            assert_eq!(version, GOLDEN_VERSION);
+        }
+        assert!(KEY_BRIDGES.is_empty());
+    }
     for ((kind, key, legacy), (golden_kind, links, golden)) in keys.iter().zip(GOLDENS) {
         assert_eq!(kind, golden_kind);
         let bridge = KEY_BRIDGES.iter().find(|bridge| bridge.from == GOLDEN_VERSION);
@@ -286,6 +299,7 @@ fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
             // the bridge from it is dropped there is nothing to check.
             if CACHE_KEY_VERSION == GOLDEN_VERSION {
                 assert_eq!(key, golden, "{kind}: key changed without a key bump");
+                assert_eq!(legacy, &None, "{kind}: no bump, nothing to bridge");
             }
             continue;
         }
@@ -303,8 +317,9 @@ fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
 }
 
 /// A bridge whose scope leaves linking units out computes no legacy key for
-/// them, and the same golden for the rest.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// them, and the same golden for the rest (a trial bump only: a release
+/// build has no bridge).
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "key-bump-trial"))]
 #[test]
 fn a_bridge_scoped_to_nonlinking_units_leaves_linking_ones_unbridged() {
     let dir = tempfile::tempdir().unwrap();

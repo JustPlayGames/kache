@@ -12,6 +12,11 @@ keywords = ["build-cache", "rustc-wrapper", "blake3", "cargo"]
 categories = ["development-tools::build-utils", "caching"]
 rust-version = "1.95"
 
+[features]
+# Lane KACHE-W22 trials only: key version 34 with a bridge from 33 (see
+# kache-format). A release never turns it on.
+key-bump-trial = ["kache-format/key-bump-trial"]
+
 [lib]
 path = "src/main.rs"
 

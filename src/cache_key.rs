@@ -280,18 +280,10 @@ mod apple_install_name;
 // previous trybuild entry misses and every other key stays valid.
 pub(crate) use kache_format::CACHE_KEY_VERSION;
 
-/// Key versions per component (lane KACHE-W20 prototype). Each recipe folds
-/// its own, so a bump of one leaves the others' entries where they are; each
-/// starts at 33, the last version they all shared. A bump of a component
-/// lists the version it replaces in that component's bridge.
-///
-/// Input predictions (see `prediction_identity_in_env`): they name the files
-/// a unit read, not how its key hashes them.
-pub(crate) const PREDICTION_KEY_VERSION: u32 = 33;
-/// C/C++/asm compiles (`compiler::cc`).
-pub(crate) const CC_KEY_VERSION: u32 = 33;
-/// Recorded build-script runs (`build_script`'s action key).
-pub(crate) const BUILD_SCRIPT_KEY_VERSION: u32 = 33;
+/// Key versions per component ([`kache_format::KeyComponent`]): each recipe
+/// folds its own, so a bump of one leaves the others' entries where they
+/// are.
+pub(crate) use kache_format::{BUILD_SCRIPT_KEY_VERSION, CC_KEY_VERSION, PREDICTION_KEY_VERSION};
 
 /// Collapse runs of ASCII whitespace into single spaces and trim
 /// leading / trailing whitespace.
@@ -766,9 +758,11 @@ pub(crate) struct KeyBridge {
     pub applies: fn(&RustcArgs) -> bool,
 }
 
-/// Prototype: the bump to 34 changes no hashed byte, so every rustc entry of
-/// 33 is adoptable. `KACHE_KEY_BRIDGE_SCOPE=nonlinking` plays a bump that
-/// changed how linking units key (as 33's linker identity did): those miss.
+/// Trial (`key-bump-trial`): the bump to 34 changes no hashed byte, so every
+/// rustc entry of 33 is adoptable. `KACHE_KEY_BRIDGE_SCOPE=nonlinking` plays
+/// a bump that changed how linking units key (as 33's linker identity did):
+/// those miss.
+#[cfg(feature = "key-bump-trial")]
 fn bridge_all_rustc(args: &RustcArgs) -> bool {
     match std::env::var("KACHE_KEY_BRIDGE_SCOPE").as_deref() {
         Ok("nonlinking") => !args.invokes_linker(),
@@ -776,7 +770,11 @@ fn bridge_all_rustc(args: &RustcArgs) -> bool {
     }
 }
 
-/// The rustc key versions this release adopts entries of.
+/// The rustc key versions this release adopts entries of. A release with no
+/// bump has none: its keys are the previous release's, byte for byte.
+#[cfg(not(feature = "key-bump-trial"))]
+pub(crate) const KEY_BRIDGES: &[KeyBridge] = &[];
+#[cfg(feature = "key-bump-trial")]
 pub(crate) const KEY_BRIDGES: &[KeyBridge] = &[KeyBridge {
     from: 33,
     applies: bridge_all_rustc,
