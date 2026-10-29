@@ -780,6 +780,16 @@ pub(crate) const KEY_BRIDGES: &[KeyBridge] = &[KeyBridge {
     applies: bridge_all_rustc,
 }];
 
+/// The earlier key versions a current bridge still reads: their rows stay
+/// adoptable, so `kache gc --stale-schema` keeps them within its grace.
+pub(crate) fn bridged_key_versions() -> Vec<u32> {
+    KEY_BRIDGES
+        .iter()
+        .map(|bridge| bridge.from)
+        .filter(|from| *from != CACHE_KEY_VERSION)
+        .collect()
+}
+
 /// The bridge this invocation's key also computes a legacy key for, unless
 /// `KACHE_KEY_BRIDGE=0`.
 fn key_bridge_for(args: &RustcArgs) -> Option<&'static KeyBridge> {

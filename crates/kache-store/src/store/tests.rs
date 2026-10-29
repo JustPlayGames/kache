@@ -8627,71 +8627,111 @@ fn test_store_evict_older_than_keeps_recent() {
     assert!(store.contains("k1"));
 }
 
+/// `kache gc --stale-schema` removes what no key of the running recipe
+/// reaches: an earlier rustc version and unrecorded (`0`) rows. It keeps
+/// rows of components whose own key version did not move (a C compile, a
+/// build-script run), and an earlier version a key bridge still adopts until
+/// it has been idle for the grace (lane KACHE-W22).
 #[test]
 fn evict_stale_key_schemas_keeps_only_the_running_schema() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
+    let prior = kache_format::CACHE_KEY_VERSION - 1;
 
-    for (key, content) in [
-        ("current", b"current artifact".as_slice()),
-        ("old", b"old artifact".as_slice()),
-        ("legacy", b"legacy artifact".as_slice()),
-    ] {
-        let output = dir.path().join(format!("{key}.rlib"));
-        std::fs::write(&output, content).unwrap();
+    // (key, crate name, crate types, key_schema)
+    let rows: &[(&str, &str, &[&str], u32)] = &[
+        (
+            "current",
+            "current",
+            &["lib"],
+            kache_format::CACHE_KEY_VERSION,
+        ),
+        ("old", "old", &["lib"], prior),
+        ("legacy", "legacy", &["lib"], 0),
+        ("bridged", "bridged", &["lib"], prior),
+        ("cc", "foo.c", &[], kache_format::CC_KEY_VERSION),
+        (
+            "build_script",
+            kache_format::BUILD_SCRIPT_RUN_CRATE_NAME,
+            &["build-script"],
+            kache_format::BUILD_SCRIPT_KEY_VERSION,
+        ),
+    ];
+    for (key, crate_name, crate_types, schema) in rows {
+        let output = dir.path().join(format!("{key}.out"));
+        std::fs::write(&output, format!("{key} artifact")).unwrap();
+        let crate_types: Vec<String> = crate_types.iter().map(|t| t.to_string()).collect();
         store
             .put(
                 key,
-                key,
-                &["lib".into()],
+                crate_name,
+                &crate_types,
                 &[],
                 "",
                 "dev",
-                &[(output.clone(), format!("{key}.rlib"))],
+                &[(output.clone(), format!("{key}.out"))],
                 "",
                 "",
             )
             .unwrap();
         store.remove_clone_for_test(&output);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET key_schema = ?2, last_accessed = datetime('now', '-1 day')
+                 WHERE cache_key = ?1",
+                params![key, schema],
+            )
+            .unwrap();
     }
+    let day = std::time::Duration::from_secs(86_400);
 
-    let prior_schema = kache_format::CACHE_KEY_VERSION.saturating_sub(1);
-    store
-        .db
-        .execute(
-            "UPDATE entries
-                 SET key_schema = ?1, last_accessed = datetime('now', '-1 day')
-                 WHERE cache_key = 'old'",
-            params![prior_schema],
-        )
-        .unwrap();
-    store
-        .db
-        .execute(
-            "UPDATE entries
-                 SET key_schema = 0, last_accessed = datetime('now', '-1 day')
-                 WHERE cache_key = 'legacy'",
-            [],
-        )
-        .unwrap();
-
-    let stats = store
-        .evict_stale_key_schemas(kache_format::CACHE_KEY_VERSION)
-        .unwrap();
-    assert_eq!(stats.entries_evicted, 2);
+    // Not bridged: the earlier rustc row goes with the unrecorded one.
+    let stats = store.evict_stale_key_schemas(&[], day).unwrap();
+    assert_eq!(stats.entries_evicted, 3, "old, legacy, bridged");
+    assert_eq!(stats.blobs_removed, 3);
     assert!(stats.bytes_freed > 0);
-    assert_eq!(stats.blobs_removed, 2);
-    assert_eq!(stats.entries_pinned, 0);
-    assert!(store.contains("current"));
-    assert!(!store.contains("old"));
-    assert!(!store.contains("legacy"));
-    assert_eq!(store.entry_count().unwrap(), 1);
-
-    let second = store
-        .evict_stale_key_schemas(kache_format::CACHE_KEY_VERSION)
-        .unwrap();
+    for key in ["current", "cc", "build_script"] {
+        assert!(store.contains(key), "{key}");
+    }
+    assert_eq!(store.entry_count().unwrap(), 3);
+    let second = store.evict_stale_key_schemas(&[], day).unwrap();
     assert_eq!(second.entries_evicted, 0);
+
+    // Bridged: kept while used within the grace, then removed.
+    let output = dir.path().join("bridged.out");
+    std::fs::write(&output, "bridged artifact").unwrap();
+    store
+        .put(
+            "bridged",
+            "bridged",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(output.clone(), "bridged.out".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&output);
+    store
+        .db
+        .execute(
+            "UPDATE entries SET key_schema = ?1, last_accessed = datetime('now', '-1 day')
+             WHERE cache_key = 'bridged'",
+            params![prior],
+        )
+        .unwrap();
+    let kept = store.evict_stale_key_schemas(&[prior], 14 * day).unwrap();
+    assert_eq!(kept.entries_evicted, 0);
+    assert!(store.contains("bridged"));
+    let gone = store
+        .evict_stale_key_schemas(&[prior], std::time::Duration::from_secs(3600))
+        .unwrap();
+    assert_eq!(gone.entries_evicted, 1);
+    assert!(!store.contains("bridged"));
 }
 
 #[test]
@@ -15244,7 +15284,8 @@ fn read_only_store_serves_hits_and_writes_nothing() {
         "evict_older_than must be refused on a read-only store"
     );
     assert!(
-        ro.evict_stale_key_schemas(0).is_err(),
+        ro.evict_stale_key_schemas(&[], std::time::Duration::ZERO)
+            .is_err(),
         "evict_stale_key_schemas must be refused on a read-only store"
     );
     assert!(

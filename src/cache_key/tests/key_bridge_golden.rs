@@ -289,7 +289,7 @@ fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
         for version in [CC_KEY_VERSION, BUILD_SCRIPT_KEY_VERSION, PREDICTION_KEY_VERSION] {
             assert_eq!(version, GOLDEN_VERSION);
         }
-        assert!(KEY_BRIDGES.is_empty());
+        assert!(bridged_key_versions().is_empty());
     }
     for ((kind, key, legacy), (golden_kind, links, golden)) in keys.iter().zip(GOLDENS) {
         assert_eq!(kind, golden_kind);
