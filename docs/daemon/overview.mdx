@@ -58,8 +58,9 @@ Local-only caching can fall back to the local engine when delegation is
 unavailable; this is not the normal way to disable the daemon. Compiler-driven remote reads, writes,
 and prefetch need the daemon. `kache sync` can transfer entries directly without
 it. If delegation is unavailable before Commit, the engine continues with the
-local store. After Commit, a lost daemon connection fails the invocation; see
-[Architecture](/docs/how-it-works/architecture).
+local store. After Commit, a daemon that goes away without answering leaves
+the compile to the local engine, once; see
+[Daemon lifecycle](/docs/daemon/lifecycle#stopping-during-builds).
 
 ## Endpoint placement
 
