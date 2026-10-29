@@ -7359,6 +7359,43 @@ async fn server_main(
         }
     });
 
+    // Free heap the builds' requests leave behind, between sweeps (which
+    // trim on their own): see `HeapTrimGate`.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    tokio::spawn(async move {
+        let gate = Arc::new(std::sync::Mutex::new(
+            crate::platform::HeapTrimGate::default(),
+        ));
+        let mut interval = tokio::time::interval(HEAP_TRIM_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let gate = Arc::clone(&gate);
+            let _ = tokio::task::spawn_blocking(move || {
+                let Some(before) = crate::platform::resident_bytes() else {
+                    return;
+                };
+                let Ok(mut gate) = gate.lock() else {
+                    return;
+                };
+                if !gate.due(before) {
+                    return;
+                }
+                let started = Instant::now();
+                crate::platform::below_normal(crate::platform::release_free_heap);
+                let after = crate::platform::resident_bytes().unwrap_or(before);
+                gate.trimmed(after);
+                tracing::info!(
+                    before_mib = before >> 20,
+                    after_mib = after >> 20,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "gave free heap back"
+                );
+            })
+            .await;
+        }
+    });
+
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -7987,6 +8024,10 @@ impl Drop for DownloadingGuard {
 
 /// How often the daemon sweeps the store (age, housekeeping, size).
 const PERIODIC_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// How often the daemon reads its resident memory to see whether a heap
+/// trim is due (`HeapTrimGate`): one small `/proc` read.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HEAP_TRIM_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the daemon reads free space on its own, a `statvfs` per store.
 /// Wrappers ask at most once in five minutes, and only after storing: builds

@@ -331,6 +331,47 @@ pub fn release_free_heap() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn release_free_heap() {}
 
+/// This process's resident memory in bytes, from `/proc/self/statm`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf only reads a system constant.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page).ok().map(|page| pages * page)
+}
+
+/// When the daemon gives its free heap back between sweeps: once its
+/// resident memory has grown [`HeapTrimGate::GROWTH`] past the lowest it
+/// has been since the last trim. Builds' requests leave freed memory in
+/// glibc's arenas, which only a trim returns, and sweeps (which trim) can be
+/// hours apart: the build machine's daemon went from 0.5 to 1.4 GB in the
+/// 15 minutes after one, and a trim took it from 2.2 GB to 0.5 GB. Memory
+/// that is in use stays, and the next trim waits for as much growth again,
+/// so a daemon that really holds more trims no more often.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Debug, Default)]
+pub struct HeapTrimGate {
+    floor: Option<u64>,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl HeapTrimGate {
+    pub const GROWTH: u64 = 256 << 20;
+
+    /// Whether to trim at `resident` bytes.
+    pub fn due(&mut self, resident: u64) -> bool {
+        let floor = self.floor.map_or(resident, |floor| floor.min(resident));
+        self.floor = Some(floor);
+        resident >= floor.saturating_add(Self::GROWTH)
+    }
+
+    /// A trim left `resident` bytes.
+    pub fn trimmed(&mut self, resident: u64) {
+        self.floor = Some(resident);
+    }
+}
+
 /// The soft limit to ask for: the hard limit, capped by what the kernel lets
 /// one process open. `None` when that is no higher than `soft`.
 #[cfg(unix)]
@@ -729,6 +770,33 @@ mod tests {
             xml
         };
         xml.matches("<heap nr=").count()
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_heap_is_trimmed_after_growth_past_its_lowest_point() {
+        const MIB: u64 = 1 << 20;
+        let mut gate = super::HeapTrimGate::default();
+        assert!(
+            !gate.due(500 * MIB),
+            "the first reading only sets the floor"
+        );
+        assert!(!gate.due(700 * MIB));
+        // A sweep's own trim lowered it: growth counts from there.
+        assert!(!gate.due(300 * MIB));
+        assert!(!gate.due(555 * MIB));
+        assert!(gate.due(556 * MIB));
+        // Memory in use stays: the next trim waits for as much growth again.
+        gate.trimmed(550 * MIB);
+        assert!(!gate.due(805 * MIB));
+        assert!(gate.due(806 * MIB));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn resident_bytes_reads_this_process() {
+        let resident = super::resident_bytes().unwrap();
+        assert!(resident > 1 << 20, "{resident}");
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
