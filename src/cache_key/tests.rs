@@ -2,6 +2,8 @@ use super::*;
 use crate::args::RustcArgs;
 use crate::test_support::process_state_test_lock;
 
+mod key_bridge_golden;
+
 const GNU_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
 const DARWIN_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: aarch64-apple-darwin\nrelease: 1.90.0\n";
 
