@@ -4092,7 +4092,7 @@ async fn send_gc_hint_is_acknowledged_and_the_daemon_sweeps() {
     put_upload_evict_entry(&store, dir.path(), "evictable", 1200, false);
 
     let listener = bind_listener(&socket_path);
-    let daemon = Arc::new(Daemon::new(config.clone()));
+    let daemon = Arc::new(Daemon::new(config.clone()).settled());
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept");
         handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
@@ -6404,7 +6404,8 @@ fn daemon_on(
     config: Config,
     backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
 ) -> Arc<Daemon> {
-    let daemon = Arc::new(Daemon::new(config));
+    // Settled: an upload's size sweep starts at once, as these tests expect.
+    let daemon = Arc::new(Daemon::new(config).settled());
     daemon.set_remote_backend_for_test(Arc::clone(backend));
     daemon
 }
@@ -16763,4 +16764,47 @@ fn a_seeding_hands_its_memo_rows_over_rather_than_waiting_for_the_index() {
     memoise_seeded_files(&alone, std::slice::from_ref(&file), since_ns);
     let again = crate::cache_key::FileFingerprint::from_path(&placed).unwrap();
     assert_eq!(alone.file_hash_at(&again), Some(hash));
+}
+
+/// A daemon that has just started defers a hinted size sweep to the end of
+/// STARTUP_GC_DELAY, as its periodic one, and then sweeps; one that has run
+/// that long sweeps on the hint (lane KACHE-W21: tasty.56 swept 670 GB seven
+/// seconds after its start, while the builds it restarted under stored).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_daemon_defers_a_hinted_sweep_to_the_end_of_its_startup_delay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100;
+    let store = Store::open(&config).unwrap();
+    let swept = |daemon: Daemon, key: &'static str| {
+        put_upload_evict_entry(&store, dir.path(), key, 200, false);
+        let daemon = Arc::new(daemon);
+        daemon.handle_gc_hint();
+        let store = &store;
+        async move {
+            let start = Instant::now();
+            while store.contains(key) && start.elapsed() < Duration::from_secs(10) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            (!store.contains(key), start.elapsed())
+        }
+    };
+
+    let mut fresh = Daemon::new(config.clone());
+    fresh.started = Instant::now();
+    let (gone, _) = tokio::time::timeout(Duration::from_secs(1), swept(fresh, "fresh"))
+        .await
+        .unwrap_or((false, Duration::ZERO));
+    assert!(!gone, "no sweep in the first second of a daemon");
+
+    let mut ending = Daemon::new(config.clone());
+    ending.started = Instant::now() - STARTUP_GC_DELAY + Duration::from_millis(1500);
+    let (gone, after) = swept(ending, "ending").await;
+    assert!(gone, "the deferred sweep runs once the delay is over");
+    assert!(after >= Duration::from_millis(1000), "not before: {after:?}");
+
+    let mut settled = Daemon::new(config);
+    settled.started = Instant::now() - STARTUP_GC_DELAY;
+    let (gone, after) = swept(settled, "settled").await;
+    assert!(gone && after < Duration::from_secs(5), "{after:?}");
 }

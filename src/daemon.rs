@@ -1949,6 +1949,9 @@ pub(crate) struct Daemon {
     request_clock: Arc<crate::maintenance::RequestClock>,
     /// Set while a hinted sweep is queued or running; further hints coalesce.
     gc_hint_pending: AtomicBool,
+    /// When this daemon started: its size sweeps wait for
+    /// [`STARTUP_GC_DELAY`] after it, as its periodic one does.
+    started: Instant,
     /// The stores whose sweep for a delegated compile is queued or running;
     /// further requests for one of them coalesce into that sweep.
     invocation_gc_pending: Mutex<HashSet<PathBuf>>,
@@ -2113,6 +2116,7 @@ impl Daemon {
             stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
+            started: Instant::now(),
             invocation_gc_pending: Mutex::new(HashSet::new()),
             readonly_skip_warned: Mutex::new(None),
             #[cfg(any(unix, windows))]
@@ -6388,12 +6392,61 @@ impl Daemon {
     /// that worker exits and has no later chance at entries a live build
     /// pins, while the daemon sweeps again on the next hint or upload after
     /// the backoff.
+    ///
+    /// A daemon that has just started defers the sweep to the end of
+    /// [`STARTUP_GC_DELAY`], as it does its periodic one: it starts while
+    /// builds wait on it (an update, a crash), they come back storing at
+    /// once, and a sweep then holds the index's write lock against them
+    /// (tasty.56 started 15:57:32Z and swept 670 GB at 15:57:39Z on the first
+    /// hint). The trigger and backoff it then asks are the ones every daemon
+    /// shares, so a fresh daemon sweeps no sooner than the previous one would
+    /// have. A disk running low ends the wait at once.
     fn handle_gc_hint(self: &Arc<Self>) -> Response {
         if self.claim_gc_hint() {
             let daemon = Arc::clone(self);
-            tokio::task::spawn_blocking(move || daemon.run_hinted_sweep());
+            match self.startup_sweep_deadline() {
+                None => {
+                    tokio::task::spawn_blocking(move || daemon.run_hinted_sweep());
+                }
+                Some(deadline) => {
+                    tracing::info!(
+                        "size sweep deferred: the daemon started {}s ago and sweeps from {}s on",
+                        self.started.elapsed().as_secs(),
+                        STARTUP_GC_DELAY.as_secs()
+                    );
+                    tokio::spawn(async move {
+                        while let Some(left) = deadline.checked_duration_since(Instant::now())
+                            && !left.is_zero()
+                        {
+                            tokio::time::sleep(left.min(FREE_SPACE_CHECK_INTERVAL)).await;
+                            if daemon.any_store_low_on_disk() {
+                                break;
+                            }
+                        }
+                        let _ = tokio::task::spawn_blocking(move || daemon.run_hinted_sweep()).await;
+                    });
+                }
+            }
         }
         Response::ok()
+    }
+
+    /// A daemon that has run [`STARTUP_GC_DELAY`]: its size sweeps start at
+    /// once, for tests of the sweeps themselves.
+    #[cfg(test)]
+    pub(crate) fn settled(mut self) -> Self {
+        self.started = Instant::now()
+            .checked_sub(STARTUP_GC_DELAY)
+            .unwrap_or(self.started);
+        self
+    }
+
+    /// When a size sweep a hint asks for may start: `None` (now) once the
+    /// daemon has run [`STARTUP_GC_DELAY`] or while a store's disk runs low,
+    /// else the end of that delay.
+    fn startup_sweep_deadline(&self) -> Option<Instant> {
+        let deadline = self.started + STARTUP_GC_DELAY;
+        (Instant::now() < deadline && !self.any_store_low_on_disk()).then_some(deadline)
     }
 
     /// A delegated compiler already resolved its cache policy. Keep that
@@ -8051,7 +8104,8 @@ fn spawn_free_space_watch(daemon: Arc<Daemon>, period: Duration) -> tokio::task:
     })
 }
 
-/// The soonest a started daemon sweeps. A daemon restarts while builds wait
+/// The soonest a started daemon sweeps, on its timer or on a size hint
+/// ([`Daemon::handle_gc_hint`]). A daemon restarts while builds wait
 /// on it (an update, a crash), and its clients come back storing at once:
 /// a sweep then holds the index's write lock while they store, and their
 /// stores give up as "database is locked".
