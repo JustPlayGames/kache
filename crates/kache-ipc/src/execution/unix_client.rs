@@ -487,7 +487,14 @@ mod tests {
         frame.push(b'\n');
         control.write_all(&frame).unwrap();
         drop(control);
-        assert!(!client.service().unwrap());
+        // Another test's spawn can hold the peer end between its fork and
+        // exec, so the late reply may still be written once; the next call
+        // then reads the closed channel. Neither may fail.
+        let mut served = 0;
+        while client.service().unwrap() {
+            served += 1;
+            assert!(served < 2, "service went on after the daemon closed");
+        }
 
         // Any other transport error still fails.
         assert!(released(&io::Error::from(io::ErrorKind::BrokenPipe)));
