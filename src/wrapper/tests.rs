@@ -13119,8 +13119,16 @@ fn cargo_target_in(workspace: &Path) -> PathBuf {
 /// short bound, and the build's next unit records the root once the index
 /// lets it. Without the bound, a tenth of a 400-unit burst lost five seconds
 /// here.
+///
+/// The writer holds the lock until the unit returns, and lets go by itself
+/// only after `HOLD`: half the index's 5 s busy timeout, so a unit that
+/// waits for the lock (the bug) outlasts the hold, takes the lock and records
+/// the root. A unit that gives up after its 25 ms returns while the lock is
+/// still held, however slowly a loaded machine runs it. A 100 ms bound on
+/// the unit's wall time failed 18 in 360 copies run 12 at once on 4 vCPUs.
 #[test]
 fn a_busy_index_does_not_hold_a_unit_for_its_target_root() {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(2500);
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path().join("cache"));
     let store = Store::open(&config).unwrap();
@@ -13128,16 +13136,26 @@ fn a_busy_index_does_not_hold_a_unit_for_its_target_root() {
     let target = cargo_target_in(&workspace);
 
     let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
-    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let started = std::time::Instant::now();
+    let (held, wait_held) = std::sync::mpsc::channel();
+    let (returned, wait_returned) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held.send(()).unwrap();
+        let let_go_by_itself = wait_returned.recv_timeout(HOLD).is_err();
+        writer.execute_batch("COMMIT").unwrap();
+        let_go_by_itself
+    });
+    wait_held.recv().unwrap();
     register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
-    let waited = started.elapsed();
+    let _ = returned.send(());
     assert!(
-        waited < std::time::Duration::from_millis(100),
-        "the unit waited {waited:?} for its target root"
+        !writer.join().unwrap(),
+        "the unit was still waiting for its target root when the writer let go after {HOLD:?}"
     );
-    writer.execute_batch("COMMIT").unwrap();
-    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+    assert!(
+        store.tracked_target_roots(0).unwrap().is_empty(),
+        "the unit took the lock it should have left to the daemon"
+    );
 
     register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
     let roots = store.tracked_target_roots(0).unwrap();
