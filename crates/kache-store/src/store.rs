@@ -3732,8 +3732,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             );
             return Ok(false);
         }
+        let verify_started = std::time::Instant::now();
+        let mut verified_bytes = 0u64;
         for file in &meta.files {
             let blob = self.blob_path(&file.hash);
+            verified_bytes += file.size;
             if validate_blob_metadata(&blob, file.size).is_err() {
                 return Ok(false);
             }
@@ -3749,6 +3752,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
+        let verify_ms = verify_started.elapsed().as_secs_f64() * 1e3;
+        let register_started = std::time::Instant::now();
         meta.cache_key = cache_key.to_string();
         meta.key_schema = kache_format::CACHE_KEY_VERSION;
         let meta_json = serde_json::to_string_pretty(&meta).context("serializing adopted meta")?;
@@ -3798,9 +3803,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         tx.commit()?;
         tracing::info!(
-            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}",
+            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}: {} files, \
+             {verified_bytes} bytes re-hashed in {verify_ms:.1} ms, registered in {:.1} ms",
             &legacy_key[..16.min(legacy_key.len())],
-            &cache_key[..16.min(cache_key.len())]
+            &cache_key[..16.min(cache_key.len())],
+            meta.files.len(),
+            register_started.elapsed().as_secs_f64() * 1e3
         );
         Ok(true)
     }
