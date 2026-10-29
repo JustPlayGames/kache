@@ -158,6 +158,11 @@ pub(crate) fn render(
         "Recorded build: {}",
         latest.last_activity.to_rfc3339()
     ));
+    lines.push(format!(
+        "Recorded with Kache {}. Installed: {}.",
+        recorded_versions(latest, events).join(", "),
+        crate::VERSION
+    ));
     lines.push(String::new());
 
     let misses = analysis.misses_total;
@@ -242,8 +247,11 @@ pub(crate) fn render(
         }
     }
 
-    let (probes, real): (Vec<_>, Vec<_>) =
-        analysis.passthroughs.iter().partition(|group| group.probe);
+    let (probes, real): (Vec<_>, Vec<_>) = analysis
+        .passthroughs
+        .iter()
+        .filter(|group| group.fixed_in.is_none())
+        .partition(|group| group.probe);
     if !real.is_empty() || !probes.is_empty() {
         let mut body: Vec<Vec<String>> = real
             .iter()
@@ -270,6 +278,17 @@ pub(crate) fn render(
         ));
     }
 
+    let historical_rows = analysis
+        .passthroughs
+        .iter()
+        .filter_map(|group| {
+            group
+                .fixed_in
+                .map(|fixed_in| vec![term::count(group.count as u64), fixed_bug_words(fixed_in)])
+        })
+        .collect::<Vec<_>>();
+    append_historical_bugs(&mut lines, &historical_rows);
+
     lines.push(String::new());
     let costliest = analysis
         .costliest
@@ -288,6 +307,41 @@ fn percent(part: usize, whole: usize) -> f64 {
     } else {
         part as f64 / whole as f64 * 100.0
     }
+}
+
+fn recorded_versions(session: &Session, events: &[BuildEvent]) -> Vec<String> {
+    session
+        .events
+        .iter()
+        .map(|&index| match events[index].version.as_str() {
+            "" | "0.0.0" => "unknown".to_string(),
+            version => version.to_string(),
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn fixed_bug_words(fixed_in: &str) -> String {
+    format!(
+        "prediction metadata migration failed (fixed in Kache {fixed_in}; predictions rebuild automatically)"
+    )
+}
+
+fn append_historical_bugs(lines: &mut Vec<String>, rows: &[Vec<String>]) {
+    if rows.is_empty() {
+        return;
+    }
+    lines.push(String::new());
+    lines.push(term::heading("Earlier Kache bugs"));
+    lines.extend(term::table(
+        &["COUNT", "WHAT HAPPENED"],
+        &[Align::Right, Align::Left],
+        rows,
+    ));
+    lines.push(
+        "Keep the compiled cache; these records describe failures before the fix.".to_string(),
+    );
 }
 
 /// `kache explain` with no crate. Always succeeds when the log reads; a
@@ -380,6 +434,7 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
     lines.push(
         "These records describe past builds. Rebuild to check the installed version.".to_string(),
     );
+    lines.push(format!("Installed Kache: {}.", crate::VERSION));
     if body.entries.is_empty() {
         lines.push("No skips or passthroughs recorded in this scope.".to_string());
         return lines;
@@ -389,6 +444,7 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
     let reasons = body
         .reasons
         .iter()
+        .filter(|reason| reason.fixed_in.is_none())
         .map(|reason| {
             vec![
                 term::count(reason.count as u64),
@@ -403,6 +459,16 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
         &[Align::Right, Align::Left, Align::Left, Align::Left],
         &reasons,
     ));
+    let historical =
+        body.reasons
+            .iter()
+            .filter_map(|reason| {
+                reason.fixed_in.as_deref().map(|fixed_in| {
+                    vec![term::count(reason.count as u64), fixed_bug_words(fixed_in)]
+                })
+            })
+            .collect::<Vec<_>>();
+    append_historical_bugs(&mut lines, &historical);
     lines.push(String::new());
     lines.push(term::heading("Every skip and passthrough, slowest first"));
     let entries = body
@@ -411,17 +477,25 @@ fn render_skips(body: &SkipsBody) -> Vec<String> {
         .map(|entry| {
             vec![
                 entry.timestamp.clone(),
+                match entry.version.as_str() {
+                    "" | "0.0.0" => "unknown".to_string(),
+                    version => version.to_string(),
+                },
                 entry.crate_name.clone(),
                 term::home_path(Path::new(&entry.root)),
                 entry.result.clone(),
                 term::duration_ms(entry.elapsed_ms),
-                tui_sessions::passthrough_words(&entry.reason),
+                tui_sessions::passthrough_fixed_in(&entry.reason, &entry.version).map_or_else(
+                    || tui_sessions::passthrough_words(&entry.reason),
+                    fixed_bug_words,
+                ),
             ]
         })
         .collect::<Vec<_>>();
     lines.extend(term::table(
-        &["WHEN", "CRATE", "ROOT", "RESULT", "TIME", "WHY"],
+        &["WHEN", "KACHE", "CRATE", "ROOT", "RESULT", "TIME", "WHY"],
         &[
+            Align::Left,
             Align::Left,
             Align::Left,
             Align::Left,
@@ -460,6 +534,7 @@ pub(crate) struct NotCached {
     pub reason: String,
     pub count: usize,
     pub expected: bool,
+    pub fixed_in: Option<&'static str>,
 }
 
 /// A crate that keeps missing across builds of the tree.
@@ -475,6 +550,8 @@ pub(crate) struct KeepsMissing {
 pub(crate) struct Body {
     pub root: String,
     pub recorded_at: String,
+    pub recorded_versions: Vec<String>,
+    pub installed_version: &'static str,
     pub misses: usize,
     pub earlier_misses: Option<usize>,
     pub unexplained: usize,
@@ -499,6 +576,8 @@ pub(crate) fn json_body(
     Body {
         root: builds.latest.root.clone(),
         recorded_at: builds.latest.last_activity.to_rfc3339(),
+        recorded_versions: recorded_versions(builds.latest, events),
+        installed_version: crate::VERSION,
         misses: analysis.misses_total,
         earlier_misses: builds
             .earlier
@@ -524,6 +603,7 @@ pub(crate) fn json_body(
                 reason: group.reason.clone(),
                 count: group.count,
                 expected: group.probe,
+                fixed_in: group.fixed_in,
             })
             .collect(),
         keeps_missing: analysis
@@ -762,6 +842,104 @@ mod tests {
             render(&builds, &analysis, events, 1 << 30),
             json_body(&builds, &analysis, events, 1 << 30),
         )
+    }
+
+    #[test]
+    fn fixed_prediction_errors_are_separate_without_hiding_current_failures() {
+        let reason = "refused|build-script cache bypassed: no such column: prediction_json in SELECT schema, prediction_json, last_used FROM input_predictions WHERE identity = ?1";
+        let events = ["1.2.2", "2.0.0-rc.2", "2.0.0-rc.3", "", "0.0.0"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, version)| {
+                let mut event = ev(
+                    "build_script_run",
+                    EventResult::Passthrough,
+                    "s1",
+                    index as i64,
+                    "",
+                );
+                event.version = version.to_string();
+                event.passthrough_reason = reason.to_string();
+                event
+            })
+            .collect::<Vec<_>>();
+        let (lines, body) = report(&events);
+        let text = lines.join("\n");
+        let (current, historical) = text.split_once("Earlier Kache bugs").unwrap();
+        assert!(current.contains("Not cached"), "{text}");
+        assert!(
+            current.contains("incompatible prediction metadata"),
+            "{text}"
+        );
+        assert!(!current.contains("fixed in Kache"), "{text}");
+        assert!(historical.contains("fixed in Kache 2.0.0-rc.3"), "{text}");
+        assert!(historical.contains("Keep the compiled cache"), "{text}");
+        assert_eq!(
+            body.recorded_versions,
+            ["1.2.2", "2.0.0-rc.2", "2.0.0-rc.3", "unknown"]
+        );
+        assert_eq!(body.installed_version, crate::VERSION);
+        assert!(text.contains(&format!("Installed: {}.", crate::VERSION)));
+        assert_eq!(body.not_cached.len(), 2);
+        let fixed = body
+            .not_cached
+            .iter()
+            .find(|group| group.fixed_in.is_some())
+            .unwrap();
+        let unfixed = body
+            .not_cached
+            .iter()
+            .find(|group| group.fixed_in.is_none())
+            .unwrap();
+        assert_eq!(fixed.fixed_in, Some("2.0.0-rc.3"));
+        assert_eq!(fixed.count, 2);
+        assert_eq!(unfixed.count, 3);
+        assert_eq!(format!("{}|{}", fixed.kind, fixed.reason), reason);
+
+        let (only_old, _) = report(&events[..2]);
+        let old_text = only_old.join("\n");
+        assert!(!old_text.contains("Not cached"), "{old_text}");
+        assert!(old_text.contains("Earlier Kache bugs"), "{old_text}");
+
+        let (only_current, _) = report(&events[2..]);
+        let current_text = only_current.join("\n");
+        assert!(current_text.contains("Not cached"), "{current_text}");
+        assert!(
+            !current_text.contains("Earlier Kache bugs"),
+            "{current_text}"
+        );
+    }
+
+    #[test]
+    fn prediction_bug_classification_requires_an_affected_producer() {
+        let reason = "refused|build-script cache bypassed: no such column: prediction_json in SELECT schema FROM input_predictions";
+        for version in ["1.2.2", "2.0.0-rc.1", "2.0.0-rc.2+local"] {
+            assert_eq!(
+                tui_sessions::passthrough_fixed_in(reason, version),
+                Some("2.0.0-rc.3"),
+                "{version}"
+            );
+        }
+        for version in [
+            "",
+            "unknown",
+            "0.0.0",
+            "0.0.0-dev",
+            "2.0.0-rc.3",
+            "2.0.0-rc.4",
+            "2.0.0",
+            "3.0.0",
+        ] {
+            assert_eq!(
+                tui_sessions::passthrough_fixed_in(reason, version),
+                None,
+                "{version}"
+            );
+        }
+        assert_eq!(
+            tui_sessions::passthrough_fixed_in("refused|other error", "2.0.0-rc.2"),
+            None
+        );
     }
 
     #[test]

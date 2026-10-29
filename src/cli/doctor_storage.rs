@@ -150,12 +150,15 @@ fn recent_warning_check(marker: &Path) -> Option<Check> {
     if !kache_store::markers::marker_is_fresh(marker, 86_400) {
         return None;
     }
+    let content = std::fs::read_to_string(marker).ok()?;
+    let (timestamp, _) = kache_store::markers::parse_session_marker(&content)?;
+    let timestamp = chrono::DateTime::from_timestamp(i64::try_from(timestamp).ok()?, 0)?;
     Some(Check {
-        label: "Store build warning",
+        label: "Store warning history",
         pass: false,
-        detail: "a build emitted a store-open warning in the last 24 hours; a passing database check now does not explain that earlier failure".into(),
+        detail: format!("store-open warning recorded at {}; the record has no error details or Kache version", timestamp.to_rfc3339()),
         fix: Some(
-            "rerun the failing cargo command with KACHE_LOG_FILE=kache=debug,kache_store=debug; inspect kache.log for the full error and compare its user, cache path and file limits with this shell (history requires the same temporary directory)".into(),
+            "if a build still fails, rerun it with KACHE_LOG_FILE=kache=debug,kache_store=debug and inspect kache.log; this history expires after 24 hours and requires the same temporary directory".into(),
         ),
     })
 }
@@ -406,11 +409,24 @@ mod tests {
             false,
             false
         ));
-        assert!(check.detail.contains("last 24 hours"));
-        assert!(check.fix.unwrap().contains("KACHE_LOG_FILE"));
+        assert_eq!(check.label, "Store warning history");
+        let content = fs::read_to_string(&marker).unwrap();
+        let timestamp = content.trim().parse::<i64>().unwrap();
+        let recorded_at = chrono::DateTime::from_timestamp(timestamp, 0).unwrap();
+        assert!(check.detail.contains(&recorded_at.to_rfc3339()));
+        assert!(check.detail.contains("no error details or Kache version"));
+        let fix = check.fix.unwrap();
+        assert!(fix.contains("if a build still fails"));
+        assert!(fix.contains("KACHE_LOG_FILE"));
+        assert!(fix.contains("24 hours"));
+        assert_eq!(fs::read_to_string(&marker).unwrap(), content);
         fs::write(&marker, "1").unwrap();
         assert!(recent_warning_check(&marker).is_none());
         fs::write(&marker, "invalid marker").unwrap();
+        assert!(recent_warning_check(&marker).is_none());
+        fs::write(&marker, u64::MAX.to_string()).unwrap();
+        assert!(recent_warning_check(&marker).is_none());
+        fs::write(&marker, i64::MAX.to_string()).unwrap();
         assert!(recent_warning_check(&marker).is_none());
     }
 

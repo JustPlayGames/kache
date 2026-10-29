@@ -73,9 +73,12 @@ private incremental state. See [Executables and incremental builds](/docs/gettin
 
 `kache explain` describes recorded builds. A historical SQL/schema error in a
 skip record is evidence about that build, not a new database query failing now.
-On main, incompatible prediction metadata is migrated while compiled entries
-are kept, and known legacy prediction errors have a shorter text explanation.
-JSON retains the original error for diagnosis.
+Since v2.0.0-rc.3, Kache rebuilds incompatible prediction metadata and keeps
+compiled entries. Clearing the cache is unnecessary. Recognized prediction
+failures recorded by older versions appear under "Earlier Kache bugs".
+The report shows which Kache versions recorded the build. A failure recorded
+by RC.3 or later still needs investigation. JSON retains the original error
+and producer version for diagnosis.
 
 `Details missing` or an unexplained cause means the retained event lacks the
 inputs needed to compare keys. Enable recording before reproducing the build:
@@ -85,7 +88,7 @@ inputs needed to compare keys. Enable recording before reproducing the build:
 explain_miss = true
 ```
 
-RC2 also supports `kache config set cache.explain_miss true`. Recording applies
+You can also run `kache config set cache.explain_miss true`. Recording applies
 to future events; it cannot reconstruct old key details or history already
 rotated away. After rebuilding, compare `kache explain --root "$PWD"` with
 `kache explain --all --root "$PWD"`: the first selects the latest build, while

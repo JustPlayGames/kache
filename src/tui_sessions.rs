@@ -475,6 +475,7 @@ pub(crate) struct PassthroughGroup {
     pub reason: String,
     pub count: usize,
     pub probe: bool,
+    pub fixed_in: Option<&'static str>,
 }
 
 /// A crate that keeps missing across builds of the same tree.
@@ -567,20 +568,22 @@ pub(crate) fn analyze_session(
     sort_costliest_first(&mut causes);
     let costliest = costliest_miss(analyzed.iter().map(|&index| &events[index]));
 
-    let mut passes: BTreeMap<(String, String), PassthroughGroup> = BTreeMap::new();
+    let mut passes = BTreeMap::new();
     for &index in &session.events {
         let event = &events[index];
         if !matches!(event.result, EventResult::Passthrough) {
             continue;
         }
         let (kind, reason) = passthrough_parts(&event.passthrough_reason);
+        let fixed_in = passthrough_fixed_in(&event.passthrough_reason, &event.version);
         let group = passes
-            .entry((kind.to_string(), reason.to_string()))
+            .entry((kind.to_string(), reason.to_string(), fixed_in))
             .or_insert_with(|| PassthroughGroup {
                 kind: kind.to_string(),
                 reason: reason.to_string(),
                 count: 0,
                 probe: is_probe(event),
+                fixed_in,
             });
         group.count += 1;
     }
@@ -670,6 +673,18 @@ pub(crate) fn passthrough_words(reason: &str) -> String {
     } else {
         format!("{kind}: {detail}")
     }
+}
+
+/// Recognize the prediction migration bug only in records from before its fix.
+/// Missing or invalid producer versions cannot establish that a failure is old.
+pub(crate) fn passthrough_fixed_in(reason: &str, version: &str) -> Option<&'static str> {
+    let (_, detail) = passthrough_parts(reason);
+    if !detail.starts_with("build-script cache bypassed: no such column: prediction_json in ") {
+        return None;
+    }
+    let version = semver::Version::parse(version).ok()?;
+    let fixed = semver::Version::parse("2.0.0-rc.3").unwrap();
+    (version > semver::Version::new(0, 0, 0) && version < fixed).then_some("2.0.0-rc.3")
 }
 
 /// What the log knew before each event, built in one pass so every miss is

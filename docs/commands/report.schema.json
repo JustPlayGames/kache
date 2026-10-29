@@ -471,7 +471,8 @@
         "reason": { "type": "string" },
         "count": { "type": "integer", "minimum": 0 },
         "failures": { "type": "integer", "minimum": 0 },
-        "max_elapsed_ms": { "type": "integer", "minimum": 0 }
+        "max_elapsed_ms": { "type": "integer", "minimum": 0 },
+        "fixed_in": { "type": "string", "description": "Release that fixed this recognized failure in an older producer version. Omitted for current or unrecognized failures." }
       }
     },
     "BypassDetail": {
@@ -490,6 +491,7 @@
       ],
       "properties": {
         "crate_name": { "type": "string" },
+        "version": { "type": "string", "description": "Kache version that recorded this invocation. Omitted when unavailable." },
         "root": { "type": "string" },
         "package": { "type": "string", "description": "Package a build-script run belongs to. Omitted when empty." },
         "result": {

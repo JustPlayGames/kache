@@ -12,15 +12,14 @@ the rest. Optional remote storage shares that work between machines.
 These docs follow v2 on `main`. To use the published v2 preview:
 
 ```bash
-cargo install kache --locked --version 2.0.0-rc.2
+cargo install kache --locked --version 2.0.0-rc.4
 kache init
 kache doctor --probe
 cargo build
 ```
 
-An unversioned install selects the stable channel. Features marked **main**,
-including Blaze, were added after this release
-candidate. The [upgrade guide](/docs/getting-started/upgrade-v2) maps the versions
+An unversioned install selects the stable channel. Optional Blaze routing is
+available from RC.3. The [upgrade guide](/docs/getting-started/upgrade-v2) maps the versions
 and explains the paired `kache`/`kache-engine` installation.
 
 You need Rust 1.95 or newer to install through Cargo. Prebuilt packages are

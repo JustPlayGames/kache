@@ -208,7 +208,7 @@ Storage rows include the volume identity when reported. Unix rows show available
 
 When a daemon answers, doctor compares its reported configuration with this process's snapshot and names differences in store paths, remote state and other reported settings. New daemons also report their PID, effective user and open-file limits captured after startup raised the limit. Older daemons show an informational notice when those fields are unavailable. The temporary cache probe checks the local Rust pipeline separately from the configured store and project-specific flags.
 
-If a build emitted a store-open warning in the last 24 hours, doctor reports that history even when the database opens now. The history is informational and depends on the warning marker remaining in the same temporary directory. To capture the full error, rerun the failing Cargo command with `KACHE_LOG_FILE=kache=debug,kache_store=debug` and inspect `kache.log` (see [diagnostic logs](/docs/daemon/lifecycle)).
+If a build emitted a store-open warning in the last 24 hours, "Store warning history" shows when it was recorded, even when the database opens now. The marker retains no error details or Kache version. This history is informational and requires the same temporary directory. If a build still fails, rerun it with `KACHE_LOG_FILE=kache=debug,kache_store=debug` and inspect `kache.log` (see [diagnostic logs](/docs/daemon/lifecycle)).
 
 Doctor also reports, for information, how many misses in the latest build differ from the same crates built in another checkout ("Other checkouts"); `kache explain` says what to set. It reports where the running binary is installed ("Install path"), whether the C/C++ shims are active, broken, not first on `PATH` or not installed, and whether the login service runs a binary that no longer exists, is not executable, or is a different file from the running Kache. Run `kache daemon install` to fix the last one.
 
@@ -414,6 +414,10 @@ Without a crate, `explain` reads the latest recorded build and says why it misse
 | differs from the build in another checkout | The first build of the crate in this tree, and its inputs differ from the same crate built in another checkout. `kache explain <crate>` names the input. A path into the checkout that Kache did not map needs `KACHE_BASE_DIR`; a C or C++ library a build script generated with the checkout's path or a timestamp in it needs prefix maps and `ZERO_AR_DATE`; a flag or file that really differs needs nothing |
 | no earlier compile | The first build of the crate in this tree, or older history was rotated away |
 | miss details were not recorded | The retained event lacks key-comparison details; `[cache] explain_miss = true` records them from the next build. Older releases call this unexplained |
+
+The report shows the Kache versions that recorded the build alongside the installed version. "Earlier Kache bugs" separates recognized failures from releases before a known fix. The old prediction-metadata migration failure was fixed in v2.0.0-rc.3: Kache rebuilds those predictions and keeps compiled cache entries. There is no need to clear the cache. The same failure recorded by RC.3 or later remains a normal error, as do records whose producer version is unknown.
+
+`kache explain --all` keeps the full retained history and shows the producer version for each invocation. JSON preserves the original reasons, adds `version` to individual records, and marks recognized older failures with `fixed_in`.
 
 The report ends with the command that explains the costliest crate, and the one that writes the build's timeline as a Perfetto trace. `--root` limits it to builds of one tree. It exits 0; the hidden `kache diff` prints the miss counts and unexplained shares of the two builds and exits 1 when either grew, for scripts that gate on that. `kache why-miss` is the same command under its earlier name.
 

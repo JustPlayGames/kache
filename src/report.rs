@@ -806,11 +806,15 @@ pub struct BypassReason {
     pub count: usize,
     pub failures: usize,
     pub max_elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_in: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BypassDetail {
     pub crate_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root: String,
     /// Package of a build-script run. Empty for compiles.
@@ -1864,12 +1868,14 @@ pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> Bypass
         .filter(|detail| detail.route == "direct")
         .count();
 
-    let mut grouped = std::collections::BTreeMap::<(String, String, String), BypassReason>::new();
+    let mut grouped = std::collections::BTreeMap::new();
     for detail in &details {
+        let fixed_in = crate::tui_sessions::passthrough_fixed_in(&detail.reason, &detail.version);
         let key = (
             detail.result.clone(),
             detail.route.clone(),
             detail.reason.clone(),
+            fixed_in,
         );
         let entry = grouped.entry(key).or_insert_with(|| BypassReason {
             result: detail.result.clone(),
@@ -1878,6 +1884,7 @@ pub(crate) fn build_bypass_analysis(events: &[BuildEvent], top: usize) -> Bypass
             count: 0,
             failures: 0,
             max_elapsed_ms: 0,
+            fixed_in: fixed_in.map(str::to_string),
         });
         entry.count += 1;
         if detail.exit_code.is_some_and(|code| code != 0) {
@@ -1984,6 +1991,7 @@ fn to_bypass_detail(e: &BuildEvent) -> BypassDetail {
     let (start_time, end_time, start_unix_ms, end_unix_ms) = event_timeline(e);
     BypassDetail {
         crate_name: e.crate_name.clone(),
+        version: e.version.clone(),
         root: e.root.clone(),
         package: e.package.clone(),
         result: e.result.to_string(),
