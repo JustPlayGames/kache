@@ -58,7 +58,9 @@ cache pipeline over an authenticated named pipe.
 
 `kache doctor` reports daemon health separately from compiler-execution
 eligibility. A refused handoff can use the local engine before Commit. After
-Commit, a lost connection fails the invocation rather than rerunning it.
+Commit, a daemon that goes away without answering (stopped, restarted or
+killed) leaves the compile to the local engine, once; an answer it gave, a
+failed compile included, is final.
 
 RC2 supports an explicit trust option for certain known process-identity token
 differences. It must be enabled in both configurations and requires a daemon
