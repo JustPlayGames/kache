@@ -1069,6 +1069,41 @@ pub(crate) fn pre_clean_outputs(
     }
 }
 
+/// Remove a unit's outputs, all but its `.rmeta`, before it compiles again
+/// after a daemon lost its compile (`recover_from_lost_handoff` in main.rs).
+/// Finds them as [`discover_output_files`] does (the same identity rules as
+/// [`pre_clean_outputs`]); returns how many it removed.
+pub(crate) fn remove_outputs_except_metadata(
+    output_path: Option<&Path>,
+    out_dir: Option<&Path>,
+    crate_name: Option<&str>,
+    extra_filename: Option<&str>,
+    emit: &[String],
+) -> usize {
+    let Ok(files) = discover_output_files(output_path, out_dir, crate_name, extra_filename, emit)
+    else {
+        return 0;
+    };
+    let mut removed = 0;
+    for (path, name) in files {
+        if name.ends_with(".rmeta") {
+            continue;
+        }
+        #[cfg(windows)]
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.permissions().readonly()
+        {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Remove a file if it exists and is read-only (likely a kache hardlink).
 fn remove_if_readonly(path: &Path) {
     let Ok(entry) = std::fs::symlink_metadata(path) else {
