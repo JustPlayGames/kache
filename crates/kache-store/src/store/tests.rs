@@ -1,4 +1,5 @@
 mod cost_backfill_tests;
+mod key_bridge_tests;
 
 #[test]
 fn incompatible_predictions_are_relearned_without_removing_compiled_entries() {
