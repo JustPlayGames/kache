@@ -728,13 +728,30 @@ fn otel_snapshot_from_stats(config: &Config, snap: &StatsSnapshot) -> crate::ote
 
 // ── kache stats ────────────────────────────────────────────────────────────
 
-fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
+/// The store's bytes split by who holds them: `Exclusive`, the store's own
+/// blocks, which eviction frees, and `Shared`, blocks a target directory
+/// hardlinks or clones too, which the limit leaves out and only cleaning
+/// those targets frees (lane KACHE-W21: the Cache row and the sweep log name
+/// the sum, which read as a store far over its cap). None while no block is
+/// shared and no snapshot holds one: then Cache is all exclusive.
+fn cloned_targets_rows(disk: &crate::machine::DiskView) -> Vec<StatsRow> {
     let cloned = disk.cloned_into_targets_bytes;
     let snapshot = disk.snapshot_retained_bytes;
     if cloned == 0 && snapshot == 0 {
-        return None;
+        return Vec::new();
     }
-    let mut notes = vec!["private".to_string()];
+    let mut exclusive = vec!["the store's own blocks, which eviction frees".to_string()];
+    if snapshot > 0 {
+        exclusive.push(format!(
+            "and {} held only by filesystem snapshots",
+            term::bytes(snapshot)
+        ));
+    }
+    let mut rows = vec![(
+        "Exclusive",
+        term::bytes(disk.disk_private_bytes),
+        exclusive.join(", "),
+    )];
     if cloned > 0 {
         // Evicting a blob a target still holds frees nothing, so a size
         // sweep leaves these out, and the Cache size can stay above Limit.
@@ -774,22 +791,13 @@ fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
                 )
             }
         };
-        notes.push(format!(
-            "{} cloned into target/, which the limit leaves out{why}",
-            term::bytes(cloned)
+        rows.push((
+            "Shared",
+            term::bytes(cloned),
+            format!("hardlinked or cloned into target/, which the limit leaves out{why}"),
         ));
     }
-    if snapshot > 0 {
-        notes.push(format!(
-            "{} held only by filesystem snapshots",
-            term::bytes(snapshot)
-        ));
-    }
-    Some((
-        "On disk",
-        term::bytes(disk.disk_private_bytes),
-        notes.join(", "),
-    ))
+    rows
 }
 
 /// The volume holding the cache: its size, what is free, and the free-space
@@ -1016,7 +1024,7 @@ pub fn stats(
         lifetime: lifetime_rows(lifetime.as_ref(), chrono::Local::now().date_naive()),
         ..Default::default()
     };
-    extras.cache.extend(cloned_targets_row(&disk));
+    extras.cache.extend(cloned_targets_rows(&disk));
     extras.cache.extend(volume.as_ref().map(volume_row));
     let mut compact_machine = machine.clone();
     compact_machine.rowid_high_water.clear();

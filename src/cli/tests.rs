@@ -721,73 +721,73 @@ fn the_volume_row_says_what_is_free_and_whether_recovery_is_on() {
 }
 
 #[test]
-fn cloned_targets_summary_only_appears_for_retained_blocks() {
+fn storage_splits_exclusive_and_shared_bytes_only_when_blocks_are_shared() {
     let dir = tempfile::tempdir().unwrap();
     let mut disk = crate::machine::disk_view(dir.path(), 0, 1024);
-    assert!(cloned_targets_row(&disk).map(row_text).is_none());
+    let text = |disk: &crate::machine::DiskView| {
+        cloned_targets_rows(disk)
+            .into_iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+    };
+    assert!(text(&disk).is_empty());
 
     disk.disk_private_bytes = 3;
     disk.cloned_into_targets_bytes = 7;
-    let line = cloned_targets_row(&disk)
-        .map(row_text)
-        .expect("cloned blocks need a summary");
-    assert!(line.contains("3 B"), "{line}");
-    assert!(
-        line.contains("7 B cloned into target/, which the limit leaves out"),
-        "{line}"
+    let rows = text(&disk);
+    assert_eq!(
+        rows,
+        [
+            "Exclusive | 3 B | the store's own blocks, which eviction frees",
+            "Shared | 7 B | hardlinked or cloned into target/, which the limit leaves out",
+        ]
     );
-    assert!(!line.contains("snapshots"), "{line}");
-    assert!(!line.contains("over Limit"), "{line}");
 
     // A store over its cap says how much of the excess targets hold.
     disk.store_bytes = 100;
     disk.store_limit_bytes = 95;
-    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    let shared = text(&disk).pop().unwrap();
     assert!(
-        line.contains(": it is why Cache reads 5 B over Limit, and only cleaning those targets"),
-        "{line}"
+        shared.contains(": it is why Cache reads 5 B over Limit, and only cleaning those targets"),
+        "{shared}"
     );
     disk.store_limit_bytes = 90;
-    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    let shared = text(&disk).pop().unwrap();
     assert!(
-        line.contains("; Cache reads 10 B over Limit, 7 B of it held there"),
-        "{line}"
+        shared.contains("; Cache reads 10 B over Limit, 7 B of it held there"),
+        "{shared}"
     );
     // Past what targets hold, the store's own excess is either inside the
     // 10 % it may pass Limit by before a sweep starts, or due for a sweep.
     disk.store_limit_bytes = 1000;
     disk.cloned_into_targets_bytes = 70;
     disk.store_bytes = 1100;
-    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    let shared = text(&disk).pop().unwrap();
     assert!(
-        line.contains("70 B of it held there, the other 30 B within the 10 % a store may grow"),
-        "{line}"
+        shared.contains("70 B of it held there, the other 30 B within the 10 % a store may grow"),
+        "{shared}"
     );
     disk.store_bytes = 1200;
-    let line = cloned_targets_row(&disk).map(row_text).unwrap();
+    let shared = text(&disk).pop().unwrap();
     assert!(
-        line.contains("the other 130 B past the sweep's start"),
-        "{line}"
+        shared.contains("the other 130 B past the sweep's start"),
+        "{shared}"
     );
     disk.cloned_into_targets_bytes = 7;
     disk.store_bytes = 0;
 
     disk.snapshot_retained_bytes = 5;
-    let line = cloned_targets_row(&disk)
-        .map(row_text)
-        .expect("both retainers are named");
-    assert!(line.contains("7 B cloned"), "{line}");
+    let rows = text(&disk);
     assert!(
-        line.contains("5 B held only by filesystem snapshots"),
-        "{line}"
+        rows[0].ends_with("and 5 B held only by filesystem snapshots"),
+        "{rows:?}"
     );
+    assert!(rows[1].starts_with("Shared | 7 B"), "{rows:?}");
 
     disk.cloned_into_targets_bytes = 0;
-    let line = cloned_targets_row(&disk)
-        .map(row_text)
-        .expect("snapshot blocks need a summary");
-    assert!(!line.contains("cloned"), "{line}");
-    assert!(line.contains("5 B held only"), "{line}");
+    let rows = text(&disk);
+    assert_eq!(rows.len(), 1, "snapshot blocks alone: no Shared row");
+    assert!(rows[0].contains("5 B held only"), "{rows:?}");
 }
 
 #[test]
