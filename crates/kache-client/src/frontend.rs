@@ -56,50 +56,67 @@ pub fn run(version: &str) -> Result<i32> {
                 let socket = config.socket_path();
                 let attempt =
                     execution.try_execute_attempt(&socket, config.trust_daemon_execution)?;
-                if let kache_ipc::execution::Attempt::Completed(exit) = attempt {
-                    return Ok(exit);
-                }
-                if attempt == kache_ipc::execution::Attempt::Declined {
-                    return forward_engine(
-                        &executable,
-                        version,
-                        &args,
-                        started_at,
-                        Forward::Declined,
-                    );
-                }
-                if attempt == kache_ipc::execution::Attempt::Lost {
-                    return forward_engine(
-                        &executable,
-                        version,
-                        &args,
-                        started_at,
-                        Forward::DaemonLost,
-                    );
-                }
-                // A daemon that is there but not answering is not started
-                // again, nor one that answered and declined: starting one
-                // would only find it, at the cost of an engine process.
-                #[cfg(windows)]
-                if attempt == kache_ipc::execution::Attempt::Unavailable
-                    && !kache_ipc::execution::daemon_unresponsive(&socket)
-                    && let Some(exit) = windows::try_bootstrap(
-                        &execution,
-                        &socket,
-                        config.disabled,
-                        config.trust_daemon_execution,
-                    )?
-                {
-                    return Ok(exit);
-                }
+                let bootstrap = || -> Result<kache_ipc::execution::Attempt> {
+                    // A daemon that is there but not answering is not
+                    // started again: starting one would only find it, at
+                    // the cost of an engine process.
+                    #[cfg(windows)]
+                    if !kache_ipc::execution::daemon_unresponsive(&socket) {
+                        return windows::try_bootstrap(
+                            &execution,
+                            &socket,
+                            config.disabled,
+                            config.trust_daemon_execution,
+                        );
+                    }
+                    Ok(kache_ipc::execution::Attempt::Unavailable)
+                };
+                return match next_step(attempt, bootstrap)? {
+                    Next::Exit(exit) => Ok(exit),
+                    Next::Engine(forward) => {
+                        forward_engine(&executable, version, &args, started_at, forward)
+                    }
+                };
             }
         }
     }
     forward_engine(&executable, version, &args, started_at, Forward::Plain)
 }
 
+/// What the frontend does with a compile after the daemon's answer.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// The daemon ran the compile: exit with its code.
+    Exit(i32),
+    /// Run the engine, telling it this.
+    Engine(Forward),
+}
+
+/// The next step after a daemon's answer, `attempt`. When no daemon took
+/// the compile, `bootstrap` may start one and hand it the compile again
+/// (Windows); its answer counts as the first one would have, so a compile
+/// the new daemon declined or lost after Commit reaches the engine as such:
+/// a lost one is compiled again locally after its half-written outputs are
+/// removed, never handed to a daemon once more.
+fn next_step(
+    attempt: kache_ipc::execution::Attempt,
+    bootstrap: impl FnOnce() -> Result<kache_ipc::execution::Attempt>,
+) -> Result<Next> {
+    use kache_ipc::execution::Attempt;
+    let attempt = match attempt {
+        Attempt::Unavailable => bootstrap()?,
+        attempt => attempt,
+    };
+    Ok(match attempt {
+        Attempt::Completed(exit) => Next::Exit(exit),
+        Attempt::Declined => Next::Engine(Forward::Declined),
+        Attempt::Lost => Next::Engine(Forward::DaemonLost),
+        Attempt::Unavailable => Next::Engine(Forward::Plain),
+    })
+}
+
 /// What the engine a frontend forwards to is told about the daemon.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Forward {
     Plain,
     /// The running daemon declined this compile.
@@ -297,6 +314,38 @@ mod tests {
         )
         .unwrap();
         assert!(file.is_none(), "short invocations stay inline");
+    }
+
+    #[test]
+    fn a_bootstrapped_daemons_answer_reaches_the_engine_as_the_first_ones() {
+        use kache_ipc::execution::Attempt;
+        // No daemon answered: the one the frontend starts (Windows) gets the
+        // compile, and what it answers is what the engine is told. A compile
+        // it lost after Commit must be compiled again locally, after its
+        // outputs are cleaned, not handed to whichever daemon runs next.
+        for (bootstrapped, next) in [
+            (Attempt::Completed(3), Next::Exit(3)),
+            (Attempt::Lost, Next::Engine(Forward::DaemonLost)),
+            (Attempt::Declined, Next::Engine(Forward::Declined)),
+            (Attempt::Unavailable, Next::Engine(Forward::Plain)),
+        ] {
+            assert_eq!(
+                next_step(Attempt::Unavailable, || Ok(bootstrapped)).unwrap(),
+                next,
+                "{bootstrapped:?}"
+            );
+        }
+        // A daemon that answered is never started again.
+        for (first, next) in [
+            (Attempt::Completed(0), Next::Exit(0)),
+            (Attempt::Lost, Next::Engine(Forward::DaemonLost)),
+            (Attempt::Declined, Next::Engine(Forward::Declined)),
+        ] {
+            assert_eq!(
+                next_step(first, || panic!("started a daemon after {first:?}")).unwrap(),
+                next
+            );
+        }
     }
 
     #[test]

@@ -2,15 +2,18 @@
 
 use crate::Execution;
 use anyhow::Result;
+use kache_ipc::execution::Attempt;
 use std::path::Path;
 use std::process::Stdio;
 
+/// Start a daemon and hand it the compile: its answer, or
+/// [`Attempt::Unavailable`] when none was started.
 pub(super) fn try_bootstrap(
     execution: &Execution<'_>,
     socket: &Path,
     disabled: bool,
     trusted_pipeline: bool,
-) -> Result<Option<i32>> {
+) -> Result<Attempt> {
     let bootstrap = ["kache".into(), "daemon".into(), "start".into()];
     if !disabled
         && let Ok(mut command) = super::engine_command(
@@ -26,8 +29,8 @@ pub(super) fn try_bootstrap(
             .status()
             .is_ok_and(|status| status.success())
     {
-        execution.try_execute_with_trust(socket, trusted_pipeline)
+        execution.try_execute_attempt(socket, trusted_pipeline)
     } else {
-        Ok(None)
+        Ok(Attempt::Unavailable)
     }
 }
