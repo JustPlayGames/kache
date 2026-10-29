@@ -1959,6 +1959,10 @@ pub(crate) struct Daemon {
     /// and publication requests. Compiler scheduling has its own permits.
     #[cfg(any(unix, windows))]
     execution_workers: Arc<tokio::sync::Semaphore>,
+    /// Compiles a client handed over (Commit accepted) whose worker has not
+    /// returned yet. Shutdown waits for them ([`COMPILE_DRAIN_BOUND`]), and
+    /// health reports them, so a restart can wait for none to be running.
+    compiles_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     capacity: DaemonCapacity,
 }
 
@@ -2113,6 +2117,7 @@ impl Daemon {
             readonly_skip_warned: Mutex::new(None),
             #[cfg(any(unix, windows))]
             execution_workers: Arc::new(tokio::sync::Semaphore::new(capacity.executions)),
+            compiles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             capacity,
             config,
         }
@@ -2830,12 +2835,18 @@ impl Daemon {
         }
     }
 
+    /// Compiles handed over and still running ([`Daemon::compiles_in_flight`]).
+    fn compiles_in_flight(&self) -> usize {
+        self.compiles_in_flight.load(Ordering::Acquire)
+    }
+
     fn handle_health(&self) -> Response {
         Response {
             health: Some(DaemonHealth {
                 version: self.version.clone(),
                 build_epoch: build_epoch(),
                 remote_readonly: Some(self.config.remote_readonly),
+                compiles_in_flight: Some(self.compiles_in_flight() as u64),
             }),
             ..Response::ok()
         }
@@ -7575,12 +7586,13 @@ async fn server_main(
     }
     let idle_timeout = daemon_idle_timeout(idle_secs);
 
-    accept_loop(
+    accept_loop_with(
         &listener,
         &daemon,
         &lifecycle,
         idle_timeout,
         CONNECTION_HANDLER_DRAIN_TIMEOUT,
+        COMPILE_DRAIN_BOUND,
         shutdown_signal(),
     )
     .await;
@@ -7732,6 +7744,26 @@ fn accept_error_logged(failures: u32) -> bool {
 /// shutdown acknowledgement) without letting a silent client hold the daemon
 /// open forever.
 const CONNECTION_HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long shutdown waits for compiles clients already handed over
+/// (`compiles_in_flight`) before it cancels them, counted from the start of
+/// the drain. A stop or restart used to cut them at
+/// [`CONNECTION_HANDLER_DRAIN_TIMEOUT`] and fail other people's builds.
+///
+/// Ten minutes: on the build machine (2026-10-27/29, 315,711 compiles) the
+/// p99.9 compile took 250 s, the p99.99 423 s, the longest 849 s (5 over
+/// 600 s). The drain ends when the last of them does, which is seconds in
+/// the usual case; the bound is only for a stop in the middle of the longest
+/// ones, and a compile cut there is run again by its client
+/// (`Attempt::Lost`). A service manager must give the daemon longer than
+/// this to stop: systemd's `TimeoutStopSec` at least
+/// [`SERVICE_STOP_TIMEOUT`], or it kills the daemon first.
+pub(crate) const COMPILE_DRAIN_BOUND: Duration = Duration::from_secs(600);
+
+/// The stop timeout the daemon's service needs: [`COMPILE_DRAIN_BOUND`], plus
+/// what shutdown does after the handlers (prefetch 5 s, uploads 30 s, the
+/// index's quiet compaction) and a margin.
+pub(crate) const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(720);
 
 /// Overall budget a `RemoteCheck` waits behind another task's in-flight
 /// download of the same key before giving up and reporting a remote miss
@@ -8002,12 +8034,36 @@ fn first_periodic_gc_delay(
 
 /// Accept until the shared lifecycle closes admission, an idle budget expires,
 /// or the OS requests shutdown. Per-request guards include response delivery.
+#[cfg(test)]
 async fn accept_loop(
     listener: &TokioListener,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
     idle_timeout: Option<Duration>,
     handler_drain_timeout: Duration,
+    shutdown_signal: impl std::future::Future<Output = ()>,
+) {
+    accept_loop_with(
+        listener,
+        daemon,
+        lifecycle,
+        idle_timeout,
+        handler_drain_timeout,
+        COMPILE_DRAIN_BOUND,
+        shutdown_signal,
+    )
+    .await;
+}
+
+/// [`accept_loop`], with handed-over compiles given `compile_drain_bound`
+/// (from the start of the drain) to finish before they are cancelled.
+async fn accept_loop_with(
+    listener: &TokioListener,
+    daemon: &Arc<Daemon>,
+    lifecycle: &Arc<Lifecycle>,
+    idle_timeout: Option<Duration>,
+    handler_drain_timeout: Duration,
+    compile_drain_bound: Duration,
     shutdown_signal: impl std::future::Future<Output = ()>,
 ) {
     tokio::pin!(shutdown_signal);
@@ -8110,16 +8166,55 @@ async fn accept_loop(
     // the runtime and starts draining uploads.
     lifecycle.start_drain();
     daemon.stop_prefetch_admission();
-    let drain_deadline = tokio::time::Instant::now() + handler_drain_timeout;
-    let _ = lifecycle.drain_until(drain_deadline).await;
+    let drain_started = tokio::time::Instant::now();
+    let handler_deadline = drain_started + handler_drain_timeout;
+    let compile_deadline = drain_started + compile_drain_bound.max(handler_drain_timeout);
+    let mut waited_for_compiles = false;
+    loop {
+        if lifecycle.snapshot().active == 0 {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        let compiles = daemon.compiles_in_flight();
+        // Handed-over compiles run on to the compile bound; anything else
+        // gets the handler deadline, as before.
+        if now >= compile_deadline || (now >= handler_deadline && compiles == 0) {
+            break;
+        }
+        if now >= handler_deadline && !waited_for_compiles {
+            waited_for_compiles = true;
+            tracing::info!(
+                compiles,
+                bound_s = compile_drain_bound.as_secs(),
+                "waiting for compiles handed over before shutdown"
+            );
+        }
+        tokio::select! {
+            biased;
+            _ = lifecycle.drain() => break,
+            // A client arriving now gets its connection closed at once, so it
+            // compiles locally instead of waiting in the listen queue for an
+            // answer that cannot come.
+            accepted = listener.accept() => drop(accepted),
+            Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                observe_connection_handler(result);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+    // Requests' guards end after their replies are written, so whatever is
+    // still running at the deadline is cancelled; a handed-over compile's
+    // client then runs it again itself.
+    let compiles = daemon.compiles_in_flight();
     if drain_connection_handlers(
         &mut handlers,
-        drain_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        handler_deadline.saturating_duration_since(tokio::time::Instant::now()),
     )
     .await
     {
         tracing::warn!(
             timeout_ms = handler_drain_timeout.as_millis() as u64,
+            compiles,
             "connection handler drain timed out; aborted remaining handlers"
         );
     }
@@ -8676,7 +8771,10 @@ async fn handle_connection_started_at(
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
     // does not shut it down", which causes the reader to never see EOF and
     // hangs the server loop (and tarpaulin coverage runs).
-    let mut reader = BufReader::new(&stream);
+    // Shared so a handed-over compile's worker holds the connection open
+    // until it returns (`execution::handle`).
+    let stream = Arc::new(stream);
+    let mut reader = BufReader::new(&*stream);
     let mut frame = Vec::new();
 
     loop {
@@ -8821,7 +8919,7 @@ async fn handle_connection_started_at(
 
         let mut resp_line = serde_json::to_string(&resp)?;
         resp_line.push('\n');
-        if let Err(e) = (&stream).write_all(resp_line.as_bytes()).await {
+        if let Err(e) = (&*stream).write_all(resp_line.as_bytes()).await {
             // Client closed without reading (fire-and-forget mode) — not an error.
             tracing::debug!("response write failed (client likely closed): {e}");
             break;
@@ -9663,6 +9761,7 @@ fn fetch_daemon_health(config: &Config) -> Result<DaemonHealth> {
             version: health.build,
             build_epoch: health.revision,
             remote_readonly: None,
+            compiles_in_flight: None,
         });
     }
     let response = send_request_with_timeout(
@@ -9685,6 +9784,20 @@ pub(crate) fn daemon_remote_readonly(config: &Config) -> Option<bool> {
     )
     .ok()?;
     parse_daemon_health(&response).ok()?.remote_readonly
+}
+
+/// How many compiles the daemon at `config`'s socket has taken from clients
+/// and not finished, from one legacy health round trip (no store access).
+/// `None` when no daemon answers (one that is draining no longer does) or it
+/// predates the field.
+pub(crate) fn daemon_compiles_in_flight(config: &Config) -> Option<u64> {
+    let response = send_request_with_timeout(
+        &config.socket_path(),
+        &Request::Health,
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    parse_daemon_health(&response).ok()?.compiles_in_flight
 }
 
 fn parse_daemon_health(response: &str) -> Result<DaemonHealth> {
@@ -9846,8 +9959,10 @@ pub fn send_shutdown_request(config: &Config) -> Result<()> {
         tracing::debug!("daemon did not answer the stop request yet: {error:#}");
         std::thread::sleep(Duration::from_millis(250));
     }
+    // The drain lets compiles clients handed over finish (up to
+    // COMPILE_DRAIN_BOUND), so this waits as long as a service manager would.
     anyhow::ensure!(
-        wait_for_run_lock_release(&socket_path, Duration::from_secs(35))?,
+        wait_for_run_lock_release(&socket_path, SERVICE_STOP_TIMEOUT)?,
         "daemon is still draining; ownership has not been released"
     );
     eprintln!("daemon stopped");
