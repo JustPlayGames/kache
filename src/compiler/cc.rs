@@ -7772,14 +7772,14 @@ impl CcCompiler {
         }
 
         hasher.update(b"cc_key_version:");
-        hasher.update(crate::cache_key::CACHE_KEY_VERSION.to_string().as_bytes());
+        hasher.update(crate::cache_key::CC_KEY_VERSION.to_string().as_bytes());
         hasher.update(b"\n");
         hasher.update(artifact_schema);
         tracing::trace!(
             target: "kache::cache_key",
             "[key:{}] cc_key_version={}",
             trace_name,
-            crate::cache_key::CACHE_KEY_VERSION
+            crate::cache_key::CC_KEY_VERSION
         );
 
         if !self.base_dirs.is_empty() {
