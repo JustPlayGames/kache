@@ -757,12 +757,16 @@ pub(crate) struct KeyBridge {
     pub applies: fn(&RustcArgs) -> bool,
 }
 
-fn bridge_all_rustc(_: &RustcArgs) -> bool {
-    true
+/// Prototype: the bump to 34 changes no hashed byte, so every rustc entry of
+/// 33 is adoptable. `KACHE_KEY_BRIDGE_SCOPE=nonlinking` plays a bump that
+/// changed how linking units key (as 33's linker identity did): those miss.
+fn bridge_all_rustc(args: &RustcArgs) -> bool {
+    match std::env::var("KACHE_KEY_BRIDGE_SCOPE").as_deref() {
+        Ok("nonlinking") => !args.invokes_linker(),
+        _ => true,
+    }
 }
 
-/// Prototype: the bump to 34 changes no hashed byte, so every rustc entry of
-/// 33 is adoptable.
 pub(crate) const KEY_BRIDGES: &[KeyBridge] = &[KeyBridge {
     from: 33,
     applies: bridge_all_rustc,
