@@ -73,3 +73,42 @@ fn a_legacy_entry_is_adopted_only_when_key_version_crate_and_bytes_agree() {
         }
     }
 }
+
+/// Eviction ranks a row of an earlier key version as one no key of this
+/// release reaches, until a hit says otherwise: also a hit inside
+/// [`HIT_STAMP_INTERVAL`] (a row stamped a second ago, then hit by the new
+/// release, kept ranking first). A newer release's row is not stale to an
+/// older one (a rollback keeps its rows ranked by idleness).
+#[test]
+fn a_hit_on_an_earlier_key_versions_row_stops_it_ranking_stale_at_once() {
+    let current = kache_format::CACHE_KEY_VERSION;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    legacy_entry(&store, dir.path(), "earlier", current - 1);
+    legacy_entry(&store, dir.path(), "newer", current + 1);
+    let idle = |key: &str| {
+        store
+            .eviction_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .unwrap()
+            .idle_hours
+    };
+    assert!(idle("earlier") >= STALE_KEY_SCHEMA_IDLE_HOURS, "not hit yet");
+    assert!(idle("newer") < 1.0, "a newer version is not an earlier one");
+
+    // Just stored, so well inside the stamp interval.
+    store.get("earlier").unwrap().expect("a hit");
+
+    let schema: u32 = store
+        .db
+        .query_row(
+            "SELECT key_schema FROM entries WHERE cache_key = 'earlier'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(schema, current);
+    assert!(idle("earlier") < 1.0);
+}
