@@ -799,9 +799,36 @@ mod tests {
         assert!(resident > 1 << 20, "{resident}");
     }
 
+    /// glibc fixes its arena limit the first time a thread finds more than
+    /// eight arenas, and ignores `M_ARENA_MAX` after that: in a test process
+    /// whose other tests' threads got there first, the cap cannot work, as it
+    /// cannot in a daemon that sets it late. So the check runs in a process
+    /// of its own, as the daemon sets the cap, before its threads start.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn capped_malloc_arenas_stop_many_threads_making_one_each() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::tests::capped_malloc_arenas_fixture",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "run in a process of its own by capped_malloc_arenas_stop_many_threads_making_one_each"]
+    fn capped_malloc_arenas_fixture() {
         use std::sync::{Arc, Barrier};
         assert!(super::cap_malloc_arenas(super::DAEMON_MALLOC_ARENAS));
         let before = malloc_arena_count();
