@@ -99,7 +99,7 @@ const ACTION_KIND: &[u8] = b"kache-build-script-action-v3";
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
 const OUT_PREFIX: &str = "out/";
-pub(crate) const CRATE_NAME: &str = "build_script_run";
+pub(crate) const CRATE_NAME: &str = kache_format::BUILD_SCRIPT_RUN_CRATE_NAME;
 /// Above this an `OUT_DIR` is left uncached: a directory this size is a build
 /// tree, not a build-script product, and restoring it would not be cheaper
 /// than the run.
