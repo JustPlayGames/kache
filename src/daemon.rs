@@ -9671,17 +9671,22 @@ pub fn send_memo_rows(
     send_request_fire_and_forget(socket_path, &req).is_ok()
 }
 
-/// How long a wrapper waits for the daemon to take an adoption it verified
-/// ([`send_adoption`]): the daemon answers once it holds the key's lock,
-/// before anything is written.
-const ADOPTION_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a wrapper waits for the daemon's answer to an adoption it
+/// handed over ([`send_adoption`]), as for a hit's stamp
+/// (`HIT_STAMP_HANDOFF_WAIT`): a daemon that refuses (an older release,
+/// another store) answers well within it, and one slower than this still
+/// reads the request and takes it. At 2 s, waiting for the answer summed to
+/// 15-42 s of a 3-build burst's wrappers at load ~70-120 (lane KACHE-W23).
+const ADOPTION_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Hand a verified key-bridge adoption to the daemon to register later, in a
 /// batch ([`Request::AdoptEntries`]); the wrapper restores from the verified
 /// entry without waiting for that. True when the daemon took it, or another
-/// process holds the key, or no answer came in time (the request is in its
-/// socket). False when no daemon took it (none runs, an older release,
-/// another store, an error): the wrapper then registers it itself.
+/// process holds the key, or no answer came within [`ADOPTION_HANDOFF_WAIT`]
+/// (the request is in its socket; at worst it is lost, and the key's next
+/// lookup adopts it again). False when no daemon took it (none runs, an
+/// older release, another store, an error): the wrapper then registers it
+/// itself.
 pub fn send_adoption(
     socket_path: &Path,
     cache_dir: &Path,
