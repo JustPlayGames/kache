@@ -12,6 +12,16 @@
 //! printed the same keys. Other hosts key the linker and libc differently
 //! and need goldens captured there.
 //!
+//! Windows x86_64 (MSVC) has goldens of its own (lane KACHE-W24), captured
+//! the same way on a Windows VM from the tasty.56 tree built for
+//! `x86_64-pc-windows-msvc`: there a link keys the MSVC identity (link.exe
+//! and cl.exe banners, toolset, SDK and UCRT versions, runtime libraries)
+//! instead of a linker driver and libc. The fixture is a stand-in developer
+//! prompt (`VCINSTALLDIR`, `VSCMD_ARG_TGT_ARCH`, `LIB`, ...) over a private
+//! tree, and the stand-in programs are copies of this test binary, which
+//! answer as the tool they are named after before `main` runs
+//! ([`windows_stand_in`]), so no compiler or Visual Studio is needed.
+//!
 //! A release build (no `key-bump-trial`: key version 33, no bridge) must key
 //! each of them exactly as tasty.56 did: its keys are the goldens themselves,
 //! so the machinery ships without invalidating a single entry (lane
@@ -22,14 +32,13 @@
 //! that changes nothing for it must leave its golden alone. Never update a
 //! golden to make this pass: recapture it from the bridged release.
 
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-
 use super::*;
 
 /// The bridged release's key version these goldens belong to.
 const GOLDEN_VERSION: u32 = 33;
 
 /// (kind, links, key under tasty.56 / v84).
+#[cfg(not(windows))]
 const GOLDENS: &[(&str, bool, &str)] = &[
     (
         "rlib_check",
@@ -68,16 +77,61 @@ const GOLDENS: &[(&str, bool, &str)] = &[
     ),
 ];
 
+/// (kind, links, key under tasty.56 on Windows x86_64, MSVC; captured on
+/// cc-vm-3 from a cargo-xwin build of f5cced6d, lane KACHE-W24). The
+/// clippy check's key is the same on both hosts.
+#[cfg(windows)]
+const GOLDENS: &[(&str, bool, &str)] = &[
+    (
+        "rlib_check",
+        false,
+        "6fd2628be507560a60fa90918dd4cf0bac87a77f9bc8a7d29f51008a88137174",
+    ),
+    (
+        "rlib_build",
+        false,
+        "4260a00f95c459194d070f70cadd47610b6b7dbe7e42ae7c39d6bcf18c0fe78d",
+    ),
+    (
+        "rlib_with_extern",
+        false,
+        "5f4e202001bd731d5dab7bcef43ebce947058603383588abb69b360d5e65a347",
+    ),
+    (
+        "proc_macro",
+        true,
+        "2b1cab4ebec93d78930af479d1acb8138f50cf8eaaffcc570d059686d1b56232",
+    ),
+    (
+        "bin",
+        true,
+        "cc6d902f89d06a3fa3d726e71579f32a2103727b39a49f93e146dad1c52902e0",
+    ),
+    (
+        "build_script_build",
+        true,
+        "34880d2776b15f3fe0fd41fde3e29d112446a0a7de52a4864a64771a7eae4eb3",
+    ),
+    (
+        "clippy_check",
+        false,
+        "9d9819d8fea8aacb50d1bd11d3a255f55f8d99bb5d83f8b0c99cd0c2e3d98d57",
+    ),
+];
+
 /// `(kind, key, legacy key)` of one golden invocation.
 type GoldenKey = (&'static str, String, Option<(u32, String)>);
 
+#[cfg(unix)]
 const RUSTC: &str = "#!/bin/sh\n\
 case \"$*\" in\n\
   *--print*sysroot*) echo \"${0%/bin/rustc}/sysroot\" ;;\n\
   *-vV*|*--version*) printf 'rustc 1.99.0 (golden 2026-10-01)\\nbinary: rustc\\ncommit-hash: 0123456789abcdef0123456789abcdef01234567\\ncommit-date: 2026-10-01\\nhost: x86_64-unknown-linux-gnu\\nrelease: 1.99.0\\nLLVM version: 21.1.0\\n' ;;\n\
   *) exit 1 ;;\n\
 esac\n";
+#[cfg(unix)]
 const CLIPPY: &str = "#!/bin/sh\necho 'clippy 0.1.99 (golden 2026-10-01)'\n";
+#[cfg(unix)]
 const LINKER: &str = "#!/bin/sh\n\
 bin=\"${0%/cc}\"; lib=\"${0%/bin/cc}/lib\"\n\
 for arg in \"$@\"; do case \"$arg\" in\n\
@@ -86,7 +140,9 @@ for arg in \"$@\"; do case \"$arg\" in\n\
   -print-prog-name=*) n=\"${arg#-print-prog-name=}\"; if [ -x \"$bin/$n\" ]; then echo \"$bin/$n\"; else echo \"$n\"; fi; exit 0 ;;\n\
   --version|-v|-dumpversion) echo 'cc (golden) 14.0.0'; exit 0 ;;\n\
 esac; done\n";
+#[cfg(unix)]
 const LD: &str = "#!/bin/sh\necho 'GNU ld (golden) 2.99'\n";
+#[cfg(unix)]
 /// The C runtime the stand-in linker driver places.
 const CRT: &[&str] = &[
     "Scrt1.o",
@@ -97,7 +153,9 @@ const CRT: &[&str] = &[
     "crtendS.o",
     "libc.so.6",
 ];
+#[cfg(unix)]
 const GETCONF: &str = "#!/bin/sh\necho 'glibc 2.99'\n";
+#[cfg(unix)]
 const LDD: &str = "#!/bin/sh\necho 'ldd (GNU libc) 2.99'\n";
 
 /// The key of each golden invocation, computed in a fresh workspace under
@@ -130,7 +188,20 @@ fn golden_keys(root: &Path, scope: Option<&str>) -> Vec<GoldenKey> {
     keys
 }
 
-fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
+/// The stand-in toolchain of [`golden_keys`] in the workspace `ws`.
+struct Toolchain {
+    /// The workspace, as the invocation names it.
+    ws: PathBuf,
+    /// Variables that find the toolchain, before Cargo's own.
+    vars: Vec<(&'static str, String)>,
+    rustc: PathBuf,
+    clippy: PathBuf,
+    /// `-C linker=` of the linking kinds, if the platform passes one.
+    linker: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+fn toolchain(root: &Path) -> Toolchain {
     let ws = root.join("ws");
     let bin = ws.join("toolchain/bin");
     for dir in [
@@ -164,6 +235,195 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
     }
     let ws = ws.canonicalize().unwrap();
     let bin = ws.join("toolchain/bin");
+    Toolchain {
+        vars: vec![("PATH", bin.display().to_string())],
+        rustc: bin.join("rustc"),
+        clippy: bin.join("clippy-driver"),
+        linker: Some(bin.join("cc")),
+        ws,
+    }
+}
+
+/// The MSVC toolset, SDK and UCRT versions of the Windows fixture.
+#[cfg(windows)]
+const MSVC_TOOLSET: &str = "14.99.99999";
+#[cfg(windows)]
+const WINDOWS_SDK: &str = "10.0.99999.0";
+
+/// A stand-in developer prompt: rustc and clippy-driver in a toolchain,
+/// link.exe and cl.exe in an MSVC toolset, the runtime libraries every
+/// native MSVC link hashes, and the variables `vcvars` sets. Cargo passes no
+/// `-C linker` for MSVC, so the link identity comes from this environment.
+#[cfg(windows)]
+fn toolchain(root: &Path) -> Toolchain {
+    let ws = root.join("ws");
+    let bin = ws.join("toolchain").join("bin");
+    let vc = ws.join("msvc").join("VC");
+    let tools = vc.join("Tools").join("MSVC").join(MSVC_TOOLSET);
+    let tools_bin = tools.join("bin").join("Hostx64").join("x64");
+    let vc_lib = tools.join("lib").join("x64");
+    let sdk = ws.join("sdk");
+    let ucrt_lib = sdk.join("Lib").join(WINDOWS_SDK).join("ucrt").join("x64");
+    let um_lib = sdk.join("Lib").join(WINDOWS_SDK).join("um").join("x64");
+    for dir in [
+        &ws.join("src"),
+        &ws.join("target").join("debug").join("deps"),
+        &ws.join("home"),
+        &ws.join("tmp"),
+        &ws.join("cache"),
+        &ws.join("toolchain").join("sysroot"),
+        &sdk.join("Include").join(WINDOWS_SDK),
+        &bin,
+        &tools_bin,
+        &vc_lib,
+        &ucrt_lib,
+        &um_lib,
+    ] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    for (dir, name) in [
+        (&bin, "rustc.exe"),
+        (&bin, "clippy-driver.exe"),
+        (&tools_bin, "link.exe"),
+        (&tools_bin, "cl.exe"),
+    ] {
+        windows_stand_in::place(&dir.join(name));
+    }
+    for (dir, names) in [
+        (
+            &vc_lib,
+            &[
+                "libcmt.lib",
+                "libcmtd.lib",
+                "msvcrt.lib",
+                "msvcrtd.lib",
+                "vcruntime.lib",
+                "vcruntimed.lib",
+                "libvcruntime.lib",
+                "libvcruntimed.lib",
+            ][..],
+        ),
+        (
+            &ucrt_lib,
+            &["ucrt.lib", "ucrtd.lib", "libucrt.lib", "libucrtd.lib"][..],
+        ),
+        (&um_lib, &["kernel32.lib", "ntdll.lib", "advapi32.lib"][..]),
+    ] {
+        for name in names {
+            std::fs::write(dir.join(name), format!("golden {name}")).unwrap();
+        }
+    }
+    let path = |path: &Path| path.display().to_string();
+    let dir = |path: &Path| format!("{}\\", path.display());
+    Toolchain {
+        vars: vec![
+            ("PATH", format!("{};{}", path(&bin), path(&tools_bin))),
+            ("VCINSTALLDIR", dir(&vc)),
+            ("VCToolsInstallDir", dir(&tools)),
+            ("VCToolsVersion", MSVC_TOOLSET.to_string()),
+            ("VSCMD_ARG_HOST_ARCH", "x64".to_string()),
+            ("VSCMD_ARG_TGT_ARCH", "x64".to_string()),
+            ("WindowsSdkDir", dir(&sdk)),
+            ("WindowsSDKVersion", format!("{WINDOWS_SDK}\\")),
+            ("UniversalCRTSdkDir", dir(&sdk)),
+            ("UCRTVersion", WINDOWS_SDK.to_string()),
+            (
+                "LIB",
+                format!("{};{};{}", path(&vc_lib), path(&ucrt_lib), path(&um_lib)),
+            ),
+        ],
+        rustc: bin.join("rustc.exe"),
+        clippy: bin.join("clippy-driver.exe"),
+        linker: None,
+        ws,
+    }
+}
+
+/// The stand-in programs of the Windows fixture: hard links (or copies) of
+/// the running test binary named after the tool they stand in for, beside a
+/// marker file. A C runtime initializer (`.CRT$XCU`, run before `main`)
+/// answers as that tool when it finds the marker beside its own executable,
+/// so the real test harness never starts in them. Output is fixed text,
+/// like the Unix fixture's shell scripts; kache keys tools by their output,
+/// never by their bytes.
+#[cfg(windows)]
+mod windows_stand_in {
+    use std::io::Write as _;
+    use std::path::Path;
+
+    const MARKER: &str = "kache-golden-stand-in";
+
+    pub(super) fn place(path: &Path) {
+        let exe = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&exe, path).is_err() {
+            std::fs::copy(&exe, path).unwrap();
+        }
+        std::fs::write(path.parent().unwrap().join(MARKER), "").unwrap();
+    }
+
+    #[used]
+    #[unsafe(link_section = ".CRT$XCU")]
+    static ANSWER: extern "C" fn() = answer;
+
+    extern "C" fn answer() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let Some(dir) = exe.parent() else {
+            return;
+        };
+        if !dir.join(MARKER).is_file() {
+            return;
+        }
+        let tool = exe
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+        let (text, code) = match tool.as_str() {
+            "rustc" if args.contains("--print") && args.contains("sysroot") => (
+                format!("{}\n", dir.parent().unwrap().join("sysroot").display()),
+                0,
+            ),
+            "rustc" if args.contains("-vV") || args.contains("--version") => (
+                "rustc 1.99.0 (golden 2026-10-01)\nbinary: rustc\n\
+                 commit-hash: 0123456789abcdef0123456789abcdef01234567\n\
+                 commit-date: 2026-10-01\nhost: x86_64-pc-windows-msvc\n\
+                 release: 1.99.0\nLLVM version: 21.1.0\n"
+                    .to_string(),
+                0,
+            ),
+            "rustc" => (String::new(), 1),
+            "clippy-driver" => ("clippy 0.1.99 (golden 2026-10-01)\n".to_string(), 0),
+            "link" => (
+                "Microsoft (R) Incremental Linker Version 14.99.99999.0\n\
+                 Copyright (C) Microsoft Corporation.  All rights reserved.\n"
+                    .to_string(),
+                0,
+            ),
+            "cl" => (
+                "Microsoft (R) C/C++ Optimizing Compiler Version 19.99.99999 for x64\n\
+                 Copyright (C) Microsoft Corporation.  All rights reserved.\n"
+                    .to_string(),
+                0,
+            ),
+            _ => return,
+        };
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(text.as_bytes());
+        let _ = stdout.flush();
+        std::process::exit(code);
+    }
+}
+
+fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
+    let Toolchain {
+        ws,
+        vars,
+        rustc,
+        clippy,
+        linker,
+    } = toolchain(root);
     let lib_rs = ws.join("src/lib.rs");
     let main_rs = ws.join("src/main.rs");
     let build_rs = ws.join("build.rs");
@@ -175,8 +435,7 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
     std::fs::write(&dep_rmeta, b"golden dependency metadata").unwrap();
 
     let invocation = crate::invocation::InvocationEnv::from_parts(
-        [
-            ("PATH", bin.display().to_string()),
+        vars.into_iter().chain([
             (
                 "CARGO",
                 ws.join("toolchain/bin/cargo").display().to_string(),
@@ -185,7 +444,7 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
             ("CARGO_PKG_VERSION", "0.1.0".to_string()),
             ("CARGO_MANIFEST_DIR", ws.display().to_string()),
             ("CARGO_CRATE_NAME", "golden".to_string()),
-        ],
+        ]),
         Some(ws.clone()),
         Some(ws.join("home")),
         ws.join("tmp"),
@@ -195,7 +454,7 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
     let normalizer = PathNormalizer::from_invocation(Some(&ws), &invocation);
     let env = KeyEnv::from_invocation(&invocation);
 
-    let rustc = bin.join("rustc").display().to_string();
+    let rustc = rustc.display().to_string();
     let common = |crate_name: &str, source: &Path, crate_type: &str, emit: &str| {
         let mut argv = vec![
             rustc.clone(),
@@ -223,9 +482,11 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
             "-L".into(),
             format!("dependency={}", deps.display()),
         ];
-        if crate_type != "lib" {
+        if crate_type != "lib"
+            && let Some(linker) = &linker
+        {
             argv.push("-C".into());
-            argv.push(format!("linker={}", bin.join("cc").display()));
+            argv.push(format!("linker={}", linker.display()));
         }
         argv
     };
@@ -277,9 +538,9 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
             build_rs.clone(),
         ),
     ];
-    let mut clippy = common("golden", &lib_rs, "lib", "dep-info,metadata");
-    clippy.insert(0, bin.join("clippy-driver").display().to_string());
-    kinds.push(("clippy_check", clippy, lib_rs.clone()));
+    let mut clippy_argv = common("golden", &lib_rs, "lib", "dep-info,metadata");
+    clippy_argv.insert(0, clippy.display().to_string());
+    kinds.push(("clippy_check", clippy_argv, lib_rs.clone()));
 
     kinds
         .into_iter()
@@ -302,7 +563,7 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
 
 /// Prints the keys of [`golden_keys`] in the tree it runs in, twice from
 /// two directories; the capture of [`GOLDENS`].
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(any(target_os = "linux", windows), target_arch = "x86_64"))]
 #[test]
 #[ignore = "capture: run in the bridged release's tree"]
 fn golden_capture() {
@@ -316,7 +577,7 @@ fn golden_capture() {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(any(target_os = "linux", windows), target_arch = "x86_64"))]
 #[test]
 fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
     let dir = tempfile::tempdir().unwrap();
@@ -368,7 +629,7 @@ fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
 /// them, and the same golden for the rest (a trial bump only: a release
 /// build has no bridge).
 #[cfg(all(
-    target_os = "linux",
+    any(target_os = "linux", windows),
     target_arch = "x86_64",
     feature = "key-bump-trial"
 ))]
