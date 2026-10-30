@@ -4075,7 +4075,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                  key_schema = MAX(key_schema, ?3) WHERE cache_key = ?1",
             )?;
             for (key, count) in hits {
-                stamp.execute(params![key, i64::from(*count), kache_format::CACHE_KEY_VERSION])?;
+                stamp.execute(params![
+                    key,
+                    i64::from(*count),
+                    kache_format::CACHE_KEY_VERSION
+                ])?;
             }
         }
         tx.commit()?;

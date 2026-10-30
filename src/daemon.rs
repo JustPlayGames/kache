@@ -6,13 +6,13 @@ use kache_core::timeline::{
 };
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 pub use kache_protocol::{
-    AdoptEntriesRequest, BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest, CompileStartedRequest,
-    DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome, HashFileRequest,
-    HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest, PrefetchRequest,
-    PrefetchStatsSnapshot, PrestageRequest, RecordEventsRequest, RecordFileHashesRequest,
-    RecordPredictionsRequest,
-    RecordTargetRootsRequest, RemoteCheckRequest, SeedTargetRequest, StampHitsRequest, StatsEntry,
-    StatsRequest, TransferDirection, TransferEvent, UploadJob,
+    AdoptEntriesRequest, BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest,
+    CompileStartedRequest, DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome,
+    HashFileRequest, HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest,
+    PrefetchRequest, PrefetchStatsSnapshot, PrestageRequest, RecordEventsRequest,
+    RecordFileHashesRequest, RecordPredictionsRequest, RecordTargetRootsRequest,
+    RemoteCheckRequest, SeedTargetRequest, StampHitsRequest, StatsEntry, StatsRequest,
+    TransferDirection, TransferEvent, UploadJob,
 };
 pub use kache_protocol::{
     GcBreakdown, GcRequest, GcRequestMode, PredictionPublishRequest, Request, Response,
@@ -6514,7 +6514,8 @@ impl Daemon {
                                 break;
                             }
                         }
-                        let _ = tokio::task::spawn_blocking(move || daemon.run_hinted_sweep()).await;
+                        let _ =
+                            tokio::task::spawn_blocking(move || daemon.run_hinted_sweep()).await;
                     });
                 }
             }

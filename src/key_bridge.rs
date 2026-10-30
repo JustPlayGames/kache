@@ -120,12 +120,10 @@ pub(crate) fn adopt_on_miss(
             } else {
                 ADOPTED.fetch_add(1, Ordering::Relaxed) + 1
             };
-            let bytes =
-                ADOPTED_BYTES.fetch_add(adoption.bytes, Ordering::Relaxed) + adoption.bytes;
+            let bytes = ADOPTED_BYTES.fetch_add(adoption.bytes, Ordering::Relaxed) + adoption.bytes;
             let verify_us = VERIFY_US.fetch_add(micros(adoption.verify), Ordering::Relaxed)
                 + micros(adoption.verify);
-            let register_us = REGISTER_US
-                .fetch_add(micros(adoption.register), Ordering::Relaxed)
+            let register_us = REGISTER_US.fetch_add(micros(adoption.register), Ordering::Relaxed)
                 + micros(adoption.register);
             tracing::debug!(
                 "key bridge: adopted v{version} entry for {crate_name}: {} files, {} bytes \

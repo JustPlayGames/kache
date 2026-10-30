@@ -26,7 +26,11 @@ fn legacy_entry(store: &Store, dir: &Path, key: &str, version: u32) -> EntryMeta
 fn refcount(store: &Store, hash: &str) -> i64 {
     store
         .db
-        .query_row("SELECT refcount FROM blobs WHERE hash = ?1", params![hash], |r| r.get(0))
+        .query_row(
+            "SELECT refcount FROM blobs WHERE hash = ?1",
+            params![hash],
+            |r| r.get(0),
+        )
         .unwrap()
 }
 
@@ -36,9 +40,21 @@ fn a_legacy_entry_is_adopted_only_when_key_version_crate_and_bytes_agree() {
     // (case, legacy version stored, crate asked for, tamper with the blob, adopted)
     let cases = [
         ("adopted", old, "legacy_crate", false, true),
-        ("another version's entry", old - 1, "legacy_crate", false, false),
+        (
+            "another version's entry",
+            old - 1,
+            "legacy_crate",
+            false,
+            false,
+        ),
         ("another crate's entry", old, "other_crate", false, false),
-        ("a blob that lost its bytes", old, "legacy_crate", true, false),
+        (
+            "a blob that lost its bytes",
+            old,
+            "legacy_crate",
+            true,
+            false,
+        ),
     ];
     for (case, stored_as, crate_name, tamper, adopted) in cases {
         let dir = tempfile::tempdir().unwrap();
@@ -118,7 +134,10 @@ fn a_hit_on_an_earlier_key_versions_row_stops_it_ranking_stale_at_once() {
             .unwrap()
             .idle_hours
     };
-    assert!(idle("earlier") >= STALE_KEY_SCHEMA_IDLE_HOURS, "not hit yet");
+    assert!(
+        idle("earlier") >= STALE_KEY_SCHEMA_IDLE_HOURS,
+        "not hit yet"
+    );
     assert!(idle("newer") < 1.0, "a newer version is not an earlier one");
     assert!(idle("cc") < 1.0, "a C compile at its own key version");
     assert!(
