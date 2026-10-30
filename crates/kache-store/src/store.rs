@@ -2608,15 +2608,20 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 const INDEX_SCHEMA_GENERATION: i64 = 12;
 
 /// What [`ArtifactStore::adopt_legacy_entry`] did for one entry.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Adoption {
     /// The entry's files, each re-hashed against its content address.
     pub files: usize,
     pub bytes: u64,
     pub verify: Duration,
-    /// The new row, its blob references and its meta.json.
+    /// The new row, its blob references and its meta.json, or the hand-off
+    /// of them ([`Registered::Deferred`]).
     pub register: Duration,
     pub outcome: AdoptionOutcome,
+    /// The verified legacy entry's metadata, under the new key and version:
+    /// what to restore from, whether or not its row is written yet. `None`
+    /// when nothing was verified (another process held or had the key).
+    pub meta: Option<EntryMeta>,
 }
 
 /// How an adoption ended ([`Adoption::outcome`]).
@@ -2630,6 +2635,9 @@ pub enum AdoptionOutcome {
     /// Another process holds the key's build lock (adopting or compiling
     /// it): nothing was hashed, and the caller's claim waits for it.
     Contended,
+    /// Verified, and handed to a registrar that writes the row later
+    /// ([`Registered::Deferred`]): restore from [`Adoption::meta`].
+    Deferred,
 }
 
 /// One verified adoption to register ([`ArtifactStore::register_adoptions`]).
@@ -2649,6 +2657,10 @@ pub enum Registered {
     ByPeer,
     /// The legacy row, its meta.json or a blob is gone or does not bind.
     Refused,
+    /// Handed to a registrar (the daemon's) that writes it later and holds
+    /// the key's build lock, marked storing, until then (lane KACHE-W23):
+    /// nobody waits for the index on the build's critical path.
+    Deferred,
 }
 
 /// Idle hours added to an entry of an earlier key version when it is ranked
@@ -3766,14 +3778,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         cache_key: &str,
         crate_name: &str,
     ) -> Result<Option<Adoption>> {
-        self.adopt_legacy_entry_with(legacy_key, legacy_version, cache_key, crate_name, |req| {
-            Ok(self.register_adoptions(std::slice::from_ref(req))?[0])
-        })
+        self.adopt_legacy_entry_with(
+            legacy_key,
+            legacy_version,
+            cache_key,
+            crate_name,
+            |req, _lock| Ok(self.register_adoptions(std::slice::from_ref(req))?[0]),
+        )
     }
 
     /// [`Self::adopt_legacy_entry`], with `register` writing the new row:
     /// this store's [`Self::register_adoptions`], or a daemon that batches
-    /// the registrations of many builds into one transaction.
+    /// the registrations of many builds into one transaction. `register`
+    /// gets the key's build lock, marked storing, and releases it: after its
+    /// own registration, or before a hand-off to a registrar that takes the
+    /// key's lock itself ([`Registered::Deferred`]).
     ///
     /// Safe only because the caller computed `legacy_key` with the earlier
     /// version's derivation for this same invocation. The key's build lock
@@ -3795,7 +3814,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         legacy_version: u32,
         cache_key: &str,
         crate_name: &str,
-        register: impl FnOnce(&AdoptionRequest) -> Result<Registered>,
+        register: impl FnOnce(&AdoptionRequest, KeyLock) -> Result<Registered>,
     ) -> Result<Option<Adoption>> {
         if self.read_only || legacy_key == cache_key || !self.contains(legacy_key) {
             return Ok(None);
@@ -3845,23 +3864,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             cache_key: cache_key.to_string(),
             crate_name: crate_name.to_string(),
         };
-        let outcome = match register(&request)? {
+        let outcome = match register(&request, lock)? {
             Registered::Adopted => AdoptionOutcome::Adopted,
             Registered::ByPeer => AdoptionOutcome::ByPeer,
+            Registered::Deferred => AdoptionOutcome::Deferred,
             Registered::Refused => return Ok(None),
         };
-        drop(lock);
+        let mut adopted_meta = meta;
+        adopted_meta.cache_key = cache_key.to_string();
+        adopted_meta.key_schema = kache_format::CACHE_KEY_VERSION;
         let adoption = Adoption {
-            files: meta.files.len(),
+            files: adopted_meta.files.len(),
             bytes: verified_bytes,
             verify,
             register: register_started.elapsed(),
             outcome,
+            meta: Some(adopted_meta),
         };
         tracing::debug!(
-            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}: {adoption:?}",
+            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}: {:?}, {} files, \
+             {} bytes, verified in {:?}, registered in {:?}",
             &legacy_key[..16.min(legacy_key.len())],
             &cache_key[..16.min(cache_key.len())],
+            adoption.outcome,
+            adoption.files,
+            adoption.bytes,
+            adoption.verify,
+            adoption.register,
         );
         Ok(Some(adoption))
     }

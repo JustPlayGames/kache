@@ -215,3 +215,35 @@ fn a_batch_of_adoptions_registers_each_on_its_own() {
         "already_crate"
     );
 }
+
+/// A registration handed to a registrar (KACHE-W23): the caller gets the
+/// verified entry under the new key to restore from at once, nothing is
+/// written yet, and the key's lock is the registrar's to take: the closure
+/// had it and let it go.
+#[test]
+fn a_deferred_adoption_hands_back_the_verified_entry_unwritten() {
+    let old = kache_format::CACHE_KEY_VERSION - 1;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let meta = legacy_entry(&store, dir.path(), "legacy", old);
+    let before = refcount(&store, &meta.files[0].hash);
+
+    let got = store
+        .adopt_legacy_entry_with("legacy", old, "current", "legacy_crate", |request, lock| {
+            assert_eq!(request.cache_key, "current");
+            assert!(store.store_in_flight("current"), "held and marked storing");
+            drop(lock);
+            Ok(Registered::Deferred)
+        })
+        .unwrap()
+        .expect("an outcome");
+
+    assert_eq!(got.outcome, AdoptionOutcome::Deferred);
+    let restored = got.meta.expect("the verified entry");
+    assert_eq!(restored.cache_key, "current");
+    assert_eq!(restored.key_schema, kache_format::CACHE_KEY_VERSION);
+    assert_eq!(restored.files, meta.files);
+    assert!(!store.contains("current"), "not written");
+    assert_eq!(refcount(&store, &meta.files[0].hash), before);
+    assert!(store.try_lock("current").unwrap().is_some());
+}
