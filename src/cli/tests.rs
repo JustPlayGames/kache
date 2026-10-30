@@ -1045,7 +1045,7 @@ fn stale_schema_gc_records_its_run() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().to_path_buf(), None);
 
-    gc(&config, None, true, true).unwrap();
+    gc(&config, None, true, None, true).unwrap();
 
     let stats = crate::report::read_gc_stats(&config.cache_dir).expect("stale-schema run recorded");
     assert_eq!(stats.source, "manual");

@@ -8049,13 +8049,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// `bridged` (one a key bridge of this release adopts on a miss) stays
     /// until it has been idle for `bridge_grace`: removing it would turn the
     /// adoption the bridge exists for into a compile (lane KACHE-W22).
+    ///
+    /// `limit` caps the rows one run removes, the longest unused first, so
+    /// a store with hundreds of thousands of them (a key bump's leftovers)
+    /// can be emptied in short runs (lane KACHE-W24).
     pub fn evict_stale_key_schemas(
         &self,
         bridged: &[u32],
         bridge_grace: Duration,
+        limit: Option<usize>,
     ) -> Result<GcStats> {
         self.refuse_write("evict")?;
-        let keys = self.stale_key_schema_keys(bridged, bridge_grace)?;
+        let mut keys = self.stale_key_schema_keys(bridged, bridge_grace)?;
+        if let Some(limit) = limit {
+            keys.truncate(limit);
+        }
         let candidates = self.eviction_candidates()?;
         let by_key = candidates
             .iter()
@@ -8077,7 +8085,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         ))
     }
 
-    /// The rows [`Self::evict_stale_key_schemas`] removes, in key order.
+    /// The rows [`Self::evict_stale_key_schemas`] removes, the longest unused
+    /// first.
     pub fn stale_key_schema_keys(
         &self,
         bridged: &[u32],
@@ -8106,7 +8115,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
              WHERE committed = 1
                AND (key_schema = 0 OR key_schema > {rustc} OR key_schema < {component})
                AND NOT {kept_by_bridge}
-             ORDER BY cache_key"
+             ORDER BY last_accessed, cache_key"
         ))?;
         let grace = format!("-{} seconds", bridge_grace.as_secs());
         let keys = if bridged.is_empty() {

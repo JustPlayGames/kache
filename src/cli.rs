@@ -4638,10 +4638,12 @@ pub fn gc_stale_targets(config: &Config, days: u64, apply: bool, json: bool) -> 
 /// found is not discarded before the builds that need it ran once.
 const BRIDGED_ROW_GRACE: std::time::Duration = std::time::Duration::from_secs(14 * 86_400);
 
+/// `limit` caps a `--stale-schema` run's removals.
 pub fn gc(
     config: &Config,
     max_age_hours: Option<u64>,
     stale_schema: bool,
+    limit: Option<usize>,
     json: bool,
 ) -> Result<()> {
     if stale_schema {
@@ -4670,7 +4672,7 @@ pub fn gc(
                         .len(),
                 )
         };
-        let mut stats = store.evict_stale_key_schemas(&bridged, BRIDGED_ROW_GRACE)?;
+        let mut stats = store.evict_stale_key_schemas(&bridged, BRIDGED_ROW_GRACE, limit)?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
         record_manual_gc_run(config, &stats);
         if json {
@@ -4681,6 +4683,17 @@ pub fn gc(
             describe_eviction(&stats, false),
             crate::cache_key::CACHE_KEY_VERSION,
         );
+        if limit.is_some() {
+            let left = store
+                .stale_key_schema_keys(&bridged, BRIDGED_ROW_GRACE)?
+                .len();
+            if left > 0 {
+                println!(
+                    "{} left: run it again to remove more.",
+                    term::counted(left as u64, "stale entry", "stale entries")
+                );
+            }
+        }
         if kept_for_bridge > 0 {
             println!(
                 "Kept {} of key version {} for this release to adopt, until idle {} days.",
@@ -5234,7 +5247,7 @@ pub fn clean_cache(
         CacheAction::Gc {
             max_age_hours,
             stale_schema,
-        } => gc(config, max_age_hours, stale_schema, json),
+        } => gc(config, max_age_hours, stale_schema, None, json),
         CacheAction::Purge {
             crate_name,
             question,
