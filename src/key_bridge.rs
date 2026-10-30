@@ -91,27 +91,70 @@ fn register(
     Ok(registered)
 }
 
+/// Longest a lookup waits for an adoptable key another process holds
+/// ([`adopt_on_miss`]), as [`crate::wrapper`]'s wait for an entry in flight.
+const HELD_KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// After `cache_key` missed in `store`: adopt its legacy twin's entry, if one
 /// is remembered and the store has it. The entry to restore from: the
 /// verified legacy entry under `cache_key`, whether its row is written yet
 /// or handed to the daemon to write ([`register`]); or a peer's entry
-/// committed meanwhile. `None` when there is nothing to adopt, and also when
-/// another process holds the key (adopting or compiling it): the caller's
-/// claim then waits for its commit.
+/// committed meanwhile. `None` when there is nothing to adopt.
+///
+/// A key another process holds (adopting it, or compiling it) is waited for,
+/// bounded by [`HELD_KEY_WAIT`]: its commit ends the wait, and so does the
+/// key coming free uncommitted, which this lookup then adopts itself. A
+/// wrapper lets the key go between its verification and the daemon's claim
+/// of the registration (lane KACHE-W23); a lookup that left the waiting to
+/// the miss path saw the key free and uncommitted there and compiled it (2
+/// to 4 units per 3-build burst).
 pub(crate) fn adopt_on_miss(
     store: &crate::store::Store,
     cache_key: &str,
 ) -> Option<crate::store::EntryMeta> {
-    let (version, legacy, crate_name) = legacy_of(cache_key)?;
+    let legacy = legacy_of(cache_key)?;
+    let waited = std::time::Instant::now();
+    let mut attempt = 0;
+    loop {
+        match adopt_once(store, cache_key, &legacy) {
+            Attempt::Entry(meta) => return Some(*meta),
+            Attempt::Nothing => return None,
+            Attempt::Held if attempt == 0 => {
+                CONTENDED.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    "key bridge: {} is held by another process; waiting for it",
+                    legacy.2
+                );
+            }
+            Attempt::Held => {}
+        }
+        if waited.elapsed() >= HELD_KEY_WAIT || crate::invocation::process::check().is_err() {
+            return None;
+        }
+        std::thread::sleep(
+            crate::store::lock_poll_interval(attempt).min(std::time::Duration::from_millis(10)),
+        );
+        attempt += 1;
+    }
+}
+
+/// What one adoption attempt found ([`adopt_once`]).
+enum Attempt {
+    Entry(Box<crate::store::EntryMeta>),
+    /// Another process holds the key's lock.
+    Held,
+    Nothing,
+}
+
+fn adopt_once(store: &crate::store::Store, cache_key: &str, legacy: &Legacy) -> Attempt {
+    let (version, legacy, crate_name) = (legacy.0, &legacy.1, &legacy.2);
     let adopted =
-        store.adopt_legacy_entry_with(&legacy, version, cache_key, &crate_name, |request, lock| {
+        store.adopt_legacy_entry_with(legacy, version, cache_key, crate_name, |request, lock| {
             register(store, request, lock)
         });
     match adopted {
         Ok(Some(adoption)) if adoption.outcome == crate::store::AdoptionOutcome::Contended => {
-            CONTENDED.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("key bridge: {crate_name} is held by another process; waiting for it");
-            None
+            Attempt::Held
         }
         Ok(Some(adoption)) => {
             let by_peer = adoption.meta.is_none();
@@ -146,18 +189,24 @@ pub(crate) fn adopt_on_miss(
                     register_us as f64 / 1e6
                 );
             }
-            match adoption.meta {
-                Some(meta) => Some(meta),
-                None => store.get(cache_key).ok().flatten(),
+            match adoption
+                .meta
+                .or_else(|| store.get(cache_key).ok().flatten())
+            {
+                Some(meta) => Attempt::Entry(Box::new(meta)),
+                None => Attempt::Nothing,
             }
         }
         Ok(None) => {
             NOT_FOUND.fetch_add(1, Ordering::Relaxed);
-            None
+            Attempt::Nothing
         }
         Err(error) => {
             tracing::warn!("key bridge: adopting for {crate_name} failed: {error:#}");
-            None
+            Attempt::Nothing
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
