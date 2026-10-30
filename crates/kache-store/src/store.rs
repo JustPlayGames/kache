@@ -2693,29 +2693,55 @@ static HIT_AGE_AND_STALE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock:
     )
 });
 
-/// Raise the refcount of every blob `cache_key` maps to at least the
-/// references all mappings hold on it. Run before giving this key's
-/// references back.
+/// Before `cache_key` gives back `releases` (per blob, the references its
+/// release is about to subtract), raise the refcount of each blob that
+/// release could take to zero to at least the references every other
+/// mapping holds on it plus the release's own. Returns how many it raised.
 ///
 /// A mapping can exist for references nobody counted (an older backfill
-/// mapped legacy entries before their migration). Subtracting such a mapping
-/// from a count that only covers the other owners would take one of theirs,
-/// and the blob would be reclaimed while they still need it. Flooring first
-/// can only retain too much, which the blob-index reconcile corrects.
-fn floor_blob_refs_at_mappings(
+/// mapped legacy entries before their migration). Subtracting from a count
+/// that only covers the other owners would take one of theirs, and the blob
+/// would be reclaimed while they still need it. Flooring first can only
+/// retain too much, which the blob-index reconcile corrects.
+///
+/// The floor compares against what this release subtracts, not against the
+/// mapping: a removal subtracts one per file its meta.json lists, which a
+/// drifted mapping may count differently. A count above the release stays
+/// above zero, and only a blob row at zero is deleted and unlinked, so such
+/// a blob is left as it is and summing its mappings is skipped: for a blob
+/// most entries share (the empty file: 503k mappings on one store) that sum
+/// cost about 0.2 s under the write lock on every removal. Whichever later
+/// release could take the count to zero floors it then, against the
+/// mappings left at that time.
+fn floor_blob_refs_before_release<'a>(
     conn: &rusqlite::Connection,
     cache_key: &str,
+    releases: impl IntoIterator<Item = (&'a str, i64)>,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE blobs
-         SET refcount = MAX(refcount, (
-             SELECT SUM(refs) FROM entry_blobs WHERE hash = blobs.hash
-         ))
-         WHERE hash IN (
-             SELECT hash FROM entry_blobs WHERE cache_key = ?1
-         )",
-        params![cache_key],
-    )
+    let mut raised = 0;
+    for (hash, release) in releases {
+        let refcount: Option<i64> = conn
+            .prepare_cached("SELECT refcount FROM blobs WHERE hash = ?1")?
+            .query_row(params![hash], |row| row.get(0))
+            .optional()?;
+        // No row: nothing to subtract from and nothing to unlink.
+        let Some(refcount) = refcount.filter(|&refcount| refcount <= release) else {
+            continue;
+        };
+        let others: i64 = conn
+            .prepare_cached(
+                "SELECT COALESCE(SUM(refs), 0) FROM entry_blobs \
+                 WHERE hash = ?1 AND cache_key <> ?2",
+            )?
+            .query_row(params![hash, cache_key], |row| row.get(0))?;
+        let floor = others.saturating_add(release);
+        if refcount < floor {
+            conn.prepare_cached("UPDATE blobs SET refcount = ?2 WHERE hash = ?1")?
+                .execute(params![hash, floor])?;
+            raised += 1;
+        }
+    }
+    Ok(raised)
 }
 
 /// Give back every blob reference `cache_key`'s current mapping holds, then
@@ -2755,7 +2781,18 @@ fn discard_changed_blob(conn: &rusqlite::Connection, blob: &Path, hash: &str, sn
 }
 
 fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusqlite::Result<()> {
-    floor_blob_refs_at_mappings(conn, cache_key)?;
+    // What the subtraction below takes: this key's mapped references.
+    let releases = conn
+        .prepare_cached("SELECT hash, refs FROM entry_blobs WHERE cache_key = ?1")?
+        .query_map(params![cache_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    floor_blob_refs_before_release(
+        conn,
+        cache_key,
+        releases.iter().map(|(hash, refs)| (hash.as_str(), *refs)),
+    )?;
     conn.execute(
         "UPDATE blobs
          SET refcount = MAX(0, refcount - COALESCE((
@@ -8980,8 +9017,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return Ok(RemovalAttempt::Done(None));
         }
         // A mapping nobody counted must not spend another entry's reference
-        // and unlink a blob that entry still serves from.
-        floor_blob_refs_at_mappings(&tx, cache_key)?;
+        // and unlink a blob that entry still serves from. The loop below
+        // subtracts one per file meta.json lists.
+        let mut releases: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+        for hash in &hashes {
+            *releases.entry(hash.as_str()).or_insert(0) += 1;
+        }
+        floor_blob_refs_before_release(&tx, cache_key, releases)?;
         tx.execute(
             "DELETE FROM entry_blobs WHERE cache_key = ?1",
             params![cache_key],
