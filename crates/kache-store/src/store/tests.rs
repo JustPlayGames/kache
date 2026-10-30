@@ -5217,6 +5217,49 @@ fn a_sweep_on_a_low_disk_ranks_again_once_its_ranking_ages() {
     assert!(!store.contains("in-use"), "{stats:?}");
 }
 
+/// An automatic size sweep used to walk its whole ranking under
+/// `gc.lock`, however long its rows took: the first one after an upgrade
+/// would walk every row of a dead key version. Past its walk budget it
+/// stops, once it has removed something, and says so; a sweep someone
+/// asked for, or one on a disk short of space, goes on to its target.
+#[test]
+fn an_automatic_size_sweep_stops_at_its_walk_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 300;
+    let fill = |store: &Store| {
+        for key in ["a", "b", "c"] {
+            put_idle_entry(store, dir.path(), key, 200);
+        }
+    };
+    let mut store = Store::open(&config).unwrap();
+    store.size_sweep_walk_budget = Duration::ZERO;
+    fill(&store);
+
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(stats.cut_short, "{stats:?}");
+
+    // Short of space until it gets back under the cap: past its budget
+    // it goes on to the target (400 -> 200 bytes).
+    let short = store
+        .evict_for_free_space(SweepOrigin::Automatic, || {
+            store.physical_size().unwrap() > 300
+        })
+        .unwrap();
+    assert_eq!(short.entries_evicted, 1, "{short:?}");
+    assert!(!short.cut_short, "{short:?}");
+
+    fill(&store);
+    let requested = store
+        .evict_for_free_space(SweepOrigin::Requested, || false)
+        .unwrap();
+    assert_eq!(requested.entries_evicted, 2, "{requested:?}");
+    assert!(!requested.cut_short, "{requested:?}");
+}
+
 #[test]
 fn shared_entry_retention_requires_the_last_positive_reference() {
     assert!(holds_last_reference(1, 1));
