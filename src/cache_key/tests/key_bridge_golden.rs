@@ -31,13 +31,41 @@ const GOLDEN_VERSION: u32 = 33;
 
 /// (kind, links, key under tasty.56 / v84).
 const GOLDENS: &[(&str, bool, &str)] = &[
-    ("rlib_check", false, "42abf4e800cda9d2abcbef10bed645b238ac6bc40d63035af77f26b764b6c3fb"),
-    ("rlib_build", false, "b348bd95305e4aa7f881cc895567b062a622bbd28537853a7ccf55c477a9ee55"),
-    ("rlib_with_extern", false, "6bf39934fd39a373663552602dfae9e1ee851c61ed61681259425147282c10a7"),
-    ("proc_macro", true, "42214a1d15c4548ada0a266bd1d26f116a235216e3f14fc0d973955c07b3ee75"),
-    ("bin", true, "9efc093b661ce4e42e764919f36e3e4ead1149ae06569f3ac1e823c62e3e4f07"),
-    ("build_script_build", true, "d3b2b8caa3c769b8890909f2f0308e55f5acefed69c6ebc4396b0288c8f9c8d1"),
-    ("clippy_check", false, "9d9819d8fea8aacb50d1bd11d3a255f55f8d99bb5d83f8b0c99cd0c2e3d98d57"),
+    (
+        "rlib_check",
+        false,
+        "42abf4e800cda9d2abcbef10bed645b238ac6bc40d63035af77f26b764b6c3fb",
+    ),
+    (
+        "rlib_build",
+        false,
+        "b348bd95305e4aa7f881cc895567b062a622bbd28537853a7ccf55c477a9ee55",
+    ),
+    (
+        "rlib_with_extern",
+        false,
+        "6bf39934fd39a373663552602dfae9e1ee851c61ed61681259425147282c10a7",
+    ),
+    (
+        "proc_macro",
+        true,
+        "42214a1d15c4548ada0a266bd1d26f116a235216e3f14fc0d973955c07b3ee75",
+    ),
+    (
+        "bin",
+        true,
+        "9efc093b661ce4e42e764919f36e3e4ead1149ae06569f3ac1e823c62e3e4f07",
+    ),
+    (
+        "build_script_build",
+        true,
+        "d3b2b8caa3c769b8890909f2f0308e55f5acefed69c6ebc4396b0288c8f9c8d1",
+    ),
+    (
+        "clippy_check",
+        false,
+        "9d9819d8fea8aacb50d1bd11d3a255f55f8d99bb5d83f8b0c99cd0c2e3d98d57",
+    ),
 ];
 
 /// `(kind, key, legacy key)` of one golden invocation.
@@ -75,10 +103,7 @@ const LDD: &str = "#!/bin/sh\necho 'ldd (GNU libc) 2.99'\n";
 /// The key of each golden invocation, computed in a fresh workspace under
 /// `root`: `(kind, key, legacy key)`.
 /// `scope` is the bridge scope (`KACHE_KEY_BRIDGE_SCOPE`) to compute under.
-fn golden_keys(
-    root: &Path,
-    scope: Option<&str>,
-) -> Vec<GoldenKey> {
+fn golden_keys(root: &Path, scope: Option<&str>) -> Vec<GoldenKey> {
     let _lock = key_test_lock();
     let saved: Vec<_> = ["KACHE_KEY_BRIDGE", "KACHE_KEY_BRIDGE_SCOPE"]
         .into_iter()
@@ -108,7 +133,14 @@ fn golden_keys(
 fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
     let ws = root.join("ws");
     let bin = ws.join("toolchain/bin");
-    for dir in ["src", "target/debug/deps", "home", "tmp", "cache", "toolchain/sysroot"] {
+    for dir in [
+        "src",
+        "target/debug/deps",
+        "home",
+        "tmp",
+        "cache",
+        "toolchain/sysroot",
+    ] {
         std::fs::create_dir_all(ws.join(dir)).unwrap();
     }
     std::fs::create_dir_all(&bin).unwrap();
@@ -124,7 +156,11 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
     }
     std::fs::create_dir_all(ws.join("toolchain/lib")).unwrap();
     for name in CRT {
-        std::fs::write(ws.join("toolchain/lib").join(name), format!("golden {name}")).unwrap();
+        std::fs::write(
+            ws.join("toolchain/lib").join(name),
+            format!("golden {name}"),
+        )
+        .unwrap();
     }
     let ws = ws.canonicalize().unwrap();
     let bin = ws.join("toolchain/bin");
@@ -141,7 +177,10 @@ fn golden_keys_locked(root: &Path) -> Vec<GoldenKey> {
     let invocation = crate::invocation::InvocationEnv::from_parts(
         [
             ("PATH", bin.display().to_string()),
-            ("CARGO", ws.join("toolchain/bin/cargo").display().to_string()),
+            (
+                "CARGO",
+                ws.join("toolchain/bin/cargo").display().to_string(),
+            ),
             ("CARGO_PKG_NAME", "golden".to_string()),
             ("CARGO_PKG_VERSION", "0.1.0".to_string()),
             ("CARGO_MANIFEST_DIR", ws.display().to_string()),
@@ -286,14 +325,20 @@ fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
     if CACHE_KEY_VERSION == GOLDEN_VERSION {
         // A release with the machinery and no bump: every component still
         // at the goldens' version, nothing bridged.
-        for version in [CC_KEY_VERSION, BUILD_SCRIPT_KEY_VERSION, PREDICTION_KEY_VERSION] {
+        for version in [
+            CC_KEY_VERSION,
+            BUILD_SCRIPT_KEY_VERSION,
+            PREDICTION_KEY_VERSION,
+        ] {
             assert_eq!(version, GOLDEN_VERSION);
         }
         assert!(bridged_key_versions().is_empty());
     }
     for ((kind, key, legacy), (golden_kind, links, golden)) in keys.iter().zip(GOLDENS) {
         assert_eq!(kind, golden_kind);
-        let bridge = KEY_BRIDGES.iter().find(|bridge| bridge.from == GOLDEN_VERSION);
+        let bridge = KEY_BRIDGES
+            .iter()
+            .find(|bridge| bridge.from == GOLDEN_VERSION);
         if CACHE_KEY_VERSION == GOLDEN_VERSION || bridge.is_none() {
             // No bump since the capture: the key itself is the golden. Once
             // the bridge from it is dropped there is nothing to check.
@@ -312,14 +357,21 @@ fn each_bridged_kind_computes_the_key_the_bridged_release_computed() {
             "{kind} (links: {links}): the legacy key is not the key the bridged release computed; \
              leave this kind out of the bridge or fix the derivation"
         );
-        assert_ne!(key, golden, "{kind}: the new key must differ from the old one");
+        assert_ne!(
+            key, golden,
+            "{kind}: the new key must differ from the old one"
+        );
     }
 }
 
 /// A bridge whose scope leaves linking units out computes no legacy key for
 /// them, and the same golden for the rest (a trial bump only: a release
 /// build has no bridge).
-#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "key-bump-trial"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    feature = "key-bump-trial"
+))]
 #[test]
 fn a_bridge_scoped_to_nonlinking_units_leaves_linking_ones_unbridged() {
     let dir = tempfile::tempdir().unwrap();

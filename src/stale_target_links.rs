@@ -190,7 +190,10 @@ pub(crate) fn lines(report: &Report) -> Vec<String> {
              those targets restores them from the cache.",
             report.unlinked,
             if report.left > 0 {
-                format!(", left {} that changed or could not be removed", report.left)
+                format!(
+                    ", left {} that changed or could not be removed",
+                    report.left
+                )
             } else {
                 String::new()
             }

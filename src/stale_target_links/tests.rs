@@ -67,8 +67,18 @@ fn stale_targets_lists_store_links_and_unlinks_them_only_when_applied() {
     assert_eq!((applied.unlinked, applied.left), (1, 0));
     assert!(!link(&stale).exists());
     assert!(stale.join("debug/deps/own.o").exists());
-    assert!(stale.join("debug/deps/link.rlib").exists(), "symlinks are not followed");
-    assert!(link(&fresh).exists(), "a target used within the window is left alone");
-    assert_eq!(std::fs::metadata(&blob).unwrap().nlink(), 2, "the store's and fresh's");
+    assert!(
+        stale.join("debug/deps/link.rlib").exists(),
+        "symlinks are not followed"
+    );
+    assert!(
+        link(&fresh).exists(),
+        "a target used within the window is left alone"
+    );
+    assert_eq!(
+        std::fs::metadata(&blob).unwrap().nlink(),
+        2,
+        "the store's and fresh's"
+    );
     assert!(store.contains("key"), "entries are the sweep's to evict");
 }

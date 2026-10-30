@@ -16801,7 +16801,10 @@ async fn a_fresh_daemon_defers_a_hinted_sweep_to_the_end_of_its_startup_delay() 
     ending.started = Instant::now() - STARTUP_GC_DELAY + Duration::from_millis(1500);
     let (gone, after) = swept(ending, "ending").await;
     assert!(gone, "the deferred sweep runs once the delay is over");
-    assert!(after >= Duration::from_millis(1000), "not before: {after:?}");
+    assert!(
+        after >= Duration::from_millis(1000),
+        "not before: {after:?}"
+    );
 
     let mut settled = Daemon::new(config);
     settled.started = Instant::now() - STARTUP_GC_DELAY;

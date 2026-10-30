@@ -84,13 +84,13 @@ mod since;
 use kache_store::sharing;
 mod compiler_store;
 use compiler_store as store;
+mod stale_target_links;
 mod store_view;
 mod target_cleanup;
 mod target_dedup;
 mod target_liveness;
 mod target_seed;
 mod target_use;
-mod stale_target_links;
 mod term;
 mod test_runner;
 #[cfg(test)]
