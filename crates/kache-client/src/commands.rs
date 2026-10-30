@@ -36,6 +36,11 @@ enum Commands {
         #[arg(long)]
         stale_schema: bool,
 
+        /// With --stale-schema: remove at most this many entries, the
+        /// longest unused first, and say how many are left
+        #[arg(long, value_name = "ENTRIES", requires = "stale_schema")]
+        limit: Option<usize>,
+
         /// List the store data that target directories unused for this
         /// many days still hardlink (the size limit leaves it out, so no
         /// eviction frees it). Removes nothing without --apply

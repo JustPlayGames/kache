@@ -8687,16 +8687,30 @@ fn evict_stale_key_schemas_keeps_only_the_running_schema() {
     }
     let day = std::time::Duration::from_secs(86_400);
 
-    // Not bridged: the earlier rustc row goes with the unrecorded one.
-    let stats = store.evict_stale_key_schemas(&[], day).unwrap();
-    assert_eq!(stats.entries_evicted, 3, "old, legacy, bridged");
-    assert_eq!(stats.blobs_removed, 3);
+    // A capped run takes the longest unused first (lane KACHE-W24).
+    store
+        .db
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-3 days')
+             WHERE cache_key = 'legacy'",
+            [],
+        )
+        .unwrap();
+    let capped = store.evict_stale_key_schemas(&[], day, Some(1)).unwrap();
+    assert_eq!(capped.entries_evicted, 1);
+    assert!(!store.contains("legacy"));
+    assert!(store.contains("old"));
+
+    // Not bridged: the earlier rustc rows go, as the unrecorded one did.
+    let stats = store.evict_stale_key_schemas(&[], day, None).unwrap();
+    assert_eq!(stats.entries_evicted, 2, "old, bridged");
+    assert_eq!(stats.blobs_removed, 2);
     assert!(stats.bytes_freed > 0);
     for key in ["current", "cc", "build_script"] {
         assert!(store.contains(key), "{key}");
     }
     assert_eq!(store.entry_count().unwrap(), 3);
-    let second = store.evict_stale_key_schemas(&[], day).unwrap();
+    let second = store.evict_stale_key_schemas(&[], day, None).unwrap();
     assert_eq!(second.entries_evicted, 0);
 
     // Bridged: kept while used within the grace, then removed.
@@ -8724,11 +8738,13 @@ fn evict_stale_key_schemas_keeps_only_the_running_schema() {
             params![prior],
         )
         .unwrap();
-    let kept = store.evict_stale_key_schemas(&[prior], 14 * day).unwrap();
+    let kept = store
+        .evict_stale_key_schemas(&[prior], 14 * day, None)
+        .unwrap();
     assert_eq!(kept.entries_evicted, 0);
     assert!(store.contains("bridged"));
     let gone = store
-        .evict_stale_key_schemas(&[prior], std::time::Duration::from_secs(3600))
+        .evict_stale_key_schemas(&[prior], std::time::Duration::from_secs(3600), None)
         .unwrap();
     assert_eq!(gone.entries_evicted, 1);
     assert!(!store.contains("bridged"));
@@ -15284,7 +15300,7 @@ fn read_only_store_serves_hits_and_writes_nothing() {
         "evict_older_than must be refused on a read-only store"
     );
     assert!(
-        ro.evict_stale_key_schemas(&[], std::time::Duration::ZERO)
+        ro.evict_stale_key_schemas(&[], std::time::Duration::ZERO, None)
             .is_err(),
         "evict_stale_key_schemas must be refused on a read-only store"
     );

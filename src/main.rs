@@ -882,13 +882,14 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
         Some(Commands::Gc {
             max_age,
             stale_schema,
+            limit,
             ..
         }) => {
             let hours = max_age
                 .as_deref()
                 .map(|value| parse_age_hours("--max-age", value))
                 .transpose()?;
-            cli::gc(&config, hours, stale_schema, json)
+            cli::gc(&config, hours, stale_schema, limit, json)
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
         Some(Commands::Clean {
