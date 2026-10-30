@@ -42,7 +42,12 @@ fn launch() -> Result<i32, String> {
         .map_err(|error| format!("reading {LAUNCH_RECORD}: {error}"))?;
     let (real, kache) = targets(&directory, &record)?;
     let arguments = std::env::args_os().skip(1);
-    let status = match kache.filter(|kache| kache.is_file()) {
+    // Resolve the relative hops before CreateProcess: they can push the
+    // spelling past MAX_PATH, and verbatim Windows paths cannot contain them.
+    let status = match kache
+        .and_then(|path| path.canonicalize().ok())
+        .filter(|path| path.is_file())
+    {
         Some(kache) => Command::new(kache)
             .args(arguments)
             .env(SHIM_PATH_ENV, &invoked)
