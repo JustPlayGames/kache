@@ -8332,31 +8332,119 @@ fn removing_an_uncounted_mapping_keeps_the_other_owners_blob() {
 }
 
 #[test]
-fn floor_raises_only_this_keys_blobs_and_only_up_to_their_mappings() {
+fn floor_raises_only_blobs_the_release_could_empty_up_to_the_other_owners() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();
     store
         .db
         .execute_batch(
             "INSERT INTO blobs (hash, size, refcount) VALUES
-                     ('low', 1, 1), ('exact', 1, 5), ('high', 1, 9), ('foreign', 1, 1);
+                     ('low', 1, 1), ('exact', 1, 5), ('high', 1, 9), ('under', 1, 2),
+                     ('drifted', 1, 1), ('foreign', 1, 1);
                  INSERT INTO entry_blobs (cache_key, hash, refs) VALUES
                      ('k', 'low', 2), ('other', 'low', 1),
                      ('k', 'exact', 2), ('other', 'exact', 3),
                      ('k', 'high', 1),
+                     ('k', 'under', 1), ('other', 'under', 4),
+                     ('k', 'drifted', 1), ('other', 'drifted', 2),
                      ('k', 'norow', 1),
                      ('other', 'foreign', 4);",
         )
         .unwrap();
+    // What k's release subtracts. 'drifted' loses more than k's mapping
+    // says, as a meta.json listing a file twice would take.
+    let releases = [
+        ("low", 2),
+        ("exact", 2),
+        ("high", 1),
+        ("under", 1),
+        ("drifted", 3),
+        ("norow", 1),
+    ];
 
-    // Three rows match; 'norow' has none to raise.
-    assert_eq!(floor_blob_refs_at_mappings(&store.db, "k").unwrap(), 3);
+    assert_eq!(
+        floor_blob_refs_before_release(&store.db, "k", releases).unwrap(),
+        2
+    );
 
-    assert_eq!(blob_refcount(&store, "low"), Some(3));
+    assert_eq!(
+        blob_refcount(&store, "low"),
+        Some(3),
+        "other's 1 + the release's 2"
+    );
+    assert_eq!(
+        blob_refcount(&store, "drifted"),
+        Some(5),
+        "other's 2 + the release's 3, not the mapped 3: the release must leave other's 2"
+    );
     assert_eq!(blob_refcount(&store, "exact"), Some(5));
     assert_eq!(blob_refcount(&store, "high"), Some(9), "never lowered");
+    assert_eq!(
+        blob_refcount(&store, "under"),
+        Some(2),
+        "above the release: it stays above zero, so it waits for a release that could empty it"
+    );
     assert_eq!(blob_refcount(&store, "norow"), None);
-    assert_eq!(blob_refcount(&store, "foreign"), Some(1), "not this key's");
+    assert_eq!(
+        blob_refcount(&store, "foreign"),
+        Some(1),
+        "not this release's"
+    );
+}
+
+/// A blob most entries share (on a real store the empty file's: 503k
+/// mappings). A floor that summed every mapping of each blob a removal
+/// touches cost ~0.2 s under the write lock per removal. A count above
+/// what the removal gives back stays above zero, so the removal reads
+/// none of the other mappings: an under-counted shared blob keeps its
+/// count (the reconcile's to correct) instead of being raised to the sum.
+/// Once a removal could empty it, the floor still protects the others.
+#[test]
+fn removing_from_a_heavily_shared_blob_floors_it_only_when_it_could_reach_zero() {
+    const SHARERS: i64 = 20_000;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    put_outputs(&store, dir.path(), "a", "one", &[("a.rlib", b"shared")]);
+    put_outputs(&store, dir.path(), "b", "one", &[("b.rlib", b"shared")]);
+    let hash = content_hash(b"shared");
+    // Twenty thousand other entries map the blob; its count has drifted
+    // below their sum.
+    store
+        .db
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+             INSERT INTO entry_blobs (cache_key, hash, refs) SELECT 'sharer' || i, ?1, 1 FROM n",
+            params![hash, SHARERS],
+        )
+        .unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE blobs SET refcount = 1000 WHERE hash = ?1",
+            params![hash],
+        )
+        .unwrap();
+
+    store.remove_entry("a").unwrap();
+    assert_eq!(
+        blob_refcount(&store, &hash),
+        Some(999),
+        "a floor summing the mappings would have left {}",
+        SHARERS + 1
+    );
+
+    // Drifted down to this removal's one reference: now it could reach
+    // zero, so it is floored to the sharers' references first.
+    store
+        .db
+        .execute(
+            "UPDATE blobs SET refcount = 1 WHERE hash = ?1",
+            params![hash],
+        )
+        .unwrap();
+    store.remove_entry("b").unwrap();
+    assert_eq!(blob_refcount(&store, &hash), Some(SHARERS));
+    assert!(store.blob_path(&hash).is_file());
 }
 
 #[test]
