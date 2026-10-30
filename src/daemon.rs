@@ -6702,7 +6702,14 @@ impl Daemon {
             crate::disk_recovery::low_on_disk(config)
         })?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
-        if let Ok(after) = store.physical_size() {
+        if stats.cut_short {
+            // Stopped at its walk budget: more can go, so nothing backs off.
+            tracing::info!(
+                "auto-gc: sweep stopped after {} entries at its walk budget; the next \
+                 automatic sweep goes on",
+                stats.entries_evicted
+            );
+        } else if let Ok(after) = store.physical_size() {
             crate::wrapper::record_auto_gc_outcome(config, after, stats.bytes_held);
         }
         Ok(stats)
@@ -7006,6 +7013,7 @@ impl Daemon {
                 + age_evict_stats.entries_unreclaimable,
             // Only the size pass measures it.
             bytes_held: evict_stats.bytes_held,
+            cut_short: evict_stats.cut_short,
             disk_bytes_reclaimed: dedup_stats.disk_bytes_reclaimed
                 + evict_stats.disk_bytes_reclaimed
                 + age_evict_stats.disk_bytes_reclaimed,

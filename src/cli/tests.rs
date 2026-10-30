@@ -881,6 +881,7 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
         entries_import_pinned: 12,
         evict_write_ms: 11,
         bytes_held: 13,
+        cut_short: false,
         // Set once by the driver, never summed over policies.
         housekeeping: None,
     };
@@ -900,6 +901,7 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
         entries_import_pinned: 120,
         evict_write_ms: 110,
         bytes_held: 7,
+        cut_short: true,
         // Set once by the driver, never summed over policies.
         housekeeping: None,
     };
@@ -917,6 +919,7 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
     assert_eq!(accumulated.evict_write_ms, 121);
     assert_eq!(accumulated.entries_import_pinned, 132);
     assert!(accumulated.skipped);
+    assert!(accumulated.cut_short);
 }
 
 /// The auto-GC worker used to throw its outcome away, so a machine where
