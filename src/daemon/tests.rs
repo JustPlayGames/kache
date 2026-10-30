@@ -16809,12 +16809,13 @@ async fn a_fresh_daemon_defers_a_hinted_sweep_to_the_end_of_its_startup_delay() 
     assert!(gone && after < Duration::from_secs(5), "{after:?}");
 }
 
-/// KACHE-W22: adoptions that concurrent builds hand over are registered in
-/// batches on the stamp connection (whoever holds it registers everything
-/// queued), and each request is answered for its own entries, in order: an
-/// adopted key now has the entry, one with nothing to adopt does not.
+/// KACHE-W22/W23: the daemon takes the adoptions concurrent builds hand
+/// over and answers at once; each key stays locked (marked storing) and
+/// pinned against the daemon's sweeps until its registrar wrote the batch:
+/// an adopted key then has the entry, one with nothing to adopt does not,
+/// and a key another process holds is left to it.
 #[test]
-fn handed_adoptions_are_registered_and_each_request_answered() {
+fn handed_adoptions_are_answered_at_once_and_registered_later() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let old = crate::cache_key::CACHE_KEY_VERSION - 1;
@@ -16824,6 +16825,7 @@ fn handed_adoptions_are_registered_and_each_request_answered() {
         put_aged_entry(&config, dir.path(), &key(i));
         store.set_key_schema_for_test(&key(i), old);
     }
+    let held = store.try_lock(&key(300)).unwrap().expect("free");
     let daemon = Arc::new(Daemon::new(config.clone()));
     let request = |i: usize, legacy: String| AdoptEntriesRequest {
         cache_dir: config.cache_dir.to_string_lossy().into_owned(),
@@ -16840,6 +16842,12 @@ fn handed_adoptions_are_registered_and_each_request_answered() {
                 cache_key: key(200 + i),
                 crate_name: "testcrate".into(),
             },
+            kache_protocol::AdoptEntry {
+                legacy_key: key(i),
+                legacy_version: old,
+                cache_key: key(300),
+                crate_name: "testcrate".into(),
+            },
         ],
     };
     let answers: Vec<Response> = std::thread::scope(|scope| {
@@ -16854,20 +16862,68 @@ fn handed_adoptions_are_registered_and_each_request_answered() {
     });
     for (i, answer) in answers.iter().enumerate() {
         assert!(answer.ok, "{:?}", answer.error);
-        let found: Vec<_> = answer
+        let taken: Vec<_> = answer
             .batch_results
             .as_ref()
             .unwrap()
             .iter()
-            .map(|one| one.found)
+            .map(|one| (one.found, one.skipped))
             .collect();
-        assert_eq!(found, [Some(true), Some(false)], "request {i}");
+        assert_eq!(
+            taken,
+            [(Some(true), false), (Some(true), false), (Some(true), true)],
+            "request {i}"
+        );
+    }
+    let start = Instant::now();
+    while !daemon.pending_adoptions.lock().unwrap().is_empty()
+        && start.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(daemon.pending_adoptions.lock().unwrap().is_empty());
+    for i in 0..8 {
         assert!(store.contains(&key(100 + i)));
         assert!(!store.contains(&key(200 + i)));
+        assert!(
+            store.try_lock(&key(100 + i)).unwrap().is_some(),
+            "lock let go"
+        );
     }
+    assert!(
+        !store.contains(&key(300)),
+        "left to the process that holds it"
+    );
+    drop(held);
     let foreign = AdoptEntriesRequest {
         cache_dir: "/elsewhere".into(),
         ..request(0, key(0))
     };
     assert!(!daemon.handle_adopt_entries(&foreign).ok);
+}
+
+/// Until its registration is written, a taken adoption's keys are pinned
+/// against the daemon's own sweeps: the wrapper restores from the legacy
+/// entry's blobs meanwhile (KACHE-W23).
+#[test]
+fn a_taken_adoption_pins_both_keys_until_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config);
+    let pins = daemon.pending_pins();
+    daemon
+        .pending_adoptions
+        .lock()
+        .unwrap()
+        .extend(["legacy".to_string(), "current".to_string()]);
+    assert!(pins("legacy") && pins("current"));
+    assert!(!pins("other"));
+    let request = crate::store::AdoptionRequest {
+        legacy_key: "legacy".into(),
+        legacy_version: 1,
+        cache_key: "current".into(),
+        crate_name: "c".into(),
+    };
+    unpin_adoption(&daemon.pending_adoptions, &request);
+    assert!(!pins("legacy") && !pins("current"));
 }

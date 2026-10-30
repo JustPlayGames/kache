@@ -1948,6 +1948,10 @@ pub(crate) struct Daemon {
     /// adoptions wrappers verified: a thread of their own registers them
     /// ([`run_adoption_registrar`]), started on the first.
     adoption_registrar: OnceLock<std::sync::mpsc::Sender<PendingAdoption>>,
+    /// The keys of adoptions taken and not yet registered, legacy and new:
+    /// the wrappers restore from their blobs meanwhile, so the daemon's
+    /// sweeps keep them ([`Daemon::pending_pins`]).
+    pending_adoptions: Arc<Mutex<HashSet<String>>>,
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
     request_clock: Arc<crate::maintenance::RequestClock>,
@@ -2118,6 +2122,7 @@ impl Daemon {
             pending_predictions: Mutex::new(HashMap::new()),
             pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
             adoption_registrar: OnceLock::new(),
+            pending_adoptions: Arc::new(Mutex::new(HashSet::new())),
             stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
@@ -3275,15 +3280,18 @@ impl Daemon {
         f(&store)
     }
 
-    /// Register key-bridge adoptions a wrapper verified under their keys'
-    /// build locks (lane KACHE-W22). Group commit: one thread with a
-    /// connection of its own registers everything queued by the time it
-    /// starts a transaction, other builds' adoptions too, so concurrent
-    /// builds take the index's write lock once per batch instead of once per
-    /// entry, and never wait behind the hit stamps' connection (it held them
-    /// past a second in a 3-build burst). Each answer has `found`
-    /// (registered, or a peer's commit was there first) in `batch_results`,
-    /// in the request's order. Refused for another store.
+    /// Take key-bridge adoptions a wrapper verified under their keys' build
+    /// locks, and answer at once (lane KACHE-W23): the wrapper restores from
+    /// the verified legacy entry meanwhile, as a hit hands over its stamp.
+    /// For each entry the daemon takes the key's build lock, marks it
+    /// storing (a lookup that misses it waits for the commit, as for a
+    /// stored compile), pins both keys against its own sweeps, and queues
+    /// it for its registrar ([`run_adoption_registrar`]), which registers
+    /// everything queued in one transaction and then lets go of the locks
+    /// and pins. Each answer has `found`: taken (`skipped` when another
+    /// process held the key: it adopts or stores it itself). Refused for
+    /// another store, or when no registrar runs: the wrapper then registers
+    /// the adoption itself.
     pub fn handle_adopt_entries(&self, req: &AdoptEntriesRequest) -> Response {
         if Path::new(&req.cache_dir) != self.config.cache_dir {
             return Response::err("adoptions for another store");
@@ -3297,9 +3305,10 @@ impl Daemon {
         let registrar = self.adoption_registrar.get_or_init(|| {
             let (queue, queued) = std::sync::mpsc::channel();
             let config = self.config.clone();
+            let pins = Arc::clone(&self.pending_adoptions);
             let spawned = std::thread::Builder::new()
                 .name("kache-adoptions".into())
-                .spawn(move || run_adoption_registrar(&config, queued));
+                .spawn(move || run_adoption_registrar(&config, queued, &pins));
             if let Err(error) = spawned {
                 // The receiver went with the closure: every send fails and
                 // the wrappers register their adoptions themselves.
@@ -3307,31 +3316,40 @@ impl Daemon {
             }
             queue
         });
-        let mut answers = Vec::with_capacity(req.entries.len());
+        let store_dir = self.config.store_dir();
+        let mut results = Vec::with_capacity(req.entries.len());
         for entry in &req.entries {
-            let (answer, answered) = std::sync::mpsc::channel();
-            let request = crate::store::AdoptionRequest {
-                legacy_key: entry.legacy_key.clone(),
-                legacy_version: entry.legacy_version,
-                cache_key: entry.cache_key.clone(),
-                crate_name: entry.crate_name.clone(),
+            let mut one = Response::ok();
+            one.found = Some(true);
+            let lock = match crate::store::try_lock_key_in(&store_dir, &entry.cache_key) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    one.skipped = true;
+                    results.push(one);
+                    continue;
+                }
+                Err(error) => return Response::err(format!("adoption lock: {error:#}")),
             };
-            if registrar.send((request, answer)).is_err() {
+            let mut lock = lock;
+            lock.mark_storing();
+            if let Ok(mut pins) = self.pending_adoptions.lock() {
+                pins.insert(entry.legacy_key.clone());
+                pins.insert(entry.cache_key.clone());
+            }
+            let pending = PendingAdoption {
+                request: crate::store::AdoptionRequest {
+                    legacy_key: entry.legacy_key.clone(),
+                    legacy_version: entry.legacy_version,
+                    cache_key: entry.cache_key.clone(),
+                    crate_name: entry.crate_name.clone(),
+                },
+                lock,
+            };
+            if let Err(std::sync::mpsc::SendError(pending)) = registrar.send(pending) {
+                unpin_adoption(&self.pending_adoptions, &pending.request);
                 return Response::err("adoption registrar gone");
             }
-            answers.push(answered);
-        }
-        let mut results = Vec::with_capacity(answers.len());
-        for answered in answers {
-            match answered.recv_timeout(ADOPTION_HANDOFF_WAIT) {
-                Ok(Some(registered)) => {
-                    let mut one = Response::ok();
-                    one.found = Some(registered != crate::store::Registered::Refused);
-                    one.skipped = registered == crate::store::Registered::ByPeer;
-                    results.push(one);
-                }
-                _ => return Response::err("adoptions not registered"),
-            }
+            results.push(one);
         }
         let mut response = Response::ok();
         response.batch_results = Some(results);
@@ -3499,7 +3517,11 @@ impl Daemon {
     /// not yet written ([`Store::pin_entries_with`]).
     fn pending_pins(&self) -> crate::store::PendingPins {
         let pending = Arc::clone(&self.pending_hit_stamps);
-        Arc::new(move |key: &str| pending.lock().map_or(true, |p| p.contains_key(key)))
+        let adoptions = Arc::clone(&self.pending_adoptions);
+        Arc::new(move |key: &str| {
+            pending.lock().map_or(true, |p| p.contains_key(key))
+                || adoptions.lock().map_or(true, |p| p.contains(key))
+        })
     }
 
     /// Open `config`'s store for a sweep. The daemon's own store first gets
@@ -9497,31 +9519,41 @@ pub fn send_prediction_publish(
 /// Hit stamps the daemon holds before it refuses more ([`Daemon::handle_stamp_hits`]).
 const MAX_PENDING_HIT_STAMPS: usize = 1 << 16;
 
-/// A daemon's answer to one handed-over adoption: what the registration did,
-/// or `None` when its transaction failed.
-type AdoptionAnswer = Option<crate::store::Registered>;
-
-/// One adoption queued for [`run_adoption_registrar`], with where its answer
-/// goes.
-type PendingAdoption = (
-    crate::store::AdoptionRequest,
-    std::sync::mpsc::Sender<AdoptionAnswer>,
-);
+/// One adoption queued for [`run_adoption_registrar`]: the key's build
+/// lock, marked storing, goes once its registration is written.
+struct PendingAdoption {
+    request: crate::store::AdoptionRequest,
+    lock: crate::store::KeyLock,
+}
 
 /// The most adoptions one registration transaction takes, so a burst's
 /// batch holds the index's write lock for well under a second.
 const MAX_ADOPTION_BATCH: usize = 256;
 
+/// Let the daemon's sweeps take `request`'s keys again.
+fn unpin_adoption(pins: &Mutex<HashSet<String>>, request: &crate::store::AdoptionRequest) {
+    if let Ok(mut pins) = pins.lock() {
+        pins.remove(&request.legacy_key);
+        pins.remove(&request.cache_key);
+    }
+}
+
 /// The daemon's adoption registrar ([`Daemon::handle_adopt_entries`]): wait
 /// for one adoption, take every other already queued, register them in one
-/// transaction, answer each; until the daemon drops the queue.
-fn run_adoption_registrar(config: &Config, queued: std::sync::mpsc::Receiver<PendingAdoption>) {
+/// transaction, then release their locks and pins; until the daemon drops
+/// the queue. A failed transaction leaves those keys unregistered: their
+/// next lookup adopts them again.
+fn run_adoption_registrar(
+    config: &Config,
+    queued: std::sync::mpsc::Receiver<PendingAdoption>,
+    pins: &Mutex<HashSet<String>>,
+) {
     let store = match Store::open(config) {
         Ok(store) => store,
         Err(error) => {
             tracing::warn!("key bridge: adoption registrar cannot open the store: {error:#}");
-            for (_, answer) in queued {
-                let _ = answer.send(None);
+            for pending in queued {
+                unpin_adoption(pins, &pending.request);
             }
             return;
         }
@@ -9535,29 +9567,27 @@ fn run_adoption_registrar(config: &Config, queued: std::sync::mpsc::Receiver<Pen
                 Err(_) => break,
             }
         }
-        let requests: Vec<_> = batch.iter().map(|(request, _)| request.clone()).collect();
+        let requests: Vec<_> = batch.iter().map(|p| p.request.clone()).collect();
         let started = std::time::Instant::now();
         match store.register_adoptions(&requests) {
-            Ok(results) => {
-                // Only a key bridge's release adopts, once per entry.
-                tracing::info!(
-                    "key bridge: registered {} adoptions in one transaction in {:.1} ms",
-                    results.len(),
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-                for ((_, answer), result) in batch.iter().zip(results) {
-                    let _ = answer.send(Some(result));
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "key bridge: registering {} adoptions failed: {error:#}",
-                    batch.len()
-                );
-                for (_, answer) in &batch {
-                    let _ = answer.send(None);
-                }
-            }
+            // Only a key bridge's release adopts, once per entry.
+            Ok(results) => tracing::info!(
+                "key bridge: registered {} adoptions in one transaction in {:.1} ms ({} refused)",
+                results.len(),
+                started.elapsed().as_secs_f64() * 1e3,
+                results
+                    .iter()
+                    .filter(|r| **r == crate::store::Registered::Refused)
+                    .count()
+            ),
+            Err(error) => tracing::warn!(
+                "key bridge: registering {} adoptions failed: {error:#}",
+                batch.len()
+            ),
+        }
+        for pending in batch {
+            unpin_adoption(pins, &pending.request);
+            drop(pending.lock);
         }
     }
 }
@@ -9640,24 +9670,25 @@ pub fn send_memo_rows(
     send_request_fire_and_forget(socket_path, &req).is_ok()
 }
 
-/// How long a wrapper waits for the daemon to register an adoption it
-/// verified ([`send_adoption`]); past it the wrapper registers it itself (a
-/// late daemon then finds it committed).
-const ADOPTION_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a wrapper waits for the daemon to take an adoption it verified
+/// ([`send_adoption`]): the daemon answers once it holds the key's lock,
+/// before anything is written.
+const ADOPTION_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Hand a verified key-bridge adoption to the daemon to register in a batch
-/// ([`Request::AdoptEntries`]). `Some(registered)` from a daemon that
-/// answered for it (`registered`: the key now has its entry); `None` when no
-/// daemon took it (none runs, an older release, another store, an error or
-/// no answer in time): the wrapper then registers it itself.
+/// Hand a verified key-bridge adoption to the daemon to register later, in a
+/// batch ([`Request::AdoptEntries`]); the wrapper restores from the verified
+/// entry without waiting for that. True when the daemon took it, or another
+/// process holds the key, or no answer came in time (the request is in its
+/// socket). False when no daemon took it (none runs, an older release,
+/// another store, an error): the wrapper then registers it itself.
 pub fn send_adoption(
     socket_path: &Path,
     cache_dir: &Path,
     request: &crate::store::AdoptionRequest,
-) -> Option<bool> {
+) -> bool {
     #[cfg(unix)]
     if !socket_path.exists() {
-        return None;
+        return false;
     }
     let req = Request::AdoptEntries(AdoptEntriesRequest {
         cache_dir: cache_dir.to_string_lossy().into_owned(),
@@ -9668,12 +9699,24 @@ pub fn send_adoption(
             crate_name: request.crate_name.clone(),
         }],
     });
-    let line = send_request_with_timeout(socket_path, &req, ADOPTION_HANDOFF_WAIT).ok()?;
-    let response = serde_json::from_str::<Response>(&line).ok()?;
-    if !response.ok {
-        return None;
+    match send_request_with_timeout(socket_path, &req, ADOPTION_HANDOFF_WAIT) {
+        Ok(line) => serde_json::from_str::<Response>(&line).is_ok_and(|response| {
+            response.ok
+                && response
+                    .batch_results
+                    .as_ref()
+                    .and_then(|results| results.first())
+                    .is_some_and(|one| one.found == Some(true))
+        }),
+        Err(error) => error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            })
+        }),
     }
-    response.batch_results?.first()?.found
 }
 
 /// Hand a target root the index was too busy to record to the daemon

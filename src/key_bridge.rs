@@ -63,45 +63,57 @@ pub(crate) fn register_through_daemon(socket: std::path::PathBuf, cache_dir: std
 pub static CONTENDED: AtomicU64 = AtomicU64::new(0);
 
 /// Register `request` through the daemon serving `store`, when one takes
-/// it, else in `store` itself.
+/// it: `lock` goes first, the daemon takes the key's lock itself and writes
+/// the row later ([`crate::store::Registered::Deferred`]). Else in `store`
+/// itself, under `lock`.
 fn register(
     store: &crate::store::Store,
     request: &crate::store::AdoptionRequest,
+    lock: crate::store::KeyLock,
 ) -> anyhow::Result<crate::store::Registered> {
     let daemon = DAEMON.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some((socket, cache_dir)) = daemon
         && cache_dir == store.cache_dir()
-        && let Some(found) = crate::daemon::send_adoption(&socket, &cache_dir, request)
     {
-        return Ok(if found {
-            crate::store::Registered::Adopted
-        } else {
-            crate::store::Registered::Refused
-        });
+        // The daemon claims the key's lock before it answers; a peer that
+        // takes it in between adopts or stores the key itself.
+        drop(lock);
+        if crate::daemon::send_adoption(&socket, &cache_dir, request) {
+            return Ok(crate::store::Registered::Deferred);
+        }
+        // Not taken: register here. The transaction checks the key again,
+        // so a peer's commit meanwhile is left as it is.
+        return Ok(store.register_adoptions(std::slice::from_ref(request))?[0]);
     }
-    Ok(store.register_adoptions(std::slice::from_ref(request))?[0])
+    let registered = store.register_adoptions(std::slice::from_ref(request))?[0];
+    drop(lock);
+    Ok(registered)
 }
 
 /// After `cache_key` missed in `store`: adopt its legacy twin's entry, if one
-/// is remembered and the store has it. `true` when `cache_key` now has an
-/// entry to look up again; `false` also when another process holds the key
-/// (adopting or compiling it): the caller's claim then waits for its commit.
-pub(crate) fn adopt_on_miss(store: &crate::store::Store, cache_key: &str) -> bool {
-    let Some((version, legacy, crate_name)) = legacy_of(cache_key) else {
-        return false;
-    };
+/// is remembered and the store has it. The entry to restore from: the
+/// verified legacy entry under `cache_key`, whether its row is written yet
+/// or handed to the daemon to write ([`register`]); or a peer's entry
+/// committed meanwhile. `None` when there is nothing to adopt, and also when
+/// another process holds the key (adopting or compiling it): the caller's
+/// claim then waits for its commit.
+pub(crate) fn adopt_on_miss(
+    store: &crate::store::Store,
+    cache_key: &str,
+) -> Option<crate::store::EntryMeta> {
+    let (version, legacy, crate_name) = legacy_of(cache_key)?;
     let adopted =
-        store.adopt_legacy_entry_with(&legacy, version, cache_key, &crate_name, |request| {
-            register(store, request)
+        store.adopt_legacy_entry_with(&legacy, version, cache_key, &crate_name, |request, lock| {
+            register(store, request, lock)
         });
     match adopted {
         Ok(Some(adoption)) if adoption.outcome == crate::store::AdoptionOutcome::Contended => {
             CONTENDED.fetch_add(1, Ordering::Relaxed);
             tracing::debug!("key bridge: {crate_name} is held by another process; waiting for it");
-            false
+            None
         }
         Ok(Some(adoption)) => {
-            let by_peer = adoption.outcome == crate::store::AdoptionOutcome::ByPeer;
+            let by_peer = adoption.meta.is_none();
             let adopted = if by_peer {
                 ADOPTED.load(Ordering::Relaxed)
             } else {
@@ -121,7 +133,11 @@ pub(crate) fn adopt_on_miss(store: &crate::store::Store, cache_key: &str) -> boo
                 adoption.bytes,
                 adoption.verify.as_secs_f64() * 1e3,
                 adoption.register.as_secs_f64() * 1e3,
-                if by_peer { " (by a peer)" } else { "" }
+                match adoption.outcome {
+                    _ if by_peer => " (by a peer)",
+                    crate::store::AdoptionOutcome::Deferred => " (handed to the daemon)",
+                    _ => "",
+                }
             );
             if !by_peer && adopted.is_multiple_of(100) {
                 tracing::info!(
@@ -131,15 +147,18 @@ pub(crate) fn adopt_on_miss(store: &crate::store::Store, cache_key: &str) -> boo
                     register_us as f64 / 1e6
                 );
             }
-            true
+            match adoption.meta {
+                Some(meta) => Some(meta),
+                None => store.get(cache_key).ok().flatten(),
+            }
         }
         Ok(None) => {
             NOT_FOUND.fetch_add(1, Ordering::Relaxed);
-            false
+            None
         }
         Err(error) => {
             tracing::warn!("key bridge: adopting for {crate_name} failed: {error:#}");
-            false
+            None
         }
     }
 }
