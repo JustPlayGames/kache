@@ -266,3 +266,29 @@ fn a_deferred_adoption_hands_back_the_verified_entry_unwritten() {
     assert_eq!(refcount(&store, &meta.files[0].hash), before);
     assert!(store.try_lock("current").unwrap().is_some());
 }
+
+/// The size score divides hits by idleness, so a stale row's old hits alone
+/// could outrank a live entry despite its added idle hours (lane KACHE-W25):
+/// a stale row ranks with no hits, and goes first however many it had.
+#[test]
+fn a_stale_rows_old_hits_do_not_outrank_a_live_entry() {
+    use crate::eviction::EvictionPolicy as _;
+    let current = kache_format::CACHE_KEY_VERSION;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    legacy_entry(&store, dir.path(), "earlier", current - 1);
+    legacy_entry(&store, dir.path(), "live", current);
+    for (key, hits, idle) in [("earlier", 10_000_000, "-1 minute"), ("live", 0, "-2 days")] {
+        store
+            .db
+            .execute(
+                "UPDATE entries SET hit_count = ?2, last_accessed = datetime('now', ?3)
+                 WHERE cache_key = ?1",
+                params![key, hits, idle],
+            )
+            .unwrap();
+    }
+    let candidates = store.eviction_candidates().unwrap();
+    let order = crate::eviction::SizePressurePolicy.select(&candidates);
+    assert_eq!(order.first().map(String::as_str), Some("earlier"));
+}

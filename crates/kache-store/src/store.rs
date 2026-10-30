@@ -2664,9 +2664,11 @@ pub enum Registered {
 }
 
 /// Idle hours added to an entry of an earlier key version when it is ranked
-/// for eviction (lane KACHE-W20 prototype): every policy ranks by idleness,
-/// so an entry no key bridge adopted goes before any entry of this version,
-/// and an upgrade never keeps two generations side by side over the cap. An
+/// for eviction (lane KACHE-W20 prototype), whose hit count is ranked as 0
+/// (lane KACHE-W25: the size score divides hits by idleness, so hits alone
+/// could still outrank a live entry): every policy ranks by idleness, so an
+/// entry no key bridge adopted goes before any entry of this version, and
+/// an upgrade never keeps two generations side by side over the cap. An
 /// adopted entry's legacy row shares its blobs: removing it frees the row.
 const STALE_KEY_SCHEMA_IDLE_HOURS: f64 = 1.0e6;
 
@@ -7409,7 +7411,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         #[cfg(any(test, feature = "test-support"))]
         slow_eviction_scan_for_test(&self.config.cache_dir);
         let mut stmt = self.db.prepare(&format!(
-            "SELECT cache_key, size, hit_count, content_hash, committed,
+            "SELECT cache_key, size, CASE WHEN {stale} THEN 0 ELSE hit_count END,
+                    content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0
                       + CASE WHEN {stale} THEN ?3 ELSE 0 END,
                     compile_time_ms,
