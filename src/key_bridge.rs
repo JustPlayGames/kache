@@ -40,7 +40,8 @@ pub(crate) fn remember(key: &str, version: u32, legacy: &str, crate_name: &str) 
     );
 }
 
-fn legacy_of(key: &str) -> Option<Legacy> {
+/// The legacy key `key`'s invocation also keyed, when a bridge applies.
+pub(crate) fn legacy_of(key: &str) -> Option<Legacy> {
     LEGACY
         .lock()
         .unwrap_or_else(|e| e.into_inner())

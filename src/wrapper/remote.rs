@@ -79,3 +79,34 @@ pub(super) fn acquire_entry(
     );
     Some((meta, origin))
 }
+
+/// After the remote missed `cache_key`: ask it for the legacy key a key
+/// bridge computed for the same invocation (lane KACHE-W23). The daemon
+/// downloads and verifies it as any entry (key, crate and every blob's
+/// content address) and imports it under the legacy key; the local store
+/// then adopts it as it adopts a local legacy entry, under the key's build
+/// lock and after re-hashing its blobs ([`crate::key_bridge::adopt_on_miss`]).
+/// Restore from the entry this returns.
+pub(super) fn acquire_legacy_entry(
+    config: &Config,
+    store: &Store,
+    cache_key: &str,
+) -> Option<(EntryMeta, EventResult)> {
+    config.remote.as_ref()?;
+    let (_, legacy, crate_name) = crate::key_bridge::legacy_of(cache_key)?;
+    let (_, origin) = acquire_entry(
+        config,
+        store,
+        &legacy,
+        &crate_name,
+        NegativeReply::ContinueCompile,
+    )?;
+    let meta = crate::key_bridge::adopt_on_miss(store, cache_key)?;
+    tracing::debug!(
+        crate_name,
+        cache_key,
+        ?origin,
+        "adopted an earlier key version's remote entry"
+    );
+    Some((meta, origin))
+}

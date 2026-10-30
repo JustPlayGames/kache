@@ -8167,7 +8167,8 @@ fn try_rustc_remote_hit(
         cache_key,
         hit.crate_name,
         NegativeReply::CheckConcurrentEntry,
-    )?;
+    )
+    .or_else(|| remote::acquire_legacy_entry(hit.config, store, cache_key))?;
     Some(hit.restore_and_finish(
         store,
         &meta,
