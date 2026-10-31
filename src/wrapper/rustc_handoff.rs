@@ -65,6 +65,8 @@ pub(super) struct RustcHandoff<'a> {
     pub(super) stdout: &'a str,
     pub(super) stderr: &'a str,
     pub(super) compile_time_ms: u64,
+    /// The compiler's identity, recorded with the entry.
+    pub(super) rustc_version: Option<&'a str>,
     /// The event the synchronous path would log, without its store fields.
     pub(super) event: EventInputs<'a>,
     pub(super) size: u64,
@@ -139,7 +141,7 @@ fn store_within(
 ) -> RustcStore {
     let (args, files) = (handoff.args, handoff.files);
     if !hand_off_when_busy {
-        return RustcStore::Stored(store.put_with_compile_time(
+        return RustcStore::Stored(store.put_rustc_with_compile_time(
             handoff.cache_key,
             handoff.crate_name,
             &args.crate_types,
@@ -150,6 +152,7 @@ fn store_within(
             handoff.stdout,
             handoff.stderr,
             handoff.compile_time_ms,
+            handoff.rustc_version,
         ));
     }
     let staged = match store.put_with_compile_time_unless_busy(
@@ -163,6 +166,7 @@ fn store_within(
         handoff.stdout,
         handoff.stderr,
         handoff.compile_time_ms,
+        handoff.rustc_version,
         INDEX_BUSY_WAIT,
     ) {
         Ok(PutAttempt::Stored(result)) => return RustcStore::Stored(Ok(result)),
@@ -247,6 +251,7 @@ fn hand_off_staged(
             profile: handoff.profile.to_string(),
             outputs,
             unit: handoff.args.get_codegen_opt("metadata").map(str::to_string),
+            rustc_version: handoff.rustc_version.map(str::to_string),
             prestage,
             staged: Some(StagedPublish {
                 files: stored.to_vec(),

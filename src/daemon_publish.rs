@@ -735,6 +735,7 @@ fn take_staged(
                 &request.stderr,
                 request.compile_time_ms,
                 rustc.unit.as_deref().unwrap_or_default(),
+                rustc.rustc_version.as_deref(),
             )
         }
         _ => unreachable!("only staged rustc jobs are batched"),
@@ -771,6 +772,7 @@ fn put_job(store: &Store, request: &PublishCcRequest) -> Result<crate::store::St
                 &request.stdout,
                 &request.stderr,
                 request.compile_time_ms,
+                rustc.rustc_version.as_deref(),
             )
         }
         Some(rustc) => {
@@ -787,6 +789,7 @@ fn put_job(store: &Store, request: &PublishCcRequest) -> Result<crate::store::St
                 &request.stdout,
                 &request.stderr,
                 request.compile_time_ms,
+                rustc.rustc_version.as_deref(),
             )
         }
         None => store.put_with_compile_time_independent(
@@ -1884,6 +1887,7 @@ mod tests {
                     redated: false,
                 }],
                 unit: None,
+                rustc_version: None,
                 prestage: Vec::new(),
                 staged: Some(StagedPublish {
                     files: vec![crate::store::CachedFile {
@@ -1945,6 +1949,7 @@ mod tests {
                     redated: false,
                 }],
                 unit: None,
+                rustc_version: None,
                 prestage: Vec::new(),
                 staged: Some(StagedPublish {
                     files: vec![crate::store::CachedFile {
@@ -2140,6 +2145,7 @@ mod tests {
         let mut config = crate::test_support::test_config(dir.join("cache"));
         config.auto_gc = false;
         config.remote = Some(crate::config::RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".into(),
             backend: crate::config::RemoteBackendConfig::Filesystem(
                 crate::config::FilesystemRemoteConfig {

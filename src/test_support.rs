@@ -81,6 +81,7 @@ pub(crate) fn without_terminal(command: &mut std::process::Command) -> &mut std:
 pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
     crate::config::Config {
         blaze: false,
+        separate_check_targets: true,
         fallback: None,
         key_salt: None,
         cc_extra_allowlist_flags: Vec::new(),
@@ -109,6 +110,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,

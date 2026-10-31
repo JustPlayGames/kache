@@ -2149,6 +2149,7 @@ mod tests {
             cache: Some(CacheFileConfig {
                 readonly_store: None,
                 blaze: None,
+                separate_check_targets: None,
                 bypass_env: None,
                 bypass_argv: None,
                 bypass_crates: None,
@@ -2178,6 +2179,7 @@ mod tests {
                 auto_share_target_files: None,
                 auto_clean_idle_targets_days: None,
                 auto_recover_min_free_bytes: None,
+                restore_max_size: None,
                 auto_recover_targets: None,
                 scheduler_memory_pressure: None,
                 auto_clean_unused_units_days: None,

@@ -1594,7 +1594,7 @@ pub(crate) fn run_nvcc_for(
             let restore_start = std::time::Instant::now();
             if let Err(e) = restore_nvcc_from_cache(hit_store, &parsed, &meta) {
                 tracing::warn!(
-                    "restoring nvcc cache hit for {crate_name} failed: {e} — recompiling"
+                    "restoring nvcc cache hit for {crate_name} failed: {e:#} — recompiling"
                 );
                 return nvcc_passthrough_with_event(
                     config,
@@ -1602,7 +1602,7 @@ pub(crate) fn run_nvcc_for(
                     &crate_name,
                     &event_root,
                     start,
-                    format!("restore failed: {e}"),
+                    restore_failure_reason(&e),
                 );
             }
             let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -1672,7 +1672,7 @@ pub(crate) fn run_nvcc_for(
         let restore_start = std::time::Instant::now();
         if let Err(e) = restore_nvcc_from_cache(&store, &parsed, &meta) {
             tracing::warn!(
-                "restoring nvcc coalesced hit for {crate_name} failed: {e} — recompiling"
+                "restoring nvcc coalesced hit for {crate_name} failed: {e:#} — recompiling"
             );
             return nvcc_passthrough_with_event(
                 config,
@@ -1680,7 +1680,7 @@ pub(crate) fn run_nvcc_for(
                 &crate_name,
                 &event_root,
                 start,
-                format!("restore failed: {e}"),
+                restore_failure_reason(&e),
             );
         }
         let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -2081,7 +2081,7 @@ fn nvcc_try_remote_hit(
     let restore_start = std::time::Instant::now();
     if let Err(e) = restore_nvcc_from_cache(store, parsed, &meta) {
         tracing::warn!(
-            "restoring nvcc remote cache hit for {crate_name} failed: {e} — recompiling"
+            "restoring nvcc remote cache hit for {crate_name} failed: {e:#} — recompiling"
         );
         return Ok(Some(nvcc_passthrough_with_event(
             config,
@@ -2089,7 +2089,7 @@ fn nvcc_try_remote_hit(
             crate_name,
             event_root,
             start,
-            format!("restore failed: {e}"),
+            restore_failure_reason(&e),
         )?));
     }
     let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -2458,14 +2458,14 @@ fn run_cc_with_store(
         } else {
             let restore_start = std::time::Instant::now();
             let trace_restore = crate::phase_trace::phase("restore");
-            let restored = restore_cc_hit(hit_store, parsed, meta);
+            let restored = restore_cc_hit(config.restore_max_size, hit_store, parsed, meta);
             drop(trace_restore);
             if let Err(e) = &restored {
                 if e.downcast_ref::<PartialCcRestore>().is_some() {
                     return restored.map(|_| 0);
                 }
                 tracing::warn!(
-                    "restoring cc cache hit for {} failed: {} — recompiling",
+                    "restoring cc cache hit for {} failed: {:#} — recompiling",
                     crate_name,
                     e
                 );
@@ -2476,10 +2476,10 @@ fn run_cc_with_store(
                         crate_name,
                         event_root,
                         start,
-                        format!("restore failed: {e}"),
+                        restore_failure_reason(e),
                     );
                 }
-                lookup_rejection = format!("read-only restore failed: {e}");
+                lookup_rejection = format!("read-only restore failed: {e:#}");
             }
             if let Ok(meta) = restored {
                 let restore_ms = restore_start.elapsed().as_millis() as u64;
@@ -2591,13 +2591,13 @@ fn run_cc_with_store(
         cc_restore_committed(precompiled.is_some(), cc_scheduled_hit_ok(parsed, meta))
     }) {
         let restore_start = std::time::Instant::now();
-        let restored = restore_cc_hit(store, parsed, meta);
+        let restored = restore_cc_hit(config.restore_max_size, store, parsed, meta);
         if let Err(e) = restored {
             if e.downcast_ref::<PartialCcRestore>().is_some() {
                 return Err(e);
             }
             tracing::warn!(
-                "restoring cc coalesced hit for {} failed: {} — recompiling",
+                "restoring cc coalesced hit for {} failed: {:#} — recompiling",
                 crate_name,
                 e
             );
@@ -2607,7 +2607,7 @@ fn run_cc_with_store(
                 crate_name,
                 event_root,
                 start,
-                format!("restore failed: {e}"),
+                restore_failure_reason(&e),
             );
         }
         let meta = restored?;
@@ -3335,6 +3335,7 @@ fn prepare_cc_cached_artifact(
 }
 
 fn apply_cc_post_publish_actions(
+    restore_max_size: u64,
     published: &[(PathBuf, ArtifactKind)],
     env: &crate::invocation::InvocationEnv,
 ) -> Result<()> {
@@ -3348,9 +3349,11 @@ fn apply_cc_post_publish_actions(
             if action.is_content_transform() {
                 continue;
             }
-            action.apply(path, &*host).with_context(|| {
-                format!("cc restore: applying {action:?} to {}", path.display())
-            })?;
+            action
+                .apply(path, &*host, restore_max_size)
+                .with_context(|| {
+                    format!("cc restore: applying {action:?} to {}", path.display())
+                })?;
         }
     }
     Ok(())
@@ -3359,11 +3362,12 @@ fn apply_cc_post_publish_actions(
 /// All finalization happens after publication, so any failure must stop the
 /// caller from invoking the compiler over the restored outputs.
 fn finalize_cc_restore(
+    restore_max_size: u64,
     published: &[(PathBuf, ArtifactKind)],
     parsed: &crate::compiler::cc::CcArgs,
 ) -> Result<()> {
     let finish = || -> Result<()> {
-        apply_cc_post_publish_actions(published, &parsed.invocation_env)?;
+        apply_cc_post_publish_actions(restore_max_size, published, &parsed.invocation_env)?;
         #[cfg(unix)]
         if parsed.mode == crate::compiler::cc::CompileMode::Link
             && let Some(output) = parsed.object_output_path()
@@ -3458,6 +3462,7 @@ fn restore_cc_stdout_from_cache(
 
 /// Decode and validate diagnostic locations before publishing any hit output.
 fn restore_cc_hit(
+    restore_max_size: u64,
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
     mut meta: EntryMeta,
@@ -3472,7 +3477,7 @@ fn restore_cc_hit(
     {
         meta.stderr = stderr;
     }
-    restore_cc_from_cache(store, parsed, &meta)?;
+    restore_cc_from_cache(restore_max_size, store, parsed, &meta)?;
     Ok(meta)
 }
 
@@ -3483,6 +3488,7 @@ fn restore_cc_hit(
 /// after publication starts, the caller receives `PartialCcRestore` and must
 /// not run the compiler over the partially restored output set.
 fn restore_cc_from_cache(
+    restore_max_size: u64,
     store: &Store,
     parsed: &crate::compiler::cc::CcArgs,
     meta: &crate::store::EntryMeta,
@@ -3582,7 +3588,7 @@ fn restore_cc_from_cache(
         published_kinds.push((target, kind));
     }
     publish_prepared_cc_artifacts(prepared)?;
-    finalize_cc_restore(&published_kinds, parsed)
+    finalize_cc_restore(restore_max_size, &published_kinds, parsed)
 }
 
 /// After a local miss, ask the daemon for an exact remote entry.
@@ -3614,13 +3620,13 @@ fn cc_try_remote_hit(
         return Ok(None);
     };
     let restore_start = std::time::Instant::now();
-    let restored = restore_cc_hit(store, parsed, meta);
+    let restored = restore_cc_hit(config.restore_max_size, store, parsed, meta);
     if let Err(e) = restored {
         if e.downcast_ref::<PartialCcRestore>().is_some() {
             return Err(e);
         }
         tracing::warn!(
-            "restoring cc remote cache hit for {} failed: {} — recompiling",
+            "restoring cc remote cache hit for {} failed: {:#} — recompiling",
             crate_name,
             e
         );
@@ -3630,7 +3636,7 @@ fn cc_try_remote_hit(
             crate_name,
             event_root,
             start,
-            format!("restore failed: {e}"),
+            restore_failure_reason(&e),
         )?));
     }
     let meta = restored?;
@@ -4750,7 +4756,7 @@ fn run_parsed_rustc(
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "restoring local cache hit for {} failed: {} — recompiling",
+                            "restoring local cache hit for {} failed: {:#} — recompiling",
                             crate_name,
                             e
                         );
@@ -4761,7 +4767,7 @@ fn run_parsed_rustc(
                                 crate_name,
                                 &event_root,
                                 start,
-                                format!("restore failed: {e}"),
+                                restore_failure_reason(&e),
                                 key_record,
                             );
                         }
@@ -4790,7 +4796,7 @@ fn run_parsed_rustc(
         ) {
             if let Err(e) = restored {
                 tracing::warn!(
-                    "restoring cache hit for {} failed: {} — recompiling",
+                    "restoring cache hit for {} failed: {:#} — recompiling",
                     crate_name,
                     e
                 );
@@ -4800,7 +4806,7 @@ fn run_parsed_rustc(
                     crate_name,
                     &event_root,
                     start,
-                    format!("restore failed: {e}"),
+                    restore_failure_reason(&e),
                     key_record,
                 );
             }
@@ -4928,15 +4934,19 @@ fn run_parsed_rustc(
 
     // 3. Cache miss — join the machine-wide flight, take a permit, then
     // claim the key and re-check under the build lock.
-    let (miss_guard, scheduled_hit) = admit_scheduler_miss(
-        config,
-        &store,
-        &cache_key,
-        FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
-        crate_name,
-        args.invokes_linker(),
-        cache_entry_has_files,
-    );
+    let (miss_guard, scheduled_hit) = if precompiled.is_none() {
+        admit_scheduler_miss(
+            config,
+            &store,
+            &cache_key,
+            FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()),
+            crate_name,
+            args.invokes_linker(),
+            cache_entry_has_files,
+        )
+    } else {
+        (MissGuard::empty(), None)
+    };
     let (lock, committed) = if let Some(meta) = scheduled_hit {
         (None, Some(meta))
     } else {
@@ -4978,7 +4988,7 @@ fn run_parsed_rustc(
             &key_record,
         ) {
             tracing::warn!(
-                "restoring cache hit for {} failed: {} — recompiling",
+                "restoring cache hit for {} failed: {:#} — recompiling",
                 crate_name,
                 e
             );
@@ -4988,7 +4998,7 @@ fn run_parsed_rustc(
                 crate_name,
                 &event_root,
                 start,
-                format!("restore failed: {e}"),
+                restore_failure_reason(&e),
                 key_record,
             );
         }
@@ -5407,6 +5417,13 @@ fn run_parsed_rustc(
     let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
     let mut store_error = String::new();
+    let identity_compiler = args.inner_rustc.as_deref().unwrap_or(&args.rustc);
+    let rustc_version =
+        crate::cache_key::rustc_version_text_for(identity_compiler, args.invocation_env());
+    let rustc_identity = rustc_version
+        .as_deref()
+        .and_then(|version| version.lines().next())
+        .and_then(|line| line.strip_prefix("rustc "));
     // The put is on the build's critical path. When the index is too busy
     // to register the entry at once, the daemon may finish it
     // (`rustc_handoff`).
@@ -5425,6 +5442,7 @@ fn run_parsed_rustc(
             stdout: &result.stdout,
             stderr: &result.stderr,
             compile_time_ms,
+            rustc_version: rustc_identity,
             event: EventInputs::new(&event_root, crate_name, EventResult::Miss, 0)
                 .rebuilt_observed(rebuilt.clone())
                 .compile_time_ms(compile_time_ms)
@@ -5446,7 +5464,7 @@ fn run_parsed_rustc(
             rustc_handoff::RustcStore::Stored(put) => put,
         }
     } else {
-        store.put_with_compile_time(
+        store.put_rustc_with_compile_time(
             &cache_key,
             crate_name,
             &args.crate_types,
@@ -5457,6 +5475,7 @@ fn run_parsed_rustc(
             &result.stdout,
             &result.stderr,
             compile_time_ms,
+            rustc_identity,
         )
     };
     // A stored entry grew the store: throttled size check and a detached
@@ -6384,6 +6403,7 @@ enum RestoredBytes {
 ///      recompile** — never a false hit. ENOENT is called out below so the
 ///      degradation reads as the benign race it is rather than corruption.
 fn materialize_cached_artifact(
+    restore_max_size: u64,
     store: &Store,
     cached_file: &crate::store::CachedFile,
     target_path: &Path,
@@ -6580,7 +6600,7 @@ fn materialize_cached_artifact(
             continue;
         }
         let loadability = action
-            .apply(target_path, platform)
+            .apply(target_path, platform, restore_max_size)
             .with_context(|| format!("{context}: applying {action:?}"))?;
         if loadability == crate::compiler::Loadability::Verified {
             verified_now = true;
@@ -8857,6 +8877,7 @@ fn restore_from_cache_with_memo_store(
         }
         let shared_rlib = restores_as_shared_rlib(args, &cached_file.name, &meta.files);
         let restored = materialize_cached_artifact(
+            config.restore_max_size,
             store,
             cached_file,
             &target_path,
@@ -9567,6 +9588,11 @@ const UNCACHEABLE_REASON: &str = "uncacheable|";
 /// (kunobi-ninja/kache#431).
 fn uncacheable_reason(error: &anyhow::Error) -> String {
     format!("{UNCACHEABLE_REASON}{error:#}")
+}
+
+/// Keep the root cause when a failed restore is recorded for report/explain.
+fn restore_failure_reason(error: &anyhow::Error) -> String {
+    format!("restore failed: {error:#}")
 }
 
 /// What a passthrough reason quotes of rustc's own output. A failed pre-pass

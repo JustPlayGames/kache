@@ -1283,6 +1283,7 @@ async fn cache_pack_upload_and_restore_use_the_existing_layout() {
     let registry = Registry::start().await;
     let backend = registry.backend();
     let remote = RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".into(),
         backend: RemoteBackendConfig::Oci(registry.config.clone()),
     };
@@ -1300,6 +1301,7 @@ async fn cache_pack_upload_and_restore_use_the_existing_layout() {
     let meta = EntryMeta {
         cache_key: blake3::hash(b"oci-fixture-cache-key").to_hex().to_string(),
         key_schema: crate::cache_key::CACHE_KEY_VERSION,
+        rustc_version: None,
         crate_name: "fixture".into(),
         crate_types: vec!["lib".into()],
         files: vec![CachedFile {

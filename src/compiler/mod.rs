@@ -580,7 +580,12 @@ impl PostRestoreAction {
     /// explicitly — rather than calling `platform::current()` here —
     /// keeps tests deterministic: a unit test can inject a counting /
     /// failing / no-op platform.
-    pub fn apply(&self, path: &std::path::Path, platform: &dyn Platform) -> Result<Loadability> {
+    pub fn apply(
+        &self,
+        path: &std::path::Path,
+        platform: &dyn Platform,
+        restore_max_size: u64,
+    ) -> Result<Loadability> {
         match self {
             PostRestoreAction::Sign(SigningPurpose::OsLoading) => {
                 // Verify-then-sign lives inside the platform impl so
@@ -589,7 +594,8 @@ impl PostRestoreAction {
                 platform.ensure_binary_loadable(path)
             }
             PostRestoreAction::UnpackDebugBundle => {
-                unpack_debug_bundle(path).map(|()| Loadability::Unverified)
+                unpack_debug_bundle_with_cap(path, restore_max_size)
+                    .map(|()| Loadability::Unverified)
             }
             PostRestoreAction::ExpandDepInfoPaths => {
                 // A content transform — handled in memory via
@@ -604,11 +610,8 @@ impl PostRestoreAction {
     }
 }
 
-/// Cap on total bytes written while unpacking one debug bundle. A `.dSYM`
-/// is at most a few hundred MB even for very large binaries; anything past
-/// 2 GiB is a corrupt or hostile archive, not debug info
-/// (kunobi-ninja/kache#319; mirrors `remote_layout`'s extraction cap, #212).
-const MAX_DEBUG_BUNDLE_BYTES: u64 = 2_147_483_648; // 2 GiB
+#[cfg(test)]
+const MAX_DEBUG_BUNDLE_BYTES: u64 = crate::config::DEFAULT_RESTORE_MAX_SIZE;
 
 /// Unpack a restored `<name>.dsym.tar` into a sibling `<name>.dSYM` bundle
 /// directory (kunobi-ninja/kache#319).
@@ -626,12 +629,6 @@ const MAX_DEBUG_BUNDLE_BYTES: u64 = 2_147_483_648; // 2 GiB
 /// Errors propagate: the wrapper's restore loop treats any restore failure
 /// as a clean miss and recompiles, which is exactly the right response to a
 /// tampered or corrupt entry.
-fn unpack_debug_bundle(tar_path: &std::path::Path) -> Result<()> {
-    unpack_debug_bundle_with_cap(tar_path, MAX_DEBUG_BUNDLE_BYTES)
-}
-
-/// [`unpack_debug_bundle`] with an explicit byte cap, so the bomb guard is
-/// testable without materializing a multi-GiB archive.
 fn unpack_debug_bundle_with_cap(tar_path: &std::path::Path, max_bytes: u64) -> Result<()> {
     use anyhow::Context as _;
 
@@ -667,10 +664,7 @@ fn unpack_debug_bundle_with_cap(tar_path: &std::path::Path, max_bytes: u64) -> R
         // framing will ever yield, so reject before writing anything.
         total_bytes = total_bytes.saturating_add(entry.size());
         if total_bytes > max_bytes {
-            anyhow::bail!(
-                "debug bundle exceeds the {max_bytes}-byte extraction cap \
-                 (corrupt or hostile archive)"
-            );
+            anyhow::bail!("debug bundle exceeds the {max_bytes}-byte extraction cap");
         }
         let path = entry
             .path()
@@ -1603,7 +1597,7 @@ mod tests {
 
         let platform = CountingPlatform::new();
         PostRestoreAction::Sign(SigningPurpose::OsLoading)
-            .apply(&path, &platform)
+            .apply(&path, &platform, MAX_DEBUG_BUNDLE_BYTES)
             .expect("apply must not error even when the platform impl is a no-op");
         assert_eq!(
             platform.ensure_calls(),
@@ -1647,7 +1641,7 @@ mod tests {
         .unwrap();
 
         PostRestoreAction::UnpackDebugBundle
-            .apply(&tar_path, &CountingPlatform::new())
+            .apply(&tar_path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
             .unwrap();
 
         // `foo-abc123.dsym.tar` → sibling `foo-abc123.dSYM` bundle dir.
@@ -1681,7 +1675,7 @@ mod tests {
         .unwrap();
 
         PostRestoreAction::UnpackDebugBundle
-            .apply(&tar_path, &CountingPlatform::new())
+            .apply(&tar_path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
             .unwrap();
 
         assert!(
@@ -1730,7 +1724,7 @@ mod tests {
         std::fs::write(&tar_path, forged_tar_with_entry_name(b"../escaped-file")).unwrap();
 
         let err = PostRestoreAction::UnpackDebugBundle
-            .apply(&tar_path, &CountingPlatform::new())
+            .apply(&tar_path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1759,7 +1753,7 @@ mod tests {
         .unwrap();
 
         let err = PostRestoreAction::UnpackDebugBundle
-            .apply(&tar_path, &CountingPlatform::new())
+            .apply(&tar_path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1778,7 +1772,7 @@ mod tests {
         let path = dir.path().join("foo.tar");
         std::fs::write(&path, synthetic_tar(&[("Contents/x", b"y")])).unwrap();
         let err = PostRestoreAction::UnpackDebugBundle
-            .apply(&path, &CountingPlatform::new())
+            .apply(&path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
             .unwrap_err()
             .to_string();
         assert!(err.contains(".dsym.tar"), "got: {err}");
@@ -1804,7 +1798,7 @@ mod tests {
             std::fs::write(&tar_path, builder.into_inner().unwrap()).unwrap();
 
             let err = PostRestoreAction::UnpackDebugBundle
-                .apply(&tar_path, &CountingPlatform::new())
+                .apply(&tar_path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -1837,6 +1831,82 @@ mod tests {
         unpack_debug_bundle_with_cap(&tar_path, 100)
             .expect("a bundle exactly at the cap is within budget");
         assert!(dir.path().join("capped.dSYM/Contents/blob").exists());
+    }
+
+    /// GNU sparse entries exercise the real multi-GiB extraction boundary
+    /// with filesystem holes rather than allocating or streaming GiBs of data.
+    #[cfg(unix)]
+    fn synthetic_sparse_tar(entries: &[(&str, u64)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (path, size) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_entry_type(tar::EntryType::GNUSparse);
+            header.set_size(0);
+            let gnu = header.as_gnu_mut().unwrap();
+            gnu.set_real_size(*size);
+            gnu.sparse[0].set_offset(*size);
+            gnu.sparse[0].set_length(0);
+            header.set_cksum();
+            bytes.extend_from_slice(header.as_bytes());
+        }
+        bytes.extend_from_slice(&[0; 1024]);
+        bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_bundles_above_two_gib_and_at_eight_gib_restore() {
+        use crate::compiler::platform::tests::CountingPlatform;
+
+        for size in [3_u64 << 30, 8_u64 << 30] {
+            let dir = tempfile::tempdir().unwrap();
+            let tar_path = dir.path().join("large.dsym.tar");
+            let archive = synthetic_sparse_tar(&[("Contents/Resources/DWARF/large", size)]);
+            assert_eq!(archive.len(), 1536);
+            std::fs::write(&tar_path, archive).unwrap();
+
+            PostRestoreAction::UnpackDebugBundle
+                .apply(&tar_path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
+                .unwrap();
+
+            let dwarf = dir.path().join("large.dSYM/Contents/Resources/DWARF/large");
+            assert_eq!(std::fs::metadata(dwarf).unwrap().len(), size);
+        }
+        assert_eq!(MAX_DEBUG_BUNDLE_BYTES, 8_589_934_592);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_bundle_cap_counts_all_entries_and_preserves_the_previous_bundle() {
+        use crate::compiler::platform::tests::CountingPlatform;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("large.dSYM");
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::write(bundle.join("kept"), b"previous bundle").unwrap();
+        let tar_path = dir.path().join("large.dsym.tar");
+        std::fs::write(
+            &tar_path,
+            synthetic_sparse_tar(&[
+                ("Contents/Resources/DWARF/first", 4_u64 << 30),
+                ("Contents/Resources/DWARF/second", (4_u64 << 30) + 1),
+            ]),
+        )
+        .unwrap();
+
+        let error = PostRestoreAction::UnpackDebugBundle
+            .apply(&tar_path, &CountingPlatform::new(), MAX_DEBUG_BUNDLE_BYTES)
+            .unwrap_err();
+        assert!(error.to_string().contains("8589934592-byte extraction cap"));
+        assert_eq!(
+            std::fs::read(bundle.join("kept")).unwrap(),
+            b"previous bundle"
+        );
+        assert!(!bundle.join("Contents").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     /// `ArtifactSet::push` genuinely appends — the store-time debug bundle
