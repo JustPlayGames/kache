@@ -1794,7 +1794,13 @@ pub const RANKING_FRESH_FOR: Duration = Duration::from_secs(300);
 /// after an upgrade walks every row of a dead key version, which on one
 /// store was some 276k rows. The ranking before the walk is not counted.
 /// A disk short of space keeps the sweep going.
-pub const SIZE_SWEEP_WALK_BUDGET: Duration = Duration::from_secs(30);
+///
+/// Long enough for one sweep to matter: each sweep also ranks the whole store
+/// (1-4 minutes on a busy machine, 2026-10-31), and a walk of 30 s removed
+/// 3-15 GB, about what builds added before the next one, so sweeps never
+/// reached the target and ran back to back. Nothing of a build's waits on
+/// `gc.lock`; removals pace their index writes either way.
+pub const SIZE_SWEEP_WALK_BUDGET: Duration = Duration::from_secs(180);
 
 /// Paces an eviction sweep's writes so build processes waiting on the index
 /// write lock get it between slices.
@@ -7921,8 +7927,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // read statement left open across them would pin the WAL snapshot.
         let last_refs = {
             let mut stmt = self.db.prepare(
+                // The filter is holds_last_reference's: most rows fail it,
+                // and each one read costs two 64-character strings.
                 "SELECT eb.cache_key, b.hash, b.size, b.refcount, eb.refs
-                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash",
+                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                 WHERE b.refcount > 0 AND b.refcount <= eb.refs",
             )?;
             stmt.query_map([], |row| {
                 Ok((
