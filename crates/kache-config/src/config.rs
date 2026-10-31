@@ -129,6 +129,9 @@ fn absolutize_volume_path(path: &Path) -> PathBuf {
 /// 20,000 of the usual 1.4 KB (kunobi-ninja/kache#1209).
 pub const DEFAULT_EVENT_LOG_MAX_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Maximum bytes downloaded or unpacked for one restored entry or debug bundle.
+pub const DEFAULT_RESTORE_MAX_SIZE: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Default for [`Config::auto_clean_unused_units_days`].
 pub const DEFAULT_UNUSED_UNITS_DAYS: u64 = 30;
 
@@ -161,6 +164,9 @@ pub struct Config {
     /// so ingest and restore stay on that volume.
     pub volume_stores: Vec<VolumeStore>,
     pub max_size: u64,
+    /// Per-entry remote download/extraction and debug-bundle unpack budget.
+    /// `cache.restore_max_size` / `KACHE_RESTORE_MAX_SIZE`, default 8 GiB.
+    pub restore_max_size: u64,
     pub remote: Option<RemoteConfig>,
     /// Why the remote is unavailable, when a remote *was* configured but could
     /// not be resolved. Kept as a message rather than propagated out of
@@ -172,6 +178,9 @@ pub struct Config {
     /// Route eligible local Cargo shim commands through Blaze. Off by default.
     /// `[cache] blaze` / `KACHE_BLAZE`; CI and explicit profiles stay with Cargo.
     pub blaze: bool,
+    /// Give Cargo check and Clippy their own target directory unless the user
+    /// configured an output directory. Enabled by default.
+    pub separate_check_targets: bool,
     pub cache_executables: bool,
     /// Opt-in C/C++ whole-program link caching (epic #762 / #259). Off by
     /// default until path/repro gates pass. `KACHE_CACHE_CC_LINKS` or
@@ -587,8 +596,9 @@ pub struct Config {
     /// `KACHE_AUTO_RECOVER_TARGETS=1`/`=true` or `[cache]
     /// auto_recover_targets = true`; `kache init` offers it.
     pub auto_recover_targets: bool,
-    /// Under memory pressure, admit a compile only when no other compile
-    /// holds a scheduler slot. On by default. Set via
+    /// Under memory pressure, ordinary admission keeps compiles within a
+    /// shared ceiling of permit slots that falls while pressure lasts.
+    /// Recovery has a separate bound. On by default. Set via
     /// `KACHE_SCHEDULER_MEMORY_PRESSURE=0`/`=false` or `[cache]
     /// scheduler_memory_pressure = false` to disable.
     pub scheduler_memory_pressure: bool,
@@ -664,6 +674,7 @@ pub struct PlannerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConfig {
+    pub restore_max_size: u64,
     /// Key prefix for all remote artifacts (default: "artifacts").
     pub prefix: String,
     pub backend: RemoteBackendConfig,
@@ -784,6 +795,7 @@ impl RemoteConfig {
     #[cfg(any(test, feature = "test-support"))]
     pub fn test_s3(bucket: &str, prefix: &str) -> Self {
         Self {
+            restore_max_size: DEFAULT_RESTORE_MAX_SIZE,
             prefix: prefix.to_string(),
             backend: RemoteBackendConfig::S3(S3RemoteConfig {
                 bucket: bucket.to_string(),
@@ -924,12 +936,17 @@ pub struct CcFileConfig {
 pub struct CacheFileConfig {
     /// Optional Blaze routing for local development. See [`Config::blaze`].
     pub blaze: Option<bool>,
+    /// See [`Config::separate_check_targets`].
+    pub separate_check_targets: Option<bool>,
     pub local_store: Option<String>,
     /// Job/process-lifetime state, separate from the persistent local store.
     pub runtime_dir: Option<String>,
     /// Another store read after the local one. See [`Config::readonly_store`].
     pub readonly_store: Option<String>,
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
     pub local_max_size: Option<String>,
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
+    pub restore_max_size: Option<String>,
     pub remote: Option<RemoteFileConfig>,
     pub planner: Option<PlannerFileConfig>,
     /// Strict local-only mode. See [`Config::local_only`].
@@ -975,6 +992,7 @@ pub struct CacheFileConfig {
     /// See [`Config::auto_clean_idle_targets_days`].
     pub auto_clean_idle_targets_days: Option<u64>,
     /// See [`Config::auto_recover_min_free_bytes`].
+    #[serde(default, deserialize_with = "crate::size::optional_bytes")]
     pub auto_recover_min_free_bytes: Option<u64>,
     /// See [`Config::auto_recover_targets`].
     pub auto_recover_targets: Option<bool>,
@@ -1015,6 +1033,7 @@ pub struct CacheFileConfig {
     pub bypass_env: Option<Vec<String>>,
     pub bypass_argv: Option<Vec<String>>,
     pub bypass_crates: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
     pub event_log_max_size: Option<String>,
     pub event_log_keep_lines: Option<usize>,
     pub compression_level: Option<i32>,
@@ -1023,6 +1042,7 @@ pub struct CacheFileConfig {
     pub remote_key_listing: Option<bool>,
     pub remote_key_cache_refresh_secs: Option<u64>,
     pub prefetch_max_keys: Option<u64>,
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
     pub prefetch_max_bytes: Option<String>,
     pub prefetch_deadline_secs: Option<u64>,
     /// Put-side admission threshold. See [`Config::min_store_compile_ms`].
@@ -1357,6 +1377,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_RUNTIME_DIR",
     "KACHE_READONLY_STORE",
     "KACHE_MAX_SIZE",
+    "KACHE_RESTORE_MAX_SIZE",
     "KACHE_CACHE_EXECUTABLES",
     "KACHE_CACHE_CC_LINKS",
     "KACHE_TRUST_CODEGEN_BACKENDS",
@@ -1421,6 +1442,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_HEARTBEAT_SECS",
     "KACHE_EXPLAIN_MISS",
     "KACHE_BLAZE",
+    "KACHE_SEPARATE_CHECK_TARGETS",
     "KACHE_SCHEDULER",
     "KACHE_PLANNER_ENDPOINT",
     "KACHE_PLANNER_TIMEOUT_MS",
@@ -1440,6 +1462,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_RUNTIME_DIR", "cache.runtime_dir"),
     ("KACHE_READONLY_STORE", "cache.readonly_store"),
     ("KACHE_MAX_SIZE", "cache.local_max_size"),
+    ("KACHE_RESTORE_MAX_SIZE", "cache.restore_max_size"),
     ("KACHE_CACHE_EXECUTABLES", "cache.cache_executables"),
     ("KACHE_CACHE_CC_LINKS", "cache.cache_cc_links"),
     (
@@ -1556,6 +1579,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_HEARTBEAT_SECS", "cache.heartbeat_secs"),
     ("KACHE_EXPLAIN_MISS", "cache.explain_miss"),
     ("KACHE_BLAZE", "cache.blaze"),
+    (
+        "KACHE_SEPARATE_CHECK_TARGETS",
+        "cache.separate_check_targets",
+    ),
     ("KACHE_SCHEDULER", "cache.scheduler"),
     ("KACHE_PLANNER_ENDPOINT", "cache.planner.endpoint"),
     ("KACHE_PLANNER_TIMEOUT_MS", "cache.planner.timeout_ms"),
@@ -1742,6 +1769,19 @@ impl Config {
             });
         let max_size = explicit_max_size
             .unwrap_or_else(|| disk_share_budget(kache_fs::volume::probe(&cache_dir).total_bytes));
+
+        let restore_max_size = env_or_ignored_for(invocation, "KACHE_RESTORE_MAX_SIZE", ignore_env)
+            .ok()
+            .and_then(|s| parse_restore_max_size(&s, "KACHE_RESTORE_MAX_SIZE"))
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.restore_max_size.as_deref())
+                    .and_then(|s| parse_restore_max_size(s, "[cache] restore_max_size"))
+            })
+            .unwrap_or(DEFAULT_RESTORE_MAX_SIZE);
 
         let cache_executables =
             env_or_ignored_for(invocation, "KACHE_CACHE_EXECUTABLES", ignore_env)
@@ -2187,6 +2227,17 @@ impl Config {
                     .and_then(|cache| cache.blaze)
                     .unwrap_or(false)
             });
+        let separate_check_targets =
+            env_or_ignored_for(invocation, "KACHE_SEPARATE_CHECK_TARGETS", ignore_env)
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+                .unwrap_or_else(|_| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|file| file.cache.as_ref())
+                        .and_then(|cache| cache.separate_check_targets)
+                        .unwrap_or(true)
+                });
         let record_sessions = Self::record_sessions_enabled_for(invocation, &file_config);
         let windows_hardlink = Self::windows_hardlink_enabled_for(invocation, &file_config);
         let shared_hardlink_restores =
@@ -2266,7 +2317,7 @@ impl Config {
         // an error means the compiler never runs at all — a config typo would
         // break every build instead of costing cache hits. Record the reason and
         // continue local-only.
-        let (remote, remote_error) = if local_only {
+        let (mut remote, remote_error) = if local_only {
             (None, None)
         } else {
             match Self::load_remote_config_for(invocation, &file_config) {
@@ -2282,6 +2333,9 @@ impl Config {
                 }
             }
         };
+        if let Some(remote) = remote.as_mut() {
+            remote.restore_max_size = restore_max_size;
+        }
         let remote_key_listing = explicit_remote_key_listing
             .unwrap_or_else(|| default_remote_key_listing(remote.as_ref()));
         let pull_request_prefix =
@@ -2340,10 +2394,12 @@ impl Config {
             runtime_dir,
             socket_path_override,
             max_size,
+            restore_max_size,
             remote,
             remote_error,
             disabled,
             blaze,
+            separate_check_targets,
             local_only,
             remote_readonly,
             readonly_store,
@@ -2640,6 +2696,7 @@ impl Config {
             .and_then(|r| r.prefix.clone())
             .unwrap_or_else(|| "artifacts".to_string());
         Ok(RemoteConfig {
+            restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: resolve_remote_prefix(&prefix)?,
             backend: RemoteBackendConfig::Gcs(GcsRemoteConfig {
                 bucket,
@@ -2680,6 +2737,7 @@ impl Config {
         };
         config.reference()?;
         Ok(RemoteConfig {
+            restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: resolve_remote_prefix(remote.prefix.as_deref().unwrap_or("artifacts"))?,
             backend: RemoteBackendConfig::Oci(config),
         })
@@ -2801,6 +2859,7 @@ impl Config {
             }
 
             return Ok(Some(RemoteConfig {
+                restore_max_size: DEFAULT_RESTORE_MAX_SIZE,
                 prefix,
                 backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
                     root,
@@ -2879,6 +2938,7 @@ impl Config {
             .filter(|s| !s.is_empty());
 
         Ok(Some(RemoteConfig {
+            restore_max_size: DEFAULT_RESTORE_MAX_SIZE,
             prefix,
             backend: RemoteBackendConfig::S3(S3RemoteConfig {
                 bucket,
@@ -3351,7 +3411,7 @@ impl Config {
         let ignore_env = Self::ignore_env_enabled(file_config);
         env_or_ignored_for(invocation, "KACHE_AUTO_RECOVER_MIN_FREE_BYTES", ignore_env)
             .ok()
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| parse_size_checked(&s, "KACHE_AUTO_RECOVER_MIN_FREE_BYTES"))
             .or_else(|| {
                 file_config
                     .as_ref()
@@ -4988,8 +5048,17 @@ fn exclude_expanded_pattern_matches(expanded: &str, candidates: &[PathBuf]) -> b
         .any(|candidate| pattern.matches_path(candidate))
 }
 
+fn parse_restore_max_size(value: &str, source: &str) -> Option<u64> {
+    let bytes = parse_size_checked(value, source)?;
+    if bytes == 0 {
+        tracing::warn!(%source, "restore size limit must be greater than zero; ignoring value");
+        return None;
+    }
+    Some(bytes)
+}
+
 pub fn parse_size(s: &str) -> Option<u64> {
-    s.parse::<ByteSize>().ok().map(|b| b.as_u64())
+    crate::size::parse_size(s)
 }
 
 /// Store budget derived from the volume that holds the cache directory.
@@ -5147,6 +5216,62 @@ mod invocation_tests {
             Some(root.join("home")),
             root.join("tmp"),
         )
+    }
+
+    #[test]
+    fn size_settings_resolve_units_integer_bytes_and_snapshot_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(".kache.toml");
+        let vars = [("KACHE_HOST_CONFIG", "")];
+        let env = snapshot(root.path(), &vars);
+        for (raw, expected) in [
+            ("4096", 4096),
+            ("\"1.5GiB\"", 1_610_612_736),
+            ("\"1GB\"", 1_000_000_000),
+        ] {
+            std::fs::write(&path, format!("[cache]\nlocal_max_size = {raw}\nevent_log_max_size = {raw}\nprefetch_max_bytes = {raw}\nauto_recover_min_free_bytes = {raw}\nrestore_max_size = {raw}\n[cache.remote]\nbucket = \"test\"\n")).unwrap();
+            let config = Config::load_for(&env).unwrap();
+            assert_eq!(config.max_size, expected);
+            assert_eq!(config.event_log_max_size, expected);
+            assert_eq!(config.prefetch_max_bytes, expected);
+            assert_eq!(config.auto_recover_min_free_bytes, expected);
+            assert_eq!(config.restore_max_size, expected);
+            assert_eq!(config.remote.unwrap().restore_max_size, expected);
+        }
+        let overridden = snapshot(
+            root.path(),
+            &[
+                ("KACHE_HOST_CONFIG", ""),
+                ("KACHE_RESTORE_MAX_SIZE", "12GiB"),
+                ("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", "500MB"),
+            ],
+        );
+        let config = Config::load_for(&overridden).unwrap();
+        assert_eq!(config.restore_max_size, 12_884_901_888);
+        assert_eq!(config.remote.unwrap().restore_max_size, 12_884_901_888);
+        assert_eq!(config.auto_recover_min_free_bytes, 500_000_000);
+        std::fs::write(&path, "[cache]\nignore_env = true\nrestore_max_size = \"2GiB\"\nauto_recover_min_free_bytes = \"3GiB\"\n").unwrap();
+        let config = Config::load_for(&overridden).unwrap();
+        assert_eq!(config.restore_max_size, 2_147_483_648);
+        assert_eq!(config.auto_recover_min_free_bytes, 3_221_225_472);
+        for invalid in ["0", "garbage", "16EiB"] {
+            std::fs::write(
+                &path,
+                format!("[cache]\nrestore_max_size = \"{invalid}\"\n"),
+            )
+            .unwrap();
+            let config = Config::load_for(&env).unwrap();
+            assert_eq!(config.restore_max_size, 8_589_934_592);
+        }
+        std::fs::write(&path, "[cache]\nrestore_max_size = \"2GiB\"\n").unwrap();
+        let invalid_env = snapshot(
+            root.path(),
+            &[("KACHE_HOST_CONFIG", ""), ("KACHE_RESTORE_MAX_SIZE", "0")],
+        );
+        assert_eq!(
+            Config::load_for(&invalid_env).unwrap().restore_max_size,
+            2_147_483_648
+        );
     }
 
     #[test]

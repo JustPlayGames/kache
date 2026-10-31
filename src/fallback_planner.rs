@@ -97,7 +97,7 @@ pub async fn resolve_identity_candidates_speculative(
                     RemoteErrorClass::Transient => {
                         retryable_failures.push((key.clone(), class));
                     }
-                    RemoteErrorClass::Timeout => {
+                    RemoteErrorClass::Timeout | RemoteErrorClass::Deadline => {
                         return SpeculativeIdentityOutcome::NonRetryableFailures(vec![(
                             key.clone(),
                             class,
@@ -500,6 +500,7 @@ mod tests {
     ) -> Config {
         Config {
             blaze: false,
+            separate_check_targets: true,
             readonly_store: None,
             remote_error: None,
             socket_path_override: None,
@@ -530,6 +531,7 @@ mod tests {
             auto_share_target_files: true,
             auto_clean_idle_targets_days: 0,
             auto_recover_min_free_bytes: 0,
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,

@@ -812,6 +812,7 @@ fn min_store_compile_is_opt_in_and_obeys_env_precedence() {
 #[test]
 fn remote_key_listing_defaults_to_on_only_for_a_filesystem_remote() {
     let filesystem = RemoteConfig {
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: RemoteBackendConfig::Filesystem(FilesystemRemoteConfig {
             root: PathBuf::from("/cache"),
@@ -819,6 +820,7 @@ fn remote_key_listing_defaults_to_on_only_for_a_filesystem_remote() {
         }),
     };
     let s3 = RemoteConfig {
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: RemoteBackendConfig::S3(S3RemoteConfig {
             bucket: "bucket".to_string(),
@@ -1733,7 +1735,7 @@ fn a_malformed_host_file_is_ignored_and_reported() {
     let _lock = config_path_lock();
     for host_content in [
         "[cache\nthis is not toml",
-        "[cache]\nlocal_max_size = 5\n", // valid TOML, wrong type
+        "[cache]\nlocal_max_size = true\n", // valid TOML, wrong type
     ] {
         let dir = tempfile::tempdir().unwrap();
         let (host, chosen) = write_host_and_chosen(
@@ -2837,6 +2839,7 @@ fn test_file_config_roundtrip() {
         workspace: None,
         cache: Some(CacheFileConfig {
             blaze: None,
+            separate_check_targets: None,
             readonly_store: None,
             bypass_env: None,
             bypass_argv: None,
@@ -2863,6 +2866,7 @@ fn test_file_config_roundtrip() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
+            restore_max_size: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
@@ -3495,6 +3499,7 @@ fn test_env_overrides_detect() {
 fn test_config_store_dir() {
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3523,6 +3528,7 @@ fn test_config_store_dir() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -3583,6 +3589,7 @@ fn test_config_store_dir() {
 fn test_config_index_db_path() {
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3611,6 +3618,7 @@ fn test_config_index_db_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -3667,6 +3675,7 @@ fn test_config_index_db_path() {
 fn test_config_event_log_path() {
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3695,6 +3704,7 @@ fn test_config_event_log_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -3770,6 +3780,7 @@ fn test_config_socket_path() {
     let _env_guard = set_env_for_test("KACHE_SOCKET_PATH", None);
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3798,6 +3809,7 @@ fn test_config_socket_path() {
         auto_share_target_files: true,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -4511,6 +4523,7 @@ fn test_save_and_load_file_config() {
         workspace: None,
         cache: Some(CacheFileConfig {
             blaze: None,
+            separate_check_targets: None,
             readonly_store: None,
             bypass_env: None,
             bypass_argv: None,
@@ -4537,6 +4550,7 @@ fn test_save_and_load_file_config() {
             auto_share_target_files: None,
             auto_clean_idle_targets_days: None,
             auto_recover_min_free_bytes: None,
+            restore_max_size: None,
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
@@ -6144,4 +6158,43 @@ fn blaze_requires_explicit_opt_in_and_honors_the_selected_file() {
     assert!(!load(&[("KACHE_BLAZE", "0")]));
     std::fs::write(&path, "[cache]\nblaze=true\nignore_env=true\n").unwrap();
     assert!(load(&[("KACHE_BLAZE", "false")]));
+}
+
+#[test]
+fn check_targets_default_on_with_file_and_environment_opt_out() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join(".kache.toml");
+    let load = |extra: &[(&str, &str)]| {
+        let mut vars = vec![
+            (
+                "KACHE_CONFIG".to_owned(),
+                path.to_string_lossy().into_owned(),
+            ),
+            ("KACHE_HOST_CONFIG".into(), String::new()),
+        ];
+        vars.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let env = InvocationEnv::from_parts(
+            vars,
+            Some(root.path().into()),
+            Some(root.path().into()),
+            root.path().into(),
+        );
+        Config::load_for(&env).unwrap().separate_check_targets
+    };
+    std::fs::write(&path, "[cache]\n").unwrap();
+    assert!(load(&[]));
+    assert!(!load(&[("KACHE_SEPARATE_CHECK_TARGETS", "0")]));
+    assert!(!load(&[("KACHE_SEPARATE_CHECK_TARGETS", "FaLsE")]));
+    std::fs::write(&path, "[cache]\nseparate_check_targets=false\n").unwrap();
+    assert!(!load(&[]));
+    assert!(load(&[("KACHE_SEPARATE_CHECK_TARGETS", "1")]));
+    std::fs::write(
+        &path,
+        "[cache]\nseparate_check_targets=false\nignore_env=true\n",
+    )
+    .unwrap();
+    assert!(!load(&[("KACHE_SEPARATE_CHECK_TARGETS", "true")]));
+    std::fs::write(&path, "[cache]\nseparate_check_targets=true\n").unwrap();
+    assert!(load(&[]));
+    assert!(!load(&[("KACHE_SEPARATE_CHECK_TARGETS", "false")]));
 }

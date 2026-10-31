@@ -13,9 +13,61 @@ After a local and remote miss, the wrapper joins a machine-wide flight for its c
 
 The permit pool size is `std::thread::available_parallelism()`, with a floor of 1. Unmeasured compiles occupy one slot. Unmeasured rustc invocations that run the system linker (binaries, dylibs, cdylibs, and proc macros) occupy two. A library compile is not a link, even though Cargo asks it to emit `link`. On Unix, a real compile records the child's peak RSS by crate name. Later invocations of that crate occupy `ceil(rss / slot)` slots, clamped to the pool. A slot is the machine's memory divided by the pool size, and never less than 512 MiB. On Linux the memory is the smaller of physical memory and the cgroup's `memory.max`. Where the memory cannot be read, a slot is 512 MiB.
 
-The memory estimate cannot see what else is running: builds outside Kache, an editor, a browser. So the scheduler also checks whether the machine is short of memory. Under memory pressure a compile asks for the whole pool: it waits for the other compiles to finish, so they run one after another until pressure eases. Slots held by running tests still count against that as usual, so a test waiting on a compile cannot stall it. On macOS, pressure is the kernel's pressure level at warning or critical. On Linux it is memory PSI, some task stalled on memory for at least 10% of the last ten seconds, read from the process's cgroup when it has its own `memory.pressure` and from the host otherwise. Other systems report no pressure. Set `cache.scheduler_memory_pressure = false` or `KACHE_SCHEDULER_MEMORY_PRESSURE=0` to turn the check off.
+The memory estimate cannot see what else is running: builds outside Kache, an editor, a browser. So the scheduler also checks whether the machine is short of memory, and keeps a ceiling on the slots compiles hold. Builds that share the cache directory share the ceiling. Ordinary admission takes a compile only while the slots held, its own included, stay within the ceiling. Compiles already running keep their slots when the ceiling falls below what they hold; new compiles wait until enough of them finish. A compile heavier than the ceiling waits for the whole pool to be free and runs alone. Recovery admission is bounded separately below.
 
-If the scheduler directory cannot be used, compilation continues without a permit. A compile that has waited 30 minutes for a peer's compile or for free slots also continues without one. Set `KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn the scheduler off.
+- At critical pressure the ceiling drops to one slot at once.
+- At warning pressure it halves, rounded up, at most once every 10 seconds, down to the compile reserve: a quarter of the pool, at least one slot. A warning never raises a lower ceiling.
+- Once pressure clears, the ceiling stays put until readings have been calm for 10 seconds, then grows by a quarter of the pool every 10 seconds up to the whole pool. Any reading that is not calm restarts that wait, so readings that alternate never raise it.
+- A reading that cannot be taken leaves the ceiling where it is and also restarts the wait.
+
+Slots held by running tests still count against the ordinary request, so a test waiting on a compile cannot stall it: that compile fits in the compile reserve whatever the ceiling. On macOS, warning and critical are the kernel's pressure levels. On Linux, warning is memory PSI with some task stalled on memory for at least 10% of the last ten seconds, and critical is every task stalled for that long. The reading comes from the process's cgroup when it has its own `memory.pressure`, and from the host otherwise. Other systems have no reading, so their ceiling stays at the whole pool. Set `cache.scheduler_memory_pressure = false` or `KACHE_SCHEDULER_MEMORY_PRESSURE=0` to turn the check off; that build then ignores the ceiling and does not move it. Kache releases before the ceiling ask for the whole pool under pressure instead.
+
+Compiles and test binaries queue for regular slots across builds that share the
+cache directory, including worktrees and separate target directories. Requests
+are ordered by arrival, with foreground requests placed 10 seconds ahead of
+background requests. An older background request therefore goes before foreground
+requests that arrive more than 10 seconds later. Running compiles keep their slots.
+
+A background build has Darwin background priority (`taskpolicy -b`) or positive
+niceness on macOS, positive niceness or `SCHED_BATCH`/`SCHED_IDLE` on Linux, or the
+idle or below-normal priority class on Windows. Daemon requests use the calling
+build's priority.
+
+When the first request needs more slots than are free, smaller requests can pass
+it once per pool slot. It then reserves free slots until enough are available.
+Tests reserve only test slots. Heavy compiles count slots reserved for waiting
+tests alongside slots running tests hold, so they fit in the compile reserve. Cancelled
+waiters remove their tickets; the next planner removes tickets left by killed
+processes. A waiter that has not run for two seconds is skipped until it runs
+again. If the queue is unusable or its lock remains held for one second, requests
+try free slots without queue ordering.
+
+Kache releases before this queue take free slots without queuing. Their running compiles still count against the pool, but while releases are mixed on one machine an older wrapper can take slots a queued request was saving up.
+
+Compiler invocations share a 30-minute allowance for ordinary coordination waits,
+including dependency discovery, a peer compiling the same key and permit
+acquisition. Each phase spends the allowance left by earlier phases. Each
+ordinary capacity wait is also capped at 30 seconds. Compiler runtime and key
+computation do not spend the allowance. A compile-first result is stored without
+asking for another compiler permit.
+
+When ordinary capacity admission reaches its limit, one compile at a time can use
+recovery capacity. Recovery adds at most two weighted slots to the regular pool,
+or one on a single-slot pool. A heavier compile still needs regular slots for
+the rest of its weight. Recovery uses the measured or default compile weight
+and ignores the memory pressure ceiling. Other waiters
+continue checking ordinary capacity and wait for the recovery holder to finish.
+That additional wait can exceed the ordinary wait limit and remains cancellable. A
+holder exiting releases its locks, including after a crash.
+
+Recovery keeps the request's queue position when it needs regular slots. Its
+extra slots have a separate single-compiler gate and do not follow queue order.
+
+If neither ordinary nor recovery admission can obtain capacity before the shared
+coordination allowance expires, compilation continues without a permit. The same
+fallback applies when the scheduler directory cannot be used. Set
+`KACHE_SCHEDULER=0` or `[cache] scheduler = false` to turn the
+scheduler off. Test-runner lease waits keep their own limits.
 
 Two cargo processes that miss the same crate still share one real compile when the first stores an entry the second can restore. Distinct target directories remain required.
 
@@ -31,3 +83,19 @@ above.
 ## Several test runs at once
 
 Test binaries can wait for the same pool. Set `kache test-runner` as Cargo's target runner and each test binary takes slots until it exits. A quarter of the pool, at least one slot, stays reserved for compiles. Builds started inside a running test use that test's slots. See [Test runner](/docs/getting-started/configuration#test-runner) to turn it on.
+
+## Restoring large cache entries
+
+`cache.restore_max_size` / `KACHE_RESTORE_MAX_SIZE` limits each compressed remote
+entry download and its extracted file contents, and each unpacked debug bundle.
+The default is `8GiB`. The limit must be positive; an entry that exceeds it falls
+back to compilation. It does not reserve memory or set a combined budget for
+concurrent restores.
+
+```bash
+kache config set cache.restore_max_size 12GiB
+kache daemon restart
+```
+
+Remote decoders also limit the zstd window to 128 MiB. Raising the restore-size
+limit does not raise that memory bound or disable archive path and link checks.

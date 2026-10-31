@@ -102,6 +102,7 @@ fn handoff<'a>(
         stdout: "",
         stderr: "warning: kept\n",
         compile_time_ms: 7,
+        rustc_version: Some("1.99.0 (abc 2026-01-01)"),
         event: EventInputs::new("/ws", "foo", EventResult::Miss, 0),
         size: 96 << 10,
         start,
@@ -512,6 +513,7 @@ async fn on_a_free_index_the_miss_is_stored_before_the_wrapper_returns() {
         .get(&compiled.key)
         .unwrap()
         .expect("visible when the wrapper returns");
+    assert_eq!(meta.rustc_version.as_deref(), Some("1.99.0 (abc 2026-01-01)"));
     assert_eq!(
         std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
         written
@@ -567,6 +569,8 @@ async fn on_a_busy_index_the_wrapper_returns_and_the_daemon_commits_after() {
     let meta = store.get(&compiled.key).unwrap().expect("committed");
     assert_eq!(meta.files.len(), 1);
     assert_eq!(meta.stderr, "warning: kept\n");
+    assert_eq!(meta.rustc_version.as_deref(), Some("1.99.0 (abc 2026-01-01)"));
+    assert_eq!(store.preview_rustc_version("1.99.0").unwrap().entries, 1);
     assert_eq!(
         std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
         written
@@ -684,6 +688,10 @@ fn hand_offs_queued_on_a_busy_index_commit_in_one_transaction() {
                     std::fs::read(&one.rlib).unwrap()
                 );
             }
+            assert_eq!(
+                store.preview_rustc_version("1.99.0").unwrap().entries,
+                COUNT
+            );
             let events = raw_events(config);
             assert_eq!(events.len(), COUNT);
             for event in &events {

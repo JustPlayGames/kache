@@ -1086,6 +1086,7 @@ fn compile_started_wire_tags_and_stats_default() {
             socket_path: "/c/daemon.sock".into(),
             started_at_ms: 1,
             auto_recover_min_free_bytes: None,
+            restore_max_size: None,
             auto_recover_targets: None,
         }),
         publishes_pending: 0,
@@ -1451,6 +1452,7 @@ async fn test_send_request_with_timeout_bounds_unresponsive_daemon() {
 pub(super) fn test_config(dir: &Path) -> Config {
     Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -1479,6 +1481,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -1684,6 +1687,7 @@ fn only_a_refused_listing_stops_the_refresher() {
     assert!(!listing_was_refused(&flaky, s3.as_ref()));
     let root = tempfile::tempdir().unwrap();
     let filesystem = crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: crate::config::RemoteBackendConfig::Filesystem(
             crate::config::FilesystemRemoteConfig {
@@ -1928,6 +1932,7 @@ fn server_main_binds_socket_and_handles_shutdown() {
         config.daemon_idle_timeout_secs = 0;
         config.prefetch_enabled = false;
         config.remote = Some(crate::config::RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
             prefix: "artifacts".into(),
             backend: crate::config::RemoteBackendConfig::Filesystem(
                 crate::config::FilesystemRemoteConfig {
@@ -6675,7 +6680,7 @@ fn prediction_fetch_deadline_uses_the_shorter_enabled_budget() {
 }
 
 #[tokio::test]
-async fn prediction_fetch_deadline_cancels_stalled_get_and_degrades_reads() {
+async fn prediction_fetch_deadline_cancels_stalled_get_without_degrading_reads() {
     let dir = tempfile::tempdir().unwrap();
     let mut daemon = resilience_test_daemon(dir.path(), Arc::new(StallingGetBackend));
     daemon.config.remote_restore_timeout_secs = 1;
@@ -6691,16 +6696,15 @@ async fn prediction_fetch_deadline_cancels_stalled_get_and_degrades_reads() {
     assert!(response.ok);
     assert_eq!(response.prediction, None);
     assert!(
-        daemon.remote_breaker.is_degraded(),
-        "the cancelled GET must count as a failure"
+        !daemon.remote_breaker.is_degraded(),
+        "a local prediction deadline must not count as a remote failure"
     );
     let request = fetch_request(ROW_IDENTITY);
     let next = daemon.handle_prediction_fetch(&request);
     tokio::pin!(next);
     assert!(
-        matches!(futures::poll!(&mut next), std::task::Poll::Ready(response)
-        if response.ok && response.prediction.is_none()),
-        "later requests must answer immediately"
+        futures::poll!(&mut next).is_pending(),
+        "later requests must still be admitted to the remote"
     );
 }
 
@@ -6834,7 +6838,7 @@ impl crate::remote_backend::RemoteBackend for BlockingIdentityBackend {
 
 struct FailingIdentityBackend {
     inner: Arc<dyn crate::remote_backend::RemoteBackend>,
-    kind: std::io::ErrorKind,
+    kind: Option<std::io::ErrorKind>,
     identity_keys: Mutex<Vec<String>>,
 }
 
@@ -6851,7 +6855,10 @@ impl crate::remote_backend::RemoteBackend for FailingIdentityBackend {
     ) -> Result<Option<crate::remote_backend::GetObject>> {
         if key.contains("/_manifests/") {
             self.identity_keys.lock().unwrap().push(key.to_string());
-            return Err(std::io::Error::new(self.kind, "classified manifest failure").into());
+            if let Some(kind) = self.kind {
+                return Err(std::io::Error::new(kind, "classified manifest failure").into());
+            }
+            RemoteDeadline::from_instant(Some(Instant::now())).check("identity manifest")?;
         }
         self.inner.get(key, max_bytes).await
     }
@@ -6931,6 +6938,71 @@ impl crate::remote_backend::RemoteBackend for PutFailBackend {
 
     fn describe(&self, key: &str) -> String {
         format!("failure://test/{key}")
+    }
+}
+
+struct DeadlineUploadBackend {
+    fail_head: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::remote_backend::RemoteBackend for DeadlineUploadBackend {
+    async fn head(&self, _key: &str) -> Result<bool> {
+        if self.fail_head {
+            RemoteDeadline::from_instant(Some(Instant::now())).check("upload HEAD")?;
+        }
+        Ok(false)
+    }
+
+    async fn get(
+        &self,
+        _key: &str,
+        _max_bytes: Option<u64>,
+    ) -> Result<Option<crate::remote_backend::GetObject>> {
+        panic!("upload must not GET");
+    }
+
+    async fn put(&self, _key: &str, _body: Vec<u8>, _content_type: Option<&str>) -> Result<()> {
+        RemoteDeadline::from_instant(Some(Instant::now())).check("upload PUT")
+    }
+
+    async fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+        panic!("upload must not list");
+    }
+
+    fn describe(&self, key: &str) -> String {
+        format!("deadline://test/{key}")
+    }
+}
+
+#[tokio::test]
+async fn upload_deadlines_remain_retryable_without_degrading_remote_health() {
+    for fail_head in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(resilience_test_daemon(
+            dir.path(),
+            Arc::new(DeadlineUploadBackend { fail_head }),
+        ));
+        let key = test_cache_key("deadline-upload");
+        seed_store_entry(&daemon.config, &key, "serde", dir.path());
+        let job = persist_upload_job(
+            &daemon.config,
+            &UploadJob {
+                key: key.clone(),
+                entry_dir: String::new(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+                client_version: None,
+            },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let response = daemon.do_upload(&job).await;
+            assert!(!response.ok);
+            assert!(response.error.unwrap().starts_with("retryable:"));
+        }
+        assert!(!daemon.remote_breaker.is_degraded());
+        assert!(upload_spool_path(&daemon.config, &key).is_file());
     }
 }
 
@@ -11092,6 +11164,505 @@ async fn index_list_receipt_keeps_backend_completion_when_bookkeeping_is_cancell
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn identity_manifest_candidates_protect_cheap_demands_across_planning() {
+    let _lock = crate::config::config_path_lock();
+    let _minimum = EnvVarForTest::remove("KACHE_MIN_COMPILE_MS");
+    let _manifest_override = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+    for timing in [
+        "before-session",
+        "before-plan",
+        "after-plan",
+        "after-advisory",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.remote_readonly = true;
+        let backend = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.signal_warming_complete();
+        assert!(daemon.remote_backend.set(backend.clone()).is_ok());
+        let request = BuildStartedRequest {
+            session_id: format!("manifest-{timing}"),
+            intent: kache_core::BuildIntent {
+                identity_key: Some("id/manifest-candidates".into()),
+                ..Default::default()
+            },
+            client_epoch: 0,
+            client_version: None,
+        };
+        let cheap: Vec<_> = (0..12)
+            .map(|index| check_request(dir.path(), &format!("cheap-{timing}-{index}")))
+            .collect();
+        let expensive = test_cache_key(&format!("expensive-{timing}"));
+        put_test_object(
+            &backend,
+            &test_pack_object_key(&expensive, "serde"),
+            &build_entry_pack(&expensive, "serde"),
+        )
+        .await;
+        let mut entries: Vec<_> = cheap
+            .iter()
+            .map(|entry| crate::remote::ManifestEntry {
+                cache_key: entry.key.clone(),
+                crate_name: "serde".into(),
+                compile_time_ms: 0,
+                artifact_size: 100,
+            })
+            .collect();
+        entries.push(crate::remote::ManifestEntry {
+            cache_key: expensive.clone(),
+            crate_name: "serde".into(),
+            compile_time_ms: 2_000,
+            artifact_size: 100,
+        });
+        let manifest = crate::remote::BuildManifest {
+            version: 3,
+            created: "2026-10-29T00:00:00Z".into(),
+            manifest_key: "id/manifest-candidates".into(),
+            entries,
+        };
+        let capacity = daemon.prefetch_gate.available_permits();
+        let held = daemon
+            .prefetch_gate
+            .acquire_many(capacity as u32)
+            .await
+            .unwrap();
+        if timing != "before-session" {
+            daemon.ensure_active_session(&request);
+        }
+        let planner_key = test_cache_key("planner-before-manifest");
+        let (initial_plan_id, initial_source) = if timing == "after-advisory" {
+            ("original-advisory-plan", "advisory")
+        } else {
+            ("", "fallback")
+        };
+        let planned_before_manifest = matches!(timing, "after-plan" | "after-advisory");
+        if planned_before_manifest {
+            daemon.install_plan(
+                &request.session_id,
+                initial_plan_id,
+                initial_source,
+                std::iter::once(planner_key.clone()),
+                request.intent.identity_key.clone(),
+            );
+        }
+        assert_eq!(
+            identity_manifest_prefetch_from(&daemon, manifest.manifest_key.clone(), manifest).await,
+            1
+        );
+        if timing == "before-session" {
+            daemon.ensure_active_session(&request);
+        }
+        if !planned_before_manifest {
+            daemon.install_plan(
+                &request.session_id,
+                "",
+                "fallback",
+                std::iter::once(planner_key.clone()),
+                request.intent.identity_key.clone(),
+            );
+        }
+        for demand in &cheap {
+            let response = daemon.handle_remote_check(demand).await;
+            assert!(response.ok, "{response:?}");
+            assert_eq!(response.found, Some(false));
+        }
+        assert!(
+            !*daemon.prefetch_cancel.borrow(),
+            "{timing}: cheap manifest entries must not cancel queued prefetch"
+        );
+        {
+            let slot = daemon.active_plan.lock().unwrap();
+            let plan = slot.as_ref().unwrap();
+            assert_eq!(plan.demanded_candidates.len(), 12, "{timing}");
+            assert_eq!(
+                plan.candidates.len(),
+                14,
+                "all manifest entries and the planner key count"
+            );
+            assert!(!plan.cancelled);
+        }
+        let replacement = test_cache_key("replacement-planner-key");
+        daemon.install_plan(
+            &request.session_id,
+            "replacement",
+            "advisory",
+            std::iter::once(replacement.clone()),
+            request.intent.identity_key.clone(),
+        );
+        {
+            let slot = daemon.active_plan.lock().unwrap();
+            let plan = slot.as_ref().unwrap();
+            assert_eq!(plan.demanded_candidates.len(), 12);
+            assert_eq!(plan.candidates.len(), 14);
+            assert!(plan.candidates.contains(&replacement));
+            assert!(!plan.candidates.contains(&planner_key));
+        }
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if daemon
+                    .recent_transfers
+                    .lock()
+                    .unwrap()
+                    .back()
+                    .is_some_and(|event| event.cache_key == expensive && event.ok)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the expensive entry must still finish prefetching");
+        assert!(Store::open(&daemon.config).unwrap().contains(&expensive));
+        let origin = latest_transfer(&daemon).prefetch.unwrap();
+        assert_eq!(
+            origin.session_id,
+            if timing == "before-session" {
+                ""
+            } else {
+                &request.session_id
+            }
+        );
+        assert_eq!(origin.plan_id, initial_plan_id);
+        assert_eq!(
+            origin.source,
+            match timing {
+                "before-session" => "unscoped",
+                "before-plan" => "none",
+                "after-advisory" => "advisory",
+                _ => "fallback",
+            }
+        );
+        assert_eq!(
+            origin.candidate_source,
+            kache_core::CandidateSource::Manifest
+        );
+        assert_eq!(
+            daemon
+                .prefetch_stats
+                .downloads_completed
+                .load(Ordering::Relaxed),
+            1,
+            "cheap entries must not be downloaded"
+        );
+
+        for index in 0..50 {
+            let unrelated = check_request(dir.path(), &format!("unrelated-{timing}-{index}"));
+            assert!(daemon.handle_remote_check(&unrelated).await.ok);
+        }
+        assert!(
+            *daemon.prefetch_cancel.borrow(),
+            "genuinely unrelated demands must still cancel an unhelpful plan"
+        );
+    }
+}
+
+fn manifest_candidate_session(session: &str, identity: Option<&str>) -> BuildStartedRequest {
+    BuildStartedRequest {
+        session_id: session.into(),
+        intent: kache_core::BuildIntent {
+            identity_key: identity.map(str::to_owned),
+            ..Default::default()
+        },
+        client_epoch: 0,
+        client_version: None,
+    }
+}
+
+fn cheap_candidate_manifest(
+    key: &str,
+    keys: impl IntoIterator<Item = String>,
+) -> crate::remote::BuildManifest {
+    crate::remote::BuildManifest {
+        version: 3,
+        created: "2026-10-29T00:00:00Z".into(),
+        manifest_key: key.into(),
+        entries: keys
+            .into_iter()
+            .map(|cache_key| crate::remote::ManifestEntry {
+                cache_key,
+                crate_name: "serde".into(),
+                compile_time_ms: 0,
+                artifact_size: 100,
+            })
+            .collect(),
+    }
+}
+
+fn manifest_candidate_daemon(path: &Path) -> Arc<Daemon> {
+    let mut daemon = resilience_test_daemon(path, test_remote_backend());
+    daemon.config.remote_readonly = true;
+    Arc::new(daemon)
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn identity_manifest_candidates_wait_for_their_session_and_are_claimed_once() {
+    let _lock = crate::config::config_path_lock();
+    let _minimum = EnvVarForTest::remove("KACHE_MIN_COMPILE_MS");
+    let _manifest_override = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = manifest_candidate_daemon(dir.path());
+    let keys: Vec<_> = (0..12)
+        .map(|i| test_cache_key(&format!("owned-manifest-{i}")))
+        .collect();
+    let manifest = cheap_candidate_manifest("id/first", keys.clone());
+    assert_eq!(
+        identity_manifest_prefetch_from(&daemon, "id/first".into(), manifest).await,
+        0
+    );
+
+    let unrelated = manifest_candidate_session("unrelated", Some("id/second"));
+    daemon.ensure_active_session(&unrelated);
+    daemon.install_plan(
+        "unrelated",
+        "",
+        "fallback",
+        std::iter::once("unrelated-planner-key".into()),
+        unrelated.intent.identity_key,
+    );
+    assert_eq!(
+        daemon
+            .active_plan
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .candidates,
+        HashSet::from(["unrelated-planner-key".into()])
+    );
+
+    let matching = manifest_candidate_session("matching", Some("id/first"));
+    daemon.ensure_active_session(&matching);
+    daemon.install_plan(
+        "matching",
+        "",
+        "fallback",
+        std::iter::once("matching-planner-key".into()),
+        matching.intent.identity_key,
+    );
+    {
+        let mut slot = daemon.active_plan.lock().unwrap();
+        let plan = slot.as_mut().unwrap();
+        assert_eq!(
+            plan.candidates.len(),
+            13,
+            "even an entirely cheap manifest provides candidate knowledge"
+        );
+        for key in &keys {
+            assert!(!plan.record_demand(key));
+        }
+        assert_eq!(plan.demanded_candidates.len(), 12);
+    }
+
+    let later = manifest_candidate_session("later", Some("id/first"));
+    daemon.ensure_active_session(&later);
+    daemon.install_plan(
+        "later",
+        "",
+        "fallback",
+        std::iter::once("later-planner-key".into()),
+        later.intent.identity_key,
+    );
+    let mut slot = daemon.active_plan.lock().unwrap();
+    let plan = slot.as_mut().unwrap();
+    assert_eq!(plan.candidates, HashSet::from(["later-planner-key".into()]));
+    let mut cancelled = false;
+    for key in &keys {
+        cancelled |= plan.record_demand(key);
+    }
+    assert!(cancelled, "a later build must judge its own candidates");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn legacy_manifest_candidates_can_be_claimed_without_an_identity_hint() {
+    let _lock = crate::config::config_path_lock();
+    let _minimum = EnvVarForTest::remove("KACHE_MIN_COMPILE_MS");
+    let _manifest_override = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = manifest_candidate_daemon(dir.path());
+    let keys: Vec<_> = (0..12)
+        .map(|i| test_cache_key(&format!("legacy-manifest-{i}")))
+        .collect();
+    let legacy_key = crate::identity::host_target_triple();
+    let manifest = cheap_candidate_manifest(&legacy_key, keys.clone());
+    assert_eq!(
+        identity_manifest_prefetch_from(&daemon, legacy_key, manifest).await,
+        0
+    );
+    let request = manifest_candidate_session("legacy", None);
+    daemon.ensure_active_session(&request);
+    daemon.install_plan(
+        "legacy",
+        "",
+        "fallback",
+        std::iter::once("planner".into()),
+        None,
+    );
+    let mut slot = daemon.active_plan.lock().unwrap();
+    let plan = slot.as_mut().unwrap();
+    assert_eq!(plan.candidates.len(), 13);
+    for key in &keys {
+        assert!(!plan.record_demand(key));
+    }
+    assert_eq!(plan.demanded_candidates.len(), 12);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn late_manifest_candidates_reconsider_adaptive_cancel_but_preserve_shutdown() {
+    let _lock = crate::config::config_path_lock();
+    let _minimum = EnvVarForTest::remove("KACHE_MIN_COMPILE_MS");
+    let _manifest_override = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
+    for state in ["matching", "unrelated", "stopping"] {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = manifest_candidate_daemon(dir.path());
+        let request = manifest_candidate_session(state, Some("id/late-manifest"));
+        daemon.ensure_active_session(&request);
+        daemon.install_plan(
+            state,
+            "",
+            "fallback",
+            std::iter::once("planner".into()),
+            request.intent.identity_key,
+        );
+        let demands: Vec<_> = (0..12)
+            .map(|index| check_request(dir.path(), &format!("late-{state}-{index}")))
+            .collect();
+        for demand in &demands {
+            assert!(daemon.handle_remote_check(demand).await.ok);
+        }
+        assert!(*daemon.prefetch_cancel.borrow());
+        if state == "stopping" {
+            daemon.stop_prefetch_admission();
+        }
+        let keys = demands.iter().enumerate().map(|(index, demand)| {
+            if state == "unrelated" {
+                test_cache_key(&format!("other-manifest-{index}"))
+            } else {
+                demand.key.clone()
+            }
+        });
+        let manifest = cheap_candidate_manifest("id/late-manifest", keys);
+        assert_eq!(
+            identity_manifest_prefetch_from(&daemon, "id/late-manifest".into(), manifest).await,
+            0
+        );
+        if state == "matching" {
+            // A coordinator can have observed the old cancellation before
+            // the manifest update acquired the active-plan lock.
+            daemon.cancel_prefetch_plan(&PrefetchOrigin {
+                session_id: state.into(),
+                source: "fallback".into(),
+                ..Default::default()
+            });
+        }
+        let slot = daemon.active_plan.lock().unwrap();
+        let plan = slot.as_ref().unwrap();
+        let expected_cancel = state != "matching";
+        assert_eq!(plan.cancelled, expected_cancel, "{state}");
+        assert_eq!(*daemon.prefetch_cancel.borrow(), expected_cancel, "{state}");
+        assert_eq!(
+            plan.demanded_candidates.len(),
+            if state == "unrelated" { 0 } else { 12 }
+        );
+    }
+}
+
+#[test]
+fn explicit_manifest_candidates_use_the_selected_key_and_belong_to_one_session() {
+    for before_session in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = manifest_candidate_daemon(dir.path());
+        let request = manifest_candidate_session("explicit", Some("id/canonical-build"));
+        let key = test_cache_key("explicit-manifest-entry");
+        if !before_session {
+            daemon.ensure_active_session(&request);
+            daemon.install_plan(
+                "explicit",
+                "",
+                "fallback",
+                std::iter::empty(),
+                request.intent.identity_key.clone(),
+            );
+        }
+        let origin = daemon.register_manifest_candidates(
+            "named-ci-manifest".into(),
+            HashSet::from([key.clone()]),
+            Some("named-ci-manifest"),
+        );
+        assert_eq!(origin.is_some(), !before_session);
+        if before_session {
+            daemon.ensure_active_session(&request);
+            daemon.install_plan(
+                "explicit",
+                "",
+                "fallback",
+                std::iter::empty(),
+                request.intent.identity_key.clone(),
+            );
+        }
+        assert!(
+            daemon
+                .active_plan
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .candidates
+                .contains(&key)
+        );
+
+        // The snapshot selects one key, not every custom-named manifest.
+        let other = test_cache_key("unselected-manifest-entry");
+        assert!(
+            daemon
+                .register_manifest_candidates(
+                    "other-ci-manifest".into(),
+                    HashSet::from([other.clone()]),
+                    Some("named-ci-manifest")
+                )
+                .is_none()
+        );
+        assert!(
+            !daemon
+                .active_plan
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .candidates
+                .contains(&other)
+        );
+
+        let next = manifest_candidate_session("next", Some("id/canonical-build"));
+        daemon.ensure_active_session(&next);
+        daemon.install_plan(
+            "next",
+            "",
+            "fallback",
+            std::iter::empty(),
+            next.intent.identity_key,
+        );
+        assert!(
+            daemon
+                .active_plan
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_monolithic_manifest_prefetch_downloads_and_filters() {
     // Serve a build manifest whose single entry is below the prefetch cost
     // threshold, so identity_manifest_prefetch downloads + parses it, then
@@ -11475,6 +12046,7 @@ async fn enabled_manifest_warming_spawns_and_releases_its_barrier() {
     let mut config = test_config(dir.path());
     config.prefetch_enabled = true;
     config.remote = Some(crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".into(),
         backend: crate::config::RemoteBackendConfig::Filesystem(
             crate::config::FilesystemRemoteConfig {
@@ -12065,6 +12637,75 @@ async fn demand_queue_timeouts_do_not_suppress_recovery_after_permits_are_releas
 }
 
 #[tokio::test]
+async fn demand_deadlines_do_not_suppress_a_healthy_remote_hit() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = test_remote_backend();
+    let recovery = check_request(dir.path(), "in-flight-deadline-recovery");
+    put_test_object(
+        &inner,
+        &test_pack_object_key(&recovery.key, &recovery.crate_name),
+        &build_entry_pack(&recovery.key, &recovery.crate_name),
+    )
+    .await;
+    let backend = Arc::new(DirectRestoreBackend {
+        inner,
+        gets: 0.into(),
+        started: tokio::sync::Semaphore::new(0),
+        release: Some(tokio::sync::Semaphore::new(0)),
+    });
+    let daemon = resilience_test_daemon(dir.path(), backend.clone());
+
+    for label in ["in-flight-one", "in-flight-two", "in-flight-three"] {
+        let mut request = check_request(dir.path(), label);
+        request.deadline_ms = Some(200);
+        let response = daemon.handle_remote_check(&request).await;
+        assert!(
+            response.ok,
+            "a local deadline must return a miss: {response:?}"
+        );
+        assert_eq!(response.found, Some(false));
+    }
+    assert_eq!(backend.gets.load(Ordering::Relaxed), 3);
+    assert_eq!(daemon.negative_keys.len(), 0);
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .downloads_failed
+            .load(Ordering::Relaxed),
+        3
+    );
+    assert!(
+        !daemon.remote_breaker.is_degraded(),
+        "local deadlines are not evidence of a remote outage"
+    );
+
+    backend.release.as_ref().unwrap().add_permits(1);
+    let response = daemon.handle_remote_check(&recovery).await;
+    assert!(response.ok, "{response:?}");
+    assert_eq!(
+        response.found,
+        Some(true),
+        "a healthy remote hit must remain available after three expired demand budgets"
+    );
+    assert_eq!(backend.gets.load(Ordering::Relaxed), 4);
+    assert_eq!(
+        daemon
+            .transfer_counters
+            .downloads_suppressed
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(
+        daemon
+            .config
+            .store_dir()
+            .join(&recovery.key)
+            .join("meta.json")
+            .is_file()
+    );
+}
+
+#[tokio::test]
 async fn demand_queue_errors_preserve_prior_remote_failures() {
     let dir = tempfile::tempdir().unwrap();
     let daemon = resilience_test_daemon(dir.path(), Arc::new(PanicOnGetBackend));
@@ -12099,8 +12740,7 @@ async fn demand_queue_errors_preserve_prior_remote_failures() {
 }
 
 /// #327: a restore that exceeds `remote_restore_timeout_secs` is dropped
-/// and answered as a miss within the deadline, and the timeout feeds the
-/// breaker.
+/// and answered as a miss within the deadline, without changing remote health.
 #[tokio::test]
 async fn test_restore_deadline_returns_miss_instead_of_hanging() {
     let dir = tempfile::tempdir().unwrap();
@@ -14416,7 +15056,7 @@ async fn speculative_error_class_controls_retry_without_repeating_permanent_fail
     transient_config.remote = Some(test_remote_config());
     let transient_backend = Arc::new(FailingIdentityBackend {
         inner: test_remote_backend(),
-        kind: std::io::ErrorKind::ConnectionReset,
+        kind: Some(std::io::ErrorKind::ConnectionReset),
         identity_keys: Mutex::new(Vec::new()),
     });
     let mut transient_daemon = Daemon::new(transient_config);
@@ -14460,7 +15100,7 @@ async fn speculative_error_class_controls_retry_without_repeating_permanent_fail
     permanent_config.remote = Some(test_remote_config());
     let permanent_backend = Arc::new(FailingIdentityBackend {
         inner: test_remote_backend(),
-        kind: std::io::ErrorKind::PermissionDenied,
+        kind: Some(std::io::ErrorKind::PermissionDenied),
         identity_keys: Mutex::new(Vec::new()),
     });
     let permanent_daemon = Arc::new(Daemon::new(permanent_config));
@@ -14512,41 +15152,50 @@ async fn speculative_error_class_controls_retry_without_repeating_permanent_fail
 async fn speculative_timeout_is_not_retried_within_build_started() {
     let _lock = crate::config::config_path_lock();
     let _manifest_key = EnvVarForTest::remove("KACHE_MANIFEST_KEY");
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.remote = Some(test_remote_config());
-    let backend = Arc::new(FailingIdentityBackend {
-        inner: test_remote_backend(),
-        kind: std::io::ErrorKind::TimedOut,
-        identity_keys: Mutex::new(Vec::new()),
-    });
-    let daemon = Arc::new(Daemon::new(config));
-    daemon.set_remote_backend_for_test(backend.clone());
-    let intent = kache_core::BuildIntent {
-        identity_key: Some("id/test".into()),
-        crate_names: vec!["serde".into()],
-        ..Default::default()
-    };
+    for (kind, expected) in [
+        (
+            Some(std::io::ErrorKind::TimedOut),
+            RemoteErrorClass::Timeout,
+        ),
+        (None, RemoteErrorClass::Deadline),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        let backend = Arc::new(FailingIdentityBackend {
+            inner: test_remote_backend(),
+            kind,
+            identity_keys: Mutex::new(Vec::new()),
+        });
+        let daemon = Arc::new(Daemon::new(config));
+        daemon.set_remote_backend_for_test(backend.clone());
+        let intent = kache_core::BuildIntent {
+            identity_key: Some("id/test".into()),
+            crate_names: vec!["serde".into()],
+            ..Default::default()
+        };
 
-    let outcome =
-        crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent).await;
-    assert!(matches!(
-        &outcome,
-        crate::fallback_planner::SpeculativeIdentityOutcome::NonRetryableFailures(failures)
-            if failures.len() == 1 && failures[0].1 == RemoteErrorClass::Timeout
-    ));
-    assert_eq!(backend.identity_keys.lock().unwrap().len(), 1);
+        let outcome =
+            crate::fallback_planner::resolve_identity_candidates_speculative(&daemon, &intent)
+                .await;
+        assert!(matches!(
+            &outcome,
+            crate::fallback_planner::SpeculativeIdentityOutcome::NonRetryableFailures(failures)
+                if failures.len() == 1 && failures[0].1 == expected
+        ));
+        assert_eq!(backend.identity_keys.lock().unwrap().len(), 1);
 
-    let plan =
-        crate::fallback_planner::build_prefetch_plan_with_identity(&daemon, &intent, outcome)
-            .await
-            .unwrap();
-    assert!(plan.candidates.is_empty());
-    assert_eq!(
-        backend.identity_keys.lock().unwrap().len(),
-        1,
-        "a timed-out speculative GET must not start a second manifest deadline"
-    );
+        let plan =
+            crate::fallback_planner::build_prefetch_plan_with_identity(&daemon, &intent, outcome)
+                .await
+                .unwrap();
+        assert!(plan.candidates.is_empty());
+        assert_eq!(
+            backend.identity_keys.lock().unwrap().len(),
+            1,
+            "a timed-out speculative GET must not start a second manifest deadline"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -15115,7 +15764,9 @@ async fn a_permanently_failed_upload_retires_its_intent_so_gc_holds_the_size_lim
         "inject mock backend"
     );
     daemon.pending_uploads.write().await.insert(key.clone());
-    let resp = run_upload_job(&daemon, &job).await;
+    let resp = tokio::time::timeout(Duration::from_secs(5), run_upload_job(&daemon, &job))
+        .await
+        .expect("a permanent upload refusal must finish without retrying");
     assert!(!resp.ok, "the remote refuses the PUT: {resp:?}");
     assert!(
         !upload_spool_path(&config, &key).exists(),
@@ -15355,16 +16006,20 @@ async fn upload_retirement_reports_flush_errors_and_skips_already_missing_intent
     }
 }
 
-struct TransientThenTerminalUploadBackend {
+struct RetryableThenTerminalUploadBackend {
     heads: AtomicU64,
     first_failure: tokio::sync::Semaphore,
+    deadline: bool,
 }
 
 #[async_trait::async_trait]
-impl crate::remote_backend::RemoteBackend for TransientThenTerminalUploadBackend {
+impl crate::remote_backend::RemoteBackend for RetryableThenTerminalUploadBackend {
     async fn head(&self, _key: &str) -> Result<bool> {
         if self.heads.fetch_add(1, Ordering::Relaxed) == 0 {
             self.first_failure.add_permits(1);
+            if self.deadline {
+                RemoteDeadline::from_instant(Some(Instant::now())).check("upload HEAD")?;
+            }
             let error = std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "temporary upload refusal",
@@ -15397,11 +16052,12 @@ impl crate::remote_backend::RemoteBackend for TransientThenTerminalUploadBackend
 
 #[tokio::test]
 async fn retried_upload_keeps_its_intent_until_cancellation_or_a_terminal_outcome() {
-    for cancel in [true, false] {
+    for (deadline, cancel) in [(false, true), (false, false), (true, true), (true, false)] {
         let dir = tempfile::tempdir().unwrap();
-        let backend = Arc::new(TransientThenTerminalUploadBackend {
+        let backend = Arc::new(RetryableThenTerminalUploadBackend {
             heads: AtomicU64::new(0),
             first_failure: tokio::sync::Semaphore::new(0),
+            deadline,
         });
         let daemon = Arc::new(resilience_test_daemon(dir.path(), backend.clone()));
         let key = test_cache_key("retry-upload-retirement");
@@ -15650,6 +16306,7 @@ async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
     let consumer = tempfile::tempdir().unwrap();
     let mut config = test_config(consumer.path());
     let remote = crate::config::RemoteConfig {
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "amh/v1".into(),
         backend: crate::config::RemoteBackendConfig::Gcs(crate::config::GcsRemoteConfig {
             bucket: "consumer-fixture".into(),

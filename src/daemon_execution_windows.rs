@@ -255,6 +255,8 @@ pub(super) async fn handle(
     // At most 64 frontend-owned children can be pending. Their final drops
     // can happen on this async task, so cleanup has a nonblocking channel.
     let (finish, mut finished) = tokio::sync::mpsc::unbounded_channel();
+    // The pinned handle cannot name another process, whatever its PID.
+    let priority = crate::scheduler::Priority::of_windows_class(client_class.unwrap_or(0));
     let broker = Arc::new(Broker::new(send, finish, peer, prepared.env.clone()));
     let context = InvocationContext {
         daemon: Some(Arc::clone(daemon)),
@@ -268,6 +270,7 @@ pub(super) async fn handle(
             .into_owned(),
         io: InvocationIo::from_broker(broker),
         cancellation: Some(cancellation.clone()),
+        priority: Some(priority),
     };
     let activity = daemon.request_clock.begin_activity();
     // From Accepted until the worker returns: shutdown waits for it, and its

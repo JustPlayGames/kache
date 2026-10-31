@@ -55,6 +55,10 @@ pub struct RustcPublish {
     /// Cargo's `-C metadata` unit, recorded with the entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
+    /// The compiler's identity (`1.99.0 (abc 2026-01-01)`), recorded with the
+    /// entry for compiler-version cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc_version: Option<String>,
     /// Large executables to record for prestaging once stored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prestage: Vec<PrestageHint>,

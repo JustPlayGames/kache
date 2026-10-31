@@ -14,7 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::GetConsoleMode;
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessId, OpenProcess, PROCESS_DUP_HANDLE,
+    GetCurrentProcess, GetPriorityClass, GetProcessId, OpenProcess, PROCESS_DUP_HANDLE,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 
@@ -132,9 +132,9 @@ impl PeerProcess {
     /// The pinned frontend's priority class, the priority of the build it
     /// compiles for.
     pub fn priority_class(&self) -> io::Result<u32> {
-        let class = unsafe {
-            windows_sys::Win32::System::Threading::GetPriorityClass(self.process.as_raw_handle())
-        };
+        // SAFETY: the handle stays open on `self` and was opened with
+        // PROCESS_QUERY_LIMITED_INFORMATION.
+        let class = unsafe { GetPriorityClass(self.process.as_raw_handle()) };
         if class == 0 {
             return Err(io::Error::last_os_error());
         }

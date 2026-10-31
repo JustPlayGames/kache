@@ -26,12 +26,26 @@
 //! expected peak (its measured RSS, else [`UNMEASURED_COMPILE_BYTES`] or
 //! [`UNMEASURED_LINK_BYTES`]), must stay above a reserve, unless no other
 //! compile holds a slot. Running compiles record their expected peak under
-//! `scheduler/admitted/` for that. Under memory pressure a compile asks for
-//! the whole pool, so compiles run one after another until pressure eases.
-//! On Linux the available memory is bounded by the cgroup's limit.
+//! `scheduler/admitted/` for that. On Linux the available memory is bounded
+//! by the cgroup's limit.
 //!
-//! If the scheduler directory cannot be used, compilation continues without
-//! a permit. [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
+//! Under memory pressure (see [`pressure`]) ordinary admission keeps the
+//! slots compiles hold within a shared ceiling that falls while pressure
+//! lasts and grows back once it has cleared. After a capacity wait reaches
+//! its limit, recovery admits at most one extra compile and two extra
+//! weighted slots: that overcommits slots, never memory, so a closed memory
+//! gate holds a recovery compile as it holds any other, until the shared
+//! coordination allowance is spent. Linux cgroup-v2 limits are logged for
+//! diagnostics.
+//!
+//! Waiters take free slots in [`queue`] order: by arrival, foreground builds
+//! ahead of background ones (see [`priority`]), and a large request is passed
+//! by smaller ones only a bounded number of times. The slot locks stay the
+//! authority for capacity; the queue only orders who may lock them next.
+//!
+//! If the scheduler directory cannot be used or the shared coordination
+//! allowance is spent, compilation continues without a permit.
+//! [`Config::scheduler`] / `KACHE_SCHEDULER=0` turns the module off.
 //!
 //! Test binaries run through `kache test-runner` take slots too, but only
 //! above the compile reserve ([`reserve_for`]), so a compile always has a
@@ -41,14 +55,19 @@
 //! is covered by the test's slots and takes none of its own; see
 //! [`lease_covers`].
 
+mod budget;
 mod permit_wait;
 pub(crate) mod pressure;
+mod priority;
+mod queue;
 use anyhow::Result;
+pub(crate) use budget::{BudgetWait, InvocationWaitScope};
+pub(crate) use priority::{InvocationPriorityScope, Priority};
 use std::fs;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::store::StoreLock;
 
@@ -108,7 +127,8 @@ pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> Discove
     let path = cache_dir
         .join("scheduler/discovery")
         .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
-    match acquire_discovery(&path, WAIT_TIMEOUT, POLL_INTERVAL) {
+    let wait = BudgetWait::start(WAIT_TIMEOUT);
+    match acquire_discovery(&path, wait.timeout, POLL_INTERVAL) {
         Ok((lock, waited)) => DiscoveryFlight { lock, waited },
         Err(error) => {
             tracing::debug!("discovery flight unavailable: {error:#}");
@@ -231,7 +251,9 @@ impl FlightIdentity {
     }
 }
 
-/// Outcome of [`begin_miss`].
+/// Outcome of [`begin_miss`]. Returned once per miss and matched at once, so
+/// a large guard (Windows' lock handles) costs a move, not memory held.
+#[allow(clippy::large_enum_variant)]
 pub enum BeginMiss {
     /// This process should compile. The guard may be empty when the
     /// scheduler is off or the directory is unusable.
@@ -255,6 +277,7 @@ pub struct MissGuard {
 struct Permit {
     root: PathBuf,
     _slots: Vec<(u32, StoreLock)>,
+    _recovery: Vec<StoreLock>,
     _admission: Option<Admission>,
 }
 
@@ -429,10 +452,12 @@ impl Drop for Permit {
         // that wakes finds the memory and the slot free.
         self._admission.take();
         self._slots.clear();
+        self._recovery.clear();
         permit_wait::notify(&self.root);
     }
 }
 
+#[derive(Clone)]
 struct Scheduler {
     root: PathBuf,
     pool_size: u32,
@@ -481,9 +506,9 @@ impl MissGuard {
 
 /// Consult the scheduler after a local+remote miss.
 ///
-/// Hits and passthroughs must not call this. Disabled and fail-open paths
-/// return [`BeginMiss::Compile`] with an empty guard so the caller proceeds
-/// to `claim_build` without waiting. `lease` is the inherited
+/// Hits and passthroughs must not call this. A disabled or unusable scheduler
+/// returns an empty guard. A failed flight still paces the uncoalesced compile.
+/// `lease` is the inherited
 /// [`TEST_LEASE_ENV`] marker, if any; see [`Scheduler::begin_miss`].
 pub fn begin_miss(
     cache_dir: &Path,
@@ -600,7 +625,9 @@ impl Scheduler {
                 BeginMiss::Compile(MissGuard::compiling(permit, flight, self.weights_dir()))
             }
             FlightJoin::Waited => BeginMiss::Recheck,
-            FlightJoin::FailOpen => BeginMiss::Compile(MissGuard::empty()),
+            FlightJoin::FailOpen => {
+                BeginMiss::Compile(self.keyless_compile(crate_name, is_link, lease))
+            }
         }
     }
 
@@ -631,7 +658,8 @@ impl Scheduler {
                 );
                 let waited = std::time::Instant::now();
                 let _trace_wait = crate::phase_trace::phase("flight_wait");
-                let outcome = wait_for_lock(&path, self.wait_timeout, self.poll_interval);
+                let wait = BudgetWait::start(self.wait_timeout);
+                let outcome = wait_for_lock(&path, wait.timeout, self.poll_interval);
                 crate::opcounts::record_flight_wait(waited.elapsed());
                 match outcome {
                     Ok(true) => FlightJoin::Waited,
@@ -700,36 +728,196 @@ impl Scheduler {
 
     /// Take `weight` slots for a compile expected to peak at `expected`
     /// bytes (`measured`: its last measured peak), once the memory gate
-    /// admits it, blocking up to the wait timeout. The whole call is
+    /// admits it: ordinary or recovery capacity within the invocation
+    /// allowance. The whole call is
     /// attributed to `permit_wait_ms`: an immediately free pool costs
     /// microseconds, a saturated one costs the wait.
     fn acquire_permit_weighed(&self, weight: u32, expected: u64, measured: bool) -> Option<Permit> {
         let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
         let gate = MemoryGate::new(&self.root, expected, measured);
-        let slots = self.wait_for_permit_gated(
-            0..self.pool_size,
-            |waited| {
-                let weight = pressure::weight(weight, self.pool_size, pressure::now());
-                compile_need(weight, self.pool_size, waited, || tests_held(&self.root))
-            },
+        let wait = BudgetWait::capacity(self.wait_timeout);
+        let mut bounded = self.clone();
+        bounded.wait_timeout = wait.timeout;
+        let request = Request::new(queue::Kind::Compile, false);
+        let mut ticket = None;
+        let slots = bounded.wait_for_request_gated(
+            &request,
+            |waited, saved_for_tests| self.ordinary_need(weight, waited, saved_for_tests),
             || gate.admits(),
+            &mut ticket,
         );
+        let recover = wait.scoped();
+        drop(wait);
+        let permit = match slots {
+            Some(slots) => Some(self.keep(slots, weight)),
+            None if recover => self.acquire_recovery_permit(weight, &request, &gate, &mut ticket),
+            None => None,
+        };
         crate::opcounts::record_permit_wait(started.elapsed());
-        let slots = slots?;
-        let admission = pressure::enabled()
+        let mut permit = permit?;
+        permit._admission = pressure::enabled()
             .then(|| Admission::record(&self.root, expected, measured))
             .flatten();
-        Some(Permit {
-            root: self.root.clone(),
-            _slots: slots,
-            _admission: admission,
-        })
+        Some(permit)
     }
 
-    /// Wait for `need(waited)` free slots in `range`. The need is asked again
-    /// on every scan, with `waited` false on the first: a compile's need
-    /// shrinks while tests hold slots.
+    /// After the ordinary wait allowance, one compiler can use recovery
+    /// capacity. It may overcommit at most two weighted slots (one on a
+    /// one-slot pool); a heavier compile still needs regular slots for the
+    /// rest. Other waiters keep waiting for capacity, with cancellation. A
+    /// compile the memory gate still holds back waits here too: recovery is
+    /// for slots nobody is giving up, not for memory that is not there.
+    fn acquire_recovery_permit(
+        &self,
+        weight: u32,
+        request: &Request,
+        gate: &MemoryGate<'_>,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Option<Permit> {
+        let wait = BudgetWait::start(WAIT_TIMEOUT);
+        let started = std::time::Instant::now();
+        loop {
+            crate::invocation::process::check().ok()?;
+            let seen = permit_wait::snapshot(&self.root);
+            let remaining = wait.timeout.saturating_sub(started.elapsed());
+            let step = if gate.admits() {
+                self.try_recovery_request(weight, request, ticket, remaining)
+            } else {
+                Ok(None)
+            };
+            match step {
+                Ok(Some(permit)) => return Some(permit),
+                Ok(None) => {
+                    let remaining = wait.timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        tracing::debug!(
+                            "scheduler coordination allowance exhausted; compiling without a permit"
+                        );
+                        return None;
+                    }
+                    permit_wait::park(
+                        &self.root,
+                        None,
+                        seen,
+                        permit_wait::saturated_slice().min(remaining),
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        "scheduler recovery unavailable ({error:#}); compiling without a permit"
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn try_recovery_permit(&self, weight: u32) -> Result<Option<Permit>> {
+        self.try_recovery_request(
+            weight,
+            &Request::new(queue::Kind::Compile, false),
+            &mut None,
+            self.wait_timeout,
+        )
+    }
+
+    fn try_recovery_request(
+        &self,
+        weight: u32,
+        request: &Request,
+        ticket: &mut Option<queue::Ticket>,
+        allowance: Duration,
+    ) -> Result<Option<Permit>> {
+        let started = std::time::Instant::now();
+        let ordinary = self.ordinary_need(weight, true, request.saved_for_tests.get());
+        if let Collect::Ready(slots) = self.admit(request, ordinary, ticket, allowance)? {
+            return Ok(Some(self.keep(slots, weight)));
+        }
+        let Some(gate) = StoreLock::try_acquire(&permits_dir(&self.root).join("recovery-0"))?
+        else {
+            return Ok(None);
+        };
+        let need = compile_need(weight, self.pool_size, true, || {
+            tests_held(&self.root).saturating_add(request.saved_for_tests.get())
+        });
+        let extra = need.min(2);
+        let regular = need - extra;
+        let slots = if regular == 0 {
+            Vec::new()
+        } else {
+            match self.admit(
+                request,
+                regular,
+                ticket,
+                allowance.saturating_sub(started.elapsed()),
+            )? {
+                Collect::Ready(slots) => slots,
+                Collect::Busy(_) => return Ok(None),
+            }
+        };
+        let mut recovery = vec![gate];
+        for index in 1..extra {
+            let Some(lock) =
+                StoreLock::try_acquire(&permits_dir(&self.root).join(format!("recovery-{index}")))?
+            else {
+                return Ok(None);
+            };
+            recovery.push(lock);
+        }
+        if let Some(ticket) = ticket.take() {
+            ticket.admitted();
+        }
+        tracing::debug!(
+            requested_slots = need,
+            recovery_slots = extra,
+            "scheduler wait allowance exhausted; admitted one recovery compile"
+        );
+        Ok(Some(Permit {
+            root: self.root.clone(),
+            _slots: slots,
+            _recovery: recovery,
+            _admission: None,
+        }))
+    }
+
+    /// Free slots an ordinary compile of `weight` waits for: its weight and
+    /// the slots above the memory pressure ceiling (see [`pressure::ask`]),
+    /// capped by [`compile_need`] at what tests leave.
+    fn ordinary_need(&self, weight: u32, waited: bool, saved_for_tests: u32) -> u32 {
+        let ceiling = pressure::ceiling(&self.root, self.pool_size);
+        compile_need(
+            pressure::ask(weight, self.pool_size, ceiling),
+            self.pool_size,
+            waited,
+            || tests_held(&self.root).saturating_add(saved_for_tests),
+        )
+    }
+
+    /// A permit holding the lowest `weight` of `slots`. The rest were the
+    /// free slots the pressure ceiling asks for, which are released at once.
+    fn keep(&self, mut slots: Vec<(u32, StoreLock)>, weight: u32) -> Permit {
+        let keep = weight.max(1) as usize;
+        if slots.len() > keep {
+            slots.truncate(keep);
+            // A test may be waiting for exactly these slots.
+            permit_wait::notify(&self.root);
+        }
+        Permit {
+            root: self.root.clone(),
+            _slots: slots,
+            _recovery: Vec::new(),
+            _admission: None,
+        }
+    }
+
+    /// Wait for `need(waited, saved_for_tests)` free slots of `kind`, in
+    /// [`queue`] order. The need is asked again on every scan, with `waited`
+    /// false on the first, and with the free slots the last scan found the
+    /// queue saving for a waiting test: a compile's need shrinks while tests
+    /// hold slots or have slots saved for them. With `spare`, the request also
+    /// takes the free test slots no waiter wants.
     ///
     /// A scan that locked nothing another process is holding retries on
     /// [`POLL_INTERVAL`]. A scan that found held slots arms a release watch
@@ -737,29 +925,49 @@ impl Scheduler {
     /// sleeps in [`permit_wait`].
     fn wait_for_permit(
         &self,
-        range: Range<u32>,
-        need: impl Fn(bool) -> u32,
+        kind: queue::Kind,
+        need: impl Fn(bool, u32) -> u32,
+        spare: bool,
     ) -> Option<Vec<(u32, StoreLock)>> {
-        self.wait_for_permit_gated(range, need, || true)
+        let request = Request::new(kind, spare);
+        // Dropped on every return, cancellation included: the request
+        // leaves the queue.
+        let mut ticket = None;
+        self.wait_for_request(&request, need, &mut ticket)
     }
 
-    /// [`Self::wait_for_permit`], taking slots only while `gate` admits.
-    fn wait_for_permit_gated(
+    fn wait_for_request(
         &self,
-        range: Range<u32>,
-        need: impl Fn(bool) -> u32,
+        request: &Request,
+        need: impl Fn(bool, u32) -> u32,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Option<Vec<(u32, StoreLock)>> {
+        self.wait_for_request_gated(request, need, || true, ticket)
+    }
+
+    /// [`Self::wait_for_request`], taking slots only while `gate` admits.
+    fn wait_for_request_gated(
+        &self,
+        request: &Request,
+        need: impl Fn(bool, u32) -> u32,
         gate: impl Fn() -> bool,
+        ticket: &mut Option<queue::Ticket>,
     ) -> Option<Vec<(u32, StoreLock)>> {
         let start = std::time::Instant::now();
         let mut waited = false;
         loop {
             crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
-            let asking = need(waited).max(1) as usize;
             // A closed memory gate takes no slots: it retries on the short
-            // poll, as an empty scan does, until memory frees or time runs out.
+            // poll, as an empty scan does, until memory frees or time runs
+            // out. A ticket it holds is not refreshed meanwhile, so the
+            // queue skips it after [`queue::STALE_AFTER`] and it gets its
+            // place back when the gate opens.
+            // A need of zero would never be met.
+            let mut asking = 1;
             let step = if gate() {
-                self.collect_permits(range.clone(), asking, start)
+                asking = need(waited, request.saved_for_tests.get()).max(1);
+                self.collect_permits(request, asking, ticket, start)
             } else if start.elapsed() >= self.wait_timeout {
                 tracing::debug!("scheduler permit wait timed out; running without a permit");
                 WaitStep::Stop
@@ -772,17 +980,15 @@ impl Scheduler {
                 WaitStep::Busy(busy) if !busy.is_empty() => {
                     let armed = permit_wait::arm(&self.root, &busy);
                     let seen = permit_wait::snapshot(&self.root);
-                    match self.collect_permits(range.clone(), asking, start) {
+                    match self.collect_permits(request, asking, ticket, start) {
                         WaitStep::Ready(slots) => return Some(slots),
                         WaitStep::Stop => return None,
                         WaitStep::Busy(_) => {
                             let remaining = self.wait_timeout.saturating_sub(start.elapsed());
-                            permit_wait::park(
-                                &self.root,
-                                armed,
-                                seen,
-                                permit_wait::saturated_slice().min(remaining),
-                            );
+                            let nap = permit_wait::saturated_slice().min(remaining);
+                            #[cfg(test)]
+                            PERMIT_POLL_MAX.with(|max| max.set(max.get().max(nap)));
+                            permit_wait::park(&self.root, armed, seen, nap);
                         }
                     }
                 }
@@ -813,11 +1019,7 @@ impl Scheduler {
             tracing::debug!("no test slots above the compile reserve; running without a lease");
             return None;
         }
-        let range = reserve_for(self.pool_size)..self.pool_size;
-        let mut slots = self.wait_for_permit(range.clone(), |_| need)?;
-        if elastic {
-            slots.extend(self.take_free_slots(range));
-        }
+        let slots = self.wait_for_permit(queue::Kind::Test, |_, _| need, elastic)?;
         // One marker per slot, so a compile can count the slots tests hold.
         let markers = slots
             .iter()
@@ -880,7 +1082,8 @@ pub(crate) fn test_need(want: u32, pool: u32) -> u32 {
 /// and never less than the reserve. A test may be waiting on this very
 /// compile, and tests never take reserve slots, so this is what keeps both
 /// moving. Only a heavy compile that has waited calls `tests_held`, which
-/// counts the slots tests hold.
+/// counts the slots tests hold, and the free slots the [`queue`] saves for a
+/// waiting test: those are no more a compile's than held ones.
 pub(crate) fn compile_need(
     weight: u32,
     pool: u32,
@@ -1050,15 +1253,37 @@ enum WaitStep {
     Stop,
 }
 
+/// What one permit request asks the [`queue`] for.
+struct Request {
+    kind: queue::Kind,
+    spare: bool,
+    rank: u64,
+    /// What the last scan found the queue saving for a waiting test.
+    saved_for_tests: std::cell::Cell<u32>,
+}
+
+impl Request {
+    fn new(kind: queue::Kind, spare: bool) -> Self {
+        Self {
+            kind,
+            spare,
+            rank: queue::rank(SystemTime::now(), priority::current()),
+            saved_for_tests: std::cell::Cell::new(0),
+        }
+    }
+}
+
 impl Scheduler {
     fn collect_permits(
         &self,
-        range: Range<u32>,
-        need: usize,
+        request: &Request,
+        need: u32,
+        ticket: &mut Option<queue::Ticket>,
         start: std::time::Instant,
     ) -> WaitStep {
         note_permit_scan();
-        match try_collect_slots(self, range, need) {
+        let remaining = self.wait_timeout.saturating_sub(start.elapsed());
+        match self.admit(request, need, ticket, remaining) {
             Ok(Collect::Ready(slots)) => WaitStep::Ready(slots),
             Ok(Collect::Busy(busy)) => {
                 if start.elapsed() >= self.wait_timeout {
@@ -1075,6 +1300,148 @@ impl Scheduler {
                 WaitStep::Stop
             }
         }
+    }
+}
+
+impl Scheduler {
+    /// The slots a request of `kind` can take.
+    fn range(&self, kind: queue::Kind) -> Range<u32> {
+        match kind {
+            queue::Kind::Compile => 0..self.pool_size,
+            queue::Kind::Test => reserve_for(self.pool_size)..self.pool_size,
+        }
+    }
+
+    /// Take `need` slots if the queue gives them to this request now, and
+    /// queue it when it does not. Should the queue be unusable, or its lock
+    /// stay held for [`queue::LOCK_WAIT`], take free slots out of order.
+    fn admit(
+        &self,
+        request: &Request,
+        need: u32,
+        ticket: &mut Option<queue::Ticket>,
+        allowance: Duration,
+    ) -> Result<Collect> {
+        request.saved_for_tests.set(0);
+        let wait = queue::LOCK_WAIT.min(allowance);
+        match queue::lock(&self.root, wait) {
+            Ok(Some(_queue)) => match self.admit_in_order(request, need, ticket) {
+                Ok(collect) => return Ok(collect),
+                Err(error) => {
+                    tracing::debug!("permit queue unusable ({error:#}); taking slots out of order")
+                }
+            },
+            Ok(None) => tracing::debug!("permit queue stayed locked; taking slots out of order"),
+            Err(error) => {
+                crate::invocation::process::check()?;
+                tracing::debug!("permit queue lock failed ({error:#}); taking slots out of order")
+            }
+        }
+        self.collect_unordered(request, need)
+    }
+
+    /// Admit under `queue.lock`. With no other ticket queued, this is the
+    /// first-come scan of [`Scheduler::collect_unordered`].
+    fn admit_in_order(
+        &self,
+        request: &Request,
+        need: u32,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Result<Collect> {
+        let now = SystemTime::now();
+        let me = match ticket {
+            Some(ticket) => {
+                ticket.refresh(need, now)?;
+                ticket.entry().clone()
+            }
+            None => queue::Entry::new(request.rank, request.kind, need),
+        };
+        let queued = queue::list(&self.root)?;
+        let collect = if queued.iter().all(|entry| entry.id == me.id) {
+            self.collect_unordered(request, need)?
+        } else {
+            self.collect_planned(request, &me, queued, now)?
+        };
+        match collect {
+            Collect::Ready(slots) => {
+                if let Some(ticket) = ticket.take() {
+                    ticket.admitted();
+                }
+                Ok(Collect::Ready(slots))
+            }
+            Collect::Busy(busy) => {
+                if ticket.is_none() {
+                    *ticket = Some(queue::Ticket::create(&self.root, me, now)?);
+                }
+                Ok(Collect::Busy(busy))
+            }
+        }
+    }
+
+    /// Take the first `need` free slots of the request's range, and with
+    /// `spare` every other free one.
+    fn collect_unordered(&self, request: &Request, need: u32) -> Result<Collect> {
+        let range = self.range(request.kind);
+        Ok(
+            match try_collect_slots(self, range.clone(), need as usize)? {
+                Collect::Ready(mut slots) if request.spare => {
+                    slots.extend(self.take_free_slots(range));
+                    Collect::Ready(slots)
+                }
+                collect => collect,
+            },
+        )
+    }
+
+    /// Lock every free slot of the pool, let [`queue::plan`] decide which are
+    /// this request's, and release the rest.
+    fn collect_planned(
+        &self,
+        request: &Request,
+        me: &queue::Entry,
+        queued: Vec<queue::Entry>,
+        now: SystemTime,
+    ) -> Result<Collect> {
+        // The whole pool, whatever the request's kind: a compile ahead of a
+        // test takes reserve slots first.
+        let mut free = Vec::new();
+        let mut busy = Vec::new();
+        for index in 0..self.pool_size {
+            match StoreLock::try_acquire(&self.permit_path(index))? {
+                Some(lock) => free.push((index, lock)),
+                None => busy.push(index),
+            }
+        }
+        let indexes: Vec<u32> = free.iter().map(|(index, _)| *index).collect();
+        let plan = queue::plan(
+            &queue::with_entry(queued, me),
+            &me.id,
+            &indexes,
+            reserve_for(self.pool_size),
+            queue::pass_budget(self.pool_size),
+            request.spare,
+            |entry| queue::ready(&self.root, entry, now),
+            |entry| queue::passes(&self.root, entry),
+        );
+        let admitted = match plan {
+            Ok(admitted) => admitted,
+            Err(waiting) => {
+                request.saved_for_tests.set(waiting.saved_for_tests);
+                return Ok(Collect::Busy(busy));
+            }
+        };
+        if let Some(passed) = &admitted.passed
+            && let Err(error) = queue::record_pass(&self.root, passed)
+        {
+            tracing::debug!("could not count a pass of the first waiter: {error:#}");
+        }
+        Ok(Collect::Ready(
+            free.into_iter()
+                .filter(|(index, _)| {
+                    admitted.slots.contains(index) || admitted.spare.contains(index)
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -1914,6 +2281,7 @@ pub(crate) fn parse_memory_events(text: &str) -> Option<MemoryEvents> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pressure::Level;
     use std::process::Command;
     use std::sync::{Arc, Mutex};
 
@@ -1940,8 +2308,8 @@ mod tests {
     struct PinnedPressure;
 
     impl PinnedPressure {
-        fn new(pressured: bool) -> Self {
-            pressure::force(Some(pressured));
+        fn new(level: Level) -> Self {
+            pressure::force(Some(level));
             Self
         }
     }
@@ -1976,7 +2344,11 @@ mod tests {
                             wait_for_lock(&path, Duration::from_secs(5), Duration::from_millis(5))
                                 .is_err()
                         ),
-                        _ => assert!(scheduler.wait_for_permit(0..1, |_| 1).is_none()),
+                        _ => assert!(
+                            scheduler
+                                .wait_for_permit(queue::Kind::Compile, |_, _| 1, false)
+                                .is_none()
+                        ),
                     }
                 });
                 std::thread::sleep(Duration::from_millis(30));
@@ -1992,8 +2364,377 @@ mod tests {
         // Slot-count fixtures must not depend on the host's memory pressure.
         // This replaces a pin the caller already set. Pin again afterwards
         // when the test wants pressure.
-        pressure::force(Some(false));
+        pressure::force(Some(Level::Calm));
         Scheduler::open_with(dir, pool, Duration::from_secs(5), Duration::from_millis(10)).unwrap()
+    }
+
+    fn bounded_test_wait<T>(work: impl FnOnce() -> T) -> T {
+        let token = crate::invocation::process::Cancellation::default();
+        let _scope = crate::invocation::process::CancellationScope::enter(Some(token.clone()));
+        std::thread::scope(|threads| {
+            let (stop, receive) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                if matches!(
+                    receive.recv_timeout(Duration::from_secs(2)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    token.cancel();
+                }
+            });
+            let result = work();
+            let _ = stop.send(());
+            result
+        })
+    }
+
+    #[test]
+    fn exhausted_compiler_allowance_uses_one_counted_recovery_compile() {
+        for (pool, level) in [
+            (1, Level::Calm),
+            (4, Level::Calm),
+            (1, Level::Critical),
+            (4, Level::Critical),
+        ] {
+            let dir = temp_cache();
+            let scheduler = test_scheduler(dir.path(), pool);
+            let _pin = PinnedPressure::new(level);
+            let holder = scheduler.acquire_permit(pool).unwrap();
+            let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+            let recovered =
+                bounded_test_wait(|| scheduler.acquire_permit(2)).expect("recovery capacity");
+            let extra = if pool == 1 { 1 } else { 2 };
+            assert_eq!(recovered._recovery.len(), extra);
+            assert_eq!(permits_in_use(dir.path()), Some(pool + extra as u32));
+            assert!(scheduler.try_recovery_permit(1).unwrap().is_none());
+            drop(recovered);
+            assert_eq!(permits_in_use(dir.path()), Some(pool));
+            let next = scheduler.try_recovery_permit(1).unwrap().unwrap();
+            assert_eq!(next._recovery.len(), 1);
+            drop(next);
+            drop(holder);
+            assert_eq!(permits_in_use(dir.path()), Some(0));
+        }
+    }
+
+    #[test]
+    fn a_compiler_spends_its_remaining_allowance_before_recovery() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let _holder = scheduler.acquire_permit(1).unwrap();
+        let _scope = InvocationWaitScope::with_budget(Duration::from_millis(50));
+        let recovered = bounded_test_wait(|| scheduler.acquire_permit(1)).unwrap();
+        assert_eq!(recovered._recovery.len(), 1);
+        assert_eq!(
+            BudgetWait::start(Duration::from_secs(5)).timeout,
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn recovery_preserves_the_final_deadline_when_weight_cannot_fit() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _holder = scheduler.acquire_permit(4).unwrap();
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        bounded_test_wait(|| {
+            assert!(scheduler.acquire_permit(4).is_none());
+            assert!(
+                crate::invocation::process::check().is_ok(),
+                "the allowance must end the wait before test cancellation"
+            );
+        });
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+    }
+
+    #[test]
+    fn heavy_recovery_still_needs_regular_slots_and_returns_partial_locks() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let mut held: Vec<_> = (0..4)
+            .map(|slot| {
+                StoreLock::try_acquire(&scheduler.permit_path(slot))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert!(scheduler.try_recovery_permit(4).unwrap().is_none());
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+        drop(held.pop());
+        assert!(scheduler.try_recovery_permit(4).unwrap().is_none());
+        assert_eq!(permits_in_use(dir.path()), Some(3));
+        drop(held.pop());
+        let recovered = scheduler.try_recovery_permit(4).unwrap().unwrap();
+        assert_eq!(recovered._slots.len(), 2);
+        assert_eq!(recovered._recovery.len(), 2);
+        assert_eq!(permits_in_use(dir.path()), Some(6));
+        drop(recovered);
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+    }
+
+    #[test]
+    fn recovery_rechecks_ordinary_capacity_and_limits_pressure_overcommit() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let ordinary = scheduler.try_recovery_permit(2).unwrap().unwrap();
+        assert_eq!(ordinary._slots.len(), 2);
+        assert!(ordinary._recovery.is_empty());
+        drop(ordinary);
+        let holder = scheduler.acquire_permit(1).unwrap();
+        let _warning = PinnedPressure::new(Level::Warning);
+        let within = scheduler.try_recovery_permit(1).unwrap().unwrap();
+        assert_eq!(within._slots.len(), 1, "the halved ceiling has room for it");
+        assert!(within._recovery.is_empty());
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(within);
+        let _critical = PinnedPressure::new(Level::Critical);
+        let recovered = scheduler.try_recovery_permit(1).unwrap().unwrap();
+        assert!(recovered._slots.is_empty());
+        assert_eq!(recovered._recovery.len(), 1);
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(recovered);
+        drop(holder);
+    }
+
+    #[test]
+    fn recovery_leaves_reserved_regular_slots_for_the_earlier_waiter() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _held: Vec<_> = (2..4)
+            .map(|index| {
+                StoreLock::try_acquire(&scheduler.permit_path(index))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let ahead = hold_ticket(dir.path(), 0, queue::Kind::Compile, 3, SystemTime::now());
+        for _ in 0..4 {
+            queue::record_pass(&scheduler.root, ahead.entry()).unwrap();
+        }
+        assert!(scheduler.try_recovery_permit(4).unwrap().is_none());
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(ahead);
+        let permit = scheduler.try_recovery_permit(4).unwrap().unwrap();
+        assert_eq!(permit._slots.len(), 2);
+        assert_eq!(permit._recovery.len(), 2);
+    }
+
+    #[test]
+    fn recovery_keeps_the_ordinary_tickets_rank_and_passes() {
+        let dir = temp_cache();
+        let mut scheduler = test_scheduler(dir.path(), 4);
+        let _holder = scheduler.acquire_permit(4).unwrap();
+        scheduler.wait_timeout = Duration::ZERO;
+        let request = Request {
+            rank: 17,
+            kind: queue::Kind::Compile,
+            spare: false,
+            saved_for_tests: std::cell::Cell::new(0),
+        };
+        let mut ticket = None;
+        assert!(
+            scheduler
+                .wait_for_request(&request, |_, _| 4, &mut ticket)
+                .is_none()
+        );
+        let original = ticket.as_ref().unwrap().entry().clone();
+        queue::record_pass(&scheduler.root, &original).unwrap();
+        assert!(
+            scheduler
+                .try_recovery_request(4, &request, &mut ticket, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        let remaining = ticket.as_ref().unwrap().entry();
+        assert_eq!(remaining.id, original.id);
+        assert_eq!(remaining.rank, 17);
+        assert_eq!(remaining.need, 2);
+        assert_eq!(queue::passes(&scheduler.root, remaining), 1);
+        drop(ticket);
+        assert!(queued(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn recovery_rechecks_capacity_with_the_slots_saved_for_tests() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let _running = scheduler.acquire_test_lease(TestWant::Fixed(1)).unwrap();
+        let waiting = hold_ticket(dir.path(), 0, queue::Kind::Test, 3, SystemTime::now());
+        for _ in 0..4 {
+            queue::record_pass(&scheduler.root, waiting.entry()).unwrap();
+        }
+        let gate = StoreLock::try_acquire(&permits_dir(&scheduler.root).join("recovery-0"))
+            .unwrap()
+            .unwrap();
+        let request = Request::new(queue::Kind::Compile, false);
+        let mut ticket = None;
+        assert!(
+            scheduler
+                .try_recovery_request(3, &request, &mut ticket, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(request.saved_for_tests.get(), 2);
+        drop(gate);
+        let permit = scheduler
+            .try_recovery_request(3, &request, &mut ticket, Duration::ZERO)
+            .unwrap()
+            .expect("the compile reserve is ordinary capacity");
+        assert!(permit._recovery.is_empty());
+        assert_eq!(
+            permit
+                ._slots
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert!(ticket.is_none());
+        assert_eq!(
+            queued(dir.path()).len(),
+            1,
+            "the waiting test keeps its ticket"
+        );
+    }
+
+    #[test]
+    fn spent_allowance_does_not_restart_discovery_flight_or_key_waits() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let identity = FlightIdentity::cc("queued").with_key("key");
+        let _flight = StoreLock::try_acquire(&scheduler.flight_path(&identity))
+            .unwrap()
+            .unwrap();
+        let discovery = dir
+            .path()
+            .join("scheduler/discovery")
+            .join(blake3::hash(b"discovery").to_hex().as_str());
+        let _discovery = StoreLock::try_acquire(&discovery).unwrap().unwrap();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        let store = crate::store::Store::open(&config).unwrap();
+        let _key = match store.claim_build("key").unwrap() {
+            crate::store::BuildClaim::Acquired(lock) => lock,
+            _ => panic!("fresh key must have a build lock"),
+        };
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        let discovered = bounded_test_wait(|| join_discovery_flight(dir.path(), "discovery"));
+        assert!(discovered.lock.is_none());
+        assert!(discovered.waited);
+        let miss = bounded_test_wait(|| scheduler.begin_miss(&identity, "queued", false, None));
+        let BeginMiss::Compile(guard) = miss else {
+            panic!("exhausted flight wait must allow a compile");
+        };
+        assert!(guard._flight.is_none());
+        assert!(
+            guard._permit.is_some(),
+            "uncoalesced work must still take capacity"
+        );
+        drop(guard);
+        assert!(
+            !bounded_test_wait(|| crate::invocation::wait_for_committed(&store, "key", None))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_committed_entry_keeps_its_default_wait_shortcut_with_a_budget() {
+        let dir = temp_cache();
+        let config = crate::test_support::test_config(dir.path().to_path_buf());
+        let store = crate::store::Store::open(&config).unwrap();
+        let key = blake3::hash(b"already-committed").to_hex().to_string();
+        let artifact = dir.path().join("libready.rlib");
+        fs::write(&artifact, b"complete").unwrap();
+        store
+            .put(
+                &key,
+                "ready",
+                &["lib".into()],
+                &[],
+                "host",
+                "debug",
+                &[(artifact, "libready.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        let lock = store.entry_dir(&key).with_extension("lock");
+        if lock.exists() {
+            fs::remove_file(&lock).unwrap();
+        }
+        fs::create_dir(&lock).unwrap();
+        assert!(store.contains(&key));
+        let _scope = InvocationWaitScope::enter();
+        assert!(crate::invocation::wait_for_committed(&store, &key, None).unwrap());
+        assert!(crate::invocation::wait_for_committed(&store, &key, Some(Duration::ZERO)).is_err());
+        let missing = blake3::hash(b"still-missing").to_hex().to_string();
+        fs::create_dir_all(store.entry_dir(&missing).with_extension("lock")).unwrap();
+        assert!(crate::invocation::wait_for_committed(&store, &missing, None).is_err());
+        let token = crate::invocation::process::Cancellation::default();
+        token.cancel();
+        let _cancel = crate::invocation::process::CancellationScope::enter(Some(token));
+        assert!(crate::invocation::wait_for_committed(&store, &key, None).is_err());
+    }
+
+    #[test]
+    fn recovery_errors_fail_open_and_cancellation_releases_waiters() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let holder = scheduler.acquire_permit(1).unwrap();
+        let gate = StoreLock::try_acquire(&permits_dir(&scheduler.root).join("recovery-0"))
+            .unwrap()
+            .unwrap();
+        let token = crate::invocation::process::Cancellation::default();
+        let (send, receive) = std::sync::mpsc::channel();
+        let waiter_token = token.clone();
+        let mut copy = scheduler.clone();
+        copy.wait_timeout = Duration::ZERO;
+        let waiter = std::thread::spawn(move || {
+            let _cancel = crate::invocation::process::CancellationScope::enter(Some(waiter_token));
+            let _scope = InvocationWaitScope::with_budget(Duration::from_secs(5));
+            let permit = copy.acquire_permit(1);
+            send.send(permit.is_none()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        token.cancel();
+        let cancelled = receive.recv_timeout(Duration::from_secs(2));
+        // Release the gate even on failure so a broken cancellation branch
+        // cannot leave a test thread parked for the rest of the suite.
+        drop(gate);
+        drop(holder);
+        waiter.join().unwrap();
+        assert!(cancelled.unwrap());
+
+        let holder = scheduler.acquire_permit(1).unwrap();
+        fs::remove_file(permits_dir(&scheduler.root).join("recovery-0")).unwrap();
+        fs::create_dir(permits_dir(&scheduler.root).join("recovery-0")).unwrap();
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        assert!(scheduler.acquire_permit(1).is_none());
+        drop(holder);
+    }
+
+    #[test]
+    fn killing_a_recovery_holder_returns_its_capacity() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 1);
+        let _holder = scheduler.acquire_permit(1).unwrap();
+        let mut child = spawn_fixture(dir.path(), "scheduler::tests::recovery_owner_child_fixture");
+        wait_ready(dir.path(), &mut child);
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        assert!(scheduler.try_recovery_permit(1).unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(1));
+        assert!(scheduler.try_recovery_permit(1).unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for killing_a_recovery_holder_returns_its_capacity"]
+    fn recovery_owner_child_fixture() {
+        let root = PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").unwrap());
+        let scheduler = test_scheduler(&root, 1);
+        let _scope = InvocationWaitScope::with_budget(Duration::ZERO);
+        let _permit = scheduler.acquire_permit(1).unwrap();
+        fs::write(root.join("lock-ready"), b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     fn spawn_fixture(dir: &Path, test_name: &str) -> std::process::Child {
@@ -2951,7 +3692,11 @@ mod tests {
         )
         .unwrap();
         reset_permit_scans();
-        assert!(scheduler.wait_for_permit(0..1, |_| 2).is_none());
+        assert!(
+            scheduler
+                .wait_for_permit(queue::Kind::Compile, |_, _| 2, false)
+                .is_none()
+        );
         // Observe the requested sleep: runner contention can delay a wakeup
         // regardless of the interval the scheduler selected.
         assert_eq!(
@@ -2974,12 +3719,16 @@ mod tests {
         let _held = StoreLock::try_acquire(&scheduler.permit_path(0))
             .unwrap()
             .unwrap();
-        let started = std::time::Instant::now();
-        assert!(scheduler.wait_for_permit(0..1, |_| 1).is_none());
+        reset_permit_scans();
         assert!(
-            started.elapsed() < Duration::from_millis(190),
-            "stopped after {:?}; the wait slept a full slice past the timeout",
-            started.elapsed()
+            scheduler
+                .wait_for_permit(queue::Kind::Compile, |_, _| 1, false)
+                .is_none()
+        );
+        // Check the requested sleep; a loaded runner may wake us much later.
+        assert!(
+            PERMIT_POLL_MAX.with(|max| max.get()) <= Duration::from_millis(80),
+            "the requested sleep must fit the remaining wait allowance"
         );
     }
 
@@ -2998,7 +3747,7 @@ mod tests {
         let (tid_tx, tid_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             permit_wait::force_slice(Some(SLICE));
-            pressure::force(Some(false));
+            pressure::force(Some(pressure::Level::Calm));
             let waiter = Scheduler::open_with(&root, 1, SLICE, Duration::from_millis(10)).unwrap();
             tid_tx.send(current_tid()).unwrap();
             let started = std::time::Instant::now();
@@ -3105,7 +3854,7 @@ mod tests {
 
     #[test]
     fn permits_in_use_counts_held_slots() {
-        let _calm = PinnedPressure::new(false);
+        let _calm = PinnedPressure::new(Level::Calm);
         let dir = temp_cache();
         assert_eq!(
             permits_in_use(dir.path()),
@@ -3144,17 +3893,17 @@ mod tests {
 
         let dir = temp_cache();
         let scheduler = test_scheduler(dir.path(), 4);
-        let _pressured = PinnedPressure::new(true);
+        let _pressured = PinnedPressure::new(Level::Critical);
         let one = scheduler.acquire_permit(1).unwrap();
         assert_eq!(
             permits_in_use(dir.path()),
-            Some(4),
-            "under pressure an ask of one locks the whole pool"
+            Some(1),
+            "under pressure a compile still locks only its weight"
         );
         drop(one);
         assert_eq!(permits_in_use(dir.path()), Some(0));
         let two = scheduler.acquire_permit(2).unwrap();
-        assert_eq!(permits_in_use(dir.path()), Some(4));
+        assert_eq!(permits_in_use(dir.path()), Some(2));
         drop(two);
         assert_eq!(permits_in_use(dir.path()), Some(0));
     }
@@ -3477,7 +4226,7 @@ mod tests {
     fn budget_scheduler(dir: &Path, pool: u32) -> Scheduler {
         // Replaces a pin the caller already set. Pin again afterwards when
         // the test wants pressure.
-        pressure::force(Some(false));
+        pressure::force(Some(Level::Calm));
         Scheduler::open_with(dir, pool, BUDGET, Duration::from_millis(5)).unwrap()
     }
 
@@ -3500,37 +4249,142 @@ mod tests {
     }
 
     #[test]
-    fn memory_pressure_admits_a_compile_only_when_no_other_holds_a_slot() {
-        pressure::force(Some(false));
+    fn critical_pressure_runs_one_compile_and_grows_back_only_after_settling() {
         let dir = temp_cache();
-        let scheduler = Scheduler::open_with(
-            dir.path(),
-            4,
-            Duration::from_millis(150),
-            Duration::from_millis(5),
-        )
-        .unwrap();
-        let _pin = PinnedPressure::new(false);
+        let scheduler = budget_scheduler(dir.path(), 4);
+        let calm = PinnedPressure::new(Level::Calm);
         let held = scheduler.acquire_permit(1).unwrap();
-        assert_eq!(
-            held._slots.len(),
-            1,
-            "a calm compile takes the one slot it asked for"
-        );
-        pressure::force(Some(true));
+        let other = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(permits_in_use(dir.path()), Some(2));
+        drop(calm);
+        let critical = PinnedPressure::new(Level::Critical);
         assert!(
             scheduler.acquire_permit(1).is_none(),
-            "under pressure a compile waits for the other to finish"
+            "under critical pressure a compile waits for the others to finish"
         );
-        drop(held);
+        drop((held, other));
         let alone = scheduler.acquire_permit(1).unwrap();
-        assert_eq!(alone._slots.len(), 4, "it takes the whole pool");
-        drop(alone);
-        pressure::force(Some(false));
-        let first = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(alone._slots.len(), 1, "it keeps only its weight");
+        assert!(scheduler.acquire_permit(1).is_none(), "one at a time");
+        drop(critical);
+
+        let _calm = PinnedPressure::new(Level::Calm);
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "calm readings must last a settling period before the ceiling grows"
+        );
+        // A run of calm readings that began a settling period ago.
+        let now = queue::millis(SystemTime::now());
+        fs::write(
+            scheduler.root.join("pressure"),
+            format!("1 {} {}", now - 20_000, now - 10_000),
+        )
+        .unwrap();
         let second = scheduler.acquire_permit(1).unwrap();
-        assert_eq!(first._slots.len() + second._slots.len(), 2);
-        drop(_pin);
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(2),
+            "a quarter of the pool more"
+        );
+        assert!(scheduler.acquire_permit(1).is_none());
+        drop((alone, second));
+    }
+
+    #[test]
+    fn a_falling_ceiling_keeps_running_compiles_and_admits_within_it() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 8);
+        let mut running: Vec<_> = (0..6)
+            .map(|_| scheduler.acquire_permit(1).unwrap())
+            .collect();
+        let _warning = PinnedPressure::new(Level::Warning);
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "the halved ceiling of 4 is below the 6 slots held"
+        );
+        assert_eq!(
+            permits_in_use(dir.path()),
+            Some(6),
+            "running compiles keep their slots"
+        );
+        running.truncate(3);
+        let admitted = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(admitted._slots.len(), 1);
+        assert_eq!(permits_in_use(dir.path()), Some(4));
+        assert!(scheduler.acquire_permit(1).is_none(), "the ceiling is full");
+        running.clear();
+        drop(admitted);
+
+        let heavy = scheduler.acquire_permit(6).unwrap();
+        assert_eq!(
+            heavy._slots.len(),
+            6,
+            "a compile heavier than the ceiling runs alone with its weight"
+        );
+        assert!(scheduler.acquire_permit(1).is_none());
+    }
+
+    #[test]
+    fn a_one_slot_pool_runs_one_compile_at_any_pressure() {
+        for level in [Level::Calm, Level::Warning, Level::Critical, Level::Unknown] {
+            let dir = temp_cache();
+            let scheduler = budget_scheduler(dir.path(), 1);
+            let _pin = PinnedPressure::new(level);
+            let only = scheduler.acquire_permit(1).unwrap();
+            assert_eq!(only._slots.len(), 1, "{level:?}");
+            assert!(scheduler.acquire_permit(1).is_none(), "{level:?}");
+            drop(only);
+            assert!(scheduler.acquire_permit(2).is_some(), "{level:?}");
+        }
+    }
+
+    #[test]
+    fn a_compile_under_pressure_still_fits_beside_running_tests() {
+        for level in [Level::Warning, Level::Critical] {
+            let dir = temp_cache();
+            let scheduler = test_scheduler(dir.path(), 4);
+            let _tests = scheduler.acquire_test_lease(TestWant::Elastic(1)).unwrap();
+            let _pin = PinnedPressure::new(level);
+            let permit = scheduler
+                .acquire_permit(1)
+                .expect("a test may be waiting on this compile");
+            let slots: Vec<u32> = permit._slots.iter().map(|(slot, _)| *slot).collect();
+            assert_eq!(slots, [0], "{level:?}: the compile reserve");
+            assert_eq!(permits_in_use(dir.path()), Some(4));
+        }
+    }
+
+    #[test]
+    fn a_weightless_compile_still_keeps_one_slot() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let permit = scheduler.acquire_permit(0).unwrap();
+        assert_eq!(permit._slots.len(), 1);
+        assert_eq!(permits_in_use(dir.path()), Some(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn releasing_the_slots_above_the_ceiling_wakes_waiters() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 4);
+        let seen = super::permit_wait::snapshot(&scheduler.root);
+        let calm = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(
+            super::permit_wait::snapshot(&scheduler.root),
+            seen,
+            "nothing was released"
+        );
+        drop(calm);
+        let seen = super::permit_wait::snapshot(&scheduler.root);
+        let _critical = PinnedPressure::new(Level::Critical);
+        let alone = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(alone._slots.len(), 1);
+        assert_eq!(
+            super::permit_wait::snapshot(&scheduler.root),
+            seen.wrapping_add(1),
+            "the three free slots it locked were released"
+        );
     }
 
     /// Pin this thread's memory reading until drop (and calm pressure).
@@ -3549,7 +4403,7 @@ mod tests {
 
         fn pin(available_gib: u64, total_gib: u64, reclaimable_gib: Option<u64>) -> Self {
             const GIB: u64 = 1024 * 1024 * 1024;
-            pressure::force(Some(false));
+            pressure::force(Some(pressure::Level::Calm));
             pressure::force_memory(Some(pressure::MemoryReading {
                 available: available_gib * GIB,
                 total: total_gib * GIB,
@@ -3605,6 +4459,31 @@ mod tests {
     /// first. One compile still running on a guessed peak brings back the
     /// full reserve with the cache counted as used, and outside a cgroup (a
     /// desktop) the full reserve always stays.
+    /// Recovery overcommits slots, not memory: with slots free but the gate
+    /// closed, a compile past its capacity wait stays out until the shared
+    /// allowance is spent, and comes in as soon as the memory is there.
+    #[test]
+    fn a_closed_memory_gate_holds_a_recovery_compile_too() {
+        let dir = temp_cache();
+        let mut scheduler = gate_scheduler(dir.path(), 8);
+        scheduler.wait_timeout = Duration::from_millis(50);
+        let _other = StoreLock::try_acquire(&scheduler.permit_path(7))
+            .unwrap()
+            .unwrap();
+        const GIB: u64 = 1024 * 1024 * 1024;
+        {
+            let _memory = PinnedMemory::new(1, 16);
+            let _scope = InvocationWaitScope::with_budget(Duration::from_millis(300));
+            assert!(
+                scheduler.acquire_permit_expecting(1, GIB).is_none(),
+                "held back by the memory, with every other slot free"
+            );
+        }
+        let _memory = PinnedMemory::new(15, 16);
+        let _scope = InvocationWaitScope::with_budget(Duration::from_millis(300));
+        assert!(scheduler.acquire_permit_expecting(1, GIB).is_some());
+    }
+
     #[test]
     fn the_gate_relaxes_only_in_a_cgroup_while_every_peak_is_measured() {
         const GIB: u64 = 1024 * 1024 * 1024;
@@ -3846,7 +4725,7 @@ mod tests {
     fn exited_test_lease_owner_restores_admission() {
         let dir = temp_cache();
         let scheduler = test_scheduler(dir.path(), 4);
-        let _calm = PinnedPressure::new(false);
+        let _calm = PinnedPressure::new(Level::Calm);
         let mut child = spawn_fixture(
             dir.path(),
             "scheduler::tests::test_lease_owner_child_fixture",
@@ -4072,17 +4951,14 @@ mod tests {
 
     #[test]
     fn heavy_compiles_take_their_full_weight_without_tests() {
-        // Calm: the ask is the count. Pressured: the same ask locks the pool.
-        for (pressured, held) in [(false, 3), (true, 4)] {
+        // Pressure asks for the slots above the ceiling to be free too, but
+        // the compile keeps only its weight.
+        for level in [Level::Calm, Level::Critical] {
             let dir = temp_cache();
             let scheduler = budget_scheduler(dir.path(), 4);
-            let _pin = PinnedPressure::new(pressured);
+            let _pin = PinnedPressure::new(level);
             let _permit = scheduler.acquire_permit(3).unwrap();
-            assert_eq!(
-                permits_in_use(dir.path()),
-                Some(held),
-                "pressured={pressured}"
-            );
+            assert_eq!(permits_in_use(dir.path()), Some(3), "{level:?}");
             assert!(
                 !tests_dir(&scheduler.root).exists(),
                 "compiles alone leave no test state"
@@ -4093,11 +4969,11 @@ mod tests {
     #[test]
     fn covered_misses_skip_the_permit_but_join_the_flight() {
         // A covered miss stays at zero slots either way. An uncovered miss
-        // takes its weight when calm and the whole pool under pressure.
-        for (pressured, uncovered) in [(false, 1), (true, 2)] {
+        // takes its weight, under pressure too.
+        for level in [Level::Calm, Level::Critical] {
             let dir = temp_cache();
             let scheduler = budget_scheduler(dir.path(), 2);
-            let _pin = PinnedPressure::new(pressured);
+            let _pin = PinnedPressure::new(level);
             fs::create_dir_all(tests_dir(&scheduler.root)).unwrap();
             let marker = tests_dir(&scheduler.root).join("1");
             let _marker_lock = StoreLock::try_acquire(&marker).unwrap().unwrap();
@@ -4110,7 +4986,7 @@ mod tests {
             };
             assert!(covered._flight.is_some(), "a covered miss joins the flight");
             assert!(covered._permit.is_none(), "a covered miss takes no permit");
-            assert_eq!(permits_in_use(dir.path()), Some(0), "pressured={pressured}");
+            assert_eq!(permits_in_use(dir.path()), Some(0), "{level:?}");
             drop(covered);
 
             let BeginMiss::Compile(uncovered_miss) =
@@ -4123,11 +4999,7 @@ mod tests {
                 uncovered_miss._permit.is_some(),
                 "an uncovered miss takes a permit"
             );
-            assert_eq!(
-                permits_in_use(dir.path()),
-                Some(uncovered),
-                "pressured={pressured}"
-            );
+            assert_eq!(permits_in_use(dir.path()), Some(1), "{level:?}");
         }
     }
 
@@ -4135,19 +5007,15 @@ mod tests {
     /// unless the scheduler is off or a test lease covers it.
     #[test]
     fn a_keyless_compile_takes_a_permit_and_no_flight() {
-        for (pressured, held) in [(false, 1), (true, 2)] {
+        for level in [Level::Calm, Level::Critical] {
             let dir = temp_cache();
             let scheduler = budget_scheduler(dir.path(), 2);
-            let _pin = PinnedPressure::new(pressured);
+            let _pin = PinnedPressure::new(level);
 
             let guard = scheduler.keyless_compile("c_unit", false, None);
             assert!(guard._permit.is_some(), "a keyless compile takes a permit");
             assert!(guard._flight.is_none(), "its discovery flight dedupes it");
-            assert_eq!(
-                permits_in_use(dir.path()),
-                Some(held),
-                "pressured={pressured}"
-            );
+            assert_eq!(permits_in_use(dir.path()), Some(1), "{level:?}");
             drop(guard);
             assert_eq!(permits_in_use(dir.path()), Some(0));
 
@@ -4159,22 +5027,24 @@ mod tests {
                 covered._permit.is_none(),
                 "a covered compile takes no permit"
             );
-            assert_eq!(permits_in_use(dir.path()), Some(0), "pressured={pressured}");
+            assert_eq!(permits_in_use(dir.path()), Some(0), "{level:?}");
         }
 
         let dir = temp_cache();
         let disabled = begin_keyless_compile(dir.path(), false, "c_unit", false, None);
         assert!(disabled.is_empty());
         {
-            let _calm = PinnedPressure::new(false);
+            let _calm = PinnedPressure::new(Level::Calm);
             let enabled = begin_keyless_compile(dir.path(), true, "c_unit", false, None);
             assert!(!enabled.is_empty());
             assert_eq!(permits_in_use(dir.path()), Some(UNMEASURED_COMPILE_WEIGHT));
         }
-        let _pressured = PinnedPressure::new(true);
+        let _pressured = PinnedPressure::new(Level::Critical);
         let enabled = begin_keyless_compile(dir.path(), true, "c_unit", false, None);
         assert!(!enabled.is_empty());
-        assert_eq!(permits_in_use(dir.path()), Some(default_pool_size()));
+        assert_eq!(permits_in_use(dir.path()), Some(UNMEASURED_COMPILE_WEIGHT));
+        let ceiling = fs::read_to_string(scheduler_root(dir.path()).join("pressure")).unwrap();
+        assert!(ceiling.starts_with("1 "), "stored ceiling: {ceiling:?}");
     }
 
     #[test]
@@ -4290,5 +5160,457 @@ mod tests {
         )
         .expect("a test run must persist a peak RSS sample");
         assert!(rss > 1024, "got {rss}");
+    }
+
+    /// The tickets queued under `cache`, in rank order.
+    fn queued(cache: &Path) -> Vec<queue::Entry> {
+        queue::list(&scheduler_root(cache)).unwrap()
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// One build's compile, waiting for `weight` slots of a pool of `pool` on
+    /// its own thread. It holds its permit until [`Requester::finish`].
+    struct Requester {
+        admitted: std::sync::mpsc::Receiver<()>,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        thread: std::thread::JoinHandle<bool>,
+    }
+
+    impl Requester {
+        fn spawn(cache: &Path, pool: u32, weight: u32, priority: Priority) -> Self {
+            Self::spawn_at(cache, pool, weight, priority, Level::Calm)
+        }
+
+        /// [`Requester::spawn`], reading memory pressure as `level`.
+        fn spawn_at(
+            cache: &Path,
+            pool: u32,
+            weight: u32,
+            priority: Priority,
+            level: Level,
+        ) -> Self {
+            let (admit, admitted) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let cache = cache.to_path_buf();
+            let thread = std::thread::spawn(move || {
+                let _priority = InvocationPriorityScope::enter(Some(priority));
+                let scheduler = test_scheduler(&cache, pool);
+                pressure::force(Some(level));
+                let Some(permit) = scheduler.acquire_permit(weight) else {
+                    return false;
+                };
+                admit.send(()).unwrap();
+                let _ = released.recv();
+                drop(permit);
+                true
+            });
+            Self {
+                admitted,
+                release: Some(release),
+                thread,
+            }
+        }
+
+        /// Spawn, then wait until the request is admitted.
+        fn running(cache: &Path, pool: u32, weight: u32, priority: Priority) -> Self {
+            let requester = Self::spawn(cache, pool, weight, priority);
+            requester.admitted(Duration::from_secs(5));
+            requester
+        }
+
+        /// Spawn, then wait until the queue holds `queued` tickets.
+        fn queued(cache: &Path, pool: u32, weight: u32, priority: Priority, queued: usize) -> Self {
+            let requester = Self::spawn(cache, pool, weight, priority);
+            wait_until("the request to queue", || {
+                super::tests::queued(cache).len() == queued
+            });
+            requester
+        }
+
+        fn admitted(&self, within: Duration) {
+            self.admitted
+                .recv_timeout(within)
+                .expect("the request was not admitted");
+        }
+
+        fn still_waiting(&self) -> bool {
+            matches!(
+                self.admitted.recv_timeout(Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            )
+        }
+
+        /// Release the permit and wait for the thread to drop it.
+        fn finish(mut self) {
+            drop(self.release.take());
+            assert!(
+                self.thread.join().unwrap(),
+                "the request was never admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_of_small_requests_cannot_overtake_a_large_one_forever() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let background = Priority::Background;
+        let first = Requester::running(cache, 2, 1, background);
+        let second = Requester::running(cache, 2, 1, background);
+        let large = Requester::queued(cache, 2, 2, background, 1);
+        // Equal millisecond ranks are ordered by random ticket ID. Ensure the
+        // later requests actually rank after the large one.
+        let large_rank = queued(cache)[0].rank;
+        wait_until("a later request rank", || {
+            queue::rank(SystemTime::now(), background) > large_rank
+        });
+
+        // While the large request does not fit, smaller ones pass it, once
+        // per slot of the pool.
+        first.finish();
+        let pass_one = Requester::running(cache, 2, 1, background);
+        second.finish();
+        let pass_two = Requester::running(cache, 2, 1, background);
+        {
+            let root = scheduler_root(cache);
+            // Refresh truncates and rewrites ticket state under this lock.
+            // Read the pass count under the same lock to avoid a partial read.
+            let _queue = queue::lock(&root, Duration::from_secs(5)).unwrap().unwrap();
+            let waiting = queued(cache);
+            assert_eq!(waiting.len(), 1);
+            assert_eq!(queue::passes(&root, &waiting[0]), 2);
+        }
+
+        // The budget is spent: a freed slot is saved for the large request.
+        pass_one.finish();
+        let late = Requester::queued(cache, 2, 1, background, 2);
+        assert!(late.still_waiting(), "a third small request passed");
+        assert!(large.still_waiting(), "one free slot is not enough");
+        pass_two.finish();
+        large.admitted(Duration::from_secs(5));
+        assert!(late.still_waiting(), "the large request runs alone");
+        large.finish();
+        late.admitted(Duration::from_secs(5));
+        late.finish();
+        assert!(queued(cache).is_empty());
+    }
+
+    #[test]
+    fn queued_compiles_wait_for_room_under_the_shared_ceiling() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let background = Priority::Background;
+        let holder = Requester::running(cache, 4, 2, background);
+        let pressured = Requester::spawn_at(cache, 4, 1, background, Level::Warning);
+        wait_until("the pressured request to queue", || {
+            queued(cache).len() == 1
+        });
+        assert_eq!(
+            queued(cache)[0].need,
+            3,
+            "its slot and the two above the ceiling"
+        );
+        let calm = Requester::queued(cache, 4, 1, background, 2);
+        assert!(
+            calm.still_waiting(),
+            "a calm reading does not raise the shared ceiling at once"
+        );
+        holder.finish();
+        pressured.admitted(Duration::from_secs(5));
+        calm.admitted(Duration::from_secs(5));
+        assert_eq!(permits_in_use(cache), Some(2), "each keeps one slot");
+        pressured.finish();
+        calm.finish();
+        assert!(queued(cache).is_empty());
+    }
+
+    #[test]
+    fn a_foreground_request_goes_before_earlier_background_ones() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let holder = Requester::running(cache, 1, 1, Priority::Background);
+        let background = Requester::queued(cache, 1, 1, Priority::Background, 1);
+        let later_background = Requester::queued(cache, 1, 1, Priority::Background, 2);
+        let foreground = Requester::queued(cache, 1, 1, Priority::Foreground, 3);
+        let ranks: Vec<u64> = queued(cache).iter().map(|entry| entry.rank).collect();
+        assert!(
+            ranks[0] + 9_000 < ranks[1],
+            "the foreground ticket ranks first: {ranks:?}"
+        );
+
+        holder.finish();
+        foreground.admitted(Duration::from_secs(5));
+        assert!(background.still_waiting());
+        foreground.finish();
+        // Background requests still run, in the order they came.
+        background.admitted(Duration::from_secs(5));
+        assert!(later_background.still_waiting());
+        background.finish();
+        later_background.admitted(Duration::from_secs(5));
+        later_background.finish();
+    }
+
+    #[test]
+    fn a_cancelled_waiter_leaves_the_queue() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let holder = Requester::running(cache, 1, 1, Priority::Foreground);
+        let token = crate::invocation::process::Cancellation::default();
+        let waiter = {
+            let cache = cache.to_path_buf();
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let _scope = crate::invocation::process::CancellationScope::enter(Some(token));
+                test_scheduler(&cache, 1).acquire_permit(1).is_some()
+            })
+        };
+        wait_until("the waiter to queue", || queued(cache).len() == 1);
+        let behind = Requester::queued(cache, 1, 1, Priority::Background, 2);
+        token.cancel();
+        assert!(
+            !waiter.join().unwrap(),
+            "a cancelled waiter takes no permit"
+        );
+        assert_eq!(queued(cache).len(), 1, "only the request behind is left");
+        assert_eq!(
+            fs::read_dir(scheduler_root(cache).join("waiters"))
+                .unwrap()
+                .count(),
+            1
+        );
+        holder.finish();
+        behind.admitted(Duration::from_secs(5));
+        behind.finish();
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for a_killed_waiter_loses_its_place"]
+    fn queued_waiter_child_fixture() {
+        let cache = PathBuf::from(std::env::var_os("KACHE_TEST_SCHEDULER_ROOT").unwrap());
+        let _ = test_scheduler(&cache, 1).acquire_permit(1);
+    }
+
+    #[test]
+    fn a_killed_waiter_loses_its_place() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = test_scheduler(cache, 1);
+        let holder = scheduler.acquire_permit(1).unwrap();
+        let mut child = spawn_fixture(cache, "scheduler::tests::queued_waiter_child_fixture");
+        wait_until("the child to queue", || queued(cache).len() == 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(queued(cache).len(), 1, "a killed waiter cannot clean up");
+
+        drop(holder);
+        let started = std::time::Instant::now();
+        let permit = scheduler.acquire_permit(1);
+        assert!(permit.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the dead ticket held the queue for {:?}",
+            started.elapsed()
+        );
+        assert!(queued(cache).is_empty(), "the next planner deleted it");
+        assert_eq!(
+            fs::read_dir(scheduler_root(cache).join("waiters"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    /// A ticket held by this thread, as a waiter that last looked at `seen`.
+    fn hold_ticket(
+        cache: &Path,
+        rank: u64,
+        kind: queue::Kind,
+        need: u32,
+        seen: SystemTime,
+    ) -> queue::Ticket {
+        queue::Ticket::create(
+            &scheduler_root(cache),
+            queue::Entry::new(rank, kind, need),
+            seen,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_waiter_that_has_not_looked_for_a_while_is_skipped() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 1);
+        let fresh = hold_ticket(cache, 0, queue::Kind::Compile, 1, SystemTime::now());
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "a live ticket ahead takes the free slot first"
+        );
+        drop(fresh);
+        let _starved = hold_ticket(
+            cache,
+            0,
+            queue::Kind::Compile,
+            1,
+            SystemTime::now() - Duration::from_secs(3),
+        );
+        assert!(scheduler.acquire_permit(1).is_some());
+        assert_eq!(queued(cache).len(), 1, "it keeps its place for later");
+    }
+
+    #[test]
+    fn slots_held_without_a_ticket_still_count() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 2);
+        // What a wrapper from before the queue holds: the slot lock alone.
+        let older = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        let _ahead = hold_ticket(cache, 0, queue::Kind::Compile, 1, SystemTime::now());
+        assert!(
+            scheduler.acquire_permit(1).is_none(),
+            "slot 1 is the ticket's, slot 0 the older wrapper's"
+        );
+        drop(older);
+        let permit = scheduler.acquire_permit(1).unwrap();
+        assert_eq!(permit._slots[0].0, 1, "slot 0 is left for the ticket ahead");
+    }
+
+    #[test]
+    fn a_held_queue_lock_falls_back_to_first_come() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 1);
+        let _queue = StoreLock::try_acquire(&queue::lock_path(&scheduler.root))
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(scheduler.acquire_permit(1).is_some());
+        assert!(started.elapsed() >= BUDGET, "it waited for the queue first");
+        assert!(queued(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn an_unusable_queue_falls_back_to_first_come() {
+        let dir = temp_cache();
+        let scheduler = budget_scheduler(dir.path(), 1);
+        fs::write(queue::queue_dir(&scheduler.root), b"not a directory").unwrap();
+        let busy = StoreLock::try_acquire(&scheduler.permit_path(0))
+            .unwrap()
+            .unwrap();
+        assert!(scheduler.acquire_permit(1).is_none());
+        drop(busy);
+        assert!(scheduler.acquire_permit(1).is_some());
+    }
+
+    #[test]
+    fn cancellation_while_the_queue_is_locked_takes_no_slot() {
+        let dir = temp_cache();
+        let cache = dir.path().to_path_buf();
+        let _queue = StoreLock::try_acquire(&queue::lock_path(&scheduler_root(&cache)))
+            .unwrap()
+            .unwrap();
+        let token = crate::invocation::process::Cancellation::default();
+        let waiter = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let _scope = crate::invocation::process::CancellationScope::enter(Some(token));
+                test_scheduler(&cache, 1).acquire_permit(1).is_some()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(30));
+        token.cancel();
+        assert!(!waiter.join().unwrap());
+    }
+
+    #[test]
+    fn an_elastic_lease_leaves_the_slots_queued_tests_need() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 8);
+        let now = SystemTime::now();
+        let _ahead = hold_ticket(cache, 0, queue::Kind::Test, 2, now);
+        let _behind = hold_ticket(cache, u64::MAX / 2, queue::Kind::Test, 1, now);
+        let lease = scheduler.acquire_test_lease(TestWant::Elastic(1)).unwrap();
+        // Slots 2 and 3 for the ticket ahead, 4 for the lease, 5 for the one
+        // behind; 6 and 7 are spare.
+        let slots: Vec<u32> = lease._slots.iter().map(|(index, _)| *index).collect();
+        assert_eq!(slots, [4, 6, 7]);
+    }
+
+    #[test]
+    fn a_compile_runs_beside_a_test_that_saves_test_slots() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let scheduler = budget_scheduler(cache, 4);
+        let _lease = scheduler.acquire_test_lease(TestWant::Fixed(2)).unwrap();
+        let waiting = hold_ticket(cache, 0, queue::Kind::Test, 3, SystemTime::now());
+        for _ in 0..queue::pass_budget(4) {
+            queue::record_pass(&scheduler.root, waiting.entry()).unwrap();
+        }
+        let permit = scheduler
+            .acquire_permit(1)
+            .expect("the reserve stays a compile's");
+        assert_eq!(permit._slots[0].0, 0);
+        assert!(
+            scheduler.acquire_test_lease(TestWant::Fixed(1)).is_none(),
+            "slot 3 is saved for the waiting test"
+        );
+    }
+
+    #[test]
+    fn a_heavy_compile_counts_slots_saved_for_a_test_as_held_by_tests() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        // Pool 4: slot 0 is the compile reserve, slots 1..4 are test slots.
+        let scheduler = test_scheduler(cache, 4);
+        // A running test the compile below may be blocking, through a nested
+        // build or a shared flight.
+        let running = scheduler.acquire_test_lease(TestWant::Fixed(1)).unwrap();
+        assert_eq!(running.marker_path(), tests_dir(&scheduler.root).join("1"));
+        // A test that waits for three slots and has been passed out of budget
+        // saves slots 2 and 3.
+        let waiting = hold_ticket(cache, 0, queue::Kind::Test, 3, SystemTime::now());
+        for _ in 0..queue::pass_budget(4) {
+            queue::record_pass(&scheduler.root, waiting.entry()).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let permit = scheduler
+            .acquire_permit(3)
+            .expect("a heavy compile must fit in what tests leave: the reserve");
+        let slots: Vec<u32> = permit._slots.iter().map(|(index, _)| *index).collect();
+        assert_eq!(slots, [0]);
+        // Well before the waiting ticket goes stale and stops saving slots.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_pool_of_one_admits_queued_requests_in_turn() {
+        let dir = temp_cache();
+        let cache = dir.path();
+        let holder = Requester::running(cache, 1, 1, Priority::Foreground);
+        let waiters: Vec<_> = (1..=3)
+            .map(|queued| Requester::queued(cache, 1, 1, Priority::Foreground, queued))
+            .collect();
+        holder.finish();
+        for waiter in waiters {
+            waiter.admitted(Duration::from_secs(5));
+            waiter.finish();
+        }
+        assert!(queued(cache).is_empty());
     }
 }

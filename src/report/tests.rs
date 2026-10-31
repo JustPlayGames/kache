@@ -638,6 +638,7 @@ fn write_test_events(dir: &std::path::Path) -> Config {
 
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -666,6 +667,7 @@ fn write_test_events(dir: &std::path::Path) -> Config {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -2026,6 +2028,7 @@ fn test_missing_transfer_data() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2054,6 +2057,7 @@ fn test_missing_transfer_data() {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -2134,6 +2138,7 @@ fn test_suggestion_high_miss_share() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2162,6 +2167,7 @@ fn test_suggestion_high_miss_share() {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -2241,6 +2247,7 @@ fn test_suggestion_high_hit_overhead() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2269,6 +2276,7 @@ fn test_suggestion_high_hit_overhead() {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -2349,6 +2357,7 @@ fn test_suggestion_network_download_failures_and_fanout() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2377,6 +2386,7 @@ fn test_suggestion_network_download_failures_and_fanout() {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -2462,6 +2472,7 @@ fn test_suggestion_network_latency_thresholds() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -2490,6 +2501,7 @@ fn test_suggestion_network_latency_thresholds() {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -2978,6 +2990,7 @@ fn test_empty_report() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3006,6 +3019,7 @@ fn test_empty_report() {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
@@ -3467,6 +3481,7 @@ fn report_counts_each_download_transfer_format() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         blaze: false,
+        separate_check_targets: true,
         readonly_store: None,
         fallback: None,
         key_salt: None,
@@ -3495,6 +3510,7 @@ fn report_counts_each_download_transfer_format() {
         auto_share_target_files: false,
         auto_clean_idle_targets_days: 0,
         auto_recover_min_free_bytes: 0,
+        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,

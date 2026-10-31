@@ -477,6 +477,7 @@ struct EntryFields<'a> {
     stdout: &'a str,
     stderr: &'a str,
     compile_time_ms: u64,
+    rustc_version: Option<&'a str>,
 }
 
 thread_local! {
@@ -1848,7 +1849,8 @@ const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 /// megabytes.
 pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
-const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Default maximum wait for another process to publish a key it is building.
+pub const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a waiter sleeps before its next `try_lock`: 1 ms, doubling up to
@@ -2469,6 +2471,8 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
     let _ =
         db.execute_batch("ALTER TABLE entries ADD COLUMN key_schema INTEGER NOT NULL DEFAULT 0");
 
+    compiler_gc::ensure_schema(db)?;
+
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS blobs (
             hash     TEXT PRIMARY KEY,
@@ -2618,11 +2622,12 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
 ///    which joins it, failed there).
 /// 12: replace incompatible `record_json` prediction memos with the current
 ///    payload schema. Compiled cache entries are retained.
+/// 13: `entries.rustc_version`, for explicit compiler-version cleanup.
 ///
 /// A release that finds a higher number leaves it (and skips the DDL): the
 /// stamp only ever goes up. Releases before this rule stamp their own number
 /// back, so a newer one runs its DDL once more after such an open.
-const INDEX_SCHEMA_GENERATION: i64 = 12;
+const INDEX_SCHEMA_GENERATION: i64 = 13;
 
 /// What [`ArtifactStore::adopt_legacy_entry`] did for one entry.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -4056,9 +4061,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let inserted = sp.execute(
                 "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, \
                      num_features, size, content_hash, compile_time_ms, key_schema, committed, \
-                     durable, compile_time_backfilled, unit_id) \
+                     durable, compile_time_backfilled, unit_id, rustc_version) \
                  SELECT ?1, crate_name, crate_type, profile, num_features, size, content_hash, \
-                     compile_time_ms, ?2, 1, durable, compile_time_backfilled, unit_id \
+                     compile_time_ms, ?2, 1, durable, compile_time_backfilled, unit_id, \
+                     rustc_version \
                  FROM entries WHERE cache_key = ?3 AND committed = 1",
                 params![
                     request.cache_key,
@@ -4311,6 +4317,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stderr,
             compile_time_ms,
             PutSources::Outputs,
+            None,
         )
     }
 
@@ -4342,6 +4349,39 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stderr,
             compile_time_ms,
             PutSources::Independent,
+            None,
+        )
+    }
+
+    /// Publish a Rust compilation with its compiler identity for targeted cleanup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_rustc_with_compile_time(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        rustc_version: Option<&str>,
+    ) -> Result<StorePutResult> {
+        self.put_with_compile_time_policy(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            PutSources::Outputs,
+            rustc_version,
         )
     }
 
@@ -4374,6 +4414,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stdout: &str,
         stderr: &str,
         compile_time_ms: u64,
+        rustc_version: Option<&str>,
     ) -> Result<StorePutResult> {
         anyhow::ensure!(
             expected.len() == output_files.len(),
@@ -4391,6 +4432,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stderr,
             compile_time_ms,
             PutSources::Snapshots(expected),
+            rustc_version,
         )
     }
 
@@ -4417,6 +4459,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stdout: &str,
         stderr: &str,
         compile_time_ms: u64,
+        rustc_version: Option<&str>,
         wait: Duration,
     ) -> Result<PutAttempt> {
         let staged = self.stage_put(
@@ -4431,6 +4474,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stderr,
             compile_time_ms,
             PutSources::Outputs,
+            rustc_version,
         )?;
         Ok(
             match self.register_staged(&staged, RegistrationWait::AtMost(wait))? {
@@ -4467,6 +4511,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stdout: &str,
         stderr: &str,
         compile_time_ms: u64,
+        rustc_version: Option<&str>,
     ) -> Result<StorePutResult> {
         let checked = self.check_staged_handed_off(
             cache_key,
@@ -4482,6 +4527,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stderr,
             compile_time_ms,
             "",
+            rustc_version,
         );
         match self.register_batch(vec![checked], RegistrationWait::Patient) {
             BatchAttempt::Registered(mut results) => {
@@ -4522,6 +4568,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stderr: &str,
         compile_time_ms: u64,
         unit: &str,
+        rustc_version: Option<&str>,
     ) -> CheckedHandoff {
         if let Err(error) = self.refuse_write("store an entry") {
             return CheckedHandoff::refused(error);
@@ -4575,6 +4622,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 stdout,
                 stderr,
                 compile_time_ms,
+                rustc_version,
             },
             files.to_vec(),
             snapshots.iter().map(|path| (path.clone(), true)).collect(),
@@ -4775,6 +4823,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stderr: &str,
         compile_time_ms: u64,
         sources_kind: PutSources<'_>,
+        rustc_version: Option<&str>,
     ) -> Result<StorePutResult> {
         let staged = self.stage_put(
             cache_key,
@@ -4788,6 +4837,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stderr,
             compile_time_ms,
             sources_kind,
+            rustc_version,
         )?;
         self.register_staged(&staged, RegistrationWait::Patient)?
             .context("registering a stored entry")
@@ -4809,6 +4859,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stderr: &str,
         compile_time_ms: u64,
         sources_kind: PutSources<'_>,
+        rustc_version: Option<&str>,
     ) -> Result<StagedPut> {
         self.refuse_write("store an entry")?;
         let allow_source_hardlinks = !matches!(sources_kind, PutSources::Independent);
@@ -4990,6 +5041,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 stdout,
                 stderr,
                 compile_time_ms,
+                rustc_version,
             },
             cached_files,
             sources,
@@ -5018,6 +5070,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stdout,
             stderr,
             compile_time_ms,
+            rustc_version,
         } = fields;
         let total_size = cached_files.iter().map(|file| file.size).sum();
         let content_hash = compute_content_hash(&cached_files);
@@ -5037,6 +5090,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let meta = EntryMeta {
             cache_key: cache_key.to_string(),
             key_schema: kache_format::CACHE_KEY_VERSION,
+            rustc_version: rustc_version.map(str::to_owned),
             crate_name: crate_name.to_string(),
             crate_types: crate_types.to_vec(),
             files: cached_files,
@@ -5159,8 +5213,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         crate::atomic::atomic_replace_deferrable(&meta_path, staged.meta_json.as_bytes(), durable)
             .context("writing entry metadata")?;
         conn.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled, unit_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1, ?11)",
-            params![cache_key, staged.meta.crate_name, staged.crate_type_str, staged.meta.profile, staged.num_features, staged.total_size as i64, staged.content_hash, staged.meta.compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, false, staged.unit],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled, unit_id, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1, ?11, ?12)",
+            params![cache_key, staged.meta.crate_name, staged.crate_type_str, staged.meta.profile, staged.num_features, staged.total_size as i64, staged.content_hash, staged.meta.compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, false, staged.unit, staged.meta.rustc_version],
         )?;
         Ok(())
     }
@@ -5326,8 +5380,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         record_entry_blobs(&tx, cache_key, &meta.files)?;
         tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, unixepoch(), 1)",
-            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema, false],
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, unixepoch(), 1, ?11)",
+            params![cache_key, meta.crate_name, crate_type_str, meta.profile, num_features, total_size as i64, content_hash, meta.compile_time_ms as i64, meta.key_schema, false, meta.rustc_version],
         )?;
         tx.commit()?;
 
@@ -5550,7 +5604,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )?;
             tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
             let inserted = tx.execute(
-                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, unixepoch(), 1)",
+                "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, unixepoch(), 1, ?11)",
                 params![
                     entry.cache_key,
                     meta.crate_name,
@@ -5561,7 +5615,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     content_hash,
                     meta.compile_time_ms as i64,
                     meta.key_schema,
-                    false
+                    false,
+                    meta.rustc_version
                 ],
             )?;
             // A retried download can repair a missing CAS blob even when its
@@ -5962,7 +6017,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Claim the entry row first. If it is already there, a concurrent or
         // earlier rebuild owns this entry's refcounts and we must not add more.
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, compile_time_backfilled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 1)",
+            "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, compile_time_backfilled, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 1, ?10)",
             params![
                 cache_key,
                 meta.crate_name,
@@ -5972,7 +6027,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 total_size as i64,
                 content_hash,
                 meta.compile_time_ms as i64,
-                meta.key_schema
+                meta.key_schema,
+                meta.rustc_version
             ],
         )?;
         if inserted == 0 {
@@ -9710,3 +9766,7 @@ impl Drop for SlowEvictionScanGuard {
 
 #[cfg(test)]
 mod tests;
+
+#[path = "store/compiler_gc.rs"]
+mod compiler_gc;
+pub use compiler_gc::CompilerEntries;
