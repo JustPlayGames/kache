@@ -144,7 +144,7 @@ performs brokered restores under its own process restrictions:
 - background uploads and durable upload replay
 - speculative prefetch, and fetching and publishing input records on the remote
 - seeding a new checkout's target directory with registry units another checkout built (`cache.seed_new_targets`)
-- copying large executables beside their destinations while the rest of a build runs
+- copying large executables beside their destinations while the rest of a build runs, for clients that restore on their own (a brokered restore takes no such copy, and its build asks for none)
 - flushing entries stored without an fsync, every two seconds
 - scheduled garbage collection
 - index upkeep, target-directory cleanup and target-file sharing when the machine is quiet
