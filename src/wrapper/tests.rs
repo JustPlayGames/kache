@@ -1417,6 +1417,30 @@ fn auto_gc_sweep_due_starts_above_the_trigger_and_honours_the_backoff() {
     assert!(auto_gc_sweep_due(&cfg, 1101));
 }
 
+/// 2026-10-31: every sweep stopped at its walk budget, so `held` was last
+/// written by a whole sweep 6 h earlier. When it expired, the trigger saw
+/// the whole store, target directories' part included, and a sweep ran at
+/// every check.
+#[test]
+fn a_sweep_cut_short_keeps_held_fresh_without_backing_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1000;
+    record_auto_gc_outcome(&cfg, 5000, 4000);
+    assert!(!auto_gc_sweep_due(&cfg, 5000), "held is left out");
+    age_auto_gc_record_for_test(&cfg.cache_dir, AUTO_GC_HELD_TTL.as_secs());
+    assert!(auto_gc_sweep_due(&cfg, 5000), "an expired figure counts for nothing");
+
+    record_auto_gc_cut_short(&cfg, 5000, 4000);
+    assert_eq!(recent_auto_gc_held(&cfg.cache_dir), 4000);
+    assert!(!auto_gc_sweep_due(&cfg, 5000), "fresh again");
+    assert_eq!(auto_gc_backoff_interval_for_test(&cfg.cache_dir), Some(0));
+    assert!(
+        auto_gc_sweep_due(&cfg, 5101),
+        "over the trigger without it: the next check goes on, no backoff"
+    );
+}
+
 /// 2026-10-26: a sweep ended over the trigger at 19:04Z and its 600 s
 /// backoff held while builds took free space from 15 GiB to ENOSPC.
 #[test]

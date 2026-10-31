@@ -4471,11 +4471,11 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
     else {
         return;
     };
-    // Stopped at its walk budget: more can go, so nothing backs off.
-    if last.cut_short {
-        return;
-    }
     match Store::open(config).and_then(|store| store.physical_size()) {
+        // Stopped at its walk budget: more can go, so nothing backs off.
+        Ok(size) if last.cut_short => {
+            crate::wrapper::record_auto_gc_cut_short(config, size, last.bytes_held)
+        }
         Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size, last.bytes_held),
         Err(e) => tracing::debug!("auto-gc: store size after the sweep unknown: {e:#}"),
     }
