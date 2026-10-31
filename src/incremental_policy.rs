@@ -924,6 +924,9 @@ impl Lease {
                 false
             }
         };
+        if kept {
+            cleanup::drop_superseded_sessions(&self.unit.rustc_dir);
+        }
         if kept && outcome == CompileOutcome::Success {
             worktree_seed::publish(&self.unit, self.worktree_seed_key.as_deref());
         }

@@ -456,7 +456,7 @@ fn finalized_session(path: &Path, depth: usize) -> bool {
         }))
 }
 
-fn session_timestamp(path: &Path, depth: usize) -> Option<u64> {
+pub(super) fn session_timestamp(path: &Path, depth: usize) -> Option<u64> {
     if !finalized_session(path, depth) {
         return None;
     }
@@ -465,7 +465,7 @@ fn session_timestamp(path: &Path, depth: usize) -> Option<u64> {
 
 /// rustc selects the greatest base-36 timestamp in the session name. Keep
 /// unfamiliar layouts intact, and retain ties rather than choosing between them.
-fn newest_session(entries: &[fs::DirEntry], depth: usize) -> Option<u64> {
+pub(super) fn newest_session(entries: &[fs::DirEntry], depth: usize) -> Option<u64> {
     if depth != 1 {
         return None;
     }
