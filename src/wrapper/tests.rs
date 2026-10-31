@@ -989,7 +989,7 @@ fn auto_gc_wanted_fires_only_over_budget_and_respects_throttle() {
     assert!(stamp.exists(), "under budget must create the stamp");
 
     // Over budget but with a fresh stamp: check is throttled.
-    cfg.max_size = 1024; // 1 KiB budget, store holds 4 KiB (> +10% slack)
+    cfg.max_size = 1024; // 1 KiB budget, store holds 4 KiB
     assert!(
         !auto_gc_wanted(&cfg, &store),
         "fresh stamp must throttle the check even if over budget"
@@ -1093,7 +1093,7 @@ fn disk_pressure_hints_even_below_cache_budget_and_the_detached_worker_recovers(
 }
 
 #[test]
-fn auto_gc_wanted_respects_disable_and_slack() {
+fn auto_gc_wanted_respects_disable_and_the_trigger() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(dir.path().to_path_buf());
     let store = Store::open(&cfg).unwrap();
@@ -1104,13 +1104,13 @@ fn auto_gc_wanted_respects_disable_and_slack() {
     cfg.max_size = 1;
     assert!(!auto_gc_wanted(&cfg, &store), "auto_gc=false must disable");
 
-    // Enabled but within the +10% slack band: no trigger. The store holds
-    // exactly 4096 bytes; max_size 4000 → threshold 4400 ≥ 4096.
+    // Enabled but under the trigger. The store holds exactly 4096 bytes;
+    // max_size 5000 → trigger 4500 ≥ 4096.
     cfg.auto_gc = true;
-    cfg.max_size = 4000;
+    cfg.max_size = 5000;
     assert!(
         !auto_gc_wanted(&cfg, &store),
-        "inside the slack band must not trigger"
+        "under the trigger must not start a sweep"
     );
 }
 
@@ -1329,8 +1329,9 @@ fn auto_gc_constants_are_pinned() {
     assert_eq!(AUTO_GC_SLACK_PERCENT, 10);
     assert_eq!(AUTO_GC_MAX_BACKOFF.as_secs(), 7200);
     assert_eq!(AUTO_GC_HELD_TTL.as_secs(), 21_600);
-    // Start above 110% of max_size, stop at 90%.
-    assert_eq!(auto_gc_threshold(1000), 1100);
+    // Start above 88% of max_size, stop at 78%; `kache gc` stops at 90%.
+    assert_eq!(auto_gc_threshold(1000), 880);
+    assert_eq!(kache_store::eviction::automatic_target(1000), 780);
     assert_eq!(kache_store::eviction::eviction_target(1000), 900);
 }
 
@@ -1356,34 +1357,34 @@ fn the_outcome_line_mentions_a_wait_only_when_there_is_one() {
     assert!(line.contains("next automatic sweep in 1s"), "{line}");
 }
 
-/// max 1000, so the trigger is 1100.
+/// max 1000, so the trigger is 880.
 #[test]
 fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
     let ttl = AUTO_GC_HELD_TTL.as_secs();
     // Under the trigger only once the held bytes are left out: no
     // backoff, but a record that carries them.
-    let record = next_auto_gc_backoff(None, 50, 5000, 3900, 1000).unwrap();
+    let record = next_auto_gc_backoff(None, 50, 5000, 4120, 1000).unwrap();
     assert_eq!(
         record,
         AutoGcBackoff {
             since: 50,
             interval_secs: 0,
             size_after: 5000,
-            held: 3900,
+            held: 4120,
         }
     );
     assert_eq!(
         next_auto_gc_backoff(None, 50, 5000, 0, 1000).map(|r| r.interval_secs),
         Some(600)
     );
-    assert_eq!(next_auto_gc_backoff(None, 50, 1100, 0, 1000), None);
+    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000), None);
     // Over it even so: a backoff, carrying the held bytes, doubling from
     // the check interval after a record that had none.
-    let backoff = next_auto_gc_backoff(Some(record), 60, 5000, 3899, 1000).unwrap();
-    assert_eq!((backoff.interval_secs, backoff.held), (600, 3899));
+    let backoff = next_auto_gc_backoff(Some(record), 60, 5000, 4119, 1000).unwrap();
+    assert_eq!((backoff.interval_secs, backoff.held), (600, 4119));
 
     assert_eq!(recent_held_bytes(None, 50), 0);
-    assert_eq!(recent_held_bytes(Some(record), 50 + ttl - 1), 3900);
+    assert_eq!(recent_held_bytes(Some(record), 50 + ttl - 1), 4120);
     assert_eq!(recent_held_bytes(Some(record), 50 + ttl), 0);
 
     let healthy = || false;
@@ -1396,8 +1397,8 @@ fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
         auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000, healthy),
         "the figure expired"
     );
-    assert!(auto_gc_due_at(None, 60, 1101, 1000, healthy));
-    assert!(!auto_gc_due_at(None, 60, 1100, 1000, healthy));
+    assert!(auto_gc_due_at(None, 60, 881, 1000, healthy));
+    assert!(!auto_gc_due_at(None, 60, 880, 1000, healthy));
 }
 
 #[test]
@@ -1405,16 +1406,16 @@ fn auto_gc_sweep_due_starts_above_the_trigger_and_honours_the_backoff() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(dir.path().to_path_buf());
     cfg.max_size = 1000;
-    assert!(!auto_gc_sweep_due(&cfg, 1099));
-    assert!(!auto_gc_sweep_due(&cfg, 1100));
-    assert!(auto_gc_sweep_due(&cfg, 1101));
+    assert!(!auto_gc_sweep_due(&cfg, 879));
+    assert!(!auto_gc_sweep_due(&cfg, 880));
+    assert!(auto_gc_sweep_due(&cfg, 881));
 
-    record_auto_gc_outcome(&cfg, 1101, 0);
-    assert!(!auto_gc_sweep_due(&cfg, 1101), "a held backoff defers");
-    assert!(!auto_gc_sweep_due(&cfg, 1201));
-    assert!(auto_gc_sweep_due(&cfg, 1202), "growth past the slack");
+    record_auto_gc_outcome(&cfg, 881, 0);
+    assert!(!auto_gc_sweep_due(&cfg, 881), "a held backoff defers");
+    assert!(!auto_gc_sweep_due(&cfg, 981));
+    assert!(auto_gc_sweep_due(&cfg, 982), "growth past the slack");
     expire_auto_gc_backoff_for_test(&cfg.cache_dir);
-    assert!(auto_gc_sweep_due(&cfg, 1101));
+    assert!(auto_gc_sweep_due(&cfg, 881));
 }
 
 /// 2026-10-31: every sweep stopped at its walk budget, so `held` was last
@@ -1426,13 +1427,13 @@ fn a_sweep_cut_short_keeps_held_fresh_without_backing_off() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(dir.path().to_path_buf());
     cfg.max_size = 1000;
-    record_auto_gc_outcome(&cfg, 5000, 4000);
+    record_auto_gc_outcome(&cfg, 5000, 4120);
     assert!(!auto_gc_sweep_due(&cfg, 5000), "held is left out");
     age_auto_gc_record_for_test(&cfg.cache_dir, AUTO_GC_HELD_TTL.as_secs());
     assert!(auto_gc_sweep_due(&cfg, 5000), "an expired figure counts for nothing");
 
-    record_auto_gc_cut_short(&cfg, 5000, 4000);
-    assert_eq!(recent_auto_gc_held(&cfg.cache_dir), 4000);
+    record_auto_gc_cut_short(&cfg, 5000, 4120);
+    assert_eq!(recent_auto_gc_held(&cfg.cache_dir), 4120);
     assert!(!auto_gc_sweep_due(&cfg, 5000), "fresh again");
     assert_eq!(auto_gc_backoff_interval_for_test(&cfg.cache_dir), Some(0));
     assert!(
@@ -1456,17 +1457,17 @@ fn a_disk_running_low_starts_the_sweep_through_the_backoff() {
             Some(kache_fs::VolumeUsage { total: 1000, free }),
         )
     };
-    record_auto_gc_outcome(&cfg, 1101, 0);
+    record_auto_gc_outcome(&cfg, 881, 0);
     {
         let _healthy = usage(25);
-        assert!(!auto_gc_sweep_due(&cfg, 1101), "the backoff holds");
+        assert!(!auto_gc_sweep_due(&cfg, 881), "the backoff holds");
     }
     {
         let _low = usage(24);
-        assert!(auto_gc_sweep_due(&cfg, 1101), "low disk ends the backoff");
-        assert!(!auto_gc_sweep_due(&cfg, 1100), "but not the trigger");
+        assert!(auto_gc_sweep_due(&cfg, 881), "low disk ends the backoff");
+        assert!(!auto_gc_sweep_due(&cfg, 880), "but not the trigger");
         cfg.auto_recover_min_free_bytes = 0;
-        assert!(!auto_gc_sweep_due(&cfg, 1101), "no floor, no low band");
+        assert!(!auto_gc_sweep_due(&cfg, 881), "no floor, no low band");
     }
 }
 
@@ -1476,12 +1477,12 @@ fn auto_gc_wanted_starts_one_byte_above_the_trigger() {
     let mut cfg = test_config(dir.path().to_path_buf());
     cfg.max_size = 1000;
     let store = Store::open(&cfg).unwrap();
-    put_sized_entry(&store, dir.path(), "at-the-trigger", 1100);
-    assert_eq!(store.physical_size().unwrap(), 1100);
+    put_sized_entry(&store, dir.path(), "at-the-trigger", 880);
+    assert_eq!(store.physical_size().unwrap(), 880);
     assert!(!auto_gc_wanted(&cfg, &store));
 
     put_sized_entry(&store, dir.path(), "x", 1);
-    assert_eq!(store.physical_size().unwrap(), 1101);
+    assert_eq!(store.physical_size().unwrap(), 881);
     expire_auto_gc_stamp(&cfg);
     assert!(auto_gc_wanted(&cfg, &store));
 }
@@ -1838,15 +1839,15 @@ fn unix_now_secs_reads_the_wall_clock() {
 
 #[test]
 fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
-    // max 1000: the trigger is 1100.
-    assert_eq!(next_auto_gc_backoff(None, 50, 1100, 0, 1000), None);
-    let first = next_auto_gc_backoff(None, 50, 1101, 0, 1000).unwrap();
+    // max 1000: the trigger is 880.
+    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000), None);
+    let first = next_auto_gc_backoff(None, 50, 881, 0, 1000).unwrap();
     assert_eq!(
         first,
         AutoGcBackoff {
             since: 50,
             interval_secs: 600,
-            size_after: 1101,
+            size_after: 881,
             held: 0,
         }
     );
@@ -1870,7 +1871,7 @@ fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
             .interval_secs,
         7200
     );
-    assert_eq!(next_auto_gc_backoff(Some(second), 100, 900, 0, 1000), None);
+    assert_eq!(next_auto_gc_backoff(Some(second), 100, 880, 0, 1000), None);
 }
 
 #[test]
@@ -1908,7 +1909,7 @@ fn record_auto_gc_outcome_persists_the_backoff_until_the_store_fits() {
         1200
     );
 
-    record_auto_gc_outcome(&cfg, 900, 0);
+    record_auto_gc_outcome(&cfg, 880, 0);
     assert!(!auto_gc_backoff_path(&cfg.cache_dir).exists());
     assert!(auto_gc_sweep_due(&cfg, 5000));
 }

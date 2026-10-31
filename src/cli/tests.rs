@@ -757,16 +757,9 @@ fn storage_splits_exclusive_and_shared_bytes_only_when_blocks_are_shared() {
         shared.contains("; Cache reads 10 B over Limit, 7 B of it held there"),
         "{shared}"
     );
-    // Past what targets hold, the store's own excess is either inside the
-    // 10 % it may pass Limit by before a sweep starts, or due for a sweep.
+    // Past what targets hold, the store's own excess is due for a sweep.
     disk.store_limit_bytes = 1000;
     disk.cloned_into_targets_bytes = 70;
-    disk.store_bytes = 1100;
-    let shared = text(&disk).pop().unwrap();
-    assert!(
-        shared.contains("70 B of it held there, the other 30 B within the 10 % a store may grow"),
-        "{shared}"
-    );
     disk.store_bytes = 1200;
     let shared = text(&disk).pop().unwrap();
     assert!(

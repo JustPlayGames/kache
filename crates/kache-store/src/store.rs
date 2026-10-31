@@ -8000,9 +8000,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// Fires at `max_size` and evicts down to 90% of it — a real hysteresis
     /// band, not the single 90% line that used to serve as both trigger and
-    /// target. The threshold lives here rather than at each call site so
-    /// `kache gc`, the daemon's periodic sweep, and the post-upload check all
-    /// get the same band (see [`crate::eviction::over_eviction_trigger`]).
+    /// target. An automatic sweep ([`Self::evict_for_free_space`]) fires at
+    /// 88% and evicts down to 78%, so that the cap holds while builds write
+    /// (see [`crate::eviction::automatic_trigger`]).
     pub fn evict(&self) -> Result<GcStats> {
         self.evict_for(SweepOrigin::Requested)
     }
@@ -8053,9 +8053,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         mut short_of_space: impl FnMut() -> bool,
     ) -> Result<GcStats> {
         self.refuse_write("evict")?;
-        let target = crate::eviction::eviction_target(self.config.max_size);
+        let max_size = self.config.max_size;
+        let (over, target) = match origin {
+            SweepOrigin::Automatic => (
+                crate::eviction::automatic_trigger(max_size),
+                crate::eviction::automatic_target(max_size),
+            ),
+            SweepOrigin::Requested => (max_size, crate::eviction::eviction_target(max_size)),
+        };
         let mut size = self.physical_size()?;
-        if !crate::eviction::over_eviction_trigger(size, self.config.max_size) {
+        if size <= over {
             return Ok(GcStats::default());
         }
         let walk_budget = (origin == SweepOrigin::Automatic).then_some(self.size_sweep_walk_budget);

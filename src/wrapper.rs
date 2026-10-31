@@ -357,9 +357,8 @@ pub(crate) fn warn_nonlocal_cache_fs_once(config: &Config) {
 /// checks the hot-path cost is a single `stat()` on the stamp file.
 const AUTO_GC_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Slack over `max_size` before a background GC is spawned, in percent.
-/// `evict()` already targets 90% of `max_size`; triggering only above 110%
-/// keeps the two thresholds apart so the store doesn't thrash at the boundary.
+/// How far past what the last sweep left a store must grow to end a backoff
+/// early, in percent of `max_size`.
 const AUTO_GC_SLACK_PERCENT: u64 = 10;
 
 /// Longest the auto-GC backoff grows. The daemon's periodic sweep runs every
@@ -372,9 +371,9 @@ fn auto_gc_backoff_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("auto-gc-backoff.json")
 }
 
-/// Size above which an automatic sweep starts: `max_size` plus slack.
+/// Size above which an automatic sweep starts.
 pub(crate) fn auto_gc_threshold(max_size: u64) -> u64 {
-    max_size.saturating_add(max_size / 100 * AUTO_GC_SLACK_PERCENT)
+    kache_store::eviction::automatic_trigger(max_size)
 }
 
 /// A sweep ended with the store still over the trigger. Most often the
@@ -623,10 +622,11 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     }
 
     tracing::info!(
-        "auto-gc: cache or disk pressure, triggering background GC (store {}, max {}, slack {}%)",
+        "auto-gc: cache or disk pressure, triggering background GC (store {}, max {}, starts \
+         above {})",
         total,
         swept.max_size,
-        AUTO_GC_SLACK_PERCENT
+        auto_gc_threshold(swept.max_size)
     );
     true
 }

@@ -34,10 +34,40 @@ pub const EVICT_TARGET_PERCENT: u64 = 90;
 /// Compute through `u128` so arbitrary byte-sized limits get an exact floor
 /// without overflowing near `u64::MAX`.
 pub fn eviction_target(max_size: u64) -> u64 {
-    ((max_size as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
+    percent_of(max_size, EVICT_TARGET_PERCENT)
 }
 
-/// The high edge of GC's hysteresis band: the size a sweep *fires* at.
+/// Percentage of `max_size` an automatic sweep starts at.
+///
+/// Below the cap, because the store goes on growing before the first removal.
+/// On the build machine (2026-10-31, 483 GB cap, 150-250 GB of writes an hour)
+/// the size check came up to 5 minutes late (up to 21 GB), ranking took up to 4
+/// (17 GB), and target directories let go of up to 20 GB between the sweeps that
+/// measure what they hold. A trigger at 110 % saw the store's own part reach
+/// 533 GB. From 88 % those 58 GB stay under the cap.
+pub const AUTO_TRIGGER_PERCENT: u64 = 88;
+
+/// Percentage of `max_size` an automatic sweep evicts down to, far enough
+/// under [`AUTO_TRIGGER_PERCENT`] that a sweep's ranking, minutes on a large
+/// store, does not run back to back.
+pub const AUTO_TARGET_PERCENT: u64 = 78;
+
+fn percent_of(max_size: u64, percent: u64) -> u64 {
+    ((max_size as u128 * percent as u128) / 100) as u64
+}
+
+/// The size an automatic sweep starts above; see [`AUTO_TRIGGER_PERCENT`].
+pub fn automatic_trigger(max_size: u64) -> u64 {
+    percent_of(max_size, AUTO_TRIGGER_PERCENT)
+}
+
+/// The size an automatic sweep evicts down to; see [`AUTO_TARGET_PERCENT`].
+pub fn automatic_target(max_size: u64) -> u64 {
+    percent_of(max_size, AUTO_TARGET_PERCENT)
+}
+
+/// The high edge of GC's hysteresis band: the size a requested sweep *fires*
+/// at. Automatic sweeps have a band of their own ([`automatic_trigger`]).
 ///
 /// Trigger and target were both [`eviction_target`], so "evict to 90% — avoids
 /// boundary thrashing" described a band that did not exist: a store parked on
