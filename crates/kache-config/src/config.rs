@@ -597,6 +597,11 @@ pub struct Config {
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
     /// `[cache] auto_clean_unused_units_days`.
     pub auto_clean_unused_units_days: u64,
+    /// Let the daemon drop adaptive incremental state no compile used for
+    /// this many hours (`0`, the default, disables it). Set via
+    /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` or `[cache]
+    /// auto_clean_adaptive_idle_hours`.
+    pub auto_clean_adaptive_idle_hours: u64,
     /// Copy another checkout's registry build units into a target directory
     /// Cargo has not built yet, before Cargo checks freshness. On by
     /// default. Set via `KACHE_SEED_NEW_TARGETS=0`/`=false` or `[cache]
@@ -982,6 +987,8 @@ pub struct CacheFileConfig {
     pub scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub auto_clean_unused_units_days: Option<u64>,
+    /// See [`Config::auto_clean_adaptive_idle_hours`].
+    pub auto_clean_adaptive_idle_hours: Option<u64>,
     /// See [`Config::seed_new_targets`].
     pub seed_new_targets: Option<bool>,
     /// See [`Config::build_script_hermetic`].
@@ -1415,6 +1422,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
+    "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
@@ -1549,6 +1557,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
         "cache.auto_clean_unused_units_days",
+    ),
+    (
+        "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
+        "cache.auto_clean_adaptive_idle_hours",
     ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_BUILD_SCRIPT_HERMETIC", "cache.build_script_hermetic"),
@@ -2233,6 +2245,8 @@ impl Config {
             Self::scheduler_memory_pressure_enabled_for(invocation, &file_config);
         let auto_clean_unused_units_days =
             Self::auto_clean_unused_units_days_for(invocation, &file_config);
+        let auto_clean_adaptive_idle_hours =
+            Self::auto_clean_adaptive_idle_hours_for(invocation, &file_config);
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
         let build_script_hermetic =
             Self::build_script_hermetic_enabled_for(invocation, &file_config);
@@ -2371,6 +2385,7 @@ impl Config {
             auto_recover_targets,
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
+            auto_clean_adaptive_idle_hours,
             seed_new_targets,
             build_script_hermetic,
             gc_evict_shared,
@@ -3298,6 +3313,27 @@ impl Config {
                     .and_then(|c| c.auto_clean_unused_units_days)
             })
             .unwrap_or(DEFAULT_UNUSED_UNITS_DAYS)
+    }
+
+    /// Adaptive incremental idle window in hours, off (`0`) by default.
+    /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` (env wins), else `[cache]
+    /// auto_clean_adaptive_idle_hours`.
+    fn auto_clean_adaptive_idle_hours_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored_for(invocation, "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.auto_clean_adaptive_idle_hours)
+            })
+            .unwrap_or(0)
     }
 
     /// Memory-pressure admission, on by default.

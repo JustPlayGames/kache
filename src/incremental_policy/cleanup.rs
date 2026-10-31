@@ -5,6 +5,25 @@ use crate::unit_prune::Pruned;
 use std::io;
 use std::time::Duration;
 
+/// How often the daemon looks for graphs past
+/// `[cache] auto_clean_adaptive_idle_hours`.
+pub(crate) const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// What a [`sweep`] does with the graphs past its window, and what it holds
+/// while it does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sweep {
+    /// Counts them.
+    Preview,
+    /// Removes them under the unit's lock and the profile's Cargo locks, as
+    /// part of removing a target's unused units.
+    WithCargoLocks,
+    /// Removes them under the unit's lock alone. Only a compiler, holding that
+    /// lock, ever reads a graph: nothing a running program or Cargo opens lives
+    /// there, so this waits for no other build and makes none wait.
+    UnitLockOnly,
+}
+
 pub(crate) fn prune_stale(
     cache_dir: &Path,
     target: &Path,
@@ -18,7 +37,7 @@ pub(crate) fn prune_stale(
         target,
         window,
         at,
-        true,
+        Sweep::WithCargoLocks,
         crate::cache_fs::probe(target).is_local,
     )
 }
@@ -28,7 +47,21 @@ pub(crate) fn preview_stale(target: &Path, window: Duration, at: SystemTime) -> 
         target,
         window,
         at,
-        false,
+        Sweep::Preview,
+        crate::cache_fs::probe(target).is_local,
+    )
+}
+
+/// Drop the graphs of `target` no compile used within `window`, while builds
+/// run: a graph is the largest thing an agent's or a branch's finished work
+/// leaves in a target, and a machine that always has a build running would
+/// otherwise never reach [`prune_stale`].
+pub(crate) fn prune_idle(target: &Path, window: Duration, at: SystemTime) -> Pruned {
+    sweep(
+        target,
+        window,
+        at,
+        Sweep::UnitLockOnly,
         crate::cache_fs::probe(target).is_local,
     )
 }
@@ -80,7 +113,7 @@ fn sweep(
     target: &Path,
     window: Duration,
     at: SystemTime,
-    remove: bool,
+    mode: Sweep,
     local: Option<bool>,
 ) -> Pruned {
     let mut pruned = Pruned::default();
@@ -103,7 +136,7 @@ fn sweep(
         if !real_directory(&auto_root) || !real_directory(&root) {
             continue;
         }
-        let _profile_locks = if remove {
+        let _profile_locks = if mode == Sweep::WithCargoLocks {
             let Some(held) = crate::unit_prune::hold(&profile) else {
                 continue;
             };
@@ -135,20 +168,25 @@ fn sweep(
             if !fs::symlink_metadata(&unit.lock_path).is_ok_and(|metadata| metadata.is_file()) {
                 continue;
             }
-            let _unit_lock = if remove {
+            // Asked first without the lock: most units are not past the window,
+            // and a compile that finds its unit locked goes without its graph.
+            if !past_window(&unit, window, at) {
+                continue;
+            }
+            let _unit_lock = if mode == Sweep::Preview {
+                None
+            } else {
                 let Some(lock) = unit.lock() else {
                     continue;
                 };
                 Some(lock)
-            } else {
-                None
             };
             let Some(bytes) = stale_bytes(&unit, window, at) else {
                 continue;
             };
             // Keep the directory and lock inode: a compiler may already have
             // opened that lock. Unlinking it would permit two independent locks.
-            if !remove || reset_locked(&unit) {
+            if mode == Sweep::Preview || reset_locked(&unit) {
                 pruned.units += 1;
                 pruned.bytes += bytes;
             }
@@ -158,6 +196,19 @@ fn sweep(
 }
 
 fn stale_bytes(unit: &AdaptiveUnit, window: Duration, at: SystemTime) -> Option<u64> {
+    past_window(unit, window, at).then(|| {
+        crate::unit_prune::size(&unit.rustc_dir) + crate::unit_prune::size(&unit.state_path)
+    })
+}
+
+fn past_window(unit: &AdaptiveUnit, window: Duration, at: SystemTime) -> bool {
+    last_used(unit).is_some_and(|last_used| {
+        at.duration_since(last_used)
+            .is_ok_and(|idle| idle >= window)
+    })
+}
+
+fn last_used(unit: &AdaptiveUnit) -> Option<SystemTime> {
     if !real_directory(&unit.rustc_dir) {
         return None;
     }
@@ -171,11 +222,7 @@ fn stale_bytes(unit: &AdaptiveUnit, window: Duration, at: SystemTime) -> Option<
     // Also honor the recorded clock when it is ahead of the filesystem clock.
     let modified = fs::symlink_metadata(&unit.unit_dir).ok()?.modified().ok()?;
     let recorded = UNIX_EPOCH.checked_add(Duration::from_secs(last_used_secs))?;
-    let last_used = modified.max(recorded);
-    if at.duration_since(last_used).ok()? < window {
-        return None;
-    }
-    Some(crate::unit_prune::size(&unit.rustc_dir) + crate::unit_prune::size(&unit.state_path))
+    Some(modified.max(recorded))
 }
 
 #[cfg(test)]
@@ -207,23 +254,71 @@ mod tests {
         old_lock.try_lock().unwrap();
         let window = Duration::from_secs(10);
         let at = UNIX_EPOCH + Duration::from_secs(110);
-        let preview = sweep(dir.path(), window, at, false, Some(true));
+        let preview = sweep(dir.path(), window, at, Sweep::Preview, Some(true));
         assert_eq!(preview.units, 2);
         assert_eq!(preview.bytes, 14);
         assert!(unit("v1").join("rustc/graph.bin").is_file());
         assert!(unit("v2").join("rustc/graph.bin").is_file());
 
-        assert_eq!(sweep(dir.path(), window, at, true, Some(true)).units, 1);
+        assert_eq!(
+            sweep(dir.path(), window, at, Sweep::WithCargoLocks, Some(true)).units,
+            1
+        );
         assert!(unit("v1").join("rustc/graph.bin").is_file());
         assert!(!unit("v2").join("rustc").exists());
         old_lock.unlock().unwrap();
-        assert_eq!(sweep(dir.path(), window, at, true, Some(true)).units, 1);
+        assert_eq!(
+            sweep(dir.path(), window, at, Sweep::WithCargoLocks, Some(true)).units,
+            1
+        );
         assert!(!unit("v1").join("rustc").exists());
         assert!(unit("v1").join("unit.lock").is_file());
         assert_eq!(
             fs::read(unit("v3").join("rustc/graph.bin")).unwrap(),
             b"payload"
         );
+    }
+
+    /// A build holding the profile's Cargo locks stops the unused-unit pass
+    /// but not this one, which takes only the unit's lock.
+    #[test]
+    fn an_idle_graph_goes_during_a_build_and_a_held_one_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let unit = |key: char| {
+            let path = profile
+                .join(AUTO_ROOT)
+                .join(POLICY_VERSION)
+                .join(key.to_string().repeat(64));
+            fs::create_dir_all(path.join("rustc")).unwrap();
+            fs::write(path.join("rustc/graph.bin"), b"payload").unwrap();
+            fs::write(path.join("unit.lock"), b"").unwrap();
+            filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+            path
+        };
+        let (idle, compiling, recent) = (unit('a'), unit('b'), unit('c'));
+        filetime::set_file_mtime(&recent, filetime::FileTime::from_unix_time(105, 0)).unwrap();
+        let cargo = crate::unit_prune::hold(&profile).unwrap();
+        let compiler = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(compiling.join("unit.lock"))
+            .unwrap();
+        compiler.try_lock().unwrap();
+
+        let window = Duration::from_secs(10);
+        let at = UNIX_EPOCH + Duration::from_secs(110);
+        assert_eq!(
+            sweep(dir.path(), window, at, Sweep::WithCargoLocks, Some(true)).units,
+            0
+        );
+        let pruned = sweep(dir.path(), window, at, Sweep::UnitLockOnly, Some(true));
+        assert_eq!(pruned.units, 1);
+        assert!(!idle.join("rustc").exists());
+        assert!(idle.join("unit.lock").is_file());
+        assert!(compiling.join("rustc/graph.bin").is_file());
+        assert!(recent.join("rustc/graph.bin").is_file());
+        drop(cargo);
     }
 
     /// rustc reads only the newest finalized session, whose name's time is
@@ -274,10 +369,16 @@ mod tests {
             filetime::set_file_mtime(&unit, filetime::FileTime::from_unix_time(100, 0)).unwrap();
             let window = Duration::from_secs(10);
             let at = UNIX_EPOCH + Duration::from_secs(110);
-            assert_eq!(sweep(dir.path(), window, at, true, local).units, 0);
+            assert_eq!(
+                sweep(dir.path(), window, at, Sweep::WithCargoLocks, local).units,
+                0
+            );
             assert_eq!(fs::read(graph.join("graph.bin")).unwrap(), b"payload");
             assert!(!profile.join(".cargo-lock").exists());
-            assert_eq!(sweep(dir.path(), window, at, true, Some(true)).units, 1);
+            assert_eq!(
+                sweep(dir.path(), window, at, Sweep::WithCargoLocks, Some(true)).units,
+                1
+            );
             assert!(!graph.exists());
         }
     }
