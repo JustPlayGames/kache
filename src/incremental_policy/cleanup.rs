@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::unit_prune::Pruned;
+use std::io;
 use std::time::Duration;
 
 pub(crate) fn prune_stale(
@@ -30,6 +31,49 @@ pub(crate) fn preview_stale(target: &Path, window: Duration, at: SystemTime) -> 
         false,
         crate::cache_fs::probe(target).is_local,
     )
+}
+
+/// Remove the finalized sessions under `rustc_dir` older than the newest of
+/// their crate, once a compile has finished. rustc reads only the newest
+/// (`find_source_directory`). Up to 1.99 it collects an older session only when
+/// the next compile ends, which leaves about twice a graph's bytes at rest for
+/// a session nothing reads (2026-10-31: 38-52 GB of a machine's 71-93 GB);
+/// nightly-2026-10-19 collects it itself, and this then finds nothing to do.
+/// Best-effort: what stays, rustc's next compile collects. The caller holds the
+/// unit's lock, so no compiler runs here.
+pub(super) fn drop_superseded_sessions(rustc_dir: &Path) {
+    let Ok(crates) = fs::read_dir(rustc_dir) else {
+        return;
+    };
+    for krate in crates.flatten() {
+        let Ok(entries) =
+            fs::read_dir(krate.path()).and_then(|entries| entries.collect::<io::Result<Vec<_>>>())
+        else {
+            continue;
+        };
+        // None for an unfamiliar layout or a session still `-working`.
+        let Some(newest) = worktree_seed::newest_session(&entries, 1) else {
+            continue;
+        };
+        for entry in entries {
+            let session = entry.path();
+            if worktree_seed::session_timestamp(&session, 2).is_some_and(|time| time < newest)
+                && fs::remove_dir_all(&session).is_ok()
+            {
+                let _ = fs::remove_file(session_lock_file(&session));
+            }
+        }
+    }
+}
+
+/// rustc's lock file of a session `s-<time>-<random>-<hash>`:
+/// `s-<time>-<random>.lock`.
+fn session_lock_file(session: &Path) -> PathBuf {
+    let name = session.file_name().unwrap_or_default().to_string_lossy();
+    let stem = name
+        .rsplit_once('-')
+        .map_or(name.as_ref(), |(stem, _)| stem);
+    session.with_file_name(format!("{stem}.lock"))
 }
 
 fn sweep(
@@ -180,6 +224,38 @@ mod tests {
             fs::read(unit("v3").join("rustc/graph.bin")).unwrap(),
             b"payload"
         );
+    }
+
+    /// rustc reads only the newest finalized session, whose name's time is
+    /// base 36. A layout it would not recognize keeps everything.
+    #[test]
+    fn a_finished_compile_keeps_only_the_newest_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustc = dir.path().join("rustc");
+        let session = |krate: &str, name: &str| {
+            let path = rustc.join(krate).join(name);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("dep-graph.bin"), name).unwrap();
+            path
+        };
+        let lock = |krate: &str, name: &str| {
+            let path = rustc.join(krate).join(name);
+            fs::write(&path, b"").unwrap();
+            path
+        };
+        // Numerically 35 < 36, though "z" sorts after "10".
+        let older = session("app-1", "s-z-rand-hash1");
+        let older_lock = lock("app-1", "s-z-rand.lock");
+        let newest = session("app-1", "s-10-rand-hash2");
+        let newest_lock = lock("app-1", "s-10-rand.lock");
+        let waiting = session("lib-2", "s-1-rand-hash");
+        let working = session("lib-2", "s-2-rand-working");
+
+        drop_superseded_sessions(&rustc);
+
+        assert!(!older.exists() && !older_lock.exists());
+        assert!(newest.join("dep-graph.bin").is_file() && newest_lock.exists());
+        assert!(waiting.exists() && working.exists());
     }
 
     #[test]
