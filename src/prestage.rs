@@ -31,7 +31,8 @@
 //!   small (tasty.18: of the copies staged on one machine over 32 hours, at
 //!   least as many bytes were left untaken as were taken, most for
 //!   destinations no build wrote again). A pass stages the newest records
-//!   first, up to [`PASS_MAX_BYTES`]. A copy nobody took within
+//!   first, up to [`PASS_MAX_BYTES`] ([`BORROWED_PASS_MAX_BYTES`] for another
+//!   target's records). A copy nobody took within
 //!   [`STALE_AFTER`] is removed by the daemon's sweep ([`sweep_staged`])
 //!   and its record muted: it is not staged again until a build stores or
 //!   restores that artifact in a target again, which rewrites the record. A
@@ -70,6 +71,13 @@ const STALE_AFTER: Duration = Duration::from_secs(20 * 60);
 
 /// How many bytes one staging pass copies at most, newest records first.
 const PASS_MAX_BYTES: u64 = 4 << 30;
+
+/// How many bytes a pass copies when the records are another target
+/// directory's. A borrowed guess is taken only if this checkout builds the
+/// same bytes. On a machine of many worktrees (2026-10-31: 106 of 109 staged
+/// copies were borrowed, 979 of 1,056 targets had no record of their own)
+/// borrowed copies went untaken at 100-500 an hour, 210 MB each.
+const BORROWED_PASS_MAX_BYTES: u64 = 512 << 20;
 
 /// How often the daemon sweeps untaken copies ([`sweep_staged`]).
 pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -628,7 +636,11 @@ fn stage_pass(
     lock.try_lock().map_err(std::io::Error::from)?;
     let generation = hint_generation(cache_dir, target_dir);
     let now = SystemTime::now();
-    let mut budget = PASS_MAX_BYTES;
+    let mut budget = if read_records(&directory).is_empty() {
+        BORROWED_PASS_MAX_BYTES
+    } else {
+        PASS_MAX_BYTES
+    };
     let records = records_for(cache_dir, target_dir);
     let results = records
         .iter()
@@ -683,7 +695,7 @@ fn stage_record(
     }
     if record.size > *budget {
         tracing::debug!(
-            "not staging {}: past the pass's {PASS_MAX_BYTES} bytes",
+            "not staging {}: past the pass's bytes",
             record.dest.display()
         );
         return Ok(());
@@ -2217,6 +2229,40 @@ mod tests {
             .map(|dest| staged_path(dest, &hash).unwrap().is_file())
             .collect();
         assert_eq!(staged, [false, false, true, true, true, true]);
+    }
+
+    /// A borrowed pass copies far less than a target's own: it is a guess
+    /// about another checkout's executables.
+    #[test]
+    fn a_borrowed_pass_stages_only_its_newest_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let lender = target(dir.path(), "a");
+        let borrower = target(dir.path(), "b");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let rels = ["debug/deps/old-0123456789abcdef", "debug/deps/new-0123456789abcdef"];
+        for (i, rel) in rels.iter().enumerate() {
+            remember(&cache, &lender, &lender.join(rel), &hash, 400 << 20);
+            let record = records_dir(&cache, &lender).join(short_hash(
+                artifact_key(Path::new(rel)).as_bytes(),
+            ));
+            std::fs::File::options()
+                .write(true)
+                .open(&record)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(600 - 60 * i as u64))
+                .unwrap();
+        }
+        let staged = |root: &Path| -> Vec<bool> {
+            rels.iter()
+                .map(|rel| staged_path(&root.join(rel), &hash).unwrap().is_file())
+                .collect()
+        };
+        assert!(hint_due(&cache, &borrower, SystemTime::now()));
+        stage(&cache, &borrower, |_| blob_path.clone());
+        assert_eq!(staged(&borrower), [false, true]);
+        stage(&cache, &lender, |_| blob_path.clone());
+        assert_eq!(staged(&lender), [true, true], "its own records keep the full bound");
     }
 
     /// A record with no misses reads and writes as before tasty.18, so the
