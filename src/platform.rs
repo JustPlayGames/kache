@@ -11,6 +11,23 @@
 
 static FRONTEND_IMAGE: std::sync::OnceLock<kache_shims::FrontendImage> = std::sync::OnceLock::new();
 
+/// Whether this account owns `path`, so that maintenance leaves another
+/// account's files alone on a store they share. Always on a platform without
+/// such owners; a path that cannot be read is not ours.
+pub(crate) fn owned_by_us(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let us = unsafe { libc::geteuid() };
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.uid() == us)
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
+}
+
 pub(crate) fn process_context() -> kache_protocol::ProcessContext {
     kache_protocol::ProcessContext {
         pid: std::process::id(),

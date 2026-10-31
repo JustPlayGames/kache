@@ -132,6 +132,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
+| `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` | `cache.auto_clean_adaptive_idle_hours` | `0` | Let the daemon drop adaptive incremental state no compile used for this many hours; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
@@ -389,6 +390,8 @@ A unit whose build script or output files name the donor checkout, other than it
 When the cache already holds a checkout's dependencies, seeding copies the same units it would otherwise restore one compiler call at a time.
 
 ### Unused build units
+
+Adaptive incremental state, rustc's private graph for a unit you edit, sits in `incremental.kache-auto` in the target directory, outside the store. With `cache.auto_clean_adaptive_idle_hours` set, the daemon checks every 15 minutes, busy machine or not, and drops the graphs no compile used for that many hours, in target directories this account owns. A dropped graph makes that unit's next two edits ordinary compiles, until it has learned again. A unit a compile holds is left alone, and a compile that starts meanwhile only goes without a graph.
 
 A target directory in regular use still collects dead weight. A lockfile update, a feature change or a new toolchain moves the build on to new units and Cargo leaves the old ones behind. The same hourly check removes, from every tracked target directory that stays, the units no build used for `cache.auto_clean_unused_units_days` days (30 by default; `0` turns it off).
 
