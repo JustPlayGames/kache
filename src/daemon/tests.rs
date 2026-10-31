@@ -3733,17 +3733,17 @@ fn upload_triggered_eviction_waits_out_the_auto_gc_backoff() {
     );
 }
 
-/// The post-upload check used to start at 100% of `max_size` while the
-/// wrapper waited for 110%, so the two alternated on a store in between.
+/// The post-upload check used to start at another size than the wrapper's,
+/// so the two alternated on a store in between.
 #[test]
 fn upload_triggered_eviction_starts_one_byte_above_the_shared_trigger() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
     config.max_size = 1000;
     let store = Store::open(&config).unwrap();
-    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
-    assert_eq!(store.physical_size().unwrap(), 1100);
-    assert!(!crate::wrapper::auto_gc_sweep_due(&config, 1100));
+    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 880, false);
+    assert_eq!(store.physical_size().unwrap(), 880);
+    assert!(!crate::wrapper::auto_gc_sweep_due(&config, 880));
 
     let daemon = Daemon::new(config.clone());
     daemon.sweep_under_size_pressure().unwrap();
@@ -3751,8 +3751,8 @@ fn upload_triggered_eviction_starts_one_byte_above_the_shared_trigger() {
     assert!(crate::report::read_gc_stats(dir.path()).is_none());
 
     put_upload_evict_entry(&store, dir.path(), "x", 1, false);
-    assert_eq!(store.physical_size().unwrap(), 1101);
-    assert!(crate::wrapper::auto_gc_sweep_due(&config, 1101));
+    assert_eq!(store.physical_size().unwrap(), 881);
+    assert!(crate::wrapper::auto_gc_sweep_due(&config, 881));
     daemon.sweep_under_size_pressure().unwrap();
     assert!(!store.contains("at_the_trigger"));
     assert!(crate::report::read_gc_stats(dir.path()).is_some());
@@ -4034,13 +4034,13 @@ fn a_gc_hint_does_nothing_at_the_trigger_and_clears_the_backoff_once_the_store_f
     let mut config = test_config(dir.path());
     config.max_size = 1000;
     let store = Store::open(&config).unwrap();
-    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
+    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 880, false);
     let daemon = Daemon::new(config.clone());
     assert!(daemon.handle_request_sync(&Request::GcHint).ok);
     assert!(store.contains("at_the_trigger"));
 
     put_upload_evict_entry(&store, dir.path(), "x", 1, false);
-    crate::wrapper::record_auto_gc_outcome(&config, 1101, 0);
+    crate::wrapper::record_auto_gc_outcome(&config, 881, 0);
     crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
     assert!(daemon.handle_request_sync(&Request::GcHint).ok);
     assert!(!store.contains("at_the_trigger"));
@@ -4208,7 +4208,7 @@ fn periodic_gc_size_pass_starts_one_byte_above_the_shared_trigger() {
     let mut config = test_config(dir.path());
     config.max_size = 1000;
     let store = Store::open(&config).unwrap();
-    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
+    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 880, false);
 
     let daemon = Daemon::new(config);
     let policy = GcPolicy::Automatic { max_age_hours: 0 };

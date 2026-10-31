@@ -5116,8 +5116,8 @@ fn a_sweep_reaching_its_target_goes_on_while_the_disk_is_short() {
         store.set_last_accessed_for_test(key, idle);
     }
 
-    // 600 bytes over a 500-byte limit: removing "oldest" reaches the
-    // 450-byte target. The disk stays short until "older" goes too.
+    // 600 bytes over a 500-byte limit: removing "older" too reaches the
+    // 390-byte target. The disk stays short until "older" has gone.
     let stats = store
         .evict_for_free_space(SweepOrigin::Automatic, || store.contains("older"))
         .unwrap();
@@ -5175,7 +5175,7 @@ fn a_low_disk_sweep_stops_at_the_usual_target_once_space_is_back() {
     let blob = put_idle_entry(&store, dir.path(), "linked", 400);
     std::fs::hard_link(&blob, dir.path().join("target-copy.rlib")).unwrap();
 
-    // 800 bytes, 400 of them linked: 400 of its own against a 450-byte
+    // 800 bytes, 400 of them linked: 400 of its own against a 390-byte
     // target. The disk is short until "first" goes.
     let stats = store
         .evict_for_free_space(SweepOrigin::Automatic, || store.contains("first"))
@@ -5222,6 +5222,38 @@ fn a_sweep_on_a_low_disk_ranks_again_once_its_ranking_ages() {
 /// would walk every row of a dead key version. Past its walk budget it
 /// stops, once it has removed something, and says so; a sweep someone
 /// asked for, or one on a disk short of space, goes on to its target.
+/// Builds write on between the size check and a sweep's first removal, so an
+/// automatic sweep starts under the cap to keep the store under it
+/// (2026-10-31: from 110 % of a 483 GB cap the store's own part reached
+/// 533 GB). A requested one keeps its 100 % to 90 %.
+#[test]
+fn an_automatic_sweep_starts_at_88_percent_and_stops_at_78() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    for (key, size) in [("a", 430), ("b", 100), ("c", 350)] {
+        put_idle_entry(&store, dir.path(), key, size);
+    }
+    assert_eq!(store.physical_size().unwrap(), 880);
+    let at_the_trigger = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert_eq!(at_the_trigger.entries_evicted, 0, "{at_the_trigger:?}");
+
+    put_idle_entry(&store, dir.path(), "d", 1);
+    let requested = store
+        .evict_for_free_space(SweepOrigin::Requested, || false)
+        .unwrap();
+    assert_eq!(requested.entries_evicted, 0, "under the cap: {requested:?}");
+
+    let automatic = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert!(automatic.entries_evicted >= 1, "{automatic:?}");
+    assert!(store.physical_size().unwrap() <= 780);
+}
+
 #[test]
 fn an_automatic_size_sweep_stops_at_its_walk_budget() {
     let dir = tempfile::tempdir().unwrap();
