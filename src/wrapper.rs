@@ -522,6 +522,28 @@ pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64, held: u64
     }
 }
 
+/// Called by every automatic driver after a sweep that stopped at its walk
+/// budget. More can go, so nothing backs off, but its probe is the newest
+/// account of what target directories hold. Without this a store swept only
+/// by such sweeps lost its `held` figure when [`AUTO_GC_HELD_TTL`] ran out,
+/// and every automatic check then found the whole store over the trigger
+/// (2026-10-31: `held` 157 GB expired, sweeps every 5 minutes with the
+/// store's own part under the trigger).
+pub(crate) fn record_auto_gc_cut_short(config: &Config, size_after: u64, held: u64) {
+    let record = AutoGcBackoff {
+        since: unix_now_secs(),
+        interval_secs: 0,
+        size_after,
+        held,
+    };
+    if let Ok(json) = serde_json::to_vec(&record)
+        && let Err(e) =
+            crate::atomic::atomic_replace(&auto_gc_backoff_path(&config.cache_dir), &json)
+    {
+        tracing::debug!("auto-gc: could not record a cut-short sweep: {e:#}");
+    }
+}
+
 /// What a recorded sweep outcome says in the log.
 fn auto_gc_outcome_line(outcome: &AutoGcBackoff, max_size: u64) -> String {
     if outcome.interval_secs > 0 {

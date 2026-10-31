@@ -6709,6 +6709,9 @@ impl Daemon {
                  automatic sweep goes on",
                 stats.entries_evicted
             );
+            if let Ok(after) = store.physical_size() {
+                crate::wrapper::record_auto_gc_cut_short(config, after, stats.bytes_held);
+            }
         } else if let Ok(after) = store.physical_size() {
             crate::wrapper::record_auto_gc_outcome(config, after, stats.bytes_held);
         }
