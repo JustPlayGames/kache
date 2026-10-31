@@ -37,14 +37,19 @@
 //!   and its record muted: it is not staged again until a build stores or
 //!   restores that artifact in a target again, which rewrites the record. A
 //!   copy whose destination a build wrote some other way is removed by the
-//!   next pass. Test binaries are not staged at all: they are restored by
-//!   link ([`forget`]).
+//!   next pass.
 //! - A successful wrapper retires the unused prediction for its artifact,
 //!   including a prediction under an older Cargo metadata hash. Publication
 //!   and retirement share a short per-artifact lock; copying and hashing do
 //!   not hold it. A completed output also stops an already queued daemon pass
 //!   from publishing that prediction after the wrapper returns. A new hint
 //!   starts another generation, so other metadata variants can still stage.
+//!
+//! - Only a wrapper that restores on its own takes a copy. A restore brokered
+//!   through the client ([`usable_here`]) copies the blob itself, so a brokered
+//!   build neither records nor hints: on a machine of brokered builds nothing
+//!   took any of the 10-55 GB of copies staged an hour (2026-10-31, inotify on
+//!   the targets in use: 0 of 266 copies in 1.6 hours).
 //!
 //! What lands at the destination is the blob's bytes in a file of its own,
 //! exactly what the restore's copy would have produced. The fingerprint is
@@ -564,11 +569,18 @@ fn hint_due(cache_dir: &Path, target_dir: &Path, now: SystemTime) -> bool {
     write_atomic(&marker, b"").is_ok()
 }
 
+/// Whether this invocation can use a staged copy: not when its restores go
+/// through the client's broker, which works on the client's side of its
+/// process restrictions and has no operation for taking one.
+pub(crate) fn usable_here() -> bool {
+    kache_store::workspace::current().is_none()
+}
+
 /// Ask the daemon to stage what `target_dir` will restore, when due. Two
 /// `stat`s on the common path; a target directory with no records also
 /// reads its project's `Cargo.toml`.
 pub(crate) fn maybe_hint(config: &crate::config::Config, target_dir: &Path) {
-    if hint_due(&config.cache_dir, target_dir, SystemTime::now()) {
+    if usable_here() && hint_due(&config.cache_dir, target_dir, SystemTime::now()) {
         crate::daemon::send_prestage(config, target_dir);
     }
 }
@@ -1977,6 +1989,39 @@ mod tests {
         assert!(!marker.exists());
         maybe_hint(&config, &target);
         assert!(marker.exists());
+    }
+
+    /// A brokered restore never takes a copy, so its build asks for none.
+    #[test]
+    fn a_brokered_build_asks_for_no_copies() {
+        struct Broker;
+        impl kache_store::workspace::Workspace for Broker {
+            fn execute(
+                &self,
+                _: kache_store::workspace::Operation<'_>,
+            ) -> std::io::Result<kache_store::workspace::Outcome> {
+                Err(std::io::Error::other("not used"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let target = target(dir.path(), "a");
+        remember(
+            &config.cache_dir,
+            &target,
+            &target.join("app"),
+            &"a".repeat(64),
+            MIN_BYTES,
+        );
+        let marker = records_dir(&config.cache_dir, &target).join(HINT_MARKER);
+        {
+            let _brokered = kache_store::workspace::Scope::enter(Some(std::sync::Arc::new(Broker)));
+            assert!(!usable_here());
+            maybe_hint(&config, &target);
+            assert!(!marker.exists());
+        }
+        maybe_hint(&config, &target);
+        assert!(marker.exists(), "a wrapper restoring on its own asks");
     }
 
     /// A new target directory borrows the records of its project's target
