@@ -7482,6 +7482,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                        FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
                       WHERE eb.cache_key = entries.cache_key
                         AND eb.refs = b.refcount),
+                    (SELECT COALESCE(SUM(b.size * eb.refs / MAX(b.refcount, 1)), 0)
+                       FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                      WHERE eb.cache_key = entries.cache_key
+                        AND eb.refs <> b.refcount),
                     EXISTS(SELECT 1 FROM entry_blobs eb2
                             WHERE eb2.cache_key = entries.cache_key),
                     last_accessed >= datetime('now', ?1),
@@ -7501,7 +7505,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     // every remaining reference (#608). Entries not yet backfilled
                     // into entry_blobs report None and rank on logical size as
                     // before.
-                    let has_blob_rows: bool = row.get(8)?;
+                    let has_blob_rows: bool = row.get(9)?;
                     let reclaimable_bytes = if has_blob_rows {
                         Some(row.get::<_, i64>(7)?)
                     } else {
@@ -7519,8 +7523,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                         compile_time_ms: row.get(6)?,
                         reclaimable_bytes,
-                        recently_accessed: row.get(9)?,
-                        recently_imported: row.get(10)?,
+                        shared_share_bytes: row.get(8)?,
+                        recently_accessed: row.get(10)?,
+                        recently_imported: row.get(11)?,
                     })
                 },
             )?

@@ -107,6 +107,11 @@ pub struct EntryFeatures {
     /// `None` means unknown (entry not yet backfilled into `entry_blobs`);
     /// policies fall back to the logical `size`.
     pub reclaimable_bytes: Option<i64>,
+    /// This entry's fair share of the blobs other entries reference too: each
+    /// such blob's size times the part of its references this entry holds.
+    /// Evicting the entry alone frees none of it; evicting every entry sharing
+    /// a blob frees all of it, so a cold set of twins is worth this much each.
+    pub shared_share_bytes: i64,
     /// Recent at candidate selection time. GC skips their metadata read and
     /// transaction setup; removal checks the grace again for other entries.
     pub recently_accessed: bool,
@@ -128,23 +133,32 @@ pub trait EvictionPolicy {
 
 /// Priority score for size-pressure eviction; **lower is evicted first**.
 ///
-/// `(hit_count + 1) / (idle_hours * reclaimable_mb)` — prefers evicting stale,
-/// rarely-hit entries whose removal actually frees bytes, degrading to LRU
-/// with a size tiebreaker when ages are similar. The size term is the entry's
-/// *marginal reclaimable* bytes (blobs it holds the last references to), not
-/// its logical size: a 500 MB entry whose blobs are all shared frees nothing,
-/// while a 200 MB entry with unique blobs frees 200 MB, and a size-pressure
-/// sweep exists to free bytes (kunobi-ninja/kache#608). Entries not yet
-/// backfilled into `entry_blobs` (`None`) rank on logical size as before.
-/// The clamps reproduce the `MAX(..., 0.01)` / `MAX(..., 0.001)` of the SQL
-/// this replaced, which exist to keep a just-accessed or free-nothing entry
-/// from dividing by zero — a fully-shared entry thus ranks as if it were
-/// tiny, i.e. last among equally stale candidates.
+/// `(hit_count + 1) / (idle_hours * bytes_mb)` — prefers evicting stale,
+/// rarely-hit entries, degrading to LRU with a size tiebreaker when ages are
+/// similar. `bytes` is what the entry stands for on disk: the blobs it holds
+/// the last references to (kunobi-ninja/kache#608: a 200 MB entry with unique
+/// blobs frees 200 MB) plus its fair share of the blobs it shares.
+///
+/// Not the marginal reclaimable bytes alone. Those are zero for every entry of
+/// a shared blob, so such entries ranked last whatever their age, none of them
+/// was ever evicted and the blob never freed: on the build machine (2026-11-01)
+/// 292 GB of a 650 GB store were blobs whose entries had all been idle for two
+/// days or more, while sweeps evicted entries idle for half an hour. Evicting
+/// one cold twin frees nothing and loses little; the sweep budgets on the bytes
+/// removals actually free, so it goes on to the other twins.
+///
+/// Entries not yet backfilled into `entry_blobs` (`None`) rank on logical size
+/// as before. The clamps reproduce the `MAX(..., 0.01)` / `MAX(..., 0.001)` of
+/// the SQL this replaced, which exist to keep a just-accessed or empty entry
+/// from dividing by zero.
 ///
 /// Note this score has no notion of what an entry costs to *rebuild*; see #594.
 pub fn size_pressure_score(e: &EntryFeatures) -> f64 {
     let idle = e.idle_hours.max(0.01);
-    let bytes = e.reclaimable_bytes.unwrap_or(e.size);
+    let bytes = match e.reclaimable_bytes {
+        Some(reclaimable) => reclaimable.saturating_add(e.shared_share_bytes),
+        None => e.size,
+    };
     let size_mb = (bytes as f64 / 1_048_576.0).max(0.001);
     (e.hit_count as f64 + 1.0) / (idle * size_mb)
 }
@@ -378,6 +392,7 @@ mod tests {
             committed: true,
             compile_time_ms: 0,
             reclaimable_bytes: None,
+            shared_share_bytes: 0,
             recently_accessed: false,
             recently_imported: false,
         }
@@ -423,6 +438,21 @@ mod tests {
         assert!(size_pressure_score(&unique_small) < size_pressure_score(&shared_big));
         let order = SizePressurePolicy.select(&[shared_big, unique_small]);
         assert_eq!(order, vec!["unique_small", "shared_big"]);
+    }
+
+    /// Twins of a blob nobody has used for days go before an entry a build used
+    /// an hour ago, though evicting either twin alone frees nothing: marginal
+    /// bytes alone ranked them last for ever, and their blob was never freed.
+    #[test]
+    fn size_pressure_ranks_cold_twins_before_warm_entries() {
+        let mut twin = feat("twin", 40 * 1024 * 1024, 0, 100.0);
+        twin.reclaimable_bytes = Some(0);
+        twin.shared_share_bytes = 20 * 1024 * 1024;
+        let mut warm = feat("warm", 5 * 1024 * 1024, 0, 1.0);
+        warm.reclaimable_bytes = Some(5 * 1024 * 1024);
+
+        let order = SizePressurePolicy.select(&[warm, twin]);
+        assert_eq!(order, vec!["twin", "warm"]);
     }
 
     /// An entry not yet backfilled into `entry_blobs` (None) ranks on its
@@ -635,6 +665,7 @@ mod tests {
                             committed,
                             compile_time_ms: 0,
                             reclaimable_bytes: [None, Some(0), Some(size)][reclaim as usize],
+                            shared_share_bytes: 0,
                             recently_accessed: false,
                             recently_imported: false,
                         },
