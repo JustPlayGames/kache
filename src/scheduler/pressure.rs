@@ -50,8 +50,8 @@ const SAMPLE_FOR: Duration = Duration::from_millis(250);
 pub(crate) const PSI_SOME_AVG10: f64 = 10.0;
 
 /// Physical memory available, in percent of the total, under which Windows
-/// counts as under pressure.
-#[cfg(any(test, windows))]
+/// counts as under pressure: there it pages. The memory gate keeps a
+/// desktop's measured compiles above it too ([`windows_measured_reserve_bytes`]).
 pub(crate) const WINDOWS_MIN_AVAILABLE_PERCENT: u64 = 10;
 
 /// Commit left (physical memory and page file), in percent of the commit
@@ -88,6 +88,22 @@ pub(crate) fn measured_reserve_bytes(total: u64) -> u64 {
         .min(reserve_bytes(total))
 }
 
+/// The memory the gate keeps free on a Windows desktop while every compile
+/// it weighs has a measured peak: the available memory under which Windows
+/// pages ([`WINDOWS_MIN_AVAILABLE_PERCENT`], the pressure reading's own
+/// line), never under [`RESERVE_FLOOR`] and never more than
+/// [`reserve_bytes`]. Windows counts the standby cache as available and
+/// takes it back first; what other programs hold is not available already.
+/// With the peaks measured, a fifth of the memory on top kept a busy
+/// desktop's compiles serialised: a 63 GiB machine at 12 GiB available
+/// paged nothing out (no page writes), yet the 12.6 GiB reserve admitted
+/// one compile at a time there, and two or three at 22 GiB.
+pub(crate) fn windows_measured_reserve_bytes(total: u64) -> u64 {
+    (total / 100 * WINDOWS_MIN_AVAILABLE_PERCENT)
+        .max(RESERVE_FLOOR)
+        .min(reserve_bytes(total))
+}
+
 /// The memory a machine (or this process's cgroup) has, and has available
 /// now, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,17 +128,28 @@ pub(crate) struct MemoryReading {
 /// small (a crate like `windows` takes about 5 GB against the 512 MiB
 /// guessed), so while one is involved the full reserve stays, and so does
 /// the cache counted as used: on an 8 GB cgroup counting the cache alone
-/// let a cold build's compiles be OOM-killed. Outside a cgroup nothing
-/// changes: the reserve is what keeps a desktop from paging out.
+/// let a cold build's compiles be OOM-killed. Outside a cgroup the reserve
+/// is what keeps a desktop from paging out: on Windows, with `measured`,
+/// [`windows_measured_reserve_bytes`]; otherwise the full one.
 pub(crate) fn fits(reading: MemoryReading, pending: u64, expected: u64, measured: bool) -> bool {
-    let (available, reserve) = match reading.reclaimable {
+    let (available, reserve) = budget(reading, measured, cfg!(windows));
+    available.saturating_sub(pending).saturating_sub(expected) >= reserve
+}
+
+/// The memory [`fits`] counts as available and the reserve it keeps, on
+/// Windows when `windows`.
+fn budget(reading: MemoryReading, measured: bool, windows: bool) -> (u64, u64) {
+    match reading.reclaimable {
         Some(cache) if measured => (
             reading.available.saturating_add(cache).min(reading.total),
             measured_reserve_bytes(reading.total),
         ),
+        None if measured && windows => (
+            reading.available,
+            windows_measured_reserve_bytes(reading.total),
+        ),
         _ => (reading.available, reserve_bytes(reading.total)),
-    };
-    available.saturating_sub(pending).saturating_sub(expected) >= reserve
+    }
 }
 
 /// `[cache] scheduler_memory_pressure`, set once at wrapper startup.
@@ -575,6 +602,35 @@ mod tests {
         assert!(fits(reading, 2 * GIB, 4 * GIB, false));
         assert!(!fits(reading, 2 * GIB, 5 * GIB, false));
         assert!(!fits(reading, u64::MAX, u64::MAX, false), "saturates");
+    }
+
+    #[test]
+    fn a_windows_desktop_keeps_its_paging_line_free_for_measured_compiles() {
+        const GIB: u64 = 1 << 30;
+        const MB: u64 = 1_000_000;
+        // The 63 GiB desktop of 2026-11-01 at 22 GiB available, two measured
+        // 4.7 GB compiles admitted moments ago and a third asking.
+        let total = 63 * GIB;
+        let reading = MemoryReading {
+            available: 22 * GIB,
+            total,
+            reclaimable: None,
+        };
+        let left = |(available, reserve): (u64, u64)| {
+            available
+                .saturating_sub(2 * 4_700 * MB)
+                .saturating_sub(4_700 * MB)
+                >= reserve
+        };
+        assert_eq!(windows_measured_reserve_bytes(total), total / 100 * 10);
+        assert_eq!(budget(reading, true, true), (22 * GIB, total / 100 * 10));
+        assert!(left(budget(reading, true, true)), "the third runs");
+        assert!(!left(budget(reading, true, false)), "the full reserve elsewhere");
+        assert!(!left(budget(reading, false, true)), "and for a guessed peak");
+        // Never under the floor, never over the full reserve.
+        assert_eq!(windows_measured_reserve_bytes(16 * GIB), RESERVE_FLOOR);
+        assert_eq!(windows_measured_reserve_bytes(8 * GIB), reserve_bytes(8 * GIB));
+        assert_eq!(windows_measured_reserve_bytes(0), reserve_bytes(0));
     }
 
     #[test]
