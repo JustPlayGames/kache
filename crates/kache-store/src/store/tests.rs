@@ -5631,6 +5631,7 @@ fn tombstones_are_pruned_by_age_and_re_eviction_resets_the_record() {
         committed: true,
         compile_time_ms: 10,
         reclaimable_bytes: None,
+        shared_share_bytes: 0,
         recently_accessed: false,
         recently_imported: false,
     };
@@ -11567,6 +11568,7 @@ fn shadow_only_victims_skip_what_the_sweep_protects() {
         committed: true,
         compile_time_ms: 1,
         reclaimable_bytes: Some(1),
+        shared_share_bytes: 0,
         recently_accessed: key == "recent",
         recently_imported: key == "imported",
     };
@@ -11682,6 +11684,60 @@ fn backfill_entry_blobs_reconstructs_marginal_bytes() {
     assert_eq!(by_key["shared_a"].reclaimable_bytes, Some(0));
     assert_eq!(by_key["shared_b"].reclaimable_bytes, Some(0));
     assert_eq!(by_key["solo"].reclaimable_bytes, Some(100));
+    assert_eq!(by_key["shared_a"].shared_share_bytes, 50);
+    assert_eq!(by_key["solo"].shared_share_bytes, 0);
+}
+
+/// A sweep evicts twins whose blob has gone cold before an entry in use, and
+/// the blob's bytes come back once the last twin goes.
+#[test]
+fn a_size_sweep_frees_a_cold_blob_its_entries_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 2_000_000;
+    let store = Store::open(&config).unwrap();
+
+    for (key, byte, size) in [
+        ("twin_a", b'x', 1_500_000),
+        ("twin_b", b'x', 1_500_000),
+        ("warm", b'y', 1_000_000),
+    ] {
+        let src = dir.path().join(format!("{key}.rlib"));
+        std::fs::write(&src, vec![byte; size]).unwrap();
+        store
+            .put(
+                key,
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.remove_clone_for_test(&src);
+    }
+    for (key, hours) in [("twin_a", 100), ("twin_b", 100), ("warm", 1)] {
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', ?1) WHERE cache_key = ?2",
+                rusqlite::params![format!("-{hours} hours"), key],
+            )
+            .unwrap();
+    }
+
+    let stats = store.evict().unwrap();
+
+    let left = |key: &str| store.get(key).unwrap().is_some();
+    assert!(!left("twin_a") && !left("twin_b"), "the cold twins go first");
+    assert!(left("warm"), "the entry in use stays");
+    assert!(
+        stats.bytes_freed >= 1_500_000,
+        "the shared blob is freed with its last twin: {stats:?}"
+    );
 }
 
 #[test]
