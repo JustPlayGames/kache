@@ -18,9 +18,12 @@
 //! - Windows: no stall measure exists, so the memory the machine has left:
 //!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
 //!   total, or commit (physical memory and page file) under
-//!   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit, or commit charged past the
-//!   physical memory. Past any of them, Windows pages the desktop out for
-//!   the compiles and the machine stops responding.
+//!   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit. Past either, Windows pages
+//!   the desktop out for the compiles, or allocations start to fail. The
+//!   commit charge alone is no reading: it counts memory programs reserved
+//!   and never touch (a WSL2 VM, a browser, the compilers themselves), so a
+//!   desktop with a third of its memory free routinely charges more than it
+//!   has.
 //! - Elsewhere, and when nothing can be read: no pressure.
 //!
 //! Pressure is the late signal. Before it, the scheduler's memory gate
@@ -324,9 +327,17 @@ pub(crate) fn pressured_from(cgroup: Option<&std::path::Path>, host: &std::path:
 
 /// Whether Windows' memory figures (`GlobalMemoryStatusEx`) are pressure:
 /// physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
-/// total, commit left under [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit, or
-/// more commit charged than there is physical memory.
+/// total, or commit left under [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit.
 /// Totals of zero are no reading, not pressure.
+///
+/// The commit charged is not compared with the physical memory. Commit is
+/// what programs reserved, not what they use: Windows backs it with the page
+/// file and needs physical pages only for what is touched, which the
+/// available figure already counts. A desktop with a WSL2 VM, a browser and
+/// a few dozen compilers charges more than its RAM with a third of it free;
+/// counting that as pressure made every compile ask for the whole pool, so
+/// a 32-slot pool ran one compile at a time (a miss waited 136 s for a
+/// permit at the median against 0.8 s, 2026-10-31).
 #[cfg(any(test, windows))]
 pub(crate) fn windows_pressured(
     available_physical: u64,
@@ -337,14 +348,8 @@ pub(crate) fn windows_pressured(
     let short = |available: u64, total: u64, percent: u64| {
         total > 0 && u128::from(available) * 100 < u128::from(total) * u128::from(percent)
     };
-    // Commit charged beyond physical memory cannot all be resident: once
-    // the programs touch it, Windows pages. The limit grows with a
-    // system-managed page file, so the share of it left says little.
-    let committed_past_memory = total_physical > 0
-        && total_commit.saturating_sub(available_commit) > total_physical;
     short(available_physical, total_physical, WINDOWS_MIN_AVAILABLE_PERCENT)
         || short(available_commit, total_commit, WINDOWS_MIN_COMMIT_PERCENT)
-        || committed_past_memory
 }
 
 #[cfg(windows)]
@@ -607,12 +612,20 @@ mod tests {
     }
 
     #[test]
-    fn windows_commit_above_physical_memory_is_pressure() {
-        const GIB: u64 = 1 << 30;
-        // 64 GiB of RAM, 30 available, but 70 of a 90 GiB commit limit
-        // committed: touching it all would page.
-        assert!(windows_pressured(30 * GIB, 64 * GIB, 20 * GIB, 90 * GIB));
-        assert!(!windows_pressured(30 * GIB, 64 * GIB, 26 * GIB, 90 * GIB));
+    fn windows_commit_charged_past_physical_memory_is_not_pressure() {
+        const MIB: u64 = 1 << 20;
+        // A 64 GiB desktop with a WSL2 VM and a build running (2026-11-01):
+        // 22.0 GiB of 63.2 available, 74.2 GiB charged of a 155.2 GiB
+        // commit limit. Nothing pages; reading it as pressure serialised
+        // every compile on the machine.
+        let (total, available) = (64_717 * MIB, 22_528 * MIB);
+        let (limit, left) = (158_925 * MIB, 82_944 * MIB);
+        assert!(limit - left > total, "charged past physical memory");
+        assert!(!windows_pressured(available, total, left, limit));
+        // The same machine pages once available memory runs out, and fails
+        // allocations once commit does, whatever the charge.
+        assert!(windows_pressured(6 * 1024 * MIB, total, left, limit));
+        assert!(windows_pressured(available, total, 7 * 1024 * MIB, limit));
     }
 
     #[test]
