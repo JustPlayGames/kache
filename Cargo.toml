@@ -163,6 +163,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     # The scheduler's slot size from physical memory.
     "Win32_System_SystemInformation",
+    # What a running compile holds, for the scheduler's memory gate.
+    "Win32_System_ProcessStatus",
     "Win32_Security",
 ] }
 

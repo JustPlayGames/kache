@@ -41,6 +41,7 @@
 //! is covered by the test's slots and takes none of its own; see
 //! [`lease_covers`].
 
+pub(crate) mod admitted;
 mod permit_wait;
 pub(crate) mod pressure;
 use anyhow::Result;
@@ -262,9 +263,10 @@ struct Permit {
 /// runs so that other compiles' memory gate counts it ([`pending_bytes`]).
 /// The file's name carries the bytes, then the pid and a counter, then
 /// `-m` when the peak was measured ([`unmeasured_running`]); its age, how
-/// much of the bytes still counts. Removed on drop.
+/// much of the bytes still counts. Once the compiler runs the name also
+/// carries its pid ([`admitted`]). Removed on drop.
 struct Admission {
-    path: PathBuf,
+    path: std::sync::Arc<std::sync::Mutex<PathBuf>>,
 }
 
 impl Admission {
@@ -286,7 +288,11 @@ impl Admission {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Some(Self { path }),
+                Ok(_) => {
+                    return Some(Self {
+                        path: admitted::track(path),
+                    });
+                }
                 // A dead process's record under a reused pid.
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(_) => return None,
@@ -298,7 +304,9 @@ impl Admission {
 
 impl Drop for Admission {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        admitted::forget(&self.path);
+        let path = self.path.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _ = fs::remove_file(&*path);
     }
 }
 
@@ -350,7 +358,10 @@ fn pending_bytes(root: &Path, now: std::time::SystemTime) -> u64 {
         else {
             continue;
         };
-        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
             continue;
         };
         // A record from the future (a clock step) counts in full.
@@ -360,8 +371,14 @@ fn pending_bytes(root: &Path, now: std::time::SystemTime) -> u64 {
             continue;
         }
         let left = ramp.saturating_sub(age.as_millis());
-        let share = u128::from(expected) * left / ramp.max(1);
-        pending = pending.saturating_add(u64::try_from(share).unwrap_or(u64::MAX));
+        let share = u64::try_from(u128::from(expected) * left / ramp.max(1)).unwrap_or(u64::MAX);
+        // What the running compiler holds already shows as used memory.
+        let used = name
+            .to_str()
+            .and_then(admitted::child_of)
+            .filter(|_| share > 0)
+            .and_then(|child| admitted::held_by(child, meta.created().unwrap_or(modified)));
+        pending = pending.saturating_add(admitted::charge(expected, share, used));
     }
     pending
 }

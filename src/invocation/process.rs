@@ -464,6 +464,8 @@ fn spawn(command: &mut Command, force_group: bool, io: Option<ChildIo>) -> io::R
     } else {
         (windows::Child::local(command.spawn()?), None)
     };
+    #[cfg(windows)]
+    crate::scheduler::admitted::spawned(child.id());
     #[cfg(unix)]
     let mut child = if let Some(broker) = crate::invocation::io::current().unix_broker() {
         broker.spawn(
