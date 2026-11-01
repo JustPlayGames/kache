@@ -1,4 +1,4 @@
-//! Whether the machine, or this process's cgroup, is short of memory now.
+//! Whether the machine, or the compile's cgroup, is short of memory now.
 //!
 //! The scheduler weighs a compile by the memory it used before, but that
 //! cannot see what else is running: several agents' builds, an IDE, a
@@ -14,7 +14,8 @@
 //! - Linux: memory PSI, some task stalled on memory for at least
 //!   [`PSI_SOME_AVG10`] percent of the last ten seconds. The cgroup's own
 //!   `memory.pressure` is read when there is one, so a container sees its
-//!   limit rather than the host's.
+//!   limit rather than the host's: the cgroup of the client a daemon-run
+//!   compile serves, where the compiler runs.
 //! - Windows: no stall measure exists, so the memory the machine has left:
 //!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
 //!   total, or commit (physical memory and page file) under
@@ -294,17 +295,36 @@ fn under_pressure() -> bool {
 
 #[cfg(target_os = "linux")]
 fn under_pressure() -> bool {
-    use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
-    static CGROUP: OnceLock<Option<PathBuf>> = OnceLock::new();
-    let cgroup = CGROUP.get_or_init(|| {
-        super::ResourceDomain::from_files(
-            Path::new("/proc/self/cgroup"),
-            Path::new("/proc/self/mountinfo"),
-        )
-        .map(|domain| domain.current.join("memory.pressure"))
-    });
+    use std::path::Path;
+    let cgroup = compile_domain().map(|domain| domain.current.join("memory.pressure"));
     pressured_from(cgroup.as_deref(), Path::new("/proc/pressure/memory"))
+}
+
+/// The cgroup the current compile runs in: the client's for a request the
+/// daemon runs, since the daemon holds the permit but the compiler runs under
+/// the client. Otherwise the daemon's service would answer for every compile:
+/// a few threads of its own stalling on the disk read as pressure, and each
+/// compile on the machine would wait for the whole pool.
+#[cfg(target_os = "linux")]
+fn compile_domain() -> Option<super::ResourceDomain> {
+    use std::path::Path;
+    use std::sync::OnceLock;
+    static OWN: OnceLock<Option<super::ResourceDomain>> = OnceLock::new();
+    match crate::invocation::client_pid() {
+        Some(_) => domain_in(Path::new("/proc")),
+        None => OWN.get_or_init(|| domain_in(Path::new("/proc"))).clone(),
+    }
+}
+
+/// [`compile_domain`] read from a `/proc` at `proc`.
+#[cfg(target_os = "linux")]
+fn domain_in(proc: &std::path::Path) -> Option<super::ResourceDomain> {
+    let process = crate::invocation::client_pid()
+        .map_or_else(|| "self".to_string(), |client| client.to_string());
+    super::ResourceDomain::from_files(
+        &proc.join(process).join("cgroup"),
+        &proc.join("self").join("mountinfo"),
+    )
 }
 
 /// The cgroup's own PSI reading when `cgroup` names a readable one, else the
@@ -416,16 +436,8 @@ pub(crate) fn within_cgroup(
 
 #[cfg(target_os = "linux")]
 fn read_memory() -> Option<MemoryReading> {
-    use std::path::Path;
-    use std::sync::OnceLock;
-    static DOMAIN: OnceLock<Option<super::ResourceDomain>> = OnceLock::new();
     let machine = meminfo_reading(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
-    let domain = DOMAIN.get_or_init(|| {
-        super::ResourceDomain::from_files(
-            Path::new("/proc/self/cgroup"),
-            Path::new("/proc/self/mountinfo"),
-        )
-    });
+    let domain = compile_domain();
     Some(match domain.as_ref().map(super::ResourceDomain::snapshot) {
         Some(snapshot) => within_cgroup(
             machine,
@@ -461,6 +473,38 @@ fn read_memory() -> Option<MemoryReading> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_request_reads_its_clients_cgroup_not_the_daemons() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cgroup");
+        let proc = dir.path().join("proc");
+        for (process, cgroup) in [("self", "service"), ("77", "scope")] {
+            std::fs::create_dir_all(proc.join(process)).unwrap();
+            std::fs::write(proc.join(process).join("cgroup"), format!("0::/{cgroup}\n")).unwrap();
+            std::fs::create_dir_all(root.join(cgroup)).unwrap();
+        }
+        std::fs::write(
+            proc.join("self").join("mountinfo"),
+            format!("36 35 0:31 / {} rw - cgroup2 cgroup2 rw\n", root.display()),
+        )
+        .unwrap();
+
+        assert_eq!(domain_in(&proc).unwrap().current, root.join("service"));
+        let client = crate::invocation::ClientScope::enter(77);
+        assert_eq!(
+            domain_in(&proc).unwrap().current,
+            root.join("scope"),
+            "the compiler runs under the client"
+        );
+        drop(client);
+        let _gone = crate::invocation::ClientScope::enter(78);
+        assert!(
+            domain_in(&proc).is_none(),
+            "a client that has gone falls back to the host's reading"
+        );
+    }
 
     #[test]
     fn concurrent_clients_keep_their_pressure_policy_on_reused_workers() {
