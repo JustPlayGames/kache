@@ -628,6 +628,20 @@ mod tests {
         assert!(windows_pressured(available, total, 7 * 1024 * MIB, limit));
     }
 
+    /// At the admission, that machine's reading leaves a compile its own
+    /// weight of a 32-slot pool, where the reading as pressure made a
+    /// 3-slot compile ask for all 32 (one compile at a time).
+    #[test]
+    fn a_compile_on_a_desktop_charged_past_its_memory_asks_its_own_weight() {
+        const MIB: u64 = 1 << 20;
+        let (total, available) = (64_717 * MIB, 22_528 * MIB);
+        let (limit, left) = (158_925 * MIB, 82_944 * MIB);
+        let pressured = windows_pressured(available, total, left, limit);
+        assert_eq!(weight(3, 32, pressured), 3);
+        let paging = windows_pressured(6 * 1024 * MIB, total, left, limit);
+        assert_eq!(weight(3, 32, paging), 32);
+    }
+
     #[test]
     fn reads_psi() {
         let calm = "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
