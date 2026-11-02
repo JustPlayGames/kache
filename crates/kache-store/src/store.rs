@@ -8071,6 +8071,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return Ok(GcStats::default());
         }
         let walk_budget = (origin == SweepOrigin::Automatic).then_some(self.size_sweep_walk_budget);
+        // An automatic sweep values young entries slow to compile more.
+        let sparing_young = crate::eviction::SizePressureSparingYoungPolicy {
+            hours: self.config.gc_spare_young_hours,
+        };
+        let policy: &dyn crate::eviction::EvictionPolicy =
+            if origin == SweepOrigin::Automatic && sparing_young.hours > 0 {
+                &sparing_young
+            } else {
+                &crate::eviction::SizePressurePolicy
+            };
         let mut stats = GcStats::default();
         loop {
             let held_probe = if short_of_space() {
@@ -8080,7 +8090,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             };
             let mut rank_again = false;
             let pass = self.evict_with_stop(
-                &crate::eviction::SizePressurePolicy,
+                policy,
                 Some((size, target)),
                 held_probe,
                 origin,

@@ -199,6 +199,7 @@ mod tests {
                 cache_dir: temp.path().join("cache"),
                 max_size: 1 << 20,
                 gc_evict_shared: false,
+                gc_spare_young_hours: 0,
                 upload_spool_max_jobs: 128,
                 deferred_durability: false,
             })
@@ -250,6 +251,7 @@ mod tests {
             cache_dir: temp.path().join("cache"),
             max_size: 1 << 20,
             gc_evict_shared: false,
+            gc_spare_young_hours: 0,
             upload_spool_max_jobs: 128,
             deferred_durability: false,
         })

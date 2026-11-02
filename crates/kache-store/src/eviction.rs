@@ -131,6 +131,26 @@ pub trait EvictionPolicy {
     fn select(&self, candidates: &[EntryFeatures]) -> Vec<String>;
 }
 
+/// How much more an automatic sweep values a young entry slow to compile than
+/// its [`size_pressure_score`] says: it ranks with ten times the score.
+///
+/// Replaying the build machine's sweeps of 2026-11-01/02 (60 sweeps, 27 h):
+/// young entries whose eviction came back as a miss cost about 80 s of compile
+/// each, while the entries a sweep took in their place cost about 2 s. Sparing
+/// every entry idle under 12 h made re-misses 38 % worse (2.35 to 3.24
+/// compile-hours: entries idle 12-24 h are yesterday's work coming back).
+/// Ranking those idle under 12 h that took 30 s or more at ten times their
+/// score cut them 77 % (2.35 to 0.54), as much as putting them last, and
+/// unlike that it degrades: with every entry over 10 s counted young, putting
+/// them last made it 55 compile-hours (sweeps ate hot entries), ten times
+/// their score still 1.39.
+pub const YOUNG_SCORE_FACTOR: f64 = 10.0;
+
+/// The compile time from which a recently used entry counts as young for
+/// [`SizePressureSparingYoungPolicy`], in milliseconds. Unknown compile times
+/// (`0`) never do.
+pub const YOUNG_MIN_COMPILE_MS: i64 = 30_000;
+
 /// Priority score for size-pressure eviction; **lower is evicted first**.
 ///
 /// `(hit_count + 1) / (idle_hours * bytes_mb)` — prefers evicting stale,
@@ -181,6 +201,44 @@ impl EvictionPolicy for SizePressurePolicy {
                 .unwrap_or(Ordering::Equal)
         });
         ranked.into_iter().map(|e| e.key.clone()).collect()
+    }
+}
+
+/// Size-pressure eviction that ranks young entries slow to compile (used
+/// within `hours`, at least [`YOUNG_MIN_COMPILE_MS`] to compile) with
+/// [`YOUNG_SCORE_FACTOR`] times their [`size_pressure_score`]: an automatic
+/// sweep takes colder entries first, and hotter ones still after them.
+///
+/// Held bytes swing with worktrees (59-275 GB a day on the build machine,
+/// 2026-11-02), and a removed worktree turns what it held into the store's own
+/// bytes at once. The sweeps that followed evicted 25-60 % of their entries
+/// idle under 12 h, and a new worktree asked for the third-party crates among
+/// them again 3-7 h later.
+pub struct SizePressureSparingYoungPolicy {
+    pub hours: u64,
+}
+
+impl SizePressureSparingYoungPolicy {
+    fn score(&self, e: &EntryFeatures) -> f64 {
+        let score = size_pressure_score(e);
+        if e.idle_hours < self.hours as f64 && e.compile_time_ms >= YOUNG_MIN_COMPILE_MS {
+            score * YOUNG_SCORE_FACTOR
+        } else {
+            score
+        }
+    }
+}
+
+impl EvictionPolicy for SizePressureSparingYoungPolicy {
+    fn name(&self) -> &'static str {
+        "size-pressure-young"
+    }
+
+    fn select(&self, candidates: &[EntryFeatures]) -> Vec<String> {
+        let mut ranked: Vec<(f64, &EntryFeatures)> =
+            candidates.iter().map(|e| (self.score(e), e)).collect();
+        ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        ranked.into_iter().map(|(_, e)| e.key.clone()).collect()
     }
 }
 

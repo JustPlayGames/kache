@@ -2228,6 +2228,7 @@ mod tests {
                 prefetch_deadline_secs: None,
                 min_store_compile_ms: Some(750),
                 gc_max_age_hours: Some(72),
+                gc_spare_young_hours: None,
                 scheduler: Some(false),
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,
