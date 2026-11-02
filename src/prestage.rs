@@ -31,19 +31,25 @@
 //!   small (tasty.18: of the copies staged on one machine over 32 hours, at
 //!   least as many bytes were left untaken as were taken, most for
 //!   destinations no build wrote again). A pass stages the newest records
-//!   first, up to [`PASS_MAX_BYTES`]. A copy nobody took within
+//!   first, up to [`PASS_MAX_BYTES`] ([`BORROWED_PASS_MAX_BYTES`] for another
+//!   target's records). A copy nobody took within
 //!   [`STALE_AFTER`] is removed by the daemon's sweep ([`sweep_staged`])
 //!   and its record muted: it is not staged again until a build stores or
 //!   restores that artifact in a target again, which rewrites the record. A
 //!   copy whose destination a build wrote some other way is removed by the
-//!   next pass. Test binaries are not staged at all: they are restored by
-//!   link ([`forget`]).
+//!   next pass.
 //! - A successful wrapper retires the unused prediction for its artifact,
 //!   including a prediction under an older Cargo metadata hash. Publication
 //!   and retirement share a short per-artifact lock; copying and hashing do
 //!   not hold it. A completed output also stops an already queued daemon pass
 //!   from publishing that prediction after the wrapper returns. A new hint
 //!   starts another generation, so other metadata variants can still stage.
+//!
+//! - Only a wrapper that restores on its own takes a copy. A restore brokered
+//!   through the client ([`usable_here`]) copies the blob itself, so a brokered
+//!   build neither records nor hints: on a machine of brokered builds nothing
+//!   took any of the 10-55 GB of copies staged an hour (2026-10-31, inotify on
+//!   the targets in use: 0 of 266 copies in 1.6 hours).
 //!
 //! What lands at the destination is the blob's bytes in a file of its own,
 //! exactly what the restore's copy would have produced. The fingerprint is
@@ -70,6 +76,13 @@ const STALE_AFTER: Duration = Duration::from_secs(20 * 60);
 
 /// How many bytes one staging pass copies at most, newest records first.
 const PASS_MAX_BYTES: u64 = 4 << 30;
+
+/// How many bytes a pass copies when the records are another target
+/// directory's. A borrowed guess is taken only if this checkout builds the
+/// same bytes. On a machine of many worktrees (2026-10-31: 106 of 109 staged
+/// copies were borrowed, 979 of 1,056 targets had no record of their own)
+/// borrowed copies went untaken at 100-500 an hour, 210 MB each.
+const BORROWED_PASS_MAX_BYTES: u64 = 512 << 20;
 
 /// How often the daemon sweeps untaken copies ([`sweep_staged`]).
 pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -556,11 +569,18 @@ fn hint_due(cache_dir: &Path, target_dir: &Path, now: SystemTime) -> bool {
     write_atomic(&marker, b"").is_ok()
 }
 
+/// Whether this invocation can use a staged copy: not when its restores go
+/// through the client's broker, which works on the client's side of its
+/// process restrictions and has no operation for taking one.
+pub(crate) fn usable_here() -> bool {
+    kache_store::workspace::current().is_none()
+}
+
 /// Ask the daemon to stage what `target_dir` will restore, when due. Two
 /// `stat`s on the common path; a target directory with no records also
 /// reads its project's `Cargo.toml`.
 pub(crate) fn maybe_hint(config: &crate::config::Config, target_dir: &Path) {
-    if hint_due(&config.cache_dir, target_dir, SystemTime::now()) {
+    if usable_here() && hint_due(&config.cache_dir, target_dir, SystemTime::now()) {
         crate::daemon::send_prestage(config, target_dir);
     }
 }
@@ -628,7 +648,11 @@ fn stage_pass(
     lock.try_lock().map_err(std::io::Error::from)?;
     let generation = hint_generation(cache_dir, target_dir);
     let now = SystemTime::now();
-    let mut budget = PASS_MAX_BYTES;
+    let mut budget = if read_records(&directory).is_empty() {
+        BORROWED_PASS_MAX_BYTES
+    } else {
+        PASS_MAX_BYTES
+    };
     let records = records_for(cache_dir, target_dir);
     let results = records
         .iter()
@@ -683,7 +707,7 @@ fn stage_record(
     }
     if record.size > *budget {
         tracing::debug!(
-            "not staging {}: past the pass's {PASS_MAX_BYTES} bytes",
+            "not staging {}: past the pass's bytes",
             record.dest.display()
         );
         return Ok(());
@@ -1967,6 +1991,39 @@ mod tests {
         assert!(marker.exists());
     }
 
+    /// A brokered restore never takes a copy, so its build asks for none.
+    #[test]
+    fn a_brokered_build_asks_for_no_copies() {
+        struct Broker;
+        impl kache_store::workspace::Workspace for Broker {
+            fn execute(
+                &self,
+                _: kache_store::workspace::Operation<'_>,
+            ) -> std::io::Result<kache_store::workspace::Outcome> {
+                Err(std::io::Error::other("not used"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let target = target(dir.path(), "a");
+        remember(
+            &config.cache_dir,
+            &target,
+            &target.join("app"),
+            &"a".repeat(64),
+            MIN_BYTES,
+        );
+        let marker = records_dir(&config.cache_dir, &target).join(HINT_MARKER);
+        {
+            let _brokered = kache_store::workspace::Scope::enter(Some(std::sync::Arc::new(Broker)));
+            assert!(!usable_here());
+            maybe_hint(&config, &target);
+            assert!(!marker.exists());
+        }
+        maybe_hint(&config, &target);
+        assert!(marker.exists(), "a wrapper restoring on its own asks");
+    }
+
     /// A new target directory borrows the records of its project's target
     /// directory that recorded last, under its own root, and stops borrowing
     /// once it has its own. Another project, or a target directory with no
@@ -2217,6 +2274,40 @@ mod tests {
             .map(|dest| staged_path(dest, &hash).unwrap().is_file())
             .collect();
         assert_eq!(staged, [false, false, true, true, true, true]);
+    }
+
+    /// A borrowed pass copies far less than a target's own: it is a guess
+    /// about another checkout's executables.
+    #[test]
+    fn a_borrowed_pass_stages_only_its_newest_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let lender = target(dir.path(), "a");
+        let borrower = target(dir.path(), "b");
+        let (blob_path, hash) = blob(dir.path(), b"an executable");
+        let rels = ["debug/deps/old-0123456789abcdef", "debug/deps/new-0123456789abcdef"];
+        for (i, rel) in rels.iter().enumerate() {
+            remember(&cache, &lender, &lender.join(rel), &hash, 400 << 20);
+            let record = records_dir(&cache, &lender).join(short_hash(
+                artifact_key(Path::new(rel)).as_bytes(),
+            ));
+            std::fs::File::options()
+                .write(true)
+                .open(&record)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(600 - 60 * i as u64))
+                .unwrap();
+        }
+        let staged = |root: &Path| -> Vec<bool> {
+            rels.iter()
+                .map(|rel| staged_path(&root.join(rel), &hash).unwrap().is_file())
+                .collect()
+        };
+        assert!(hint_due(&cache, &borrower, SystemTime::now()));
+        stage(&cache, &borrower, |_| blob_path.clone());
+        assert_eq!(staged(&borrower), [false, true]);
+        stage(&cache, &lender, |_| blob_path.clone());
+        assert_eq!(staged(&lender), [true, true], "its own records keep the full bound");
     }
 
     /// A record with no misses reads and writes as before tasty.18, so the

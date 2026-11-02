@@ -91,6 +91,13 @@ impl Drop for ClientScope {
     }
 }
 
+/// The client process the current thread's compiler request serves, `None`
+/// when the pipeline runs in the client's own process.
+#[cfg(target_os = "linux")]
+pub(crate) fn client_pid() -> Option<u32> {
+    CLIENT_PID.with(std::cell::Cell::get)
+}
+
 /// The process that ran this compiler invocation: Cargo for a unit, when
 /// Cargo runs Kache as its wrapper. A request the daemon runs for a client
 /// names the client's parent, not the daemon's; the local engine names its

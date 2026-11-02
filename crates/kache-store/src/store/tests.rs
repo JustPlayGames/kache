@@ -3573,6 +3573,7 @@ fn test_config(dir: &Path) -> Config {
         cache_dir: dir.to_path_buf(),
         max_size: 1024 * 1024,
         gc_evict_shared: false,
+        gc_spare_young_hours: 0,
         upload_spool_max_jobs: 65_536,
         deferred_durability: false,
     }
@@ -5117,8 +5118,8 @@ fn a_sweep_reaching_its_target_goes_on_while_the_disk_is_short() {
         store.set_last_accessed_for_test(key, idle);
     }
 
-    // 600 bytes over a 500-byte limit: removing "oldest" reaches the
-    // 450-byte target. The disk stays short until "older" goes too.
+    // 600 bytes over a 500-byte limit: removing "older" too reaches the
+    // 390-byte target. The disk stays short until "older" has gone.
     let stats = store
         .evict_for_free_space(SweepOrigin::Automatic, || store.contains("older"))
         .unwrap();
@@ -5176,7 +5177,7 @@ fn a_low_disk_sweep_stops_at_the_usual_target_once_space_is_back() {
     let blob = put_idle_entry(&store, dir.path(), "linked", 400);
     std::fs::hard_link(&blob, dir.path().join("target-copy.rlib")).unwrap();
 
-    // 800 bytes, 400 of them linked: 400 of its own against a 450-byte
+    // 800 bytes, 400 of them linked: 400 of its own against a 390-byte
     // target. The disk is short until "first" goes.
     let stats = store
         .evict_for_free_space(SweepOrigin::Automatic, || store.contains("first"))
@@ -5223,6 +5224,99 @@ fn a_sweep_on_a_low_disk_ranks_again_once_its_ranking_ages() {
 /// would walk every row of a dead key version. Past its walk budget it
 /// stops, once it has removed something, and says so; a sweep someone
 /// asked for, or one on a disk short of space, goes on to its target.
+/// Builds write on between the size check and a sweep's first removal, so an
+/// automatic sweep starts under the cap to keep the store under it
+/// (2026-10-31: from 110 % of a 483 GB cap the store's own part reached
+/// 533 GB). A requested one keeps its 100 % to 90 %.
+#[test]
+fn an_automatic_sweep_starts_at_88_percent_and_stops_at_78() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    for (key, size) in [("a", 430), ("b", 100), ("c", 350)] {
+        put_idle_entry(&store, dir.path(), key, size);
+    }
+    assert_eq!(store.physical_size().unwrap(), 880);
+    let at_the_trigger = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert_eq!(at_the_trigger.entries_evicted, 0, "{at_the_trigger:?}");
+
+    put_idle_entry(&store, dir.path(), "d", 1);
+    let requested = store
+        .evict_for_free_space(SweepOrigin::Requested, || false)
+        .unwrap();
+    assert_eq!(requested.entries_evicted, 0, "under the cap: {requested:?}");
+
+    let automatic = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert!(automatic.entries_evicted >= 1, "{automatic:?}");
+    assert!(store.physical_size().unwrap() <= 780);
+}
+
+/// An automatic sweep ranks a young entry slow to compile (used within the
+/// hours, 30 s or more to compile) with ten times its score: colder entries go
+/// before it, even when the plain ranking puts it first, and hotter ones still
+/// after it. Replaying the build machine's sweeps of 2026-11-01/02, this cut
+/// the compile time re-misses of evicted entries cost by 77 %.
+#[test]
+fn an_automatic_sweep_values_young_entries_slow_to_compile_ten_times() {
+    // (key, size, idle, compile seconds, hits)
+    let sweep = |entries: &[(&str, usize, &str, i64, i64)]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100_000;
+        config.gc_spare_young_hours = 12;
+        let store = Store::open(&config).unwrap();
+        for &(key, size, idle, compile_secs, hits) in entries {
+            put_idle_entry(&store, dir.path(), key, size);
+            store.set_last_accessed_for_test(key, idle);
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET compile_time_ms = ?2, hit_count = ?3 WHERE cache_key = ?1",
+                    params![key, compile_secs * 1000, hits],
+                )
+                .unwrap();
+        }
+        store
+            .evict_for_free_space(SweepOrigin::Automatic, || false)
+            .unwrap();
+        let kept: Vec<&str> = entries
+            .iter()
+            .map(|&(key, ..)| key)
+            .filter(|key| store.contains(key))
+            .collect();
+        kept.join(" ")
+    };
+
+    // 110 kB down to the 78 kB target. Plain scores: young 21, p 37, o 61,
+    // hot 6,300; "young" counts 210, so the day-old "p" and "o" go instead.
+    // (Sizes stay past the ranking's 1 KiB clamp, under which every entry
+    // ranks alike.)
+    assert_eq!(
+        sweep(&[
+            ("young", 50_000, "-1 hour", 60, 0),
+            ("p", 25_000, "-1 day", 60, 20),
+            ("o", 15_000, "-1 day", 60, 20),
+            ("hot", 20_000, "-3 minutes", 1, 5),
+        ]),
+        "young hot"
+    );
+    // 100 kB: with "o2" gone the store is still over the target, and every
+    // other entry is hotter than ten times "young"'s score: "young" goes.
+    assert_eq!(
+        sweep(&[
+            ("young", 50_000, "-1 hour", 60, 0),
+            ("hot", 45_000, "-3 minutes", 1, 5),
+            ("o2", 5_000, "-1 day", 60, 20),
+        ]),
+        "hot"
+    );
+}
+
 #[test]
 fn an_automatic_size_sweep_stops_at_its_walk_budget() {
     let dir = tempfile::tempdir().unwrap();
@@ -5600,6 +5694,7 @@ fn tombstones_are_pruned_by_age_and_re_eviction_resets_the_record() {
         committed: true,
         compile_time_ms: 10,
         reclaimable_bytes: None,
+        shared_share_bytes: 0,
         recently_accessed: false,
         recently_imported: false,
     };
@@ -11551,6 +11646,7 @@ fn shadow_only_victims_skip_what_the_sweep_protects() {
         committed: true,
         compile_time_ms: 1,
         reclaimable_bytes: Some(1),
+        shared_share_bytes: 0,
         recently_accessed: key == "recent",
         recently_imported: key == "imported",
     };
@@ -11666,6 +11762,60 @@ fn backfill_entry_blobs_reconstructs_marginal_bytes() {
     assert_eq!(by_key["shared_a"].reclaimable_bytes, Some(0));
     assert_eq!(by_key["shared_b"].reclaimable_bytes, Some(0));
     assert_eq!(by_key["solo"].reclaimable_bytes, Some(100));
+    assert_eq!(by_key["shared_a"].shared_share_bytes, 50);
+    assert_eq!(by_key["solo"].shared_share_bytes, 0);
+}
+
+/// A sweep evicts twins whose blob has gone cold before an entry in use, and
+/// the blob's bytes come back once the last twin goes.
+#[test]
+fn a_size_sweep_frees_a_cold_blob_its_entries_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 2_000_000;
+    let store = Store::open(&config).unwrap();
+
+    for (key, byte, size) in [
+        ("twin_a", b'x', 1_500_000),
+        ("twin_b", b'x', 1_500_000),
+        ("warm", b'y', 1_000_000),
+    ] {
+        let src = dir.path().join(format!("{key}.rlib"));
+        std::fs::write(&src, vec![byte; size]).unwrap();
+        store
+            .put(
+                key,
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.remove_clone_for_test(&src);
+    }
+    for (key, hours) in [("twin_a", 100), ("twin_b", 100), ("warm", 1)] {
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', ?1) WHERE cache_key = ?2",
+                rusqlite::params![format!("-{hours} hours"), key],
+            )
+            .unwrap();
+    }
+
+    let stats = store.evict().unwrap();
+
+    let left = |key: &str| store.get(key).unwrap().is_some();
+    assert!(!left("twin_a") && !left("twin_b"), "the cold twins go first");
+    assert!(left("warm"), "the entry in use stays");
+    assert!(
+        stats.bytes_freed >= 1_500_000,
+        "the shared blob is freed with its last twin: {stats:?}"
+    );
 }
 
 #[test]

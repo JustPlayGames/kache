@@ -1795,7 +1795,13 @@ pub const RANKING_FRESH_FOR: Duration = Duration::from_secs(300);
 /// after an upgrade walks every row of a dead key version, which on one
 /// store was some 276k rows. The ranking before the walk is not counted.
 /// A disk short of space keeps the sweep going.
-pub const SIZE_SWEEP_WALK_BUDGET: Duration = Duration::from_secs(30);
+///
+/// Long enough for one sweep to matter: each sweep also ranks the whole store
+/// (1-4 minutes on a busy machine, 2026-10-31), and a walk of 30 s removed
+/// 3-15 GB, about what builds added before the next one, so sweeps never
+/// reached the target and ran back to back. Nothing of a build's waits on
+/// `gc.lock`; removals pace their index writes either way.
+pub const SIZE_SWEEP_WALK_BUDGET: Duration = Duration::from_secs(180);
 
 /// Paces an eviction sweep's writes so build processes waiting on the index
 /// write lock get it between slices.
@@ -7532,6 +7538,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                        FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
                       WHERE eb.cache_key = entries.cache_key
                         AND eb.refs = b.refcount),
+                    (SELECT COALESCE(SUM(b.size * eb.refs / MAX(b.refcount, 1)), 0)
+                       FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                      WHERE eb.cache_key = entries.cache_key
+                        AND eb.refs <> b.refcount),
                     EXISTS(SELECT 1 FROM entry_blobs eb2
                             WHERE eb2.cache_key = entries.cache_key),
                     last_accessed >= datetime('now', ?1),
@@ -7551,7 +7561,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     // every remaining reference (#608). Entries not yet backfilled
                     // into entry_blobs report None and rank on logical size as
                     // before.
-                    let has_blob_rows: bool = row.get(8)?;
+                    let has_blob_rows: bool = row.get(9)?;
                     let reclaimable_bytes = if has_blob_rows {
                         Some(row.get::<_, i64>(7)?)
                     } else {
@@ -7569,8 +7579,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                         compile_time_ms: row.get(6)?,
                         reclaimable_bytes,
-                        recently_accessed: row.get(9)?,
-                        recently_imported: row.get(10)?,
+                        shared_share_bytes: row.get(8)?,
+                        recently_accessed: row.get(10)?,
+                        recently_imported: row.get(11)?,
                     })
                 },
             )?
@@ -7977,8 +7988,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // read statement left open across them would pin the WAL snapshot.
         let last_refs = {
             let mut stmt = self.db.prepare(
+                // The filter is holds_last_reference's: most rows fail it,
+                // and each one read costs two 64-character strings.
                 "SELECT eb.cache_key, b.hash, b.size, b.refcount, eb.refs
-                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash",
+                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                 WHERE b.refcount > 0 AND b.refcount <= eb.refs",
             )?;
             stmt.query_map([], |row| {
                 Ok((
@@ -8047,9 +8061,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// Fires at `max_size` and evicts down to 90% of it — a real hysteresis
     /// band, not the single 90% line that used to serve as both trigger and
-    /// target. The threshold lives here rather than at each call site so
-    /// `kache gc`, the daemon's periodic sweep, and the post-upload check all
-    /// get the same band (see [`crate::eviction::over_eviction_trigger`]).
+    /// target. An automatic sweep ([`Self::evict_for_free_space`]) fires at
+    /// 88% and evicts down to 78%, so that the cap holds while builds write
+    /// (see [`crate::eviction::automatic_trigger`]).
     pub fn evict(&self) -> Result<GcStats> {
         self.evict_for(SweepOrigin::Requested)
     }
@@ -8100,12 +8114,29 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         mut short_of_space: impl FnMut() -> bool,
     ) -> Result<GcStats> {
         self.refuse_write("evict")?;
-        let target = crate::eviction::eviction_target(self.config.max_size);
+        let max_size = self.config.max_size;
+        let (over, target) = match origin {
+            SweepOrigin::Automatic => (
+                crate::eviction::automatic_trigger(max_size),
+                crate::eviction::automatic_target(max_size),
+            ),
+            SweepOrigin::Requested => (max_size, crate::eviction::eviction_target(max_size)),
+        };
         let mut size = self.physical_size()?;
-        if !crate::eviction::over_eviction_trigger(size, self.config.max_size) {
+        if size <= over {
             return Ok(GcStats::default());
         }
         let walk_budget = (origin == SweepOrigin::Automatic).then_some(self.size_sweep_walk_budget);
+        // An automatic sweep values young entries slow to compile more.
+        let sparing_young = crate::eviction::SizePressureSparingYoungPolicy {
+            hours: self.config.gc_spare_young_hours,
+        };
+        let policy: &dyn crate::eviction::EvictionPolicy =
+            if origin == SweepOrigin::Automatic && sparing_young.hours > 0 {
+                &sparing_young
+            } else {
+                &crate::eviction::SizePressurePolicy
+            };
         let mut stats = GcStats::default();
         loop {
             let held_probe = if short_of_space() {
@@ -8115,7 +8146,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             };
             let mut rank_again = false;
             let pass = self.evict_with_stop(
-                &crate::eviction::SizePressurePolicy,
+                policy,
                 Some((size, target)),
                 held_probe,
                 origin,

@@ -740,7 +740,20 @@ fn unused_unit_cleanup_defaults_to_thirty_days() {
     let config_path = dir.path().join("config.toml");
     let _config = set_kache_config_for_test(&config_path);
     let _missing = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS");
+    let _hours = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS");
     assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 30);
+    assert_eq!(Config::load().unwrap().auto_clean_adaptive_idle_hours, 0);
+    std::fs::write(
+        &config_path,
+        "[cache]\nauto_clean_adaptive_idle_hours = 3\n",
+    )
+    .unwrap();
+    assert_eq!(Config::load().unwrap().auto_clean_adaptive_idle_hours, 3);
+    drop(_hours);
+    let _hours = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS", "5");
+    assert_eq!(Config::load().unwrap().auto_clean_adaptive_idle_hours, 5);
+    drop(_hours);
+    let _hours = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS");
     std::fs::write(&config_path, "[cache]\nauto_clean_unused_units_days = 0\n").unwrap();
     assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 0);
     let _env = NamedEnvGuard::set("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", "7");
@@ -2870,6 +2883,7 @@ fn test_file_config_roundtrip() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            auto_clean_adaptive_idle_hours: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             gc_evict_shared: None,
@@ -2909,6 +2923,7 @@ fn test_file_config_roundtrip() {
             prefetch_deadline_secs: None,
             min_store_compile_ms: None,
             gc_max_age_hours: None,
+            gc_spare_young_hours: None,
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,
@@ -3532,6 +3547,7 @@ fn test_config_store_dir() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -3573,6 +3589,7 @@ fn test_config_store_dir() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -3622,6 +3639,7 @@ fn test_config_index_db_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -3663,6 +3681,7 @@ fn test_config_index_db_path() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -3708,6 +3727,7 @@ fn test_config_event_log_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -3749,6 +3769,7 @@ fn test_config_event_log_path() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -3813,6 +3834,7 @@ fn test_config_socket_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -3854,6 +3876,7 @@ fn test_config_socket_path() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -4554,6 +4577,7 @@ fn test_save_and_load_file_config() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            auto_clean_adaptive_idle_hours: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             gc_evict_shared: None,
@@ -4593,6 +4617,7 @@ fn test_save_and_load_file_config() {
             prefetch_deadline_secs: None,
             min_store_compile_ms: None,
             gc_max_age_hours: None,
+            gc_spare_young_hours: None,
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,

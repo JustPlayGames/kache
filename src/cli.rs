@@ -767,24 +767,14 @@ fn cloned_targets_rows(disk: &crate::machine::DiskView) -> Vec<StatsRow> {
             ),
             over => {
                 // The rest is the store's own bytes past Limit. A sweep
-                // starts only once they pass Limit by 10 %, and then evicts
-                // to 90 % of it, so a store between the two is as intended.
+                // starts below Limit and evicts further below it, so this is
+                // what a running sweep has not reached yet.
                 let trigger = crate::wrapper::auto_gc_threshold(disk.store_limit_bytes);
-                let private = disk.store_bytes.saturating_sub(cloned);
-                let rest = if private <= trigger {
-                    format!(
-                        ", the other {} within the 10 % a store may grow past Limit before a \
-                         sweep starts (at {} not held by targets)",
-                        term::bytes(over - cloned),
-                        term::bytes(trigger)
-                    )
-                } else {
-                    format!(
-                        ", the other {} past the sweep's start at {}: the next check sweeps it",
-                        term::bytes(over - cloned),
-                        term::bytes(trigger)
-                    )
-                };
+                let rest = format!(
+                    ", the other {} past the sweep's start at {}: the next check sweeps it",
+                    term::bytes(over - cloned),
+                    term::bytes(trigger)
+                );
                 format!(
                     "; Cache reads {} over Limit, {} of it held there{rest}",
                     term::bytes(over),
@@ -4481,11 +4471,11 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
     else {
         return;
     };
-    // Stopped at its walk budget: more can go, so nothing backs off.
-    if last.cut_short {
-        return;
-    }
     match Store::open(config).and_then(|store| store.physical_size()) {
+        // Stopped at its walk budget: more can go, so nothing backs off.
+        Ok(size) if last.cut_short => {
+            crate::wrapper::record_auto_gc_cut_short(config, size, last.bytes_held)
+        }
         Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size, last.bytes_held),
         Err(e) => tracing::debug!("auto-gc: store size after the sweep unknown: {e:#}"),
     }

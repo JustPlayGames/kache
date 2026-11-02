@@ -6,6 +6,10 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub max_size: u64,
     pub gc_evict_shared: bool,
+    /// Entries idle under this many hours, and slow to compile, that an
+    /// automatic size sweep ranks with ten times their score. `0` turns this
+    /// off.
+    pub gc_spare_young_hours: u64,
     pub upload_spool_max_jobs: usize,
     /// Store new entries without an fsync on the build path and flush them
     /// later; a hit on an entry still pending verifies its bytes first.
@@ -49,6 +53,7 @@ mod tests {
             cache_dir: PathBuf::from("first cache"),
             max_size: 1,
             gc_evict_shared: false,
+            gc_spare_young_hours: 0,
             upload_spool_max_jobs: 2,
             deferred_durability: false,
         };

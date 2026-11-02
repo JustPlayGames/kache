@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod cleanup;
 pub(crate) mod private_outputs;
 mod worktree_seed;
-pub(crate) use cleanup::{preview_stale, prune_stale};
+pub(crate) use cleanup::{IDLE_SWEEP_INTERVAL, preview_stale, prune_idle, prune_stale};
 pub(crate) use worktree_seed::compiler_supports_automatic_seed;
 
 /// Sibling of Cargo's `<profile>/incremental` that holds every managed unit.
@@ -924,6 +924,9 @@ impl Lease {
                 false
             }
         };
+        if kept {
+            cleanup::drop_superseded_sessions(&self.unit.rustc_dir);
+        }
         if kept && outcome == CompileOutcome::Success {
             worktree_seed::publish(&self.unit, self.worktree_seed_key.as_deref());
         }
