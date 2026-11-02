@@ -184,7 +184,9 @@ pub(crate) fn spawn_periodic(
             interval.tick().await;
             let config = config.clone();
             let clock = clock.clone();
-            let task = tokio::task::spawn_blocking(move || run(&config, Trigger::Periodic(&clock)));
+            let task = tokio::task::spawn_blocking(move || {
+                crate::platform::below_normal(|| run(&config, Trigger::Periodic(&clock)))
+            });
             if let Err(error) = task.await {
                 tracing::warn!("store maintenance task panicked: {error}");
             }

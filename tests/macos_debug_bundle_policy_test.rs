@@ -80,8 +80,7 @@ impl Project {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let events = fs::read_to_string(self.cache.join("events.jsonl"))
-            .unwrap()
+        let events = common::settled_events(&self.cache)
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .filter(|event: &serde_json::Value| event["crate_name"] == "debug_bundle_policy")

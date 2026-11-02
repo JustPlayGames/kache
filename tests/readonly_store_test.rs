@@ -55,8 +55,7 @@ fn last_event(cache: &Path) -> serde_json::Value {
 }
 
 fn last_event_for(cache: &Path, crate_name: &str) -> serde_json::Value {
-    std::fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap()
+    common::settled_events(cache)
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .rfind(|event| event["crate_name"] == crate_name)

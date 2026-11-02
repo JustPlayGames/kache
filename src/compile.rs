@@ -25,6 +25,10 @@ pub struct CompileResult {
     /// A Unix signal ended the compiler. `exit_code` then reads 1, as for a
     /// compile error.
     pub signaled: bool,
+    /// Kache stopped the compiler at its dep-info, as asked: its outputs are
+    /// not there. A compile asked to stop that [`stop_compile`] let go on
+    /// ran to its end and reads `false`.
+    pub stopped: bool,
     pub stdout: String,
     /// Complete compiler stderr, retained for cache storage.
     pub stderr: String,
@@ -163,6 +167,7 @@ pub(crate) fn run_rustc(
     incremental_mode: IncrementalMode,
     metadata_sink: Option<&mut dyn Write>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    stop_rule: StopRule,
 ) -> Result<CompileResult> {
     let cwd = env
         .cwd()
@@ -194,6 +199,11 @@ pub(crate) fn run_rustc(
     }
     let spawned = std::time::Instant::now();
     let mut cmd = env.command(rustc)?;
+    #[cfg(target_os = "linux")]
+    if may_stop && stop_rule == StopRule::WhenAlone {
+        // It may be frozen while Kache decides: never leave it frozen.
+        freeze::resume_if_orphaned(&mut cmd);
+    }
     crate::toolchain_dylib::apply_for(&mut cmd, rustc, env);
     if matches!(
         incremental_mode,
@@ -304,6 +314,7 @@ pub(crate) fn run_rustc(
         child_stderr,
         metadata_sink,
         on_dep_info,
+        stop_rule,
     );
     drop(compiler_trace);
     drop(response_file);
@@ -388,6 +399,7 @@ pub(crate) fn run_rustc(
     Ok(CompileResult {
         exit_code,
         signaled: status.code().is_none(),
+        stopped: captured_stderr.stopped,
         stdout,
         stderr: stderr.into_owned(),
         pending_stderr: forwarding_metadata
@@ -404,19 +416,32 @@ fn capture_rustc_output(
     stderr: impl Read,
     metadata_sink: Option<&mut dyn Write>,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
-    capture_rustc_output_with(child, stdout, stderr, metadata_sink, None)
+    capture_rustc_output_with(child, stdout, stderr, metadata_sink, None, StopRule::Kill)
 }
 
 /// Drain both pipes. `on_dep_info` is asked, when rustc reports its dep-info
-/// written, whether to let the compile go on; `false` stops rustc there.
+/// written, whether to let the compile go on; `false` stops rustc there as
+/// `stop_rule` allows ([`stop_compile`]), and the compile goes on otherwise
+/// (`CapturedStderr::stopped` says which).
 fn capture_rustc_output_with(
     child: &mut Child,
     mut stdout: impl Read + Send,
     stderr: impl Read,
     metadata_sink: Option<&mut dyn Write>,
     on_dep_info: Option<&mut dyn FnMut() -> bool>,
+    stop_rule: StopRule,
 ) -> Result<(ExitStatus, Vec<u8>, CapturedStderr)> {
     let child = std::sync::Mutex::new(child);
+    let child_ref = &child;
+    let mut gated = on_dep_info.map(|decide| {
+        move || {
+            let _deciding = Deciding::enter(&child_ref.lock().unwrap(), stop_rule);
+            decide() || !stop_compile(&mut child_ref.lock().unwrap(), stop_rule)
+        }
+    });
+    let on_dep_info = gated
+        .as_mut()
+        .map(|gated| gated as &mut dyn FnMut() -> bool);
     std::thread::scope(|scope| {
         let stdout = scope.spawn(|| {
             let mut bytes = Vec::new();
@@ -444,6 +469,135 @@ fn capture_rustc_output_with(
         ))
     })
 }
+
+/// How a compile asked to stop at its dep-info is stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StopRule {
+    /// Kill rustc at once: it does not link, so it starts no process that
+    /// could outlive it.
+    Kill,
+    /// It links: stop it only once it is proven alone ([`stop_compile`]).
+    WhenAlone,
+}
+
+impl StopRule {
+    pub fn for_compile(links: bool) -> Self {
+        if links { Self::WhenAlone } else { Self::Kill }
+    }
+}
+
+/// Stop a compile Kache no longer needs (its entry was found while it ran).
+/// `true` once it is stopped; `false` leaves it running to its end.
+///
+/// A compile that links ([`StopRule::WhenAlone`]) is frozen first (SIGSTOP,
+/// Linux) and killed only while it has no child process and has not started
+/// codegen. A child is rustc's linker (nothing else in rustc spawns one),
+/// which would outlive a kill of rustc alone and could write the output
+/// after Kache restored it. Codegen comes before the linker; stopping only
+/// ahead of it also keeps the jobserver tokens it takes and the object files
+/// it writes out of reach of the kill. A frozen process can start neither,
+/// and the kill reaches it before it runs again, so nothing it started is
+/// left writing once it is reaped. Anything unsure (it would not stop in
+/// time, it is traced, /proc is unreadable) lets it go on, which is always
+/// correct. Elsewhere it always goes on; the wrapper does not ask there
+/// ([`STOPS_LINKING_COMPILES`]).
+fn stop_compile(child: &mut Child, rule: StopRule) -> bool {
+    if rule == StopRule::Kill {
+        let _ = child.kill();
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match freeze::stop_if_alone(child) {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::debug!("not stopping the linking compile at its dep-info: {reason}");
+                false
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// The linking compile whose dep-info `on_dep_info` is deciding about on
+    /// this thread, and whether the decision froze it
+    /// ([`hold_while_deciding`]).
+    static DECIDING: std::cell::Cell<Option<(libc::pid_t, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The span of one `on_dep_info` decision. A compile the decision froze is
+/// resumed when it ends: a stop that killed it leaves nothing to resume, and
+/// one that let it go on resumed it already.
+struct Deciding {
+    #[cfg(target_os = "linux")]
+    previous: Option<(libc::pid_t, bool)>,
+}
+
+impl Deciding {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    fn enter(child: &Child, rule: StopRule) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let deciding = (rule == StopRule::WhenAlone)
+                .then(|| libc::pid_t::try_from(child.id()).ok())
+                .flatten()
+                .map(|pid| (pid, false));
+            Self {
+                previous: DECIDING.with(|slot| slot.replace(deciding)),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        Self {}
+    }
+}
+
+impl Drop for Deciding {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Some((pid, true)) = DECIDING.with(|slot| slot.replace(self.previous)) {
+            // SAFETY: the compile is this process's child, not reaped while
+            // its output is read (the reaping waits for the reader that runs
+            // this decision), so `pid` names no other process.
+            unsafe {
+                libc::kill(pid, libc::SIGCONT);
+            }
+        }
+    }
+}
+
+/// Freeze the linking compile that `on_dep_info` is deciding about, until the
+/// decision is taken: the caller is about to wait for an entry, and a compile
+/// left running meanwhile would start its codegen, after which it can no
+/// longer be stopped ([`stop_compile`]). A compile that does not link may be
+/// killed at any point and runs on; so does every compile off Linux, and
+/// outside a decision this does nothing. The kernel resumes a frozen compile
+/// whose wrapper dies ([`freeze::resume_if_orphaned`]).
+pub(crate) fn hold_while_deciding() {
+    #[cfg(target_os = "linux")]
+    DECIDING.with(|slot| {
+        if let Some((pid, false)) = slot.get()
+            // SAFETY: as in `Deciding::drop`.
+            && unsafe { libc::kill(pid, libc::SIGSTOP) } == 0
+        {
+            slot.set(Some((pid, true)));
+        }
+    });
+}
+
+/// Whether a compile that links may be stopped on a hit: only where
+/// [`stop_compile`] can prove its linker never runs on after the stop.
+/// Windows would need rustc in a job object from its creation, which
+/// `std::process::Command` cannot do.
+pub const STOPS_LINKING_COMPILES: bool = cfg!(target_os = "linux");
+
+#[cfg(target_os = "linux")]
+mod freeze;
 
 struct CapturedStderr {
     verbatim: Vec<u8>,
@@ -896,6 +1050,41 @@ pub(crate) fn pre_clean_outputs(
     }
 }
 
+/// Remove a unit's outputs, all but its `.rmeta`, before it compiles again
+/// after a daemon lost its compile (`recover_from_lost_handoff` in main.rs).
+/// Finds them as [`discover_output_files`] does (the same identity rules as
+/// [`pre_clean_outputs`]); returns how many it removed.
+pub(crate) fn remove_outputs_except_metadata(
+    output_path: Option<&Path>,
+    out_dir: Option<&Path>,
+    crate_name: Option<&str>,
+    extra_filename: Option<&str>,
+    emit: &[String],
+) -> usize {
+    let Ok(files) = discover_output_files(output_path, out_dir, crate_name, extra_filename, emit)
+    else {
+        return 0;
+    };
+    let mut removed = 0;
+    for (path, name) in files {
+        if name.ends_with(".rmeta") {
+            continue;
+        }
+        #[cfg(windows)]
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.permissions().readonly()
+        {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// Remove a file if it exists and is read-only (likely a kache hardlink).
 fn remove_if_readonly(path: &Path) {
     let Ok(entry) = std::fs::symlink_metadata(path) else {
@@ -934,6 +1123,96 @@ fn remove_if_readonly(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit whose own command line Cargo spawned directly (it fit) but that
+    /// Kache's remapping flags lengthen past Windows' limit: seen on the GPUI
+    /// crates of a Cranelift build (gpui_platform's line was 29,610
+    /// characters), which failed to spawn ("compiler spawn failed"), ran
+    /// uncached and unremapped, and made every crate above them miss in the
+    /// next checkout. Their arguments go through a response file instead.
+    #[test]
+    fn a_line_kache_lengthens_past_the_windows_limit_takes_a_response_file() {
+        let cargo_args: Vec<String> = (0..490)
+            .map(|i| format!("--check-cfg=cfg(feature, values(\"feature-number-{i:04}\"))"))
+            .chain(["--crate-name".to_string(), "gpui_platform".to_string()])
+            .collect();
+        let program = std::ffi::OsStr::new(r"C:\Users\user\.rustup\toolchains\x\bin\rustc.exe");
+        let cargo_line = windows_command_line_bound(
+            std::iter::once(program).chain(cargo_args.iter().map(std::ffi::OsStr::new)),
+        );
+        assert!(cargo_line < WINDOWS_COMMAND_LINE_LIMIT, "{cargo_line}");
+        let remaps: Vec<String> = (0..48)
+            .map(|i| format!(r"--remap-path-prefix=\\?\C:\agent-work\checkout-{i:02}\target\debug=/kache/target"))
+            .collect();
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&remaps);
+        let args = || cargo_args.iter().map(String::as_str);
+
+        assert!(command_needs_response_file(false, &cmd, args()) == cfg!(windows));
+        let kache_line = || {
+            windows_command_line_bound(
+                std::iter::once(program)
+                    .chain(remaps.iter().map(std::ffi::OsStr::new))
+                    .chain(cargo_args.iter().map(std::ffi::OsStr::new)),
+            )
+        };
+        assert!(kache_line() > WINDOWS_COMMAND_LINE_LIMIT, "{}", kache_line());
+        assert!(needs_response_file(false, kache_line, Some(WINDOWS_COMMAND_LINE_LIMIT)));
+        // Elsewhere, and for a line that fits, nothing changes; a response
+        // file Cargo used is always kept.
+        assert!(!needs_response_file(false, kache_line, None));
+        assert!(!needs_response_file(false, || cargo_line, Some(WINDOWS_COMMAND_LINE_LIMIT)));
+        assert!(needs_response_file(true, || 0, None));
+    }
+
+    /// The bound counts every escape the standard library may add: quotes
+    /// around a word, a backslash before each quote and doubled backslashes.
+    #[test]
+    fn the_windows_command_line_bound_counts_quotes_escapes_and_wide_characters() {
+        let bound = |words: &[&str]| {
+            windows_command_line_bound(words.iter().map(|w| std::ffi::OsStr::new(*w)))
+        };
+        assert_eq!(bound(&[]), 1);
+        assert_eq!(bound(&["rustc"]), 1 + 5 + 3);
+        // `a "b"\` is quoted and escaped as `"a \"b\"\\"`: 11 units, under 6 + 4 + 3.
+        assert_eq!(bound(&[r#"a "b"\"#]), 1 + 6 + 3 + 3);
+        // Characters outside the BMP take two UTF-16 units each.
+        assert_eq!(bound(&["\u{1F600}"]), 1 + 2 + 3);
+    }
+
+    /// On Windows the bound is safe and the limit real: a line the bound puts
+    /// at the limit spawns, and one past it does not.
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawns_a_line_within_the_bound_and_refuses_one_past_the_limit() {
+        let exe = std::env::current_exe().unwrap();
+        // libtest takes every further word as a filter; none matches, so the
+        // child runs no test and exits at once.
+        let word = r#"C:\agent work\target\deps\lib"named"\"#;
+        let mut args = vec!["--exact".to_string(), "--test-threads=1".to_string()];
+        let line = |args: &[String]| {
+            windows_command_line_bound(
+                std::iter::once(exe.as_os_str()).chain(args.iter().map(std::ffi::OsStr::new)),
+            )
+        };
+        while line(&[args.clone(), vec![word.to_string()]].concat()) <= WINDOWS_COMMAND_LINE_LIMIT {
+            args.push(word.to_string());
+        }
+        let status = std::process::Command::new(&exe)
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("a line within the bound spawns");
+        assert!(status.success());
+
+        let long = vec!["x".repeat(WINDOWS_COMMAND_LINE_LIMIT)];
+        let error = std::process::Command::new(&exe)
+            .args(&long)
+            .status()
+            .expect_err("a line past the limit does not spawn");
+        assert_eq!(error.raw_os_error(), Some(206), "{error}");
+    }
     use std::cell::Cell;
     use std::fs;
     use std::io::Cursor;
@@ -1049,6 +1328,7 @@ fi
                             IncrementalMode::Strip,
                             Some(&mut metadata),
                             None,
+                            StopRule::Kill,
                         )
                         .unwrap();
                         assert_eq!(result.exit_code, 0, "{}", result.stderr);
@@ -1118,8 +1398,15 @@ fi
         let stderr = child.stderr.take().unwrap();
         let started = std::time::Instant::now();
         let mut stop = || false;
-        let (status, _, captured) =
-            capture_rustc_output_with(&mut child, stdout, stderr, None, Some(&mut stop)).unwrap();
+        let (status, _, captured) = capture_rustc_output_with(
+            &mut child,
+            stdout,
+            stderr,
+            None,
+            Some(&mut stop),
+            StopRule::Kill,
+        )
+        .unwrap();
         assert!(captured.stopped);
         assert!(!status.success());
         assert!(
@@ -1127,6 +1414,343 @@ fi
             "the compiler was left running: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A compile asked to stop while it runs a child (rustc's linker) is not
+    /// stopped: killing rustc alone would orphan the linker, which could then
+    /// write the output after Kache restored it. It goes on, and returns only
+    /// once that child is done, so nothing it started writes afterwards.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_never_leaves_a_linker_writing_after_the_compile_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("linked");
+        // The "linker" starts before the dep-info line, so it runs when the
+        // stop is asked for; its output goes nowhere near rustc's pipes, as a
+        // real linker's does.
+        let script = "(sleep 0.4; echo linked > \"$1\") >/dev/null 2>&1 & \
+             printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; \
+             wait";
+        let mut child = Command::new("sh")
+            .args(["-c", script, "sh"])
+            .arg(&out)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .invocation_spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut stop = || false;
+        let (status, _, captured) = capture_rustc_output_with(
+            &mut child,
+            stdout,
+            stderr,
+            None,
+            Some(&mut stop),
+            StopRule::WhenAlone,
+        )
+        .unwrap();
+        let at_return = fs::read(&out).ok();
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        assert_eq!(
+            fs::read(&out).ok(),
+            at_return,
+            "a child of the stopped compile wrote its output after the compile returned"
+        );
+        assert!(
+            !captured.stopped,
+            "a compile with a running child must go on"
+        );
+        assert!(status.success());
+    }
+
+    /// A decision that holds a linking compile freezes it until the decision
+    /// is taken, and the compile then goes on to its end when the decision
+    /// lets it; held and then stopped, it is killed like any stopped compile.
+    /// Outside a decision, and for a compile that does not link, holding does
+    /// nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_held_linking_compile_is_frozen_until_the_decision() {
+        fn state(pid: u32) -> Option<char> {
+            freeze::parse_state(&fs::read(format!("/proc/{pid}/stat")).ok()?)
+        }
+        hold_while_deciding();
+        let script = "printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; \
+             i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo finished";
+        for (rule, stop) in [
+            (StopRule::WhenAlone, false),
+            (StopRule::WhenAlone, true),
+            (StopRule::Kill, false),
+        ] {
+            let mut child = Command::new("sh")
+                .args(["-c", script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .invocation_spawn()
+                .unwrap();
+            let pid = child.id();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let mut states = Vec::new();
+            let mut decide = || {
+                hold_while_deciding();
+                let started = std::time::Instant::now();
+                while state(pid) != Some('T')
+                    && started.elapsed() < std::time::Duration::from_millis(300)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                states.push(state(pid));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                states.push(state(pid));
+                !stop
+            };
+            let (status, stdout, captured) = capture_rustc_output_with(
+                &mut child,
+                stdout,
+                stderr,
+                None,
+                Some(&mut decide),
+                rule,
+            )
+            .unwrap();
+            let held = rule == StopRule::WhenAlone;
+            assert_eq!(
+                states.iter().all(|state| *state == Some('T')),
+                held,
+                "{rule:?}: {states:?}"
+            );
+            assert_eq!(captured.stopped, stop, "{rule:?}");
+            if stop {
+                assert!(!status.success());
+            } else {
+                assert!(status.success(), "{rule:?}: the compile was not resumed");
+                assert_eq!(stdout, b"finished\n");
+            }
+        }
+    }
+
+    /// The thread state follows the last ')' of the stat line, whatever the
+    /// command name holds.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_state_is_read_after_the_command_name() {
+        assert_eq!(freeze::parse_state(b"42 (rustc) T 1 42"), Some('T'));
+        assert_eq!(freeze::parse_state(b"42 (a) b) R 1 42"), Some('R'));
+        assert_eq!(freeze::parse_state(b"42 (rustc)"), None);
+        assert_eq!(freeze::parse_state(b"garbage"), None);
+    }
+
+    /// rustc's codegen threads, as rustc 1.99 names them; the frontend's
+    /// threads are not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codegen_threads_are_known_by_name() {
+        for codegen in [
+            "coordinator",
+            "opt cgu.00",
+            "opt regex.1f2e3",
+            "lto fat",
+            "lto cgu.0.rcgu.",
+            "cpy cgu.3",
+            "copy x",
+        ] {
+            assert!(freeze::is_codegen_thread(codegen), "{codegen}");
+        }
+        for frontend in ["rustc", "ctrl-c", "tokio-rt-worker", "optimizer", ""] {
+            assert!(!freeze::is_codegen_thread(frontend), "{frontend}");
+        }
+    }
+
+    /// A compile with no child is stopped and reaped at once; the stop
+    /// leaves no process of it behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_compile_without_a_child_is_stopped_and_reaped() {
+        let script = "printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; \
+             while :; do :; done";
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .invocation_spawn()
+            .unwrap();
+        let pid = child.id();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let started = std::time::Instant::now();
+        let mut stop = || false;
+        let (status, _, captured) = capture_rustc_output_with(
+            &mut child,
+            stdout,
+            stderr,
+            None,
+            Some(&mut stop),
+            StopRule::WhenAlone,
+        )
+        .unwrap();
+        assert!(captured.stopped);
+        assert!(!status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the stopped compile was not reaped"
+        );
+    }
+
+    /// A linking compile frozen while Kache decides is resumed by the kernel
+    /// when the wrapper dies before it decided (Ctrl+C, a timeout's SIGTERM):
+    /// the thread that spawned it ends, as every thread of a dead wrapper
+    /// does. Left stopped, it would never take the signal that ended the job.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_frozen_compile_resumes_when_its_wrapper_dies() {
+        fn state(pid: i32) -> char {
+            let stat = fs::read(format!("/proc/{pid}/stat")).unwrap();
+            freeze::parse_state(&stat).unwrap()
+        }
+        let mut child = std::thread::spawn(|| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("30");
+            // As run_rustc starts a linking compile that may stop.
+            freeze::resume_if_orphaned(&mut cmd);
+            let child = cmd.spawn().unwrap();
+            let pid = i32::try_from(child.id()).unwrap();
+            // SAFETY: our own unreaped child.
+            unsafe { libc::kill(pid, libc::SIGSTOP) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state(pid) != 'T' {
+                assert!(std::time::Instant::now() < deadline, "it never stopped");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            child
+        })
+        .join()
+        .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let resumed = loop {
+            if state(pid) != 'T' {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            resumed,
+            "the compile stayed stopped after its wrapper's thread ended"
+        );
+    }
+
+    /// Stress against a real rustc, by hand: `KACHE_STRESS_RUSTC=<rustc>
+    /// KACHE_STRESS_SRC=<main.rs> [KACHE_STRESS_ROUNDS=n] [KACHE_STRESS_FLAGS=..]
+    /// cargo nextest run --bin kache --run-ignored only real_linking_compiles`.
+    /// A linking compile asked to stop at any moment from its dep-info to its
+    /// end is either stopped, and then nothing of it writes in its output
+    /// folder afterwards, or let go on to a successful end.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn real_linking_compiles_stopped_at_any_moment() {
+        fn listing(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+            let mut all = fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let meta = entry.metadata().ok()?;
+                    Some((
+                        entry.file_name().to_string_lossy().into_owned(),
+                        meta.len(),
+                        meta.modified().ok()?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            all.sort();
+            all
+        }
+        let rustc = std::env::var("KACHE_STRESS_RUSTC").expect("KACHE_STRESS_RUSTC");
+        let src = std::env::var("KACHE_STRESS_SRC").expect("KACHE_STRESS_SRC");
+        let rounds: u64 = std::env::var("KACHE_STRESS_ROUNDS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(60);
+        let span: u64 = std::env::var("KACHE_STRESS_SPAN_MS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1200);
+        let extra = std::env::var("KACHE_STRESS_FLAGS").unwrap_or_default();
+        let (mut stopped, mut refused, mut leftovers) = (0, 0, 0);
+        for round in 0..rounds {
+            let delay = std::time::Duration::from_millis(round * span / rounds);
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = Command::new(&rustc)
+                .args([
+                    "--edition=2021",
+                    "--crate-name=m",
+                    "--crate-type=bin",
+                    "--emit=dep-info,link",
+                    "--error-format=json",
+                    "--json=artifacts",
+                    "--out-dir",
+                ])
+                .arg(dir.path())
+                .args(extra.split_whitespace())
+                .arg(&src)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .invocation_spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let mut stop = || {
+                std::thread::sleep(delay);
+                false
+            };
+            let (status, _, captured) = capture_rustc_output_with(
+                &mut child,
+                stdout,
+                stderr,
+                None,
+                Some(&mut stop),
+                StopRule::WhenAlone,
+            )
+            .unwrap();
+            if captured.stopped {
+                stopped += 1;
+                let at_return = listing(dir.path());
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                assert_eq!(
+                    listing(dir.path()),
+                    at_return,
+                    "round {round} ({delay:?}): the output folder changed after a stopped compile returned"
+                );
+                let left = at_return
+                    .iter()
+                    .filter(|(name, ..)| name.ends_with(".o") || name.starts_with("rustc"))
+                    .count();
+                if left > 0 {
+                    eprintln!("round {round} ({delay:?}): stopped, {left} objects/temp dirs left");
+                }
+                leftovers += left;
+            } else {
+                refused += 1;
+                assert!(
+                    status.success(),
+                    "round {round}: a compile let go on failed"
+                );
+                assert!(dir.path().join("m").exists(), "round {round}: no output");
+            }
+        }
+        eprintln!("stopped {stopped}, let go on {refused}, leftover objects/temp dirs {leftovers}");
     }
 
     #[cfg(unix)]
@@ -1302,6 +1926,7 @@ fi
             let result = CompileResult {
                 exit_code: 0,
                 signaled: false,
+                stopped: false,
                 stdout: String::new(),
                 stderr: "complete stderr".to_owned(),
                 pending_stderr: pending.map(str::to_owned),
@@ -2206,64 +2831,6 @@ fi
         assert!(rlib.exists(), "writable candidates must not be removed");
     }
 
-    /// A unit whose own command line Cargo spawned directly (it fit) but that
-    /// Kache's remapping flags lengthen past Windows' limit: seen on the crates
-    /// of a large GUI framework (one line was 29,610 characters), which failed to spawn ("compiler spawn failed"), ran
-    /// uncached and unremapped, and made every crate above them miss in the
-    /// next checkout. Their arguments go through a response file instead.
-    #[test]
-    fn a_line_kache_lengthens_past_the_windows_limit_takes_a_response_file() {
-        let cargo_args: Vec<String> = (0..490)
-            .map(|i| format!("--check-cfg=cfg(feature, values(\"feature-number-{i:04}\"))"))
-            .chain(["--crate-name".to_string(), "platform".to_string()])
-            .collect();
-        let program = std::ffi::OsStr::new(r"C:\Users\user\.rustup\toolchains\x\bin\rustc.exe");
-        let cargo_line = windows_command_line_bound(
-            std::iter::once(program).chain(cargo_args.iter().map(std::ffi::OsStr::new)),
-        );
-        assert!(cargo_line < WINDOWS_COMMAND_LINE_LIMIT, "{cargo_line}");
-        let remaps: Vec<String> = (0..48)
-            .map(|i| {
-                format!(
-                    r"--remap-path-prefix=\\?\C:\src\checkout-{i:02}\target\debug=/kache/target"
-                )
-            })
-            .collect();
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(&remaps);
-        let args = || cargo_args.iter().map(String::as_str);
-
-        assert!(command_needs_response_file(false, &cmd, args()) == cfg!(windows));
-        let kache_line = || {
-            windows_command_line_bound(
-                std::iter::once(program)
-                    .chain(remaps.iter().map(std::ffi::OsStr::new))
-                    .chain(cargo_args.iter().map(std::ffi::OsStr::new)),
-            )
-        };
-        assert!(
-            kache_line() > WINDOWS_COMMAND_LINE_LIMIT,
-            "{}",
-            kache_line()
-        );
-        assert!(needs_response_file(
-            false,
-            kache_line,
-            Some(WINDOWS_COMMAND_LINE_LIMIT)
-        ));
-        // Elsewhere, and for a line that fits, nothing changes; a response
-        // file Cargo used is always kept.
-        assert!(!needs_response_file(false, kache_line, None));
-        assert!(!needs_response_file(
-            false,
-            || cargo_line,
-            Some(WINDOWS_COMMAND_LINE_LIMIT)
-        ));
-        assert!(needs_response_file(true, || 0, None));
-    }
-
-    /// The bound counts every escape the standard library may add: quotes
-    /// around a word, a backslash before each quote and doubled backslashes.
     #[test]
     fn response_file_selection_preserves_exact_fits_and_short_circuits() {
         assert!(!needs_response_file(false, || 32_767, Some(32_767)));
@@ -2280,52 +2847,5 @@ fi
         ));
         let cmd = std::process::Command::new("rustc");
         assert!(command_needs_response_file(true, &cmd, ["lib.rs"]));
-    }
-
-    #[test]
-    fn the_windows_command_line_bound_counts_quotes_escapes_and_wide_characters() {
-        let bound = |words: &[&str]| {
-            windows_command_line_bound(words.iter().map(|w| std::ffi::OsStr::new(*w)))
-        };
-        assert_eq!(bound(&[]), 1);
-        assert_eq!(bound(&["rustc"]), 1 + 5 + 3);
-        // `a "b"\` is quoted and escaped as `"a \"b\"\\"`: 11 units, under 6 + 4 + 3.
-        assert_eq!(bound(&[r#"a "b"\"#]), 1 + 6 + 3 + 3);
-        // Characters outside the BMP take two UTF-16 units each.
-        assert_eq!(bound(&["\u{1F600}"]), 1 + 2 + 3);
-    }
-
-    /// On Windows the bound is safe and the limit real: a line the bound puts
-    /// at the limit spawns, and one past it does not.
-    #[cfg(windows)]
-    #[test]
-    fn windows_spawns_a_line_within_the_bound_and_refuses_one_past_the_limit() {
-        let exe = std::env::current_exe().unwrap();
-        // libtest takes every further word as a filter; none matches, so the
-        // child runs no test and exits at once.
-        let word = r#"C:\src dir\target\deps\lib"named"\"#;
-        let mut args = vec!["--exact".to_string(), "--test-threads=1".to_string()];
-        let line = |args: &[String]| {
-            windows_command_line_bound(
-                std::iter::once(exe.as_os_str()).chain(args.iter().map(std::ffi::OsStr::new)),
-            )
-        };
-        while line(&[args.clone(), vec![word.to_string()]].concat()) <= WINDOWS_COMMAND_LINE_LIMIT {
-            args.push(word.to_string());
-        }
-        let status = std::process::Command::new(&exe)
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .expect("a line within the bound spawns");
-        assert!(status.success());
-
-        let long = vec!["x".repeat(WINDOWS_COMMAND_LINE_LIMIT)];
-        let error = std::process::Command::new(&exe)
-            .args(&long)
-            .status()
-            .expect_err("a line past the limit does not spawn");
-        assert_eq!(error.raw_os_error(), Some(206), "{error}");
     }
 }

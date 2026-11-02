@@ -641,6 +641,24 @@ fn extract_entry_pack<R: std::io::Read>(reader: R, dest_dir: &Path) -> Result<u6
     .original_bytes)
 }
 
+/// Whether this release reads a downloaded entry stored under the
+/// `key_schema` it records (lane KACHE-W23). Its own component's current
+/// version or a later one: after a bump, a C compile or build-script run
+/// whose recipe did not move keys as before, and its entries on the remote
+/// still answer (they were refused for any version but this release's).
+/// Or, for rustc, an earlier version a key bridge reads: such an entry is
+/// asked for by its legacy key only, and is adopted only after the store
+/// re-hashes it ([`crate::key_bridge`]). Never `0` (unrecorded). The key
+/// binding checked below is what ties the entry to this invocation.
+fn remote_key_schema_accepted(meta: &EntryMeta) -> bool {
+    let component =
+        kache_format::KeyComponent::of_entry(&meta.crate_name, &meta.crate_types.join(","));
+    meta.key_schema != 0
+        && (kache_format::entry_key_is_current(meta.key_schema, component)
+            || (component == kache_format::KeyComponent::Rustc
+                && crate::cache_key::bridged_key_versions().contains(&meta.key_schema)))
+}
+
 struct ExtractedEntry {
     original_bytes: u64,
     meta: EntryMeta,
@@ -729,7 +747,7 @@ fn extract_entry_pack_until<R: std::io::Read>(
         std::fs::read_to_string(&meta_path).context("reading downloaded meta.json")?;
     let meta: EntryMeta =
         serde_json::from_str(&meta_content).context("parsing downloaded meta.json")?;
-    if meta.key_schema != crate::cache_key::CACHE_KEY_VERSION {
+    if !remote_key_schema_accepted(&meta) {
         bail!(
             "downloaded entry uses incompatible key schema {}",
             meta.key_schema
@@ -1062,6 +1080,7 @@ pub(crate) mod tests {
             out_dir_alias_root: None,
             deferred_durability: false,
             daemon_publish: false,
+            daemon_publish_rustc: false,
             trust_daemon_execution: false,
             native_runtime_warmup: true,
             daemon_execution_concurrency: None,
@@ -1077,6 +1096,7 @@ pub(crate) mod tests {
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
+            auto_clean_adaptive_idle_hours: 0,
             target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
@@ -1118,6 +1138,7 @@ pub(crate) mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+            gc_spare_young_hours: 0,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -1187,6 +1208,7 @@ pub(crate) mod tests {
             out_dir_alias_root: None,
             deferred_durability: false,
             daemon_publish: false,
+            daemon_publish_rustc: false,
             trust_daemon_execution: false,
             native_runtime_warmup: true,
             daemon_execution_concurrency: None,
@@ -1202,6 +1224,7 @@ pub(crate) mod tests {
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
+            auto_clean_adaptive_idle_hours: 0,
             target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
@@ -1243,6 +1266,7 @@ pub(crate) mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+            gc_spare_young_hours: 0,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -1266,6 +1290,100 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(blob).unwrap(), b"hello world");
         assert!(restore_entry_dir.join("meta.json").exists());
         assert!(!restore_entry_dir.join("libfoo.rlib").exists());
+    }
+
+    /// KACHE-W23: a downloaded entry is read when its component's key
+    /// version says this release's keys reach it (a C compile or
+    /// build-script run whose recipe a bump left alone, also from an earlier
+    /// release), or when it is a rustc entry of a version a key bridge
+    /// adopts; never an unrecorded version or an earlier one of its own
+    /// component otherwise.
+    #[test]
+    fn a_downloaded_entry_is_read_by_its_own_components_key_version() {
+        use kache_format::{
+            BUILD_SCRIPT_KEY_VERSION, BUILD_SCRIPT_RUN_CRATE_NAME, CACHE_KEY_VERSION,
+            CC_KEY_VERSION,
+        };
+        let bridged = |version| crate::cache_key::bridged_key_versions().contains(&version);
+        let lib = vec!["lib".to_string()];
+        let cases: [(&str, &str, Vec<String>, u32, bool); 7] = [
+            (
+                "rustc, this release",
+                "serde",
+                lib.clone(),
+                CACHE_KEY_VERSION,
+                true,
+            ),
+            ("rustc, unrecorded", "serde", lib.clone(), 0, false),
+            (
+                "rustc, the version before",
+                "serde",
+                lib.clone(),
+                CACHE_KEY_VERSION - 1,
+                bridged(CACHE_KEY_VERSION - 1),
+            ),
+            (
+                "C, its component's version",
+                "foo.c",
+                vec![],
+                CC_KEY_VERSION,
+                true,
+            ),
+            ("C, before it", "foo.c", vec![], CC_KEY_VERSION - 1, false),
+            (
+                "build-script run, its component's version",
+                BUILD_SCRIPT_RUN_CRATE_NAME,
+                vec![],
+                BUILD_SCRIPT_KEY_VERSION,
+                true,
+            ),
+            (
+                "rustc, a later release",
+                "serde",
+                lib,
+                CACHE_KEY_VERSION + 1,
+                true,
+            ),
+        ];
+        for (case, crate_name, crate_types, key_schema, read) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = Store::open(&min_config(tmp.path().join("cache"))).unwrap();
+            let source = tmp.path().join("out.o");
+            std::fs::write(&source, b"component artifact").unwrap();
+            store
+                .put(
+                    "key123",
+                    crate_name,
+                    &crate_types,
+                    &[],
+                    "x86_64-unknown-linux-gnu",
+                    "debug",
+                    &[(source, "out.o".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            let entry_dir = store.entry_dir("key123");
+            let mut meta: EntryMeta =
+                serde_json::from_slice(&std::fs::read(entry_dir.join("meta.json")).unwrap())
+                    .unwrap();
+            meta.key_schema = key_schema;
+            std::fs::write(
+                entry_dir.join("meta.json"),
+                serde_json::to_vec_pretty(&meta).unwrap(),
+            )
+            .unwrap();
+            let packed = create_entry_pack_zstd(&entry_dir, &store.blobs_dir(), &meta, 3).unwrap();
+            let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&packed)).unwrap();
+            let got = extract_entry_pack(decoder, &tmp.path().join("restored"));
+            assert_eq!(got.is_ok(), read, "{case}: {got:?}");
+            if let Err(error) = got {
+                assert!(
+                    error.to_string().contains("incompatible key schema"),
+                    "{case}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1517,6 +1635,7 @@ pub(crate) mod tests {
             out_dir_alias_root: None,
             deferred_durability: false,
             daemon_publish: false,
+            daemon_publish_rustc: false,
             trust_daemon_execution: false,
             native_runtime_warmup: true,
             daemon_execution_concurrency: None,
@@ -1532,6 +1651,7 @@ pub(crate) mod tests {
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
+            auto_clean_adaptive_idle_hours: 0,
             target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
@@ -1573,6 +1693,7 @@ pub(crate) mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+            gc_spare_young_hours: 0,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -1699,6 +1820,7 @@ pub(crate) mod tests {
             out_dir_alias_root: None,
             deferred_durability: false,
             daemon_publish: false,
+            daemon_publish_rustc: false,
             trust_daemon_execution: false,
             native_runtime_warmup: true,
             daemon_execution_concurrency: None,
@@ -1714,6 +1836,7 @@ pub(crate) mod tests {
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
+            auto_clean_adaptive_idle_hours: 0,
             target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
@@ -1755,6 +1878,7 @@ pub(crate) mod tests {
             prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
             min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
             gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+            gc_spare_young_hours: 0,
             daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
             s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
             remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,

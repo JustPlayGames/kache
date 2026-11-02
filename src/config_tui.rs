@@ -141,7 +141,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
                 .unwrap_or_default(),
             env_var: "KACHE_MAX_SIZE",
             env_value: env_val("KACHE_MAX_SIZE"),
-            default_hint: "(default: 5% of the cache disk, 5GiB–100GiB)",
+            default_hint: "(default: 20% of the cache disk, 10GiB–100GiB)",
             validation_error: None,
             env_locked: env.max_size,
         },
@@ -167,7 +167,7 @@ fn build_fields(file_config: &FileConfig, env: &EnvOverrides) -> Vec<FormField> 
                 .unwrap_or_default(),
             env_var: "KACHE_CACHE_EXECUTABLES",
             env_value: env_val("KACHE_CACHE_EXECUTABLES"),
-            // Platform-dependent (on for Linux only) — see
+            // Platform-dependent (on for Linux, macOS and Windows) — see
             // `config::default_cache_executables`. The editor shows the
             // default that actually applies on this machine, not a constant.
             default_hint: if crate::config::default_cache_executables() {
@@ -2170,6 +2170,7 @@ mod tests {
                 out_dir_alias_root: None,
                 deferred_durability: None,
                 daemon_publish: None,
+                daemon_publish_rustc: None,
                 trust_daemon_execution: None,
                 native_runtime_warmup: Some(false),
                 daemon_execution_concurrency: None,
@@ -2184,6 +2185,7 @@ mod tests {
                 auto_recover_targets: None,
                 scheduler_memory_pressure: None,
                 auto_clean_unused_units_days: None,
+                auto_clean_adaptive_idle_hours: None,
                 target_liveness: None,
                 seed_new_targets: None,
                 build_script_hermetic: None,
@@ -2230,6 +2232,7 @@ mod tests {
                 prefetch_deadline_secs: None,
                 min_store_compile_ms: Some(750),
                 gc_max_age_hours: Some(72),
+                gc_spare_young_hours: None,
                 scheduler: Some(false),
                 daemon_idle_timeout_secs: Some(600),
                 s3_pool_idle_secs: None,

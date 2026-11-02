@@ -22,15 +22,15 @@ edits. For PowerShell completions, generate the script with
 
 ## Rust libraries and executable outputs
 
-Eligible Rust libraries use the artifact cache. Executable caching remains
-opt-in on Windows:
+Eligible Rust libraries use the artifact cache, and eligible executables do too
+by default, as on Linux and macOS. To turn executable caching off:
 
 ```toml title="~/.config/kache/config.toml"
 [cache]
-cache_executables = true
+cache_executables = false
 ```
 
-For one PowerShell session, set `$env:KACHE_CACHE_EXECUTABLES = "1"` before the
+For one PowerShell session, set `$env:KACHE_CACHE_EXECUTABLES = "0"` before the
 build. If you use the GitHub Action, configure its `cache-executables` input
 instead of relying on the CLI default.
 
@@ -61,7 +61,9 @@ cache pipeline over an authenticated named pipe.
 
 `kache doctor` reports daemon health separately from compiler-execution
 eligibility. A refused handoff can use the local engine before Commit. After
-Commit, a lost connection fails the invocation rather than rerunning it.
+Commit, a daemon that goes away without answering (stopped, restarted or
+killed) leaves the compile to the local engine, once; an answer it gave, a
+failed compile included, is final.
 
 RC.2 supports an explicit trust option for certain known process-identity token
 differences. It must be enabled in both configurations and requires a daemon

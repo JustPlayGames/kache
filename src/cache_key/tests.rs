@@ -3,6 +3,8 @@ use crate::args::RustcArgs;
 use crate::native_link_key::WindowsLinkInput;
 use crate::test_support::process_state_test_lock;
 
+mod key_bridge_golden;
+
 const GNU_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: x86_64-unknown-linux-gnu\nrelease: 1.90.0\n";
 const DARWIN_RUSTC_VERSION: &str = "rustc 1.90.0\nhost: aarch64-apple-darwin\nrelease: 1.90.0\n";
 
@@ -146,6 +148,7 @@ fn client_invocation(cwd: &Path, overrides: &[(&str, Option<&std::ffi::OsStr>)])
         captured.home_dir().map(Path::to_path_buf),
         captured.temp_dir().to_path_buf(),
     )
+    .with_cache_dir(captured.cache_dir().map(Path::to_path_buf))
 }
 
 fn reparse_for_client(args: &RustcArgs, env: &InvocationEnv) -> RustcArgs {
@@ -4463,6 +4466,7 @@ fn a_record_is_only_consulted_for_an_eligible_invocation() {
         let mut tree = Some(TreeGuard {
             digest: "earlier".to_string(),
             walks: Vec::new(),
+            taken: stamp_clock_ns(),
         });
         assert_eq!(
             predicted_key_inputs(&plain, &on, &mut tree),
@@ -5752,6 +5756,270 @@ fn the_registry_src_root_is_two_levels_above_a_registry_package() {
     assert_eq!(registry_src_root(Path::new("/w/kt")), None);
 }
 
+/// Registry unit `kt` of the Cargo home `home` under `base`, built into the
+/// target directory of checkout `checkout`, as Cargo runs it: in its package
+/// directory, with an absolute source.
+fn home_unit(
+    base: &Path,
+    home: &str,
+    checkout: &str,
+    version: &str,
+) -> (PathBuf, InvocationEnv, RustcArgs) {
+    let package = base.join(home).join(format!("registry/src/index-1/kt-{version}"));
+    write_file(&package.join("src/lib.rs"), "mod m;\n");
+    write_file(&package.join("src/m.rs"), "");
+    let env = client_invocation(
+        &package,
+        &[
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+            ("OUT_DIR", None),
+        ],
+    );
+    let argv = [
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "kt".to_string(),
+        package.join("src/lib.rs").display().to_string(),
+        "--out-dir".to_string(),
+        base.join(checkout).join("target/debug/deps").display().to_string(),
+    ];
+    let args = RustcArgs::parse_for(&argv, &env).unwrap();
+    (package, env, args)
+}
+
+/// A registry unit's row filed with its Cargo home cut out serves another
+/// home over the same registry, placed under that home's registry and
+/// checked on its disk; the plain shared identity stays per home.
+#[test]
+fn a_registry_units_row_serves_another_cargo_home() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path();
+    let (one, env_one, args_one) = home_unit(base, "h1", "a", "1.0.0");
+    let (two, env_two, args_two) = home_unit(base, "h2", "b", "1.0.0");
+    let identity_one = rustc_registry_prediction_identity_in(
+        &args_one,
+        env_one.vars_os().collect(),
+    )
+    .expect("a registry unit has a home-free identity");
+    assert!(identity_one.starts_with("shared-registry-v1:"));
+    assert_eq!(
+        rustc_registry_prediction_identity_in(&args_two, env_two.vars_os().collect()),
+        Some(identity_one.clone())
+    );
+    assert_ne!(
+        rustc_shared_prediction_identity_in(&args_one, env_one.vars_os().collect()),
+        rustc_shared_prediction_identity_in(&args_two, env_two.vars_os().collect()),
+        "the plain shared identity folds the home"
+    );
+    let (_, env_other, other) = home_unit(base, "h1", "a", "1.0.1");
+    let other_vars = env_other.vars_os().collect();
+    assert_ne!(
+        rustc_registry_prediction_identity_in(&other, other_vars),
+        Some(identity_one.clone()),
+        "another package version"
+    );
+    let workspace_vars = vec![("CARGO_MANIFEST_DIR".into(), base.join("w/kt").into_os_string())];
+    assert_eq!(
+        rustc_registry_prediction_identity_in(&args_one, workspace_vars),
+        None
+    );
+
+    // Filed by home one as the wrapper files it, read by home two.
+    let closure = |package: &Path| DepInfo {
+        source_files: vec![package.join("src/lib.rs"), package.join("src/m.rs")],
+        env_deps: vec![(
+            "CARGO_MANIFEST_DIR".to_string(),
+            Some(package.display().to_string()),
+        )],
+    };
+    let registry_one = registry_src_root(&one).unwrap();
+    let row = registry_row(&InputPrediction::from_dep_info(&closure(&one), None), registry_one)
+        .expect("a closure inside the registry can be filed");
+    assert!(
+        row.sources.iter().all(|source| !source.starts_with(base)),
+        "no home's path in the filed row: {:?}",
+        row.sources
+    );
+    let db = base.join("index.db");
+    let hasher = |env: &InvocationEnv| {
+        FileHasher::persistent(&db)
+            .with_invocation_env(env)
+            .with_input_predictions(true)
+    };
+    hasher(&env_one).record_input_prediction(
+        &identity_one,
+        Some("kt"),
+        &DepInfo {
+            source_files: row.sources,
+            env_deps: row.env_deps,
+        },
+        row.tree,
+    );
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None),
+        Ok(closure(&two)),
+        "home two's own spelling of the closure"
+    );
+    std::fs::remove_file(two.join("src/m.rs")).unwrap();
+    assert!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None).is_err(),
+        "a row naming a file missing from this home's package is refused"
+    );
+
+    // A closure reading outside the registry is never filed home-free.
+    let mut outside = closure(&one);
+    outside.source_files.push(base.join("w/kt/src/lib.rs"));
+    assert_eq!(
+        registry_row(&InputPrediction::from_dep_info(&outside, None), registry_one),
+        None
+    );
+}
+
+/// Registry unit `kt` of the Cargo home `home` under `base` that reads a
+/// generated file from its `OUT_DIR` in checkout `checkout`'s target.
+fn home_out_dir_unit(
+    base: &Path,
+    home: &str,
+    checkout: &str,
+) -> (PathBuf, PathBuf, InvocationEnv, RustcArgs) {
+    let package = base.join(home).join("registry/src/index-1/kt-1.0.0");
+    write_file(&package.join("src/lib.rs"), "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n");
+    let target = base.join(checkout).join("target");
+    let out = target.join("debug/build/kt-1/out");
+    write_file(&out.join("gen.rs"), "pub fn g() {}\n");
+    std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+    let env = client_invocation(
+        &package,
+        &[
+            ("CARGO_MANIFEST_DIR", Some(package.as_os_str())),
+            ("OUT_DIR", Some(out.as_os_str())),
+        ],
+    );
+    let argv = [
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "kt".to_string(),
+        package.join("src/lib.rs").display().to_string(),
+        "--out-dir".to_string(),
+        target.join("debug/deps").display().to_string(),
+    ];
+    let args = RustcArgs::parse_for(&argv, &env).unwrap();
+    (package, out, env, args)
+}
+
+/// A registry unit that reads its `OUT_DIR` gets a relocated row that
+/// another Cargo home over the same registry reads, with the registry paths
+/// placed under that home's registry and `OUT_DIR` under its own target.
+/// Without it, every pool member with a home of its own paid the dep-info
+/// pre-pass for such units, even on a hit.
+#[test]
+fn a_registry_units_relocated_row_serves_another_cargo_home() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path();
+    let (one, out_one, env_one, args_one) = home_out_dir_unit(base, "h1", "a");
+    let (two, out_two, env_two, args_two) = home_out_dir_unit(base, "h2", "b");
+    assert_ne!(
+        relocatable_prediction_identity(&args_one, env_one.vars_os().collect()),
+        relocatable_prediction_identity(&args_two, env_two.vars_os().collect()),
+        "the relocated identity folds the home"
+    );
+    let closure = |package: &Path, out: &Path| DepInfo {
+        source_files: vec![package.join("src/lib.rs"), out.join("gen.rs")],
+        env_deps: vec![
+            ("OUT_DIR".to_string(), Some(out.display().to_string())),
+            (
+                "CARGO_MANIFEST_DIR".to_string(),
+                Some(package.display().to_string()),
+            ),
+        ],
+    };
+    let db = base.join("index.db");
+    let hasher = |env: &InvocationEnv| {
+        FileHasher::persistent(&db)
+            .with_invocation_env(env)
+            .with_input_predictions(true)
+    };
+    let guard = out_dir_tree_digest(&out_one, &hasher(&env_one)).unwrap();
+    assert_eq!(
+        out_dir_tree_digest(&out_two, &hasher(&env_two)).as_deref(),
+        Some(guard.as_str()),
+        "the same generated files under both targets"
+    );
+
+    // Home one files both rows, as the wrapper does after its compile.
+    let (identity, record) =
+        relocatable_record_in(&args_one, &closure(&one, &out_one), Some(&guard), env_one.vars_os().collect())
+            .unwrap();
+    hasher(&env_one).record_portable_prediction(&identity, Some("kt"), &record);
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None),
+        Err(Rejection::NoRecord),
+        "home one's own relocated row names home one's registry"
+    );
+    let (home_free, record) = registry_relocatable_record_in(
+        &args_one,
+        &closure(&one, &out_one),
+        Some(&guard),
+        env_one.vars_os().collect(),
+    )
+    .expect("a closure in the registry and OUT_DIR is filed home-free");
+    assert!(home_free.starts_with("shared-registry-out-dir-v1:"));
+    assert_eq!(
+        registry_relocatable_identity(&args_two, env_two.vars_os().collect()),
+        Some(home_free.clone())
+    );
+    assert!(
+        !serde_json::to_string(&record).unwrap().contains(&*base.to_string_lossy()),
+        "no home's or target's path in the filed row: {record:?}"
+    );
+    hasher(&env_one).record_portable_prediction(&home_free, Some("kt"), &record);
+
+    let mut tree = None;
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut tree),
+        Ok(closure(&two, &out_two)),
+        "home two's own spelling of the closure"
+    );
+    assert_eq!(tree.map(|guard| guard.digest), Some(guard.clone()));
+
+    // Checked on this home's disk under this target's guard.
+    write_file(&out_two.join("extra.rs"), "");
+    assert_eq!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None),
+        Err(Rejection::NoRecord),
+        "another OUT_DIR guard finds no row"
+    );
+    std::fs::remove_file(out_two.join("extra.rs")).unwrap();
+    std::fs::remove_file(two.join("src/lib.rs")).unwrap();
+    assert!(
+        predicted_key_inputs(&args_two, &hasher(&env_two), &mut None).is_err(),
+        "a row naming a file missing from this home's package is refused"
+    );
+
+    // A closure naming another absolute path is never filed home-free.
+    let mut outside = closure(&one, &out_one);
+    outside
+        .env_deps
+        .push(("ELSEWHERE".to_string(), Some(base.join("w").display().to_string())));
+    assert_eq!(
+        registry_relocatable_record_in(
+            &args_one,
+            &outside,
+            Some(&guard),
+            env_one.vars_os().collect()
+        ),
+        None
+    );
+}
+
 #[test]
 fn an_out_dir_suffix_is_the_bytes_after_the_directory() {
     let suffix =
@@ -5941,6 +6209,7 @@ fn workspace_test_roots() -> WorkspaceRoots {
         canonical_target: PathBuf::from("/private/w/target"),
         out_dir: Some(PathBuf::from("/w/target/debug/build/kt-1/out")),
         vendored_package: None,
+        scoped_package: None,
     }
 }
 
@@ -6016,6 +6285,8 @@ fn rlib_only_member(base: &Path) -> (PathBuf, RustcArgs) {
 /// another checkout.
 #[test]
 fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
     let _lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
@@ -6138,6 +6409,8 @@ fn an_rlib_only_member_is_predicted_only_under_the_workspace_guard() {
 /// may have changed while the owner compiled.
 #[test]
 fn a_flight_waiter_digests_the_tree_again() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
     let _lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
@@ -6167,6 +6440,7 @@ fn a_flight_waiter_digests_the_tree_again() {
     let mut tree = Some(TreeGuard {
         digest: "before".to_string(),
         walks: Vec::new(),
+        taken: stamp_clock_ns(),
     });
     assert_eq!(
         predicted_key_inputs(&args, &hasher, &mut tree),
@@ -6343,6 +6617,8 @@ fn external_targets_keep_predictions_anchored_to_the_source_workspace() {
 
 #[test]
 fn external_target_predictions_guard_sources_and_generated_inputs() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
     let dir = tempfile::tempdir().unwrap();
     let (root, mut args) = workspace_invocation(dir.path(), "source", "kt");
     let target = dir.path().join("output/target");
@@ -6696,6 +6972,7 @@ fn the_guard_sees_only_the_files_its_walk_reaches() {
         target: root.join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        scoped_package: None,
     };
     let covers = |sources: &[PathBuf]| guard_covers(sources, &roots);
     let relative = PathBuf::from;
@@ -6833,6 +7110,7 @@ fn the_workspace_guard_covers_everything_but_target_and_git() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/kt-1/out")),
         vendored_package: None,
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let digest = || workspace_tree_digest(&roots, &hasher).unwrap();
@@ -6887,6 +7165,7 @@ fn a_cargo_build_dir_in_the_workspace_counts_by_its_tag() {
         canonical_target: dir.path().join("target"),
         out_dir: Some(out.clone()),
         vendored_package: None,
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let digest = |budget| workspace_tree_digest_within(&roots, &hasher, budget);
@@ -6930,6 +7209,7 @@ fn a_vendored_package_is_guarded_by_itself_not_the_workspace() {
         canonical_target: root.join("target").canonicalize().unwrap(),
         out_dir: Some(root.join("target/debug/build/foo-1/out")),
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let digest = |roots: &WorkspaceRoots| workspace_tree_digest(roots, &hasher).unwrap();
@@ -7005,6 +7285,7 @@ fn a_vendored_guard_moves_with_a_file_at_the_top_of_an_ancestor() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     };
     // Old times, so a name added beside the package moves them on any clock.
     let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
@@ -7048,6 +7329,7 @@ fn vendored_workspace(root: &Path) -> WorkspaceRoots {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     }
 }
 
@@ -7159,6 +7441,7 @@ fn a_vendored_guard_counts_an_unreadable_ancestor_file_as_unreadable() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: Some(root.join("third_party/rust/foo")),
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     let readable = workspace_tree_digest(&roots, &hasher).unwrap();
@@ -7267,6 +7550,7 @@ fn the_workspace_guard_gives_up_past_its_entry_budget() {
         canonical_target: root.join("target"),
         out_dir: None,
         vendored_package: None,
+        scoped_package: None,
     };
     let hasher = FileHasher::new();
     // Three files; `target` is skipped before it is counted.
@@ -7440,7 +7724,7 @@ fn a_relocated_record_is_checked_against_this_out_dir_and_guard() {
     let check = |guard: &str, env_out_dir: &str| {
         validate_portable_prediction(
             &record,
-            guard,
+            &|_| Some(guard.to_string()),
             &Places {
                 out_dir: Some("/u/out"),
                 workspace: None,
@@ -7627,7 +7911,7 @@ fn a_portable_prediction_round_trips_and_no_other_decoder_reads_it() {
     assert_eq!(hasher.portable_prediction("unit"), None);
     hasher.record_portable_prediction("unit", Some("kt"), &record);
     assert_eq!(
-        FileHasher::persistent(&db).portable_prediction("unit"),
+        FileHasher::persistent(&db).portable_prediction_under("unit", &record.tree),
         Some(record)
     );
     assert_eq!(hasher.input_prediction("unit"), None);
@@ -8069,6 +8353,111 @@ fn input_prediction_round_trips_through_the_database() {
     assert_eq!(record.tree.as_deref(), Some("tree-digest"));
 }
 
+/// Checkouts at different commits each keep their own portable row of a
+/// unit: a record made under another tree no longer replaces the row the
+/// next build under the first tree needs (GC19: 82 % of the real store's
+/// `tree-changed` hits restored a key only other checkouts had built, most
+/// of them at a commit with the same package). A row an older kache filed
+/// under the identity alone still answers when this tree has none, and a
+/// unit keeps at most [`TREE_ROWS_KEPT`] trees.
+#[test]
+fn a_portable_row_of_another_tree_leaves_this_trees_row_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    let row = |tree: &str, file: &str| PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources: vec![Portable::Workspace(file.to_string())],
+        env_deps: Vec::new(),
+        tree: tree.to_string(),
+    };
+    let tree_of = |hasher: &FileHasher<'_>, guard: &str| {
+        hasher
+            .portable_prediction_under("unit", guard)
+            .map(|record| record.tree)
+    };
+    let hasher = FileHasher::persistent(&db);
+    hasher.record_portable_prediction(
+        "unit",
+        Some("demo"),
+        &row("scoped-v1:aaa+dirs:d1", "a/src/lib.rs"),
+    );
+    hasher.record_portable_prediction(
+        "unit",
+        Some("demo"),
+        &row("scoped-v1:bbb+dirs:d2", "a/src/lib.rs"),
+    );
+    let reader = FileHasher::persistent(&db);
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:aaa").as_deref(),
+        Some("scoped-v1:aaa+dirs:d1"),
+        "the first tree's row must survive a record made under another tree"
+    );
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:bbb").as_deref(),
+        Some("scoped-v1:bbb+dirs:d2")
+    );
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:ccc"),
+        None,
+        "a tree nobody recorded has no row"
+    );
+
+    // An older kache's row, under the identity alone, answers for any tree:
+    // the caller validates it, its tree included, as before.
+    let old = serde_json::to_string(&row("scoped-v1:old", "a/src/lib.rs")).unwrap();
+    reader
+        .cache
+        .as_ref()
+        .unwrap()
+        .put_input_prediction("unit", PORTABLE_PREDICTION_SCHEMA, None, &old)
+        .unwrap();
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:ccc").as_deref(),
+        Some("scoped-v1:old")
+    );
+    assert_eq!(
+        tree_of(&reader, "scoped-v1:aaa").as_deref(),
+        Some("scoped-v1:aaa+dirs:d1")
+    );
+
+    // A registry unit's relocated row keys by its whole guard.
+    hasher.record_portable_prediction("other", None, &row("0123abcd", "x.rs"));
+    assert_eq!(
+        reader
+            .portable_prediction_under("other", "0123abcd")
+            .map(|record| record.tree)
+            .as_deref(),
+        Some("0123abcd")
+    );
+
+    // Bounded: the unit's rows for the trees used least recently go.
+    for n in 0..TREE_ROWS_KEPT + 4 {
+        hasher.record_portable_prediction(
+            "many",
+            None,
+            &row(&format!("scoped-v1:t{n:02}+dirs:x"), "a/src/lib.rs"),
+        );
+    }
+    let kept: Vec<_> = (0..TREE_ROWS_KEPT + 4)
+        .filter(|n| {
+            reader
+                .portable_prediction_under("many", &format!("scoped-v1:t{n:02}"))
+                .is_some()
+        })
+        .collect();
+    assert_eq!(kept.len(), TREE_ROWS_KEPT, "{kept:?}");
+    assert!(
+        kept.contains(&(TREE_ROWS_KEPT + 3)),
+        "the row just written stays: {kept:?}"
+    );
+    // Other units' rows are not touched by the bound.
+    assert!(
+        reader
+            .portable_prediction_under("unit", "scoped-v1:bbb")
+            .is_some()
+    );
+}
+
 /// The tree guard: a record for a proc-macro-dependent unit is only usable
 /// while the crate's files are exactly what they were, wherever the tree
 /// lives.
@@ -8362,6 +8751,64 @@ fn env_text_key_bytes_preserves_utf8_and_distinguishes_invalid() {
     }
 }
 
+/// A rustc invocation computes a tool's fingerprint once; every other caller
+/// keeps computing it per read, so a long-lived one still sees a toolchain
+/// update, and so does the daemon's next invocation on the same thread.
+#[test]
+fn a_rustc_invocation_computes_a_tool_fingerprint_once() {
+    std::thread::spawn(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("rustc-probe");
+        std::fs::write(&binary, b"not really rustc").unwrap();
+        let computed = || TOOL_FINGERPRINTS_COMPUTED.with(std::cell::Cell::get);
+        let env = InvocationEnv::capture();
+
+        // No scope: turning the memo on does nothing.
+        memoize_tool_fingerprints();
+        let before = computed();
+        let fresh = tool_fingerprint_hash(&binary, &env).unwrap();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        assert_eq!(computed() - before, 2, "without the memo every lookup computes");
+
+        {
+            let _invocation = InvocationKeyScope::enter();
+            // A scope alone does not remember: only a rustc wrapper asks.
+            let before = computed();
+            let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+            let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+            assert_eq!(computed() - before, 2);
+
+            memoize_tool_fingerprints();
+            let before = computed();
+            let first = tool_fingerprint_hash(&binary, &env).unwrap();
+            let second = tool_fingerprint_hash(&binary, &env).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(first, fresh, "the memo gives what a fresh computation gives");
+            assert_eq!(computed() - before, 1, "the second lookup is remembered");
+
+            // Another binary is its own entry.
+            let other = dir.path().join("other-rustc");
+            std::fs::write(&other, b"another").unwrap();
+            let before = computed();
+            let _ = tool_fingerprint_hash(&other, &env).unwrap();
+            assert_eq!(computed() - before, 1);
+        }
+
+        // The next invocation on this thread starts without the memo.
+        let _next = InvocationKeyScope::enter();
+        let before = computed();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        assert_eq!(computed() - before, 1);
+        memoize_tool_fingerprints();
+        let before = computed();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        let _ = tool_fingerprint_hash(&binary, &env).unwrap();
+        assert_eq!(computed() - before, 1, "and remembers nothing of the last one");
+    })
+    .join()
+    .unwrap();
+}
+
 /// The write persists where the read looks, creating the cache directory
 /// on a fresh machine. Skipped where that directory cannot be created
 /// (a sandboxed build with no writable home).
@@ -8408,7 +8855,7 @@ fn cwd_remap_probe_kills_timeouts_and_retries_without_a_cached_rejection() {
             "--nocapture",
         ])
         .env("HOME", dir.path())
-        .env("XDG_CACHE_HOME", dir.path())
+        .env("KACHE_TEST_USER_CACHE_DIR", dir.path())
         .env("KACHE_TEST_CWD_REMAP_ROOT", dir.path())
         .output()
         .expect("spawn isolated cwd-remap probe fixture");
@@ -9900,11 +10347,18 @@ fn hash_static_lib_ignores_legacy_namespaces() {
         path: format!("static-ar-v7\0{}", fingerprint.path),
         ..fingerprint.clone()
     };
-    let current_key = FileFingerprint {
+    let legacy_v8_key = FileFingerprint {
         path: format!("static-ar-v8\0{}", fingerprint.path),
+        ..fingerprint.clone()
+    };
+    let current_key = FileFingerprint {
+        path: format!("static-ar-v10-linked\0{}", fingerprint.path),
         ..fingerprint
     };
     let cache = fh.cache.as_ref().expect("persistent cache opens");
+    cache
+        .put(&legacy_v8_key, "legacy-path-bound-coff-sentinel")
+        .unwrap();
     cache
         .put(&legacy_key, "legacy-whole-file-sentinel")
         .unwrap();
@@ -9935,6 +10389,7 @@ fn hash_static_lib_ignores_legacy_namespaces() {
     assert_ne!(computed, "legacy-path-bound-dwarf-sentinel");
     assert_ne!(computed, "legacy-path-bound-blank-longname-sentinel");
     assert_ne!(computed, "legacy-path-bound-bsd-elf-sentinel");
+    assert_ne!(computed, "legacy-path-bound-coff-sentinel");
     fh.flush_memo_as_if_settled();
     assert_eq!(cache.get(&current_key).unwrap(), Some(computed.clone()));
     assert_eq!(fh.hash_static_lib(&lib).unwrap(), computed);
@@ -10090,6 +10545,67 @@ fn linked_archive_use_follows_output_and_oso_root() {
     assert_eq!(use_of("bin", false, under, None), StaticLibUse::Linked);
 }
 
+/// A link that strips debug information on Linux reads its archives without
+/// their debug sections; one that keeps debug information, or links for
+/// another target, still reads them whole.
+#[test]
+fn a_link_that_strips_debug_info_keys_its_archives_without_it() {
+    let archive = Path::new("/opt/lib/libring.a");
+    let use_of = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "src/main.rs", "--crate-type", "bin"];
+        argv.extend_from_slice(extra);
+        let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+        linked_archive_use(&RustcArgs::parse(&argv).unwrap(), archive, None)
+    };
+    let linux = ["--target", "x86_64-unknown-linux-gnu"];
+    let with = |more: &[&'static str]| [&linux[..], more].concat();
+    assert_eq!(use_of(&with(&["-C", "strip=debuginfo"])), StaticLibUse::StrippedLink);
+    assert_eq!(use_of(&with(&["-C", "strip=symbols"])), StaticLibUse::StrippedLink);
+    assert_eq!(use_of(&with(&["-C", "strip=none"])), StaticLibUse::Linked);
+    assert_eq!(use_of(&linux), StaticLibUse::Linked, "no strip");
+    assert_eq!(
+        use_of(&with(&["-C", "strip=debuginfo", "-C", "strip=none"])),
+        StaticLibUse::Linked,
+        "the last -C strip wins"
+    );
+    for target in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-illumos"] {
+        assert_eq!(
+            use_of(&["--target", target, "-C", "strip=debuginfo"]),
+            StaticLibUse::Linked,
+            "{target}"
+        );
+    }
+    let lib = RustcArgs::parse(
+        &["rustc", "src/lib.rs", "--crate-type", "rlib", "-C", "strip=debuginfo"].map(String::from),
+    )
+    .unwrap();
+    assert_eq!(linked_archive_use(&lib, archive, None), StaticLibUse::Bundled);
+
+    let dir = tempfile::tempdir().unwrap();
+    let fh = FileHasher::new();
+    let hash_in = |name: &str, bytes: &[u8], usage: StaticLibUse| {
+        let lib_dir = dir.path().join(name);
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib = lib_dir.join("libring_core.a");
+        std::fs::write(&lib, bytes).unwrap();
+        fh.hash_static_lib_for(&lib, usage).unwrap()
+    };
+    let (home_a, home_b) = crate::native_archive::two_homes_archives_for_tests();
+    let stripped = hash_in("a", &home_a, StaticLibUse::StrippedLink);
+    assert!(stripped.starts_with("gnu-ar-strip-v1:"), "{stripped}");
+    assert_eq!(stripped, hash_in("b", &home_b, StaticLibUse::StrippedLink));
+    assert_ne!(
+        hash_in("c", &home_a, StaticLibUse::Linked),
+        hash_in("d", &home_b, StaticLibUse::Linked),
+        "a link that keeps debug information reads the homes"
+    );
+    assert_ne!(
+        hash_in("e", &home_a, StaticLibUse::Bundled),
+        hash_in("f", &home_b, StaticLibUse::Bundled),
+        "an rlib bundles the archive's bytes"
+    );
+}
+
 /// A DWARF-bearing Mach-O archive shares its structural digest across
 /// checkouts only when rustc bundles it into an rlib. An invocation that
 /// links it itself writes the archive's absolute path into `N_OSO`, so
@@ -10153,8 +10669,8 @@ fn hash_static_lib_memo_rows_are_per_use() {
     let fingerprint = FileFingerprint::from_path(&lib).unwrap();
     let cache = fh.cache.as_ref().expect("persistent cache opens");
     for (namespace, expected) in [
-        ("static-ar-v8-bundled", &bundled),
-        ("static-ar-v8", &linked),
+        ("static-ar-v11-bundled", &bundled),
+        ("static-ar-v10-linked", &linked),
     ] {
         let key = FileFingerprint {
             path: format!("{namespace}\0{}", fingerprint.path),
@@ -10182,7 +10698,7 @@ fn hash_static_lib_memo_threshold_is_exclusive() {
         fh.flush_memo_as_if_settled();
         let fingerprint = FileFingerprint::from_path(&lib).unwrap();
         let key = FileFingerprint {
-            path: format!("static-ar-v8\0{}", fingerprint.path),
+            path: format!("static-ar-v10-linked\0{}", fingerprint.path),
             ..fingerprint
         };
         let expected = memoized.then_some(hash);
@@ -12038,7 +12554,6 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
         ("--error-format", "json", "human"),
         ("--json", "artifacts", "diagnostic-rendered-ansi"),
         ("--color", "always", "never"),
-        ("--diagnostic-width", "80", "120"),
     ] {
         let attached = format!("{flag}={value}");
         let first = key_of_flags(&flag_base(&source, &[&attached]));
@@ -12056,43 +12571,39 @@ fn diagnostic_flags_change_the_key_and_verbose_remains_unkeyed() {
     assert_eq!(base, key_of_flags(&flag_base(&source, &["--verbose"])));
 }
 
+/// `--diagnostic-width` only wraps printed text: a build from a terminal (Cargo
+/// passes the terminal's width) and one from a pipe (no width) share a key,
+/// in both spellings, while the format flags beside it stay keyed. A malformed
+/// or repeated width stays keyed (upstream #1708), so a cached success cannot
+/// hide the argument error rustc reports for it.
 #[test]
-fn silenced_lints_share_width_keys_but_keep_other_diagnostic_options() {
+fn diagnostic_width_leaves_the_key_alone() {
     let _lock = key_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("lib.rs");
-    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
-    for cap in [vec!["--cap-lints=allow"], vec!["--cap-lints", "allow"]] {
-        let key = |extra: &[&str]| {
-            let mut flags = cap.clone();
-            flags.extend_from_slice(extra);
-            key_of_flags(&flag_base(&source, &flags))
-        };
-        let base = key(&[]);
-        for width in ["1", "80", "120", "65535"] {
-            assert_eq!(base, key(&["--diagnostic-width", width]), "{width}");
-            assert_eq!(
-                base,
-                key(&[&format!("--diagnostic-width={width}")]),
-                "{width}"
-            );
-        }
-        for flag in ["--color=always", "--error-format=json", "--json=artifacts"] {
-            let other = key(&[flag]);
-            assert_ne!(base, other, "{flag}");
-            assert_eq!(other, key(&[flag, "--diagnostic-width=80"]), "{flag}");
-        }
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+    let json = [
+        "--error-format=json",
+        "--json=diagnostic-rendered-ansi,artifacts",
+    ];
+    let piped = key_of_flags(&flag_base(&source, &json));
+    for width in [
+        vec!["--diagnostic-width=80"],
+        vec!["--diagnostic-width", "211"],
+    ] {
+        let mut flags = json.to_vec();
+        flags.extend(width.iter().copied());
+        assert_eq!(
+            piped,
+            key_of_flags(&flag_base(&source, &flags)),
+            "{width:?}"
+        );
     }
-}
-
-#[test]
-fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
-    let _lock = key_test_lock();
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("lib.rs");
-    std::fs::write(&source, b"pub fn hello() {}\n").unwrap();
-    let key = |flags: &[&str]| key_of_flags(&flag_base(&source, flags));
-    let capped = key(&["--cap-lints=allow"]);
+    assert_ne!(
+        piped,
+        key_of_flags(&flag_base(&source, &["--diagnostic-width=80"])),
+        "the format stays keyed"
+    );
     for retained in [
         vec!["--diagnostic-width"],
         vec!["--diagnostic-width="],
@@ -12102,36 +12613,9 @@ fn diagnostic_width_keeps_unusual_arguments_and_observable_warnings_keyed() {
         vec!["--diagnostic-width=80", "--diagnostic-width=120"],
         vec!["--diagnostic-width=80", "--diagnostic-width", "120"],
     ] {
-        let mut flags = vec!["--cap-lints=allow"];
-        flags.extend_from_slice(&retained);
-        assert_ne!(capped, key(&flags), "{retained:?}");
-    }
-    for lint_flags in [
-        vec![],
-        vec!["--cap-lints=warn"],
-        vec!["--cap-lints=allow", "--cap-lints", "warn"],
-        vec!["--cap-lints", "allow", "--cap-lints=warn"],
-        vec!["--cap-lints=warn", "--cap-lints", "allow"],
-        vec!["--cap-lints", "warn", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints=allow"],
-        vec!["--cap-lints=allow", "--cap-lints"],
-        vec!["--cap-lints=allow", "--force-warn=unused"],
-        vec!["--force-warn", "unused", "--cap-lints=allow"],
-        vec!["--check-cfg", "--cap-lints=allow"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        let mut wide = lint_flags.clone();
-        wide.push("--diagnostic-width=120");
-        assert_ne!(key(&narrow), key(&wide), "{lint_flags:?}");
-    }
-    for lint_flags in [
-        vec!["--cap-lints=allow", "-W", "unused"],
-        vec!["--cap-lints=allow", "-D", "warnings"],
-    ] {
-        let mut narrow = lint_flags.clone();
-        narrow.push("--diagnostic-width=80");
-        assert_eq!(key(&lint_flags), key(&narrow), "{lint_flags:?}");
+        let mut flags = json.to_vec();
+        flags.extend(retained.iter().copied());
+        assert_ne!(piped, key_of_flags(&flag_base(&source, &flags)), "{retained:?}");
     }
 }
 
@@ -15542,7 +16026,10 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("idx.sqlite");
     let digest = "e".repeat(64);
-    let record = |file: &str, observed_later_ns: i64| {
+    // Each stamp is observed a set time after its file changed, not when the
+    // test happens to get there: on a loaded machine the write and the
+    // stat could be a whole settle window apart.
+    let record = |file: &str, observed_after_change_ns: i64| {
         let path = dir.path().join(file);
         std::fs::write(&path, "#define H 1\n").unwrap();
         let hasher = FileHasher::persistent(&db);
@@ -15553,11 +16040,11 @@ fn a_stamp_observed_before_it_settled_never_answers_a_lookup() {
                 &no_mapping,
             )
             .unwrap();
-        let changed_ns = inputs[0]
+        let changed = inputs[0]
             .fingerprint
             .mtime_ns
             .max(inputs[0].fingerprint.ctime_ns);
-        inputs[0].observed_ns = changed_ns + observed_later_ns;
+        inputs[0].observed_ns = changed + observed_after_change_ns;
         hasher.cc_preprocess_memo_record_if_unchanged(file, &digest, &inputs, &no_mapping);
         let recorded = hasher
             .cache
@@ -17018,6 +17505,7 @@ fn a_tree_guard_holds_until_its_tree_moves() {
     let unwalked = TreeGuard {
         digest: taken.digest,
         walks: Vec::new(),
+        taken: stamp_clock_ns(),
     };
     assert!(!unwalked.held(), "nothing to walk again");
 }
@@ -20347,6 +20835,686 @@ fn environment_detail_hashes_follow_the_normalized_key_inputs() {
     assert!(hashed(Vec::new()).is_empty());
 }
 
+/// Cargo hands a package's `cargo:rustc-link-arg` (winresource's
+/// `<OUT_DIR>/resource.res`) to its library too. rustc ignores it there, so
+/// a library's key must not depend on the checkout the path names; a linking
+/// unit's key still does (its link reads the file, and an rpath-style
+/// argument lands in its output).
+#[test]
+fn a_link_arg_path_keys_a_library_by_checkout_relative_spelling_only() {
+    let key = |root: &Path, crate_type: &str| {
+        let res = root.join(
+            "target/x86_64-pc-windows-msvc/debug/build/app-0123456789abcdef/out/resource.res",
+        );
+        let mut parsed = RustcArgs::parse(&[
+            "rustc".into(),
+            "--crate-name=app".into(),
+            format!("--crate-type={crate_type}"),
+            "--emit=dep-info,metadata,link".into(),
+            "--target=x86_64-pc-windows-msvc".into(),
+            "-Clink-arg=-nodefaultlib:ucrt".into(),
+            format!("-Clink-arg={}", res.display()),
+        ])
+        .unwrap();
+        parsed.source_file = None;
+        let pn = PathNormalizer::from_env(Some(root));
+        compute_cache_key(&parsed, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
+    };
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    assert_eq!(
+        key(a.path(), "lib"),
+        key(b.path(), "lib"),
+        "a library shares its key"
+    );
+    assert_ne!(
+        key(a.path(), "lib"),
+        key(a.path(), "rlib"),
+        "the crate type still counts"
+    );
+}
+
+/// embed-resource hands its compiled `.res` over as `-l dylib=<name>`
+/// (`<name>.lib` in OUT_DIR). It is not an archive, so no linker can spell
+/// `archive(member)` from it: two checkouts' identical files key alike.
+#[test]
+fn a_windows_resource_file_keys_by_its_bytes_not_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut res = super::WINDOWS_RES_MAGIC.to_vec();
+    res.extend_from_slice(&[0; 16]);
+    res.extend_from_slice(b"\x30\x00\x00\x00\x20\x00\x00\x00\xff\xff\x18\x00\xff\xff\x01\x00");
+    let [first, second] = ["a", "b"].map(|name| {
+        let out = dir.path().join(name).join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("gpui.lib");
+        std::fs::write(&lib, &res).unwrap();
+        lib
+    });
+    let fh = FileHasher::new();
+    let first_hash = fh.hash_static_lib(&first).unwrap();
+    assert!(first_hash.starts_with("res-v1:"), "{first_hash}");
+    assert_eq!(first_hash, fh.hash_static_lib(&second).unwrap());
+    res.push(0);
+    std::fs::write(&second, &res).unwrap();
+    assert_ne!(
+        first_hash,
+        FileHasher::new().hash_static_lib(&second).unwrap()
+    );
+}
+
+/// An archive the portable digest does not admit (COFF members, an MSVC
+/// `.lib` layout) keys by its bytes where rustc bundles it into an rlib,
+/// and by bytes and path where the unit links it.
+#[test]
+fn a_bundled_unportable_archive_keys_by_bytes_and_a_linked_one_by_path_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"!<arch>\n/               0           0     0     0       4         `\n\0\0\0\0/               0           0     0     0       4         `\n\0\0\0\0";
+    let [first, second] = ["a", "b"].map(|name| {
+        let out = dir.path().join(name);
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("foo.lib");
+        std::fs::write(&lib, bytes).unwrap();
+        lib
+    });
+    let bundled = |path: &Path| compute_static_lib_hash_for(path, StaticLibUse::Bundled, &crate::invocation::InvocationEnv::capture()).unwrap();
+    let linked = |path: &Path| compute_static_lib_hash_for(path, StaticLibUse::Linked, &crate::invocation::InvocationEnv::capture()).unwrap();
+    assert!(
+        bundled(&first).starts_with("bundled-ar-v1:"),
+        "{}",
+        bundled(&first)
+    );
+    assert_eq!(bundled(&first), bundled(&second));
+    assert!(linked(&first).starts_with("path-ar-v1:"));
+    assert_ne!(linked(&first), linked(&second));
+    std::fs::write(&second, [bytes.as_slice(), b"\0"].concat()).unwrap();
+    assert_ne!(bundled(&first), bundled(&second));
+}
+
+/// An archive of MSVC objects keys by its content without the directory the
+/// objects record, bundled and linked alike: a COFF link writes no path of
+/// the archive into the image, only into the PDB. Two target directories'
+/// copies of one cc-built library then key alike, so a test or binary that
+/// links it hits in both (a Windows checkout relinked every test binary).
+/// Content still counts.
+#[test]
+fn a_bundled_or_linked_msvc_archive_keys_without_its_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = include_bytes!("../coff_archive/fixtures/gen-short.lib");
+    let [first, second] = ["wc", "wd"].map(|name| {
+        let out = dir.path().join(name).join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = out.join("gen.lib");
+        std::fs::write(&lib, fixture).unwrap();
+        lib
+    });
+    let env = crate::invocation::InvocationEnv::capture();
+    let digest = |lib: &Path, usage| compute_static_lib_hash_for(lib, usage, &env).unwrap();
+    let bundled = digest(&first, StaticLibUse::Bundled);
+    assert!(bundled.starts_with("bundled-coff-v2:"), "{bundled}");
+    let linked = digest(&first, StaticLibUse::Linked);
+    assert!(linked.starts_with("linked-coff-v2:"), "{linked}");
+    assert_eq!(linked, digest(&second, StaticLibUse::Linked));
+    assert_ne!(linked, bundled, "the two uses never share a digest");
+
+    // A member's date (lib.exe stamps each member) does not count; what it
+    // defines does.
+    let mut dated = fixture.to_vec();
+    let date = 8 + 16;
+    assert_eq!(&dated[..8], b"!<arch>\n");
+    dated[date..date + 12].copy_from_slice(b"1792744814  ");
+    std::fs::write(&second, &dated).unwrap();
+    assert_eq!(digest(&second, StaticLibUse::Linked), linked);
+    let mut changed = fixture.to_vec();
+    let renamed = changed
+        .windows(9)
+        .enumerate()
+        .filter(|(_, window)| *window == b"gen_value")
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    assert!(!renamed.is_empty());
+    for at in renamed {
+        changed[at + 8] = b'f';
+    }
+    std::fs::write(&second, &changed).unwrap();
+    assert_ne!(
+        compute_static_lib_hash_for(&second, StaticLibUse::Linked, &env)
+            .unwrap_or_default(),
+        linked
+    );
+}
+
+/// The units of one Cargo invocation share the workspace walk
+/// ([`crate::session_tree`]): the digest and guard walk come out as an
+/// unshared computation gives them, a later unit of the session does not walk
+/// the workspace again, and only `OUT_DIR` is walked per unit.
+#[test]
+fn a_session_shares_the_workspace_digest_it_would_have_computed() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let _cache = crate::config::tests::set_env_for_test(
+        "KACHE_CACHE_DIR",
+        Some(dir.path().join("cache").as_os_str()),
+    );
+    let root = dir.path().join("w");
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    write_file(&root.join("assets/a.txt"), "a\n");
+    let out = root.join("target/debug/build/kt-1/out");
+    write_file(&out.join("gen.rs"), "// gen\n");
+    let roots = WorkspaceRoots {
+        root: root.clone(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target").canonicalize().unwrap(),
+        out_dir: Some(out.clone()),
+        vendored_package: None,
+        scoped_package: None,
+    };
+    let hasher = FileHasher::new();
+    let guarded = || tree_guard_of(&hasher, || workspace_tree_digest(&roots, &hasher)).unwrap();
+
+    crate::session_tree::set_test_session(None);
+    let unshared = guarded();
+    crate::session_tree::set_test_session(Some("cargo-1"));
+    let first = guarded();
+    assert_eq!(first.digest, unshared.digest);
+    assert!(first.held());
+    let sessions = dir.path().join("cache/probes/session-trees/cargo-1");
+    assert_eq!(
+        std::fs::read_dir(&sessions)
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                !name.to_string_lossy().contains('.')
+            })
+            .count(),
+        1,
+        "one answer filed for the workspace root"
+    );
+    let second = guarded();
+    assert_eq!(second.digest, unshared.digest);
+    assert!(
+        second.held(),
+        "the shared walk is the walk of the tree as it is"
+    );
+
+    // OUT_DIR is walked by every unit, in the session too.
+    write_file(&out.join("gen.rs"), "// other\n");
+    assert_ne!(guarded().digest, unshared.digest, "OUT_DIR is not shared");
+    write_file(&out.join("gen.rs"), "// gen\n");
+    crate::session_tree::set_test_session(None);
+}
+
+/// What the session gives up, and what it keeps: an edit to a workspace file
+/// outside every closure, made while one Cargo invocation runs, is not seen by
+/// that invocation's later units, but a record made from them is refused
+/// (its guard no longer holds) and the next invocation sees the edit. An edit
+/// to a file in the closure still changes the key within the session.
+#[test]
+fn edits_still_miss_under_a_shared_workspace_walk() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let _cache = crate::config::tests::set_env_for_test(
+        "KACHE_CACHE_DIR",
+        Some(base.join("cache").as_os_str()),
+    );
+    let (root, args) = workspace_invocation(&base, "w", "kt");
+    std::env::set_current_dir(&root).unwrap();
+    let lib = root.join("kt/src/lib.rs");
+    write_file(&lib, "pub fn a() {}\n");
+    write_file(&root.join("kt/assets/a.txt"), "a");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    // The arguments carry the environment and directory they were parsed in.
+    let args = reparse_for_client(&args, &InvocationEnv::capture());
+    // Old times, so the edits below show on any clock.
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for path in [&lib, &root.join("kt/assets/a.txt")] {
+        filetime::set_file_mtime(path, old).unwrap();
+    }
+    let hasher = FileHasher::persistent(&base.join("local.db")).with_input_predictions(true);
+    let closure = DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs")],
+        env_deps: Vec::new(),
+    };
+    let identity = rustc_prediction_identity(&args).unwrap();
+    let key = || {
+        compute_cache_key_with_outputs(&args, &hasher, &PathNormalizer::empty(), &KeyEnv::default())
+    };
+
+    crate::session_tree::set_test_session(Some("cargo-1"));
+    let mut tree = None;
+    let _ = predicted_key_inputs(&args, &hasher, &mut tree);
+    let guard = tree.expect("a workspace member is guarded");
+    hasher.record_input_prediction(&identity, Some("kt"), &closure, Some(guard.digest.clone()));
+    let (first, outputs) = key();
+    let first = first.unwrap();
+    assert!(outputs.used_prediction, "keyed from the record");
+
+    // A file rustc reads: the key moves within the same session.
+    write_file(&lib, "pub fn b() {}\n");
+    let (edited, outputs) = key();
+    assert!(outputs.used_prediction);
+    assert_ne!(edited.unwrap(), first, "an edited source misses");
+    write_file(&lib, "pub fn a() {}\n");
+    assert_eq!(key().0.unwrap(), first, "and hits again once put back");
+
+    // A file only a macro listing a directory could read, added mid-session.
+    write_file(&root.join("kt/assets/b.txt"), "b");
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None),
+        Ok(closure.clone()),
+        "the session keeps the walk its first unit took"
+    );
+    let mut tree = None;
+    let _ = predicted_key_inputs(&args, &hasher, &mut tree);
+    assert!(
+        !tree.unwrap().held(),
+        "a record made under the shared walk is refused"
+    );
+    // The next Cargo invocation walks again and sees it.
+    crate::session_tree::set_test_session(Some("cargo-2"));
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+    crate::session_tree::set_test_session(None);
+    assert_eq!(
+        predicted_key_inputs(&args, &hasher, &mut None),
+        Err(Rejection::TreeChanged),
+        "as without a session"
+    );
+}
+
+/// PROTOTYPE (scoped guard): rustc spells an include relative to its source
+/// with `..` left in; the closure's directory is labelled below the root the
+/// same way however the path was spelled.
+#[test]
+fn scoped_guard_labels_a_closure_directory_however_it_is_spelled() {
+    let root = Path::new("/w");
+    let spelled = lexically_normal(Path::new("/w/crates/a/src/../../../web/./media/x.js"));
+    assert_eq!(spelled, Path::new("/w/web/media/x.js"));
+    assert_eq!(
+        portable_dir_label(spelled.parent().unwrap(), root).as_deref(),
+        Some("web/media")
+    );
+    assert_eq!(portable_dir_label(root, root).as_deref(), Some(""));
+    assert_eq!(portable_dir_label(Path::new("/elsewhere/web"), root), None);
+    let relative = lexically_normal(&Path::new("/w").join("crates/a/../b/assets/i.png"));
+    assert_eq!(
+        portable_dir_label(relative.parent().unwrap(), root).as_deref(),
+        Some("crates/b/assets")
+    );
+}
+
+/// PROTOTYPE (scoped guard), Windows: either separator, and `..`, give the
+/// same `/` label, so a record made on one machine checks out on another; a
+/// verbatim spelling of the root does not match a plain one, which refuses
+/// the record rather than mislabel it.
+#[cfg(windows)]
+#[test]
+fn scoped_guard_labels_a_windows_closure_directory_with_slashes() {
+    let root = Path::new(r"C:\w");
+    for spelled in [
+        r"C:\w\crates\a\src\..\..\..\web\media\x.js",
+        r"C:\w/crates/a/src/../../../web\media/x.js",
+        r"C:\w\web\.\media\x.js",
+    ] {
+        let normal = lexically_normal(Path::new(spelled));
+        assert_eq!(
+            portable_dir_label(normal.parent().unwrap(), root).as_deref(),
+            Some("web/media"),
+            "{spelled}"
+        );
+    }
+    let verbatim = lexically_normal(Path::new(r"\\?\C:\w\web\x.js"));
+    assert_eq!(portable_dir_label(verbatim.parent().unwrap(), root), None);
+}
+
+/// `KACHE_GUARD_IGNORE` replaces the default list; an empty value ignores
+/// nothing; separators, spaces and slashes around an entry do not matter.
+#[test]
+fn scoped_guard_ignore_list_defaults_and_overrides() {
+    assert_eq!(
+        guard_ignore_entries(None),
+        [
+            ".agents",
+            ".github",
+            ".claude",
+            ".config",
+            "AGENTS.md",
+            "README.md",
+            "Cargo.lock",
+            ".env"
+        ]
+    );
+    assert!(guard_ignore_entries(Some("")).is_empty());
+    assert!(guard_ignore_entries(Some(" : ; ")).is_empty());
+    assert_eq!(
+        guard_ignore_entries(Some(" .agents/ ;docs:/notes.txt")),
+        [".agents", "docs", "notes.txt"]
+    );
+}
+
+/// One checkout, two target directories inside it (`target/` and
+/// `target/integrate-clippy`): a build script's `-L native=$OUT_DIR` keys by
+/// its path below the unit's own target directory, not by the directory's
+/// name. A search dir in some other target directory keeps its path.
+#[test]
+fn link_search_into_the_units_own_target_dir_ignores_its_name() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source = workspace.join("lib.rs");
+    std::fs::write(&source, b"pub fn hello() {}").unwrap();
+
+    let key_in = |target: &Path, native_in: &Path| {
+        let target = target.to_string_lossy();
+        let out_dir = format!("{target}/debug/deps");
+        let native = format!(
+            "native={}/debug/build/foo-sys-fedcba9876543210/out",
+            native_in.to_string_lossy()
+        );
+        let argv: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "mylib",
+            &source.to_string_lossy(),
+            "--crate-type",
+            "lib",
+            "--out-dir",
+            &out_dir,
+            "-L",
+            &format!("dependency={target}/debug/deps"),
+            "-L",
+            &native,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let args = RustcArgs::parse(&argv).unwrap();
+        let pn = PathNormalizer::from_env(Some(&workspace))
+            .with_target_dir(args.target_dir().as_deref());
+        compute_cache_key(&args, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
+    };
+
+    let plain = workspace.join("target");
+    let clippy = workspace.join("target/integrate-clippy");
+    assert_eq!(key_in(&plain, &plain), key_in(&clippy, &clippy));
+    assert_ne!(
+        key_in(&plain, &workspace.join("target/a")),
+        key_in(&plain, &workspace.join("target/b")),
+        "a search dir outside the unit's target dir keeps its path"
+    );
+    let other = |sub: &str| {
+        let argv = [
+            "rustc".to_string(),
+            "--crate-name".to_string(),
+            "mylib".to_string(),
+            source.to_string_lossy().to_string(),
+            "--crate-type".to_string(),
+            "lib".to_string(),
+            "--out-dir".to_string(),
+            plain.join("debug/deps").to_string_lossy().to_string(),
+            "-L".to_string(),
+            format!("native={}", plain.join(sub).to_string_lossy()),
+        ];
+        let args = RustcArgs::parse(&argv).unwrap();
+        let pn = PathNormalizer::from_env(Some(&workspace))
+            .with_target_dir(args.target_dir().as_deref());
+        compute_cache_key(&args, &FileHasher::new(), &pn, &KeyEnv::default()).unwrap()
+    };
+    assert_ne!(
+        other("debug/build/x/out"),
+        other("debug/build/y/out"),
+        "different dirs below the target dir key apart"
+    );
+}
+
+/// A source the unit's build script generated (`include!` from OUT_DIR) is
+/// keyed by its path below OUT_DIR and Cargo's unit dir, so one unit in two
+/// target directories of one checkout shares a key; its bytes and its unit
+/// hash still key it apart.
+#[test]
+fn out_dir_sources_key_by_their_unit_not_the_target_dir() {
+    let _lock = key_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source = workspace.join("lib.rs");
+    std::fs::write(
+        &source,
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));",
+    )
+    .unwrap();
+    let args = RustcArgs::parse(&[
+        "rustc".to_string(),
+        "--crate-name".to_string(),
+        "mylib".to_string(),
+        source.to_str().unwrap().to_string(),
+    ])
+    .unwrap();
+
+    let key = |target: &str, unit: &str, generated: &str| {
+        let out_dir = workspace
+            .join(target)
+            .join("debug/build")
+            .join(unit)
+            .join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let gen_rs = out_dir.join("gen.rs");
+        std::fs::write(&gen_rs, generated).unwrap();
+        provide_dep_info(
+            DepInfo {
+                source_files: vec![source.clone(), gen_rs],
+                env_deps: vec![(
+                    "OUT_DIR".into(),
+                    Some(out_dir.to_str().unwrap().to_string()),
+                )],
+            },
+            None,
+        );
+        let env = KeyEnv::from_parts([("OUT_DIR", out_dir.as_path())], Some(workspace.clone()));
+        let (key, _) = compute_cache_key_with_outputs(
+            &args,
+            &FileHasher::new(),
+            &PathNormalizer::from_env(Some(&workspace)),
+            &env,
+        );
+        key.unwrap()
+    };
+
+    let unit = "mylib-0123456789abcdef";
+    let a = key("target", unit, "pub fn g() {}");
+    assert_eq!(a, key("target/integrate-clippy", unit, "pub fn g() {}"));
+    assert_ne!(
+        a,
+        key("target/integrate-clippy", unit, "pub fn h() {}"),
+        "other bytes"
+    );
+    assert_ne!(
+        a,
+        key("target", "mylib-fedcba9876543210", "pub fn g() {}"),
+        "another unit"
+    );
+}
+
+#[test]
+fn out_dir_source_identity_needs_a_file_below_an_absolute_out_dir() {
+    let out = if cfg!(windows) {
+        "C:/t/debug/build/p-1/out"
+    } else {
+        "/t/debug/build/p-1/out"
+    };
+    let id = |file: &str, out_dir: Option<&str>| {
+        out_dir_source_identity(Path::new(file), out_dir.map(OsStr::new))
+            .map(|v| String::from_utf8(v).unwrap())
+    };
+    assert_eq!(
+        id(&format!("{out}/a/b.rs"), Some(out)).as_deref(),
+        Some("<OUT_DIR:p-1>/a/b.rs")
+    );
+    assert_eq!(id(&format!("{out}/a/b.rs"), None), None);
+    assert_eq!(id(out, Some(out)), None, "OUT_DIR itself is no source");
+    assert_eq!(id("/elsewhere/b.rs", Some(out)), None);
+    assert_eq!(
+        id("rel/out/b.rs", Some("rel/out")),
+        None,
+        "a relative OUT_DIR"
+    );
+    assert_eq!(
+        id(&format!("{out}/../x.rs"), Some(out)),
+        None,
+        "leaves OUT_DIR"
+    );
+    assert_eq!(id("/out/b.rs", Some("/out")), None, "no unit dir");
+}
+
+/// Cargo re-dates a check unit's outputs once the unit ends, which leaves a
+/// fresh stamp nobody may memoise until it settles. A read of bytes kache
+/// itself restored there under the re-date rule is memoised at once, so the
+/// next dependent is served; a read of other bytes is not.
+#[test]
+fn a_read_of_a_redated_output_is_memoised_before_it_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let write = |name: &str, byte: u8| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, vec![byte; MIN_PERSISTED_HASH_BYTES as usize]).unwrap();
+        path
+    };
+    let redated_row = |path: &Path, hash: &str| {
+        // As kache records it: the same mtime, the ctime before Cargo's call.
+        let mut recorded = FileFingerprint::from_path(path).unwrap();
+        recorded.ctime_ns -= 1;
+        FileHashCache::open(&db).unwrap().put_redated(&recorded, hash).unwrap();
+    };
+    let lookups_read = |path: &Path| {
+        let hasher = FileHasher::persistent(&db);
+        hasher.hash(path).unwrap();
+        hasher.stats().cache_misses
+    };
+
+    let kept = write("libkept.rmeta", 1);
+    let kept_hash = hash_file(&kept).unwrap();
+    redated_row(&kept, &kept_hash);
+    let first = FileHasher::persistent(&db);
+    assert_eq!(first.hash(&kept).unwrap(), kept_hash);
+    assert_eq!(first.stats().cache_misses, 1, "the first reader reads");
+    first.flush_memo();
+    assert_eq!(lookups_read(&kept), 0, "the next one is served");
+
+    let other = write("libother.rmeta", 2);
+    redated_row(&other, &kept_hash);
+    let first = FileHasher::persistent(&db);
+    first.hash(&other).unwrap();
+    first.flush_memo();
+    assert_eq!(lookups_read(&other), 1, "bytes kache did not record stay unmemoised");
+}
+
+/// N6: this checkout's row made under another tree (another commit checked
+/// out here, as agents' pool worktrees do) no longer ends the lookup. The
+/// shared row and another checkout's row are tried as if it were absent,
+/// under the same guard; only when none fits does the unit take the
+/// pre-pass, still reported as `tree-changed`. It used to take the pre-pass
+/// whenever its own row was stale (99 % of the hit pre-pass on the real
+/// store, 2026-10-19).
+#[test]
+fn a_stale_local_row_gives_way_to_a_row_made_under_this_tree() {
+    // Pins the whole-workspace guard (KACHE_WORKSPACE_GUARD=workspace).
+    let _guard = WorkspaceGuardForTest::whole_workspace();
+    let mut lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = lock.enter();
+    let (root, args) = rlib_only_member(&base);
+    std::env::set_current_dir(&root).unwrap();
+    write_file(&root.join("kt/src/lib.rs"), "facade::scan!();\n");
+    write_file(&root.join("kt/assets/a.txt"), "a");
+    let manifest_dir = root.join("kt");
+    let _manifest = crate::config::tests::set_env_for_test(
+        "CARGO_MANIFEST_DIR",
+        Some(manifest_dir.as_os_str()),
+    );
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    // The arguments carry the environment and directory they were parsed in.
+    let args = reparse_for_client(&args, &InvocationEnv::capture());
+    let hasher = |name: &str| FileHasher::persistent(&base.join(name)).with_input_predictions(true);
+    let inside = DepInfo {
+        source_files: vec![PathBuf::from("kt/src/lib.rs"), root.join("kt/assets/a.txt")],
+        env_deps: Vec::new(),
+    };
+    let identity = rustc_prediction_identity(&args).unwrap();
+    let mut tree = None;
+    let _ = predicted_key_inputs(&args, &hasher("probe.db"), &mut tree);
+    let guard = tree.expect("an rlib-only member is digested").digest;
+
+    // Nothing else recorded: the stale row still means the pre-pass.
+    let alone = hasher("alone.db");
+    alone.record_input_prediction(&identity, Some("kt"), &inside, Some("older-tree".into()));
+    assert_eq!(
+        predicted_key_inputs(&args, &alone, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+
+    // The shared row, made under this tree in another target directory.
+    let shared_rows = hasher("shared.db");
+    shared_rows.record_input_prediction(&identity, Some("kt"), &inside, Some("older-tree".into()));
+    let shared = rustc_shared_prediction_identity(&args).unwrap();
+    shared_rows.record_input_prediction(&shared, Some("kt"), &inside, Some(guard.clone()));
+    assert_eq!(
+        predicted_key_inputs(&args, &shared_rows, &mut None),
+        Ok(inside.clone())
+    );
+
+    // Another checkout's row, made under this tree; one made under another
+    // tree is refused like this checkout's.
+    let portable_rows = hasher("portable.db");
+    portable_rows.record_input_prediction(&identity, Some("kt"), &inside, Some("older-tree".into()));
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let roots = workspace_roots(&args, &vars).unwrap();
+    let portable = workspace_prediction_identity(&args, vars, &roots).unwrap();
+    let record = |tree: &str| PortablePrediction {
+        schema: PORTABLE_PREDICTION_SCHEMA,
+        sources: vec![
+            Portable::Literal("kt/src/lib.rs".to_string()),
+            Portable::Workspace("/kt/assets/a.txt".to_string()),
+        ],
+        env_deps: Vec::new(),
+        tree: tree.to_string(),
+    };
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record("another-tree"));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Err(Rejection::TreeChanged)
+    );
+    portable_rows.record_portable_prediction(&portable, Some("kt"), &record(&guard));
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Ok(inside.clone())
+    );
+
+    // The tree changes again: every row is stale, the pre-pass runs.
+    write_file(&root.join("kt/assets/b.txt"), "b");
+    assert_eq!(
+        predicted_key_inputs(&args, &portable_rows, &mut None),
+        Err(Rejection::TreeChanged),
+        "a file joins the directory a macro lists"
+    );
+}
+
 /// assert_cmd's shape: an exported macro reads `CARGO_BIN_EXE_<bin>`, and the
 /// crate includes `$OUT_DIR/current_target.txt`. Prefix exclusions remain
 /// conditional until the whole crate's visible concat! bindings are checked.
@@ -20573,6 +21741,167 @@ fn conditional_include_proof_still_requires_a_rust_source() {
             "{name}"
         );
     }
+}
+
+/// A workspace at `root` with the member `crates/kt`, and the roots of a
+/// unit of it under the scoped (or inputs) guard.
+fn member_workspace(root: &Path) -> WorkspaceRoots {
+    write_file(&root.join("Cargo.toml"), "[workspace]\n");
+    write_file(&root.join("crates/kt/Cargo.toml"), "[package]\n");
+    write_file(&root.join("crates/kt/src/lib.rs"), "pub mod a;\n");
+    write_file(&root.join("crates/kt/src/a.rs"), "pub mod b;\n");
+    write_file(&root.join("crates/kt/src/a/b.rs"), "");
+    write_file(&root.join("crates/kt/tests/t.rs"), "");
+    write_file(&root.join("crates/kt/benches/b.rs"), "");
+    WorkspaceRoots {
+        root: root.to_path_buf(),
+        cwd: String::new(),
+        canonical_root: root.canonicalize().unwrap(),
+        target: root.join("target"),
+        canonical_target: root.join("target"),
+        out_dir: None,
+        vendored_package: None,
+        scoped_package: Some(root.join("crates/kt")),
+    }
+}
+
+/// The inputs guard leaves the package's other directories out and names
+/// the closure's own, with every directory up to the package: an edit or a
+/// new file in `tests/` keeps the guard a record of the lib must carry, and
+/// a new name beside a module file, or a new module directory, moves it.
+/// The scoped guard moves on all of them.
+#[test]
+fn the_inputs_guard_names_the_closures_directories_in_the_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = member_workspace(&root);
+    let sources = [
+        PathBuf::from("crates/kt/src/lib.rs"),
+        PathBuf::from("crates/kt/src/a.rs"),
+        PathBuf::from("crates/kt/src/a/b.rs"),
+    ];
+    let hasher = FileHasher::new();
+    let guard = |inputs: bool| {
+        let _mode = if inputs {
+            WorkspaceGuardForTest::inputs()
+        } else {
+            WorkspaceGuardForTest::scoped()
+        };
+        let tree = workspace_tree_digest(&roots, &hasher).unwrap();
+        assert_eq!(tree.starts_with(INPUTS_GUARD_TAG), inputs);
+        expected_tree(&tree, &sources, Some(&roots)).unwrap()
+    };
+    let (inputs, scoped) = (guard(true), guard(false));
+    assert_ne!(inputs, scoped);
+
+    write_file(&root.join("crates/kt/tests/t.rs"), "#[test]\nfn t() {}\n");
+    write_file(&root.join("crates/kt/tests/new.rs"), "");
+    write_file(&root.join("crates/kt/benches/b.rs"), "fn main() {}\n");
+    assert_eq!(guard(true), inputs, "tests/ and benches/ are not read");
+    assert_ne!(guard(false), scoped, "the scoped guard digests them");
+
+    for (what, path) in [
+        ("a module file beside a.rs", "crates/kt/src/c.rs"),
+        ("a module directory beside b.rs", "crates/kt/src/a/b/mod.rs"),
+        ("a file at the top of the package", "crates/kt/macro.cfg"),
+    ] {
+        let before = guard(true);
+        write_file(&root.join(path), "");
+        assert_ne!(guard(true), before, "{what}");
+    }
+    let before = guard(true);
+    write_file(&root.join("crates/kt/macro.cfg"), "edited");
+    assert_ne!(guard(true), before, "a top file counts by content");
+}
+
+/// The inputs guard tells which directories beside the closure's hold no
+/// file, at any depth: the first file in one moves the guard, as a new
+/// directory's name does, while a file added where files are already
+/// (`tests/`, a directory that held one) keeps it. A record whose compile
+/// may have seen such a directory before its first file arrived is not made.
+#[test]
+fn the_inputs_guard_tells_the_directories_beside_the_closure_that_hold_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = member_workspace(&root);
+    std::fs::create_dir_all(root.join("crates/kt/assets/nested")).unwrap();
+    std::fs::create_dir_all(root.join("crates/kt/src/a/empty")).unwrap();
+    let sources = [
+        PathBuf::from("crates/kt/src/lib.rs"),
+        PathBuf::from("crates/kt/src/a.rs"),
+        PathBuf::from("crates/kt/src/a/b.rs"),
+    ];
+    let hasher = FileHasher::new();
+    let _mode = WorkspaceGuardForTest::inputs();
+    let guard = || {
+        let tree = workspace_tree_digest(&roots, &hasher).unwrap();
+        expected_tree(&tree, &sources, Some(&roots)).unwrap()
+    };
+    let package = root.join("crates/kt");
+    let since = |not_after| closure_dirs_digest(&sources, &roots, &package, not_after, true);
+
+    for (what, path, moves) in [
+        ("a file in tests/", "crates/kt/tests/new.rs", false),
+        (
+            "the first file below assets/",
+            "crates/kt/assets/nested/a.txt",
+            true,
+        ),
+        ("a second file in assets/", "crates/kt/assets/b.txt", false),
+        (
+            "the first file of a/empty/",
+            "crates/kt/src/a/empty/c.txt",
+            true,
+        ),
+    ] {
+        let before = guard();
+        let taken = stamp_clock_ns();
+        write_file(&root.join(path), "");
+        assert_eq!(guard() != before, moves, "{what}");
+        if moves {
+            assert_eq!(
+                since(Some(taken)),
+                None,
+                "{what}: arrived after the compile"
+            );
+        }
+    }
+    assert!(since(None).is_some());
+}
+
+#[test]
+fn inherited_dependency_names_read_every_dependency_table() {
+    let names = inherited_dependency_names(
+        "[package]\nname = \"m\"\n\n\
+         [dependencies]\na.workspace = true\nb = { workspace = true, features = [\"x\"] }\n\
+         c = \"1\"\nd = { workspace = false }\ne = { path = \"../e\" }\n\n\
+         [dev-dependencies]\nf = { workspace = true }\n\n\
+         [build_dependencies]\ng.workspace = true\n\n\
+         [target.'cfg(windows)'.dependencies]\nh = { workspace = true }\n\n\
+         [target.'cfg(unix)'.build-dependencies]\ni.workspace = true\n",
+    )
+    .unwrap();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert_eq!(names, ["a", "b", "f", "g", "h", "i"]);
+    assert_eq!(inherited_dependency_names("[package\n"), None);
+    assert_eq!(
+        inherited_dependency_names("[package]\nname = \"m\"\n").map(|names| names.len()),
+        Some(0)
+    );
+}
+
+#[test]
+fn root_manifest_digest_keeps_only_the_inherited_registry_entries() {
+    let names: BTreeSet<String> = ["serde".to_string()].into_iter().collect();
+    let base = "[workspace]\nmembers = [\"m\"]\n\n[workspace.dependencies]\nserde = \"1\"\n";
+    let other = format!("{base}tokio = \"1\"\n");
+    let bumped = "[workspace]\nmembers = [\"m\"]\n\n[workspace.dependencies]\nserde = \"2\"\n";
+    let digest = |text: &str, names| root_manifest_digest(text, names).unwrap();
+    assert_eq!(digest(base, Some(&names)), digest(&other, Some(&names)));
+    assert_ne!(digest(base, Some(&names)), digest(bumped, Some(&names)));
+    assert_ne!(digest(base, None), digest(&other, None));
+    // Filtered and whole digests never meet, even with nothing left out.
+    assert_ne!(digest(base, Some(&names)), digest(base, None));
 }
 
 #[test]
@@ -20831,7 +22160,8 @@ mod build_script_target_paths {
                 Some(self.workspace.clone()),
                 self.invocation.home_dir().map(Path::to_path_buf),
                 self.invocation.temp_dir().to_path_buf(),
-            );
+            )
+            .with_cache_dir(self.invocation.cache_dir().map(Path::to_path_buf));
             let mut argv = vec![
                 "rustc".into(),
                 "--crate-name=mylib".into(),
@@ -20989,11 +22319,18 @@ mod build_script_target_paths {
                     None,
                 )
             };
-            assert_distinct_link(
-                key(&a, &out_a),
-                key(&b, &out_b),
-                &format!("{kind} {crate_type} {extra:?}"),
-            );
+            // Ours drops the target folder's name from every `-L` kind under the unit's
+            // target (a search path's spelling never reaches an output; what it finds is
+            // keyed by the scans), upstream only from rlib native paths in OUT_DIR. Units
+            // whose sources keep absolute paths (trybuild, coverage) stay apart by other
+            // fields in both.
+            let (ka, kb) = (key(&a, &out_a), key(&b, &out_b));
+            let label = format!("{kind} {crate_type} {extra:?}");
+            if matches!(extra, ["--cfg=trybuild"] | ["-Cinstrument-coverage"]) {
+                assert_ne!(ka.0, kb.0, "{label}");
+            } else {
+                assert_eq!(ka.0, kb.0, "{label}: inside the unit's target folder");
+            }
         }
         let mut no_remap = unit;
         no_remap.invocation = InvocationEnv::from_parts(
@@ -21005,14 +22342,20 @@ mod build_script_target_paths {
             Some(no_remap.workspace.clone()),
             no_remap.invocation.home_dir().map(Path::to_path_buf),
             no_remap.invocation.temp_dir().to_path_buf(),
-        );
+        )
+        .with_cache_dir(no_remap.invocation.cache_dir().map(Path::to_path_buf));
         let key = |target: &Path, out: &Path| {
             no_remap.key(Some(target), Some(out), &[native(out)], "rlib", &[], None)
         };
-        assert_distinct_link(
-            key(&a, &out_a),
-            key(&b, &out_b),
-            "normalization opt-out retains search path identity",
+        // Ours: the `-L` rule does not depend on remapping (the spelling of a search
+        // path never reaches an output), so the search-path group matches; upstream keeps
+        // the name there. Unremapped units still key apart by their absolute sources.
+        let (ka, kb) = (key(&a, &out_a), key(&b, &out_b));
+        assert_ne!(ka.0, kb.0, "normalization opt-out keeps units apart");
+        assert_eq!(
+            ka.1.fields.unwrap()["link"],
+            kb.1.fields.unwrap()["link"],
+            "normalization opt-out: the -L rule still applies"
         );
     }
 
@@ -21077,12 +22420,24 @@ mod build_script_target_paths {
                 )
             });
             let [a, b] = keys;
-            assert_distinct_link(a, b, case);
+            // Ours (tasty.8): an `-L` lexically under the unit's target folder that stays
+            // inside it once resolved is keyed `<UNIT_TARGET>/...`, whatever the OUT_DIR, so
+            // one unit built into two target folders shares its entry. Upstream keeps the
+            // name outside its narrower native OUT_DIR alias. Both keep it for a path that
+            // is relative, outside the target, or escapes it (`..`, a symlink).
+            if matches!(
+                case,
+                "no-out-dir" | "relative-out-dir" | "outside-out-dir" | "parent-component" | "empty-suffix"
+            ) {
+                assert_eq!(a.0, b.0, "{case}: inside the unit's target folder");
+            } else {
+                assert_distinct_link(a, b, case);
+            }
         }
     }
 
     #[test]
-    fn generated_source_file_macro_keeps_the_compiler_visible_target_name() {
+    fn generated_sources_key_without_the_target_folder_name() {
         let _lock = key_test_lock();
         let dir = tempfile::tempdir().unwrap();
         let unit = Unit::new(dir.path());
@@ -21115,15 +22470,21 @@ mod build_script_target_paths {
                 )
             });
             let [a, b] = keys;
-            assert_ne!(
-                a.0, b.0,
-                "file!() exposes the generated source's remapped spelling"
+            // Ours (tasty.8): a source under the unit's OUT_DIR is keyed
+            // `<OUT_DIR:unit>/...` without the target folder's name, so a unit built
+            // into two target folders hits; its file!() then names the folder that
+            // stored it (upstream keeps the name instead). Coverage and trybuild units
+            // stay apart by other fields.
+            assert_eq!(
+                a.1.fields.as_ref().unwrap()["sources"],
+                b.1.fields.as_ref().unwrap()["sources"],
+                "OUT_DIR sources keyed without the target folder's name"
             );
-            assert_ne!(
-                a.1.fields.unwrap()["sources"],
-                b.1.fields.unwrap()["sources"],
-                "OUT_DIR env folding cannot hide a source-path collision"
-            );
+            if extra.is_empty() {
+                assert_eq!(a.0, b.0, "one unit in two target folders shares its key");
+            } else {
+                assert_ne!(a.0, b.0, "{extra:?} keeps units apart");
+            }
         }
     }
 
@@ -21156,6 +22517,39 @@ mod build_script_target_paths {
             b,
             "only resolved directories covered by the archive scan can alias",
         );
+    }
+
+    /// Ours drops the target folder's name from any `-L` under the unit's
+    /// target, but not from one that leaves it through a symlink: the files it
+    /// names are no scan's and can differ per target folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_search_path_that_symlinks_out_of_the_target_keeps_its_name() {
+        let _lock = key_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let unit = Unit::new(dir.path());
+        for (kind, crate_type) in [("all=", "rlib"), ("native=", "staticlib"), ("", "bin")] {
+            let keys = ["target-a", "target-b"].map(|name| {
+                let target = unit.workspace.join(name);
+                let external = unit.workspace.join(format!("external-{name}-{crate_type}"));
+                std::fs::create_dir_all(&external).unwrap();
+                std::fs::write(external.join("libfoo.a"), gnu_ar_one_object(name.as_bytes())).unwrap();
+                let inside = target.join("debug/deps");
+                std::fs::create_dir_all(&inside).unwrap();
+                let alias = inside.join(format!("escape-{crate_type}"));
+                std::os::unix::fs::symlink(&external, &alias).unwrap();
+                let out = Unit::out_dir(&target);
+                let search = [format!("{kind}{}", alias.display())];
+                let inside_only = [format!("{kind}{}", inside.display())];
+                (
+                    unit.key(Some(&target), Some(&out), &search, crate_type, &[], None),
+                    unit.key(Some(&target), Some(&out), &inside_only, crate_type, &[], None),
+                )
+            });
+            let [(escape_a, inside_a), (escape_b, inside_b)] = keys;
+            assert_eq!(inside_a.0, inside_b.0, "{kind}{crate_type}: a folder inside the target aliases");
+            assert_distinct_link(escape_a, escape_b, &format!("{kind}{crate_type}: a symlink out of the target"));
+        }
     }
 
     #[cfg(unix)]

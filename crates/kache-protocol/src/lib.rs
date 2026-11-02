@@ -21,6 +21,10 @@ pub struct SeedTargetRequest {
     pub workspace_root: String,
     /// `rustc -vV` from the compiler Cargo is probing.
     pub rustc_version: String,
+    /// The build only checks (`cargo check`, `cargo clippy`): seed only the
+    /// units a check of the donor's workspace used.
+    #[serde(default)]
+    pub check_lane: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -92,6 +96,116 @@ pub struct StatsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BatchRemoteCheckRequest {
     pub checks: Vec<RemoteCheckRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StampHitsRequest {
+    /// The cache directory of the store the hits were served from. The
+    /// daemon stamps only its own store and refuses any other.
+    pub cache_dir: String,
+    pub keys: Vec<String>,
+}
+
+/// Key-bridge adoptions a wrapper verified (`Request::AdoptEntries`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdoptEntriesRequest {
+    /// The cache directory of the store the entries are in. The daemon
+    /// registers only in its own store and refuses any other.
+    pub cache_dir: String,
+    pub entries: Vec<AdoptEntry>,
+}
+
+/// One adoption: `cache_key` takes the entry `legacy_version` stored under
+/// `legacy_key` for `crate_name`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdoptEntry {
+    pub legacy_key: String,
+    pub legacy_version: u32,
+    pub cache_key: String,
+    pub crate_name: String,
+}
+
+/// File-hash memo rows a wrapper's store could not write because its index
+/// was busy. The daemon writes them to its own store when the index lets it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordFileHashesRequest {
+    /// The cache directory of the store the rows belong to. The daemon
+    /// writes only to its own store and refuses any other.
+    pub cache_dir: String,
+    pub rows: Vec<FileHashRow>,
+}
+
+/// Build events a wrapper could not log because the event log stayed busy
+/// past the build's budget for it. The daemon logs them, waiting for the log
+/// as no build does, and counts them pending until then
+/// (`StatsResponse::publishes_pending`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordEventsRequest {
+    /// The event log the wrapper writes. The daemon logs only to its own
+    /// and refuses any other.
+    pub event_log: String,
+    pub events: Vec<BuildEvent>,
+}
+
+/// Target roots a wrapper's index was too busy to record. The daemon records
+/// each in its own store when the index lets it, under the same checks as the
+/// wrapper (`Store::remember_target_root_built_by`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordTargetRootsRequest {
+    /// The cache directory of the store the rows belong to. The daemon
+    /// writes only to its own store and refuses any other.
+    pub cache_dir: String,
+    pub roots: Vec<TargetRootRow>,
+}
+
+/// A Cargo target directory a build wrote into, the workspace that owns it,
+/// and the `rustc -vV` that built there (`None` keeps the recorded one).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TargetRootRow {
+    pub target: String,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub rustc: Option<String>,
+}
+
+/// Input prediction rows a wrapper's index was too busy to take. The daemon
+/// writes them to its own store when the index lets it. A row only saves a
+/// later pre-pass, and every row is validated in full before it is used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordPredictionsRequest {
+    /// The cache directory of the store the rows belong to. The daemon
+    /// writes only to its own store and refuses any other.
+    pub cache_dir: String,
+    pub rows: Vec<PredictionRow>,
+}
+
+/// One `input_predictions` row as the wrapper would have written it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PredictionRow {
+    pub identity: String,
+    pub schema: u32,
+    #[serde(default)]
+    pub crate_name: Option<String>,
+    pub json: String,
+    /// For one of a unit's rows per tree: the name every row of the unit
+    /// starts with, and how many of them stay
+    /// (`FileHashCache::put_input_prediction_keeping`).
+    #[serde(default)]
+    pub keep_under: Option<(String, u32)>,
+}
+
+/// `hash` is the content of the file at exactly this stamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileHashRow {
+    pub path: String,
+    pub size: i64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub inode: i64,
+    pub hash: String,
+    /// Recorded for an output Cargo re-dates after the unit.
+    #[serde(default)]
+    pub redated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,6 +335,10 @@ pub struct DaemonHealth {
     /// from the lifecycle control endpoint, which does not carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_readonly: Option<bool>,
+    /// Compiles clients handed over (Commit accepted) that are still running.
+    /// `None` from older daemons and from the lifecycle control endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiles_in_flight: Option<u64>,
 }
 
 /// The configuration the daemon loaded at startup, carried in every

@@ -135,11 +135,16 @@ impl PeerProcess {
         Ok(peer)
     }
 
-    /// The pinned client's priority class; zero when it cannot be read.
-    pub fn priority_class(&self) -> u32 {
+    /// The pinned frontend's priority class, the priority of the build it
+    /// compiles for.
+    pub fn priority_class(&self) -> io::Result<u32> {
         // SAFETY: the handle stays open on `self` and was opened with
         // PROCESS_QUERY_LIMITED_INFORMATION.
-        unsafe { GetPriorityClass(self.process.as_raw_handle()) }
+        let class = unsafe { GetPriorityClass(self.process.as_raw_handle()) };
+        if class == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(class)
     }
 
     pub fn verify_connection(&self, stream: &impl PeerCredentials) -> io::Result<()> {

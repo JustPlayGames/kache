@@ -38,6 +38,8 @@ mod cc_diagnostics;
 mod rustc_hit;
 use rustc_hit::RustcHitContext;
 
+mod rustc_handoff;
+
 /// Check whether progress lines should be shown ([`crate::notice`]).
 ///
 /// Controlled by `KACHE_PROGRESS` env var (off by default):
@@ -355,9 +357,8 @@ pub(crate) fn warn_nonlocal_cache_fs_once(config: &Config) {
 /// checks the hot-path cost is a single `stat()` on the stamp file.
 const AUTO_GC_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Slack over `max_size` before a background GC is spawned, in percent.
-/// `evict()` already targets 90% of `max_size`; triggering only above 110%
-/// keeps the two thresholds apart so the store doesn't thrash at the boundary.
+/// How far past what the last sweep left a store must grow to end a backoff
+/// early, in percent of `max_size`.
 const AUTO_GC_SLACK_PERCENT: u64 = 10;
 
 /// Longest the auto-GC backoff grows. The daemon's periodic sweep runs every
@@ -370,9 +371,9 @@ fn auto_gc_backoff_path(cache_dir: &Path) -> PathBuf {
     cache_dir.join("auto-gc-backoff.json")
 }
 
-/// Size above which an automatic sweep starts: `max_size` plus slack.
-fn auto_gc_threshold(max_size: u64) -> u64 {
-    max_size.saturating_add(max_size / 100 * AUTO_GC_SLACK_PERCENT)
+/// Size above which an automatic sweep starts.
+pub(crate) fn auto_gc_threshold(max_size: u64) -> u64 {
+    kache_store::eviction::automatic_trigger(max_size)
 }
 
 /// A sweep ended with the store still over the trigger. Most often the
@@ -404,6 +405,12 @@ fn recent_held_bytes(backoff: Option<AutoGcBackoff>, now: u64) -> u64 {
     backoff
         .filter(|b| now < b.since.saturating_add(AUTO_GC_HELD_TTL.as_secs()))
         .map_or(0, |b| b.held)
+}
+
+/// The bytes the last automatic sweep found held by target directories,
+/// while that figure is recent; 0 without one.
+pub(crate) fn recent_auto_gc_held(cache_dir: &Path) -> u64 {
+    recent_held_bytes(read_auto_gc_backoff(cache_dir), unix_now_secs())
 }
 
 fn read_auto_gc_backoff(cache_dir: &Path) -> Option<AutoGcBackoff> {
@@ -463,20 +470,31 @@ fn auto_gc_backoff_holds(
 
 /// The start condition of every automatic sweep, whichever driver asks: the
 /// store is over the trigger, leaving out what the last sweep found held by
-/// target directories, and that sweep left no backoff that still holds.
-/// `kache gc` does not ask.
+/// target directories, and that sweep left no backoff that still holds, or
+/// the disk is running low. `kache gc` does not ask.
 pub(crate) fn auto_gc_sweep_due(config: &Config, total: u64) -> bool {
     auto_gc_due_at(
         read_auto_gc_backoff(&config.cache_dir),
         unix_now_secs(),
         total,
         config.max_size,
+        || crate::disk_recovery::low_on_disk(config),
     )
 }
 
-fn auto_gc_due_at(backoff: Option<AutoGcBackoff>, now: u64, total: u64, max_size: u64) -> bool {
+/// A backoff waits for new data a sweep could free, but a disk running low
+/// cannot wait: builds filled one at 3 GiB a minute while a 600 s backoff
+/// held off the sweep that later freed 27 GiB a minute. `low_on_disk` is
+/// asked only when the backoff is all that stands in the way.
+fn auto_gc_due_at(
+    backoff: Option<AutoGcBackoff>,
+    now: u64,
+    total: u64,
+    max_size: u64,
+    low_on_disk: impl FnOnce() -> bool,
+) -> bool {
     total.saturating_sub(recent_held_bytes(backoff, now)) > auto_gc_threshold(max_size)
-        && !auto_gc_backoff_holds(backoff, now, total, max_size)
+        && (!auto_gc_backoff_holds(backoff, now, total, max_size) || low_on_disk())
 }
 
 /// Called by every automatic driver after a sweep that left the store at
@@ -500,6 +518,28 @@ pub(crate) fn record_auto_gc_outcome(config: &Config, size_after: u64, held: u64
         && let Err(e) = crate::atomic::atomic_replace(&path, &json)
     {
         tracing::debug!("auto-gc: could not write {}: {e:#}", path.display());
+    }
+}
+
+/// Called by every automatic driver after a sweep that stopped at its walk
+/// budget. More can go, so nothing backs off, but its probe is the newest
+/// account of what target directories hold. Without this a store swept only
+/// by such sweeps lost its `held` figure when [`AUTO_GC_HELD_TTL`] ran out,
+/// and every automatic check then found the whole store over the trigger
+/// (2026-10-31: `held` 157 GB expired, sweeps every 5 minutes with the
+/// store's own part under the trigger).
+pub(crate) fn record_auto_gc_cut_short(config: &Config, size_after: u64, held: u64) {
+    let record = AutoGcBackoff {
+        since: unix_now_secs(),
+        interval_secs: 0,
+        size_after,
+        held,
+    };
+    if let Ok(json) = serde_json::to_vec(&record)
+        && let Err(e) =
+            crate::atomic::atomic_replace(&auto_gc_backoff_path(&config.cache_dir), &json)
+    {
+        tracing::debug!("auto-gc: could not record a cut-short sweep: {e:#}");
     }
 }
 
@@ -552,15 +592,16 @@ fn auto_gc_stamp_path(cache_dir: &Path) -> PathBuf {
 
 /// Decide whether a background GC should be spawned: auto-GC enabled, the
 /// throttle interval elapsed, and the store over `max_size` plus slack.
-/// Touches the stamp *before* the size query so concurrent wrappers don't
-/// stampede on the SQLite `SUM`. Split from [`after_store`] so the decision
-/// is unit-testable without spawning processes.
+/// Claims the interval *before* the size query, under the check lock, so of
+/// the wrappers that store at once only one runs the SQLite `SUM` and only
+/// one asks for a sweep. Split from [`after_store`] so the decision is
+/// unit-testable without spawning processes.
 fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     if !config.auto_gc {
         return false;
     }
     let stamp = auto_gc_stamp_path(&config.cache_dir);
-    if !auto_gc_check_due(&stamp) {
+    if !auto_gc_check_due(&stamp) || !claim_due_auto_gc_check(config, &stamp) {
         return false;
     }
 
@@ -577,24 +618,15 @@ fn auto_gc_wanted(config: &Config, store: &Store) -> bool {
     // A `[cache.volumes]` shard is judged against its own budget and backoff.
     let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
     if !auto_gc_sweep_due(&swept, total) && !crate::disk_recovery::wanted(&swept) {
-        let now_str = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_default();
-        let _ = std::fs::write(&stamp, now_str);
-        return false;
-    }
-
-    // Exceeded threshold — claim this check slot before spawning GC
-    if !claim_auto_gc_check(config, &stamp) {
         return false;
     }
 
     tracing::info!(
-        "auto-gc: cache or disk pressure, triggering background GC (store {}, max {}, slack {}%)",
+        "auto-gc: cache or disk pressure, triggering background GC (store {}, max {}, starts \
+         above {})",
         total,
         swept.max_size,
-        AUTO_GC_SLACK_PERCENT
+        auto_gc_threshold(swept.max_size)
     );
     true
 }
@@ -611,6 +643,29 @@ fn auto_gc_check_due(stamp: &Path) -> bool {
         }
     }
     true
+}
+
+/// Claim the check interval that [`auto_gc_check_due`] found due, for this
+/// process alone. Every wrapper that stores in the same moment sees the same
+/// expired stamp, so the claim is made under an exclusive lock beside it,
+/// and the stamp is looked at again once the lock is held: only the first
+/// holder finds it still due. A holder that is busy means another process is
+/// claiming right now, which drops this check. Without a lock file (a full
+/// volume may refuse to create one) the claim goes ahead unlocked, as it
+/// always has, since that is when recovery matters most.
+fn claim_due_auto_gc_check(config: &Config, stamp: &Path) -> bool {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(stamp.with_extension("lock"));
+    let Ok(lock) = lock else {
+        return claim_auto_gc_check(config, stamp);
+    };
+    if lock.try_lock().is_err() {
+        return false;
+    }
+    auto_gc_check_due(stamp) && claim_auto_gc_check(config, stamp)
 }
 
 /// Claim the check slot by rewriting `stamp`. Without a free-space floor, a
@@ -716,10 +771,9 @@ fn is_storage_full(error: &anyhow::Error) -> bool {
 fn space_recovery_wanted(config: &Config, store: &Store) -> bool {
     let swept = config.for_store_dir(store.cache_dir(), crate::volume_gc::filesystem_bytes);
     let stamp = auto_gc_stamp_path(&config.cache_dir);
-    if !crate::disk_recovery::wanted(&swept) || !auto_gc_check_due(&stamp) {
-        return false;
-    }
-    claim_auto_gc_check(config, &stamp)
+    crate::disk_recovery::wanted(&swept)
+        && auto_gc_check_due(&stamp)
+        && claim_due_auto_gc_check(config, &stamp)
 }
 
 /// A running daemon owns automatic eviction, so it gets a hint and nothing is
@@ -1059,11 +1113,16 @@ fn open_primary_and_fallback_for(
     crate::link::set_mapped_target(config.volume_store_for_invocation(route, env).is_some());
     let routed = config.routed_for_path_for(route, env);
     let options = crate::store::StoreOptions::from_env(|name| env.var(name).ok());
-    let primary = Store::open_with_options(&routed, options.clone())?;
+    let mut primary = Store::open_with_options(&routed, options.clone())?;
     let mut fallbacks = Vec::new();
-    if !volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
+    if volume_cache_dirs_match(&routed.cache_dir, &config.cache_dir) {
+        send_hit_stamps_to_daemon(config, &mut primary);
+    } else {
         match Store::open_with_options(config, options.clone()) {
-            Ok(store) => fallbacks.push(store),
+            Ok(mut store) => {
+                send_hit_stamps_to_daemon(config, &mut store);
+                fallbacks.push(store);
+            }
             Err(e) => tracing::warn!(
                 "main store unavailable for volume-shard fallback ({}): {e:#}",
                 config.cache_dir.display()
@@ -1072,6 +1131,33 @@ fn open_primary_and_fallback_for(
     }
     fallbacks.extend(open_readonly_store(config, options));
     Ok((primary, fallbacks))
+}
+
+/// Hand the main store's hit stamps to the daemon, so a hit never waits for
+/// the index's write lock to stamp its access time (`Store::get`). The
+/// daemon stamps only its own store (a volume shard's hits stamp the shard
+/// themselves), and with no daemon the hit stamps the index itself.
+///
+/// The memo rows a restore learns go the same way when the index is busy
+/// (`Store::record_restored_file_hashes`): the hit does not wait for them,
+/// and the daemon writes them once the index lets it.
+pub(crate) fn send_hit_stamps_to_daemon(config: &Config, store: &mut Store) {
+    #[cfg(unix)]
+    {
+        let socket = config.socket_path();
+        let cache_dir = config.cache_dir.clone();
+        store.send_hit_stamps_to(Box::new(move |key| {
+            crate::daemon::send_hit_stamp(&socket, &cache_dir, key)
+        }));
+        crate::key_bridge::register_through_daemon(config.socket_path(), config.cache_dir.clone());
+        let socket = config.socket_path();
+        let cache_dir = config.cache_dir.clone();
+        store.send_busy_memo_rows_to(Box::new(move |rows| {
+            crate::daemon::send_memo_rows(&socket, &cache_dir, rows)
+        }));
+    }
+    #[cfg(not(unix))]
+    let _ = (config, store);
 }
 
 /// Retry budget for a busy store index, including time spent in lookups.
@@ -1178,7 +1264,108 @@ fn lookup_local_entry<'a>(
             return Ok(Some((store, meta)));
         }
     }
+    // Key bridge: an earlier key version's entry for this same invocation,
+    // verified, restored from at once, and re-indexed under this key in the
+    // primary store (by the daemon, later, when one runs).
+    if let Some(meta) = crate::key_bridge::adopt_on_miss(primary, cache_key) {
+        return Ok(Some((primary, meta)));
+    }
     Ok(None)
+}
+
+/// How long a lookup that missed an entry another process is storing right
+/// now ([`Store::store_in_flight`]) waits for its commit. A store holds the
+/// key for milliseconds, and the daemon's hand-off of one until the index's
+/// write lock frees (p99 3.9 s on a shared build machine under a burst, and
+/// past 6 s under heavier load). The wait ends as soon as the storing
+/// process lets go of the key, committed or not, and the mark names a live
+/// process, so its length is how long a store may take, not how long a
+/// lookup waits: at 5 s a slow commit made the peer compile the unit a
+/// second time. Past this, the unit compiles as it would have without the
+/// wait.
+const STORE_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wait, bounded, for the entry another process is storing under
+/// `cache_key` right now. `true` once it is committed. Without this, a unit
+/// looked up between a peer's hand-off and the daemon's commit compiled
+/// again: a missed hit (never a wrong one), for every unit of a checkout
+/// built right after another (kache's own out_dir_alias test, about one run
+/// in two under load).
+fn wait_for_store_in_flight(store: &Store, cache_key: &str, crate_name: &str) -> bool {
+    tracing::debug!("{crate_name}: its entry is being stored; waiting for the commit");
+    let waited = std::time::Instant::now();
+    let committed =
+        crate::invocation::wait_for_committed(store, cache_key, Some(STORE_IN_FLIGHT_WAIT))
+            .unwrap_or(false);
+    crate::opcounts::record_flight_wait(waited.elapsed());
+    tracing::debug!(
+        "{crate_name}: the stored entry {} after {} ms",
+        if committed { "was committed" } else { "did not come" },
+        waited.elapsed().as_millis()
+    );
+    committed
+}
+
+/// Longest a unit that cannot stop on a hit waits for another checkout's
+/// entry of it, which the daemon is storing, to land. Past it the unit
+/// compiles, as it did before.
+const UNIT_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether an entry of `crate_name`'s unit `unit` was in flight and landed
+/// (or was given up on by its owner) within [`UNIT_IN_FLIGHT_WAIT`].
+fn wait_for_unit_in_flight(store: &Store, crate_name: &str, unit: &str) -> bool {
+    if !store.unit_in_flight(crate_name, unit) {
+        return false;
+    }
+    tracing::debug!("{crate_name}: another checkout's entry is being stored; waiting for it");
+    let waited = std::time::Instant::now();
+    let mut attempt = 0;
+    while store.unit_in_flight(crate_name, unit) {
+        if waited.elapsed() >= UNIT_IN_FLIGHT_WAIT || crate::invocation::process::check().is_err() {
+            crate::opcounts::record_flight_wait(waited.elapsed());
+            return false;
+        }
+        std::thread::sleep(
+            crate::store::lock_poll_interval(attempt).min(std::time::Duration::from_millis(10)),
+        );
+        attempt += 1;
+    }
+    crate::opcounts::record_flight_wait(waited.elapsed());
+    true
+}
+
+/// The entry under `cache_key` when a compile that may stop reaches its
+/// dep-info. One another process is storing right now is waited for, with
+/// a compile that links frozen meanwhile so that the wait never costs the
+/// stop ([`crate::compile::hold_while_deciding`]).
+fn stored_at_dep_info(
+    store: &Store,
+    cache_key: &str,
+    crate_name: &str,
+) -> Result<Option<EntryMeta>> {
+    let stored = store.get(cache_key)?;
+    if stored.is_some() {
+        return Ok(stored);
+    }
+    if let Some(meta) = crate::key_bridge::adopt_on_miss(store, cache_key) {
+        return Ok(Some(meta));
+    }
+    if !store.store_in_flight(cache_key) {
+        // The store may have committed and let go of the key between the
+        // lookup and the check: look once more, when a meta.json says an
+        // entry may be there, rather than compile the unit a second time.
+        return if store.entry_dir(cache_key).join("meta.json").exists() {
+            store.get(cache_key)
+        } else {
+            Ok(None)
+        };
+    }
+    crate::compile::hold_while_deciding();
+    if wait_for_store_in_flight(store, cache_key, crate_name) {
+        store.get(cache_key)
+    } else {
+        Ok(None)
+    }
 }
 
 fn admit_scheduler_miss(
@@ -3508,6 +3695,7 @@ pub(crate) fn run_for(
 ) -> Result<i32> {
     let _trace = crate::phase_trace::start_for("rustc", wrapper_args, env);
     let start = wrapper_entry();
+    crate::cache_key::memoize_tool_fingerprints();
     crate::link::set_windows_hardlink_restore(config.windows_hardlink);
     crate::link::set_shared_hardlink_restores(config.shared_hardlink_restores);
     crate::link::set_storage_layout_advice(config.storage_layout_advice);
@@ -3598,7 +3786,7 @@ pub(crate) fn run_for(
         )?;
         // Cargo hardlinks and runs the binary after this wrapper returns, so
         // this is the last moment to put the launcher in its place.
-        crate::build_script::install_shim(&args);
+        crate::build_script::install_shim(effective_config, &args);
     }
     Ok(exit)
 }
@@ -3791,12 +3979,14 @@ fn resolve_located_build_script_inputs(
     let normalizer = std::cell::OnceCell::new();
     let outside = |path: &Path| {
         let normalizer = normalizer.get_or_init(|| {
-            crate::path_normalizer::PathNormalizer::from_invocation(
+            crate::path_normalizer::PathNormalizer::for_invocation(
                 workspace_root,
                 args.invocation_env(),
+                args.target_dir().as_deref(),
+                &config.base_dirs,
+                None,
+                None,
             )
-            .with_target_dir(args.target_dir().as_deref())
-            .with_base_dirs(&config.base_dirs)
         });
         crate::cache_key::source_path_identity(path, normalizer)
     };
@@ -4017,7 +4207,7 @@ fn run_parsed_rustc(
         &args.all_args,
         args.invocation_env(),
     );
-    let skip_user_facing = args.is_user_facing_executable() && !config.cache_executables;
+    let skip_user_facing = skips_cache_as_user_facing(args, config.cache_executables);
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
         precompiled.is_some(),
@@ -4077,6 +4267,24 @@ fn run_parsed_rustc(
             // No compatible donor: preserve learning and use the usual key.
             let _ = lease.finish(CompileOutcome::CompileError);
         }
+    }
+    if incremental_fast_path_allowed(
+        unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
+        excluded_source.is_some() || user_bypass.is_some(),
+        skip_user_facing,
+        reentered,
+    ) && let Some(name) = private_link_extern(args)
+    {
+        return intentional_passthrough_with_event(
+            config,
+            args,
+            crate_name,
+            &event_root,
+            start,
+            adaptive_unit.as_ref(),
+            format!("{PRIVATE_LINK_REASON}{name} was compiled incrementally"),
+            key_record,
+        );
     }
     let rustc_route = volume_route_path_rustc(args);
     let mut fallback_stores = Vec::new();
@@ -4254,8 +4462,11 @@ fn run_parsed_rustc(
     // ([`compile_before_key_after_miss`]).
     // A learning unit has no graph to reuse. Reserve a cold private compile
     // before discovery, then qualify its seed from rustc's emitted closure.
+    // Never a unit that links: its seed would compile to the end before
+    // keying, as it always has.
     let mut deferred_seed = if adaptive_policy_for_invocation
         && precompiled.is_none()
+        && !args.invokes_linker()
         && stop_on_hit_allowed(args)
         && deferral_allowed(config, args, false, extra_inputs)
     {
@@ -4287,7 +4498,7 @@ fn run_parsed_rustc(
             hash_stats: inputs_hash_stats,
             too_new: inputs_too_new,
             key_ms: inputs_key_ms,
-            guard_inputs: extra_inputs_guard_inputs,
+            guard_inputs: extra_inputs_guard_inputs.clone(),
         },
         match precompiled
             .as_mut()
@@ -4330,6 +4541,56 @@ fn run_parsed_rustc(
                 key_record,
             );
         }
+    };
+    // A unit the store had never held when its key was computed may have
+    // come from another checkout since: its entry is stored by the daemon,
+    // which the wrapper that compiled it handed it to before it let its
+    // peers go, and lands a moment later. A compile that may stop at its
+    // dep-info finds or waits for an entry still in flight as it runs; one
+    // that links (a binary, a build script, a proc macro) waits for it to
+    // land instead: off Linux it cannot stop at all, and on Linux only
+    // before its codegen, which a small crate starts milliseconds after
+    // its dep-info. Either keys again, as any unit the store holds does,
+    // once it has landed, rather than compiling the unit a second time.
+    let unit = args.get_codegen_opt("metadata").unwrap_or("");
+    let keyed = if keyed.deferred
+        && !keyed.stop_on_hit
+        && deferred_seed.is_none()
+        && (((!stop_on_hit_allowed(args) || args.invokes_linker())
+            && wait_for_unit_in_flight(&store, crate_name, unit))
+            || store
+                .file_hash_cache()
+                .has_entry_for_unit(crate_name, unit)
+                .unwrap_or(false))
+    {
+        match compute_rustc_cache_key(
+            config,
+            compiler,
+            args,
+            workspace_root.as_deref(),
+            invocation_start_ns,
+            Some(&store),
+            &key_env,
+            ExtraInputsKey {
+                digest: extra_inputs.and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+                build_script_inputs: build_script_inputs.digest(),
+                hash_stats: inputs_hash_stats,
+                too_new: inputs_too_new,
+                key_ms: inputs_key_ms,
+                guard_inputs: extra_inputs_guard_inputs,
+            },
+            // The flight this invocation holds stays held: no second join.
+            KeyDiscovery::Rederived,
+            &mut key_record,
+        ) {
+            Ok(again) if !again.deferred => ComputedKey {
+                discovery_flight: keyed.discovery_flight,
+                ..again
+            },
+            _ => keyed,
+        }
+    } else {
+        keyed
     };
     let ComputedKey {
         mut cache_key,
@@ -4381,6 +4642,16 @@ fn run_parsed_rustc(
         // key from what rustc emitted. `discovery_flight` stays held across
         // the recursion so peers wait for this compile.
         tracing::debug!("no closure record for {crate_name}; compiling before keying");
+        // A unit the index has never held may still be in flight: another
+        // checkout's entry for it, handed to the daemon and not committed
+        // yet. Then the miss is no longer certain, and the compile keys at
+        // its dep-info to find (or wait for) that entry.
+        let stop_on_hit = stop_on_hit
+            || (stop_on_hit_allowed(args)
+                && store.unit_in_flight(
+                    crate_name,
+                    args.get_codegen_opt("metadata").unwrap_or(""),
+                ));
         return compile_before_key(
             &compile_first,
             stop_on_hit,
@@ -4431,16 +4702,14 @@ fn run_parsed_rustc(
             crate::build_script_inputs::cargo_home(&|name| args.invocation_env().var_os(name))
                 .as_deref(),
         )
-        && let Err(e) = store.remember_target_root_built_by(
+    {
+        register_target_root(
+            config,
+            &store,
             &target_dir,
             workspace_root,
-            crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).as_deref(),
-        )
-    {
-        tracing::warn!(
-            "failed to register target root {}: {}",
-            target_dir.display(),
-            e
+            crate::cache_key::rustc_version_text_for(args.probed_rustc(), args.invocation_env())
+                .as_deref(),
         );
     }
     drop(trace_remember);
@@ -4474,6 +4743,8 @@ fn run_parsed_rustc(
     let may_defer = deferral_allowed(config, args, false, extra_inputs);
     // `Some(stop_on_hit)` once the miss is to compile before its key.
     let mut compile_then_key = None;
+    // A key another process is storing is waited for once per invocation.
+    let mut waited_for_store = false;
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
@@ -4580,6 +4851,16 @@ fn run_parsed_rustc(
                 &cache_key,
             );
             return Ok(0);
+        }
+
+        // Another process is storing this very key (a compile it just ran,
+        // or the daemon's hand-off of one): its entry is moments away, so
+        // look again once it is committed rather than compile it twice.
+        if !waited_for_store && store.store_in_flight(&cache_key) {
+            waited_for_store = true;
+            if wait_for_store_in_flight(&store, &cache_key, crate_name) {
+                continue;
+            }
         }
 
         // Both lookups missed. Incremental compilation needs no artifact key
@@ -5161,6 +5442,11 @@ fn run_parsed_rustc(
         return Ok(result.exit_code);
     };
 
+    // From here until the entry is committed, a lookup that misses it waits
+    // for it rather than compiling the unit again.
+    let mut lock = lock;
+    lock.mark_storing();
+    let mut lock = Some(lock);
     let store_start = std::time::Instant::now();
     let trace_store = crate::phase_trace::phase("store");
     let mut store_put = StorePutResult::default();
@@ -5172,19 +5458,60 @@ fn run_parsed_rustc(
         .as_deref()
         .and_then(|version| version.lines().next())
         .and_then(|line| line.strip_prefix("rustc "));
-    let put = store.put_rustc_with_compile_time(
-        &cache_key,
-        crate_name,
-        &args.crate_types,
-        &args.features,
-        target,
-        profile,
-        &prepared_store.files,
-        &result.stdout,
-        &result.stderr,
-        compile_time_ms,
-        rustc_identity,
-    );
+    // The put is on the build's critical path. When the index is too busy
+    // to register the entry at once, the daemon may finish it
+    // (`rustc_handoff`).
+    let _writable_metadata =
+        kache_store::WritableOutputsScope::enter(keeps_metadata_writable(args));
+    let put = if rustc_handoff::wanted(config, &store) {
+        let handoff = rustc_handoff::RustcHandoff {
+            cache_key: &cache_key,
+            crate_name,
+            target,
+            profile,
+            args,
+            compiler,
+            artifacts: result.artifacts.outputs(),
+            files: &prepared_store.files,
+            stdout: &result.stdout,
+            stderr: &result.stderr,
+            compile_time_ms,
+            rustc_version: rustc_identity,
+            event: EventInputs::new(&event_root, crate_name, EventResult::Miss, 0)
+                .rebuilt_observed(rebuilt.clone())
+                .compile_time_ms(compile_time_ms)
+                .size(result.artifacts.total_size())
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record.clone()),
+            size: result.artifacts.total_size(),
+            start,
+            store_start,
+        };
+        match rustc_handoff::store(config, &store, &mut lock, handoff) {
+            rustc_handoff::RustcStore::HandedOff => {
+                drop(trace_store);
+                record_input_prediction(config, Some(&store), args, record_closure, &key_outputs);
+                clean_incremental_dir(config, args);
+                return Ok(result.exit_code);
+            }
+            rustc_handoff::RustcStore::Stored(put) => put,
+        }
+    } else {
+        store.put_rustc_with_compile_time(
+            &cache_key,
+            crate_name,
+            &args.crate_types,
+            &args.features,
+            target,
+            profile,
+            &prepared_store.files,
+            &result.stdout,
+            &result.stderr,
+            compile_time_ms,
+            rustc_identity,
+        )
+    };
     // A stored entry grew the store: throttled size check and a detached
     // background GC if over budget (kunobi-ninja/kache#497). A put refused for
     // lack of space asks for recovery. Neither blocks the compile.
@@ -5208,6 +5535,7 @@ fn run_parsed_rustc(
                 );
                 remember_prestaged_executables(config, compiler, args, &output_dir, shared, &meta);
             }
+            redate_stored_check_outputs(&store, args, &prepared_store.files);
             flush_or_hand_off_durability(config, &store, &cache_key);
         }
         // Name the crate, as the cc path already does: a failed store leaves that
@@ -5359,6 +5687,7 @@ fn hand_off_cc_store(
         publishes_to_remote: compiler_upload_enabled(config, handoff.publishes_to_remote),
         event,
         memo: handoff.memo,
+        rustc: None,
     };
     // The daemon takes the key itself before it answers; ours must be gone
     // first, since a file lock cannot be shared across processes.
@@ -5371,35 +5700,55 @@ fn hand_off_cc_store(
         Handoff::Declined(reason) => {
             tracing::debug!("cc hand-off declined for {}: {reason}", handoff.crate_name);
             crate::daemon_publish::remove_handoff_files(&request.files);
-            match reclaim_after_declined_handoff(store, handoff.cache_key, HANDOFF_HOLDER_WAIT) {
-                Ok(BuildClaim::Acquired(lock)) => {
-                    *build_lock = Some(lock);
-                    CcHandoffOutcome::Publish
-                }
-                Ok(BuildClaim::Committed(_)) | Ok(BuildClaim::Contended) => {
-                    // A peer holds or stored the key in the gap; it publishes.
-                    let mut event = request.event;
-                    event.elapsed_ms = handoff.start.elapsed().as_millis() as u64;
-                    // An independent peer won the key. That is ordinary
-                    // contention, not a failed store. An accepted daemon job
-                    // is resolved by its receipt before reaching this branch.
-                    write_event(config, &event);
-                    print_progress(
-                        handoff.crate_name,
-                        EventResult::Miss,
-                        event.elapsed_ms,
-                        handoff.size,
-                    );
-                    CcHandoffOutcome::Done
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "reclaiming {} after a declined hand-off failed: {error:#}; storing without a lock",
-                        handoff.crate_name
-                    );
-                    CcHandoffOutcome::Publish
-                }
-            }
+            resolve_declined_handoff(
+                config,
+                store,
+                build_lock,
+                request.event,
+                handoff.cache_key,
+                handoff.crate_name,
+                handoff.start,
+                handoff.size,
+            )
+        }
+    }
+}
+
+/// After the daemon declined a hand-off: take the key back and publish
+/// here, or, when a peer holds or stored the key in the gap, write the
+/// compile's `event` and leave the entry to that peer.
+#[allow(clippy::too_many_arguments)]
+fn resolve_declined_handoff(
+    config: &Config,
+    store: &Store,
+    build_lock: &mut Option<KeyLock>,
+    event: BuildEvent,
+    cache_key: &str,
+    crate_name: &str,
+    start: std::time::Instant,
+    size: u64,
+) -> CcHandoffOutcome {
+    match reclaim_after_declined_handoff(store, cache_key, HANDOFF_HOLDER_WAIT) {
+        Ok(BuildClaim::Acquired(lock)) => {
+            *build_lock = Some(lock);
+            CcHandoffOutcome::Publish
+        }
+        Ok(BuildClaim::Committed(_)) | Ok(BuildClaim::Contended) => {
+            // A peer holds or stored the key in the gap; it publishes.
+            let mut event = event;
+            event.elapsed_ms = start.elapsed().as_millis() as u64;
+            // An independent peer won the key. That is ordinary
+            // contention, not a failed store. An accepted daemon job
+            // is resolved by its receipt before reaching this branch.
+            write_event(config, &event);
+            print_progress(crate_name, EventResult::Miss, event.elapsed_ms, size);
+            CcHandoffOutcome::Done
+        }
+        Err(error) => {
+            tracing::warn!(
+                "reclaiming {crate_name} after a declined hand-off failed: {error:#}; storing without a lock",
+            );
+            CcHandoffOutcome::Publish
         }
     }
 }
@@ -5647,13 +5996,18 @@ fn configured_rustc_depinfo_roots(
     target_dir: Option<&Path>,
     env: &crate::invocation::InvocationEnv,
 ) -> Vec<(PathBuf, String, u8)> {
-    crate::path_normalizer::PathNormalizer::from_invocation(workspace_root, env)
-        .with_target_dir(target_dir)
-        .with_base_dirs(&config.base_dirs)
-        .depinfo_source_roots()
-        .into_iter()
-        .map(|root| (root.root, root.depinfo_sentinel, root.priority))
-        .collect()
+    crate::path_normalizer::PathNormalizer::for_invocation(
+        workspace_root,
+        env,
+        target_dir,
+        &config.base_dirs,
+        None,
+        None,
+    )
+    .depinfo_source_roots()
+    .into_iter()
+    .map(|root| (root.root, root.depinfo_sentinel, root.priority))
+    .collect()
 }
 
 fn validate_extra_inputs_dep_info_before_store(
@@ -5773,7 +6127,7 @@ fn take_prestaged(
     cached_file: &crate::store::CachedFile,
     target_path: &Path,
 ) -> bool {
-    if kache_store::workspace::current().is_some() {
+    if !crate::prestage::usable_here() {
         return false;
     }
     strategy == link::LinkStrategy::Copy
@@ -5874,18 +6228,21 @@ fn remember_prestaged_executables(
     shared_loadable: Option<ArtifactKind>,
     meta: &crate::store::EntryMeta,
 ) {
-    if kache_store::workspace::current().is_some() {
+    if !crate::prestage::usable_here() {
         return;
     }
     let Some(target_dir) = prestage_target_dir(args) else {
         return;
     };
     for file in &meta.files {
-        let kind = compiler.classify_output(args, &file.name);
-        if file.size >= crate::prestage::MIN_BYTES
-            && restore_link_strategy(kind, file.executable, shared_loadable)
-                == link::LinkStrategy::Copy
-        {
+        if prestages(
+            compiler,
+            args,
+            &file.name,
+            file.size,
+            file.executable,
+            shared_loadable,
+        ) {
             let Some(dest) =
                 args.resolve_invocation_path(&artifact_target_path(args, output_dir, &file.name))
             else {
@@ -5894,6 +6251,24 @@ fn remember_prestaged_executables(
             crate::prestage::remember(&config.cache_dir, &target_dir, &dest, &file.hash, file.size);
         }
     }
+}
+
+/// Whether a stored file is a large executable the restore copies, which
+/// [`crate::prestage`] records for the next build of its target directory.
+fn prestages(
+    compiler: &RustcCompiler,
+    args: &RustcArgs,
+    name: &str,
+    size: u64,
+    executable: bool,
+    shared_loadable: Option<ArtifactKind>,
+) -> bool {
+    size >= crate::prestage::MIN_BYTES
+        && restore_link_strategy(
+            compiler.classify_output(args, name),
+            executable,
+            shared_loadable,
+        ) == link::LinkStrategy::Copy
 }
 
 /// How to materialize one restored artifact.
@@ -5914,18 +6289,78 @@ fn remember_prestaged_executables(
 /// The exception is `shared_loadable`, the executable kind of this compile
 /// that nothing rewrites in place (see [`shared_inode_loadable`]). It may
 /// share the blob's inode like an rlib.
+///
+/// A test binary is copied too, though it is stored by hardlink: Cargo judges
+/// it by its own mtime against its dependencies' outputs, so the restore's
+/// stamp on an inode another target shares would make that target's test
+/// binary look fresh after its library was rebuilt, and Cargo would run the
+/// old code there.
 fn restore_link_strategy(
     kind: ArtifactKind,
     executable: bool,
     shared_loadable: Option<ArtifactKind>,
 ) -> link::LinkStrategy {
-    if shared_loadable == Some(kind) {
+    restore_link_strategy_for(kind, executable, false, shared_loadable, false)
+}
+
+/// [`restore_link_strategy`] for a file that may be a shared rlib
+/// (`shared_rlib`, see [`restores_as_shared_rlib`]), of a unit whose
+/// metadata must stay writable (`writable_metadata`, see
+/// [`keeps_metadata_writable`]).
+fn restore_link_strategy_for(
+    kind: ArtifactKind,
+    executable: bool,
+    shared_rlib: bool,
+    shared_loadable: Option<ArtifactKind>,
+    writable_metadata: bool,
+) -> link::LinkStrategy {
+    if writable_metadata && kind == ArtifactKind::Metadata {
+        link::LinkStrategy::WritableCopy
+    } else if shared_rlib && !executable && kind.link_strategy() == link::LinkStrategy::Hardlink {
+        link::LinkStrategy::SharedLibHardlink
+    } else if shared_loadable == Some(kind) {
         link::LinkStrategy::ExecutableHardlink
     } else if executable {
         link::LinkStrategy::Copy
     } else {
         kind.link_strategy()
     }
+}
+
+/// Whether `name`, a file of an entry holding `files`, is the `.rlib` of a
+/// library unit Cargo builds with pipelining: `--emit` asks for both the
+/// metadata and the link, so Cargo counts the `.rmeta` beside the `.rlib` as
+/// an output of the unit, and the restore writes and stamps that `.rmeta`.
+/// Cargo judges the unit by the newest of its outputs, and a dependent by that
+/// or by the `.rmeta` alone, never by the `.rlib` alone, so such an `.rlib`
+/// may share the blob's inode with every target and keep the blob's mtime
+/// ([`link::LinkStrategy::SharedLibHardlink`]). In build mode Cargo never
+/// re-dates an output (check mode re-dates its `.rmeta`, and has no `.rlib`),
+/// and rustc writes a new output by renaming over the old name, so nothing
+/// changes the shared inode. Unix only: elsewhere the restore keeps
+/// [`link::LinkStrategy::Hardlink`].
+fn restores_as_shared_rlib(
+    args: &RustcArgs,
+    name: &str,
+    files: &[crate::store::CachedFile],
+) -> bool {
+    if !cfg!(unix) || args.out_dir.is_none() || args.output.is_some() {
+        return false;
+    }
+    let Some(stem) = name.strip_suffix(".rlib") else {
+        return false;
+    };
+    let emits = |kind: &str| args.emit.iter().any(|emit| emit == kind);
+    emits("metadata")
+        && emits("link")
+        && !args.crate_types.is_empty()
+        && args
+            .crate_types
+            .iter()
+            .all(|crate_type| crate_type == "lib" || crate_type == "rlib")
+        && files
+            .iter()
+            .any(|file| file.name.strip_suffix(".rmeta") == Some(stem))
 }
 
 /// The executable output of this compile that nothing rewrites in place after
@@ -5937,6 +6372,18 @@ fn restore_link_strategy(
 /// User-facing binaries, tests, examples and other dylibs stay private
 /// copies, because a post-build `strip` rewrites them in place. The platform
 /// decides the rest: macOS may re-sign a restored loadable in place.
+/// Whether the `.rmeta` of this unit must be a writable file of its own,
+/// restored and stored without sharing the blob's inode: a unit of a path
+/// package (a workspace member or path dependency), which Cargo builds
+/// without `--cap-lints allow`. `cargo fix` and `cargo clippy --fix`
+/// compile such units again without any wrapper, and rustc refuses to
+/// replace an output it cannot write (kunobi-ninja/kache#1697). The
+/// metadata of registry and git dependencies, which Cargo caps, and every
+/// rlib keep sharing the blob's inode.
+fn keeps_metadata_writable(args: &RustcArgs) -> bool {
+    !args.cargo_capped_lints()
+}
+
 fn shared_inode_loadable(args: &RustcArgs, platform_allows: bool) -> Option<ArtifactKind> {
     if !platform_allows {
         None
@@ -5996,6 +6443,7 @@ fn materialize_cached_artifact(
     target_path: &Path,
     kind: ArtifactKind,
     shared_loadable: Option<ArtifactKind>,
+    shared_rlib: bool,
     depinfo_anchor: &Path,
     depinfo_working_dir: &Path,
     depinfo_workspace_dir: Option<&Path>,
@@ -6003,6 +6451,7 @@ fn materialize_cached_artifact(
     platform: &dyn crate::compiler::Platform,
     context: &str,
     extra_inputs: Option<&crate::extra_inputs::ExtraInputsSnapshot>,
+    writable_metadata: bool,
 ) -> Result<RestoredBytes> {
     let store_path = store.blob_path(&cached_file.hash);
     if !store_path.exists() {
@@ -6064,12 +6513,20 @@ fn materialize_cached_artifact(
         }
     };
 
-    let strategy = restore_link_strategy(kind, cached_file.executable, shared_loadable);
+    let strategy = restore_link_strategy_for(
+        kind,
+        cached_file.executable,
+        shared_rlib,
+        shared_loadable,
+        writable_metadata,
+    );
     // A fresh transformed file can keep its original mode. Only the blob path
     // needs a private inode when it belongs to another process's store.
     let blob_strategy =
         if store.is_read_only() && strategy == link::LinkStrategy::ExecutableHardlink {
             link::LinkStrategy::Copy
+        } else if store.is_read_only() && strategy == link::LinkStrategy::SharedLibHardlink {
+            link::LinkStrategy::Hardlink
         } else {
             strategy
         };
@@ -6085,7 +6542,12 @@ fn materialize_cached_artifact(
         None => {
             // A large executable may already sit beside its destination,
             // copied by the daemon while the build ran (crate::prestage).
-            if store.is_read_only() && blob_strategy == link::LinkStrategy::Hardlink {
+            if output_already_holds(store, cached_file, target_path, &store_path, blob_strategy) {
+                tracing::debug!(
+                    "{context}: {} already holds the entry's bytes; kept",
+                    target_path.display()
+                );
+            } else if store.is_read_only() && blob_strategy == link::LinkStrategy::Hardlink {
                 link::prepare_writable_target_from_file(&store_path, target_path)?
                     .publish_replacing()
                     .with_context(|| format!("{context}: copying {}", target_path.display()))?;
@@ -6121,8 +6583,17 @@ fn materialize_cached_artifact(
             // not affect SQLite `last_accessed` eviction ranking, though it can
             // conservatively delay the later orphan-blob age sweep. The Windows
             // hardlink opt-in deliberately retains its documented legacy risk.
-            link::touch_mtime_write_clock(target_path)
-                .with_context(|| format!("{context}: touching {}", target_path.display()))?;
+            //
+            // A shared rlib that holds the blob's inode is the exception: its
+            // `.rmeta`, restored beside it, takes the stamp, and the inode
+            // other targets share keeps its mtime
+            // ([`link::LinkStrategy::SharedLibHardlink`]).
+            if !(blob_strategy == link::LinkStrategy::SharedLibHardlink
+                && same_inode(target_path, &store_path))
+            {
+                link::touch_mtime_write_clock(target_path)
+                    .with_context(|| format!("{context}: touching {}", target_path.display()))?;
+            }
         }
     }
 
@@ -6188,6 +6659,125 @@ fn materialize_cached_artifact(
     } else {
         RestoredBytes::Rewritten
     })
+}
+
+/// Whether `a` and `b` name the same inode. False when either cannot be read,
+/// and always off Unix.
+fn same_inode(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
+/// Whether the file at `target_path` already holds `cached_file`'s bytes, as
+/// when Cargo runs a unit again whose output an earlier restore of the same
+/// entry left in place (a third of all restores, measured over 6 h of this
+/// machine's builds). The restore then keeps the file and only stamps it, as
+/// it stamps a fresh link or copy, instead of writing the blob's bytes again.
+///
+/// Either the file is the blob itself, linked here by an earlier restore and
+/// linked nowhere else (so the stamp re-dates no other target, #794), or it is
+/// a file of its own whose memo row at its current stamp holds the blob's
+/// hash: the proof a cache key accepts for an input. An executable must also
+/// still run.
+fn output_already_holds(
+    store: &Store,
+    cached_file: &crate::store::CachedFile,
+    target_path: &Path,
+    store_path: &Path,
+    strategy: link::LinkStrategy,
+) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::symlink_metadata(target_path) else {
+            return false;
+        };
+        if !metadata.file_type().is_file() || metadata.len() != cached_file.size {
+            return false;
+        }
+        if (strategy.is_executable() || cached_file.executable) && metadata.mode() & 0o111 != 0o111
+        {
+            return false;
+        }
+        if strategy == link::LinkStrategy::WritableCopy
+            && (metadata.nlink() != 1 || metadata.mode() & 0o200 == 0)
+        {
+            return false;
+        }
+        if let Ok(blob) = std::fs::metadata(store_path)
+            && blob.dev() == metadata.dev()
+            && blob.ino() == metadata.ino()
+        {
+            // A shared rlib's inode may be shared by any number of targets.
+            return metadata.nlink() == 2 || strategy == link::LinkStrategy::SharedLibHardlink;
+        }
+        if metadata.nlink() != 1
+            && !(metadata.nlink() == 2 && cargo_uplift_shares(target_path, &metadata))
+        {
+            return false;
+        }
+        let Ok(before) = crate::cache_key::FileFingerprint::from_path(target_path) else {
+            return false;
+        };
+        if let Some(hash) = store.file_hash_at(&before) {
+            return hash == cached_file.hash;
+        }
+        // No row (Cargo re-dated a check output after its restore, say):
+        // reading it is still cheaper than writing the blob's bytes again,
+        // and the read is the proof, as long as the file did not move while
+        // it was read.
+        crate::cache_key::hash_file(target_path).is_ok_and(|hash| hash == cached_file.hash)
+            && crate::cache_key::FileFingerprint::from_path(target_path)
+                .is_ok_and(|after| after == before)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store, cached_file, target_path, store_path, strategy);
+        false
+    }
+}
+
+/// Whether the second name of `output` (a `deps/<name>-<hash>` file) is the
+/// copy Cargo uplifts it to, `<profile>/<name>`: Cargo links that name again
+/// after the unit, so stamping the shared inode affects nothing else.
+#[cfg(unix)]
+fn cargo_uplift_shares(output: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Some(deps), Some(name)) = (output.parent(), output.file_name().and_then(|n| n.to_str()))
+    else {
+        return false;
+    };
+    if deps.file_name().is_none_or(|dir| dir != "deps") {
+        return false;
+    }
+    let (stem, extension) = match name.split_once('.') {
+        Some((stem, extension)) => (stem, Some(extension)),
+        None => (name, None),
+    };
+    let Some((base, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let uplifted = match extension {
+        Some(extension) => format!("{base}.{extension}"),
+        None => base.to_string(),
+    };
+    deps.parent()
+        .and_then(|profile| std::fs::symlink_metadata(profile.join(uplifted)).ok())
+        .is_some_and(|other| other.dev() == metadata.dev() && other.ino() == metadata.ino())
 }
 
 /// The memo that one store blob, restored unchanged, passed this host's
@@ -6554,7 +7144,7 @@ fn adaptive_compile_before_key(
             return true;
         };
         let lookup_start = std::time::Instant::now();
-        let stored = ctx.store.get(&keyed.cache_key);
+        let stored = stored_at_dep_info(ctx.store, &keyed.cache_key, ctx.crate_name);
         lookup_ms = lookup_ms.saturating_add(lookup_start.elapsed().as_millis() as u64);
         (key_ms, key_hash_stats, _) = combine_key_measurements(
             key_ms,
@@ -6617,6 +7207,8 @@ fn adaptive_compile_before_key(
             ));
         }
     }
+    // A compile the stop let go on ran to its end: not a hit.
+    let hit_closure = hit_closure.filter(|_| stopped_on_hit(&executed));
     if hit_closure.is_none()
         && let Some((cache_key, fields)) = &observed
     {
@@ -6671,6 +7263,7 @@ fn adaptive_compile_before_key(
     after_rustc_exit(result.exit_code, &result.stderr, &ctx.args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
     let _ = lease.finish(outcome);
+    mark_private_outputs(result.exit_code, &result.artifacts);
     let cache_key = observed.as_ref().map_or("", |(key, _)| key.as_str());
     log_event(
         ctx.config,
@@ -6742,13 +7335,23 @@ fn compile_before_key(
     let executed = if stop_on_hit {
         let tree = tree_guard.clone();
         let mut on_dep_info = || {
+            // The store holds this unit, or another checkout's entry for it
+            // is being stored: either is likely this compile's hit. Keying
+            // takes long enough for rustc to start its codegen, after which
+            // a compile that links can no longer be stopped: freeze it first
+            // (a compile that does not link is not frozen; it can be killed
+            // at any point).
+            crate::compile::hold_while_deciding();
             let Some(dep_info) = emitted_dep_info(args) else {
                 return true;
             };
             let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
-            let stored = keyed
-                .ok()
-                .is_some_and(|keyed| ctx.store.get(&keyed.cache_key).ok().flatten().is_some());
+            let stored = keyed.ok().is_some_and(|keyed| {
+                stored_at_dep_info(ctx.store, &keyed.cache_key, crate_name)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            });
             if stored {
                 hit_closure = Some((dep_info, tree.clone()));
             }
@@ -6758,6 +7361,9 @@ fn compile_before_key(
     } else {
         compiler.execute_streaming(args)
     };
+    // A compile the stop let go on (it had started its linker or codegen)
+    // ran to its end and is keyed and stored as any other compile.
+    let hit_closure = hit_closure.filter(|_| stopped_on_hit(&executed));
     if hit_closure.is_none() {
         miss_guard.record_compile_rss(crate_name);
     }
@@ -6877,11 +7483,23 @@ fn compile_before_key(
 }
 
 /// May this compile start before its key and be stopped on a hit? rustc has
-/// to report its dep-info as a JSON artifact, and must not link: stopping
-/// kills rustc alone, and a linker it had already started could still write
-/// over the restored output.
+/// to report its dep-info as a JSON artifact. A compile that links only where
+/// the stop can prove its linker never runs on after it
+/// ([`crate::compile::STOPS_LINKING_COMPILES`]): a linker outliving rustc
+/// could write over the restored output. Never with the parallel frontend:
+/// its threads hold jobserver tokens from before the dep-info, which a
+/// stopped compile never returns (Cargo's `-j` shrinks with every stop).
 fn stop_on_hit_allowed(args: &RustcArgs) -> bool {
-    args.reports_artifacts() && !args.invokes_linker()
+    args.reports_artifacts()
+        && !args.runs_parallel_frontend()
+        && (!args.invokes_linker() || crate::compile::STOPS_LINKING_COMPILES)
+}
+
+/// Did the compile stop at its dep-info, as the hit asked? One that went on
+/// instead, or failed to run, is no hit: its outputs may be there, or a
+/// child it started may still be writing them.
+fn stopped_on_hit(executed: &Result<crate::compile::CompileResult>) -> bool {
+    executed.as_ref().is_ok_and(|result| result.stopped)
 }
 
 /// The closure the running compile wrote to its dep-info, once rustc has
@@ -6894,6 +7512,48 @@ fn emitted_dep_info(args: &RustcArgs) -> Option<crate::cache_key::DepInfo> {
         args.invocation_env(),
     )
     .ok()
+}
+
+/// Passthrough reason of a link [`private_link_extern`] keeps out of the
+/// cache. The prefix is a contract: reports group passthroughs by it.
+const PRIVATE_LINK_REASON: &str = "private link: ";
+
+/// The extern of a linking unit that an incremental compile wrote and kache
+/// did not store ([`crate::incremental_policy::private_outputs`]). The unit's
+/// key hashes that file, which no other checkout or later build writes again,
+/// so storing it would cost its dep-info pre-pass and its store on every
+/// edit for an entry nothing can hit. Such a unit compiles as a user-facing
+/// executable does with `cache_executables` off: incremental, with no key
+/// and no entry. A fresh checkout compiles its libraries without incremental
+/// state and keys and stores its links as before.
+fn private_link_extern(args: &RustcArgs) -> Option<&str> {
+    if !args.invokes_linker() {
+        return None;
+    }
+    args.externs
+        .iter()
+        .find(|dependency| {
+            dependency
+                .path
+                .as_deref()
+                .and_then(|path| args.resolve_invocation_path(path))
+                .is_some_and(|path| crate::incremental_policy::private_outputs::is_private(&path))
+        })
+        .map(|dependency| dependency.name.as_str())
+}
+
+/// Whether `args` compiles an executable kept out of the cache because
+/// `cache_executables` is off (by configuration: it is on by default where a
+/// restored executable debugs like a linked one). A Cargo build script built
+/// without debug info is cached all the same: Cargo runs it, nobody debugs
+/// it, and rustc names its `.pdb` by file name alone (`/PDBALTPATH:%_PDB%`),
+/// which the store keeps and restores with it. Kept out, every new target
+/// directory compiled each build script again (92 in a Windows build of five
+/// Studio crates, 2026-10-18).
+fn skips_cache_as_user_facing(args: &RustcArgs, cache_executables: bool) -> bool {
+    args.is_user_facing_executable()
+        && !cache_executables
+        && !(crate::build_script::build_script_output(args).is_some() && !args.debuginfo_enabled())
 }
 
 /// Compile-before-key needs a miss the local store can prove, or a compile it
@@ -6981,7 +7641,9 @@ fn record_input_prediction(
         .tree_guard
         .as_ref()
         .filter(|guard| guard.held())
-        .map(|guard| guard.digest.clone());
+        .and_then(|guard| {
+            crate::cache_key::with_closure_dirs(args, dep_info, guard.digest.clone(), guard.taken)
+        });
     let registry =
         crate::cache_key::registry_src_of(&args.invocation_env().vars_os().collect::<Vec<_>>());
     // A workspace or path unit gets a row another checkout of the workspace
@@ -7022,6 +7684,20 @@ fn record_input_prediction(
                     &identity,
                     crate::prediction_share::for_remote_plain(&row, registry),
                 );
+                // And here, any Cargo home over the same registry.
+                if let Some(identity) = crate::cache_key::rustc_registry_prediction_identity(args)
+                    && let Some(row) = crate::cache_key::registry_row(&row, registry)
+                {
+                    file_hasher.record_input_prediction(
+                        &identity,
+                        args.crate_name.as_deref(),
+                        &crate::cache_key::DepInfo {
+                            source_files: row.sources,
+                            env_deps: row.env_deps,
+                        },
+                        row.tree,
+                    );
+                }
             }
         }
     } else if let Some((identity, record)) =
@@ -7033,7 +7709,41 @@ fn record_input_prediction(
             &identity,
             crate::prediction_share::for_remote_portable(&record, registry.as_deref()),
         );
+        // And here, any Cargo home over the same registry.
+        if let Some((identity, record)) =
+            crate::cache_key::registry_relocatable_record(args, dep_info, tree.as_deref())
+        {
+            file_hasher.record_portable_prediction(&identity, args.crate_name.as_deref(), &record);
+        }
     }
+    hand_busy_predictions(config, store, &file_hasher);
+}
+
+/// Hand the prediction rows a busy index refused to the daemon, which writes
+/// them once the index lets it: the unit does not wait for the write lock
+/// after its compile, and the next build still finds its rows. The daemon
+/// takes rows of its own store only; without one they are dropped, which
+/// costs that next build a pre-pass and nothing else.
+fn hand_busy_predictions(
+    config: &Config,
+    store: &Store,
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+) {
+    let rows = file_hasher.take_busy_predictions();
+    if rows.is_empty() {
+        return;
+    }
+    let count = rows.len();
+    let handed = store.cache_dir() == config.cache_dir
+        && crate::daemon::send_prediction_rows(&config.socket_path(), &config.cache_dir, rows);
+    if handed {
+        crate::store::note_bookkeeping_handed_off();
+    }
+    tracing::debug!(
+        rows = count,
+        handed,
+        "input prediction rows not written (index busy)"
+    );
 }
 
 /// Hand a row to the daemon for the remote, when it can travel at all.
@@ -7309,17 +8019,15 @@ fn compute_rustc_cache_key(
     // them (kunobi-ninja/kache#485). MUST match the injection-side normalizer in
     // `RustcCompiler::execute`, or the key would represent one remap rule set
     // and the binary another.
-    let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+    let path_normalizer = crate::path_normalizer::PathNormalizer::for_invocation(
         workspace_root,
         args.invocation_env(),
-    )
-    .with_target_dir(args.target_dir().as_deref())
-    .with_base_dirs(&config.base_dirs)
-    .with_path_only_env_vars(config.path_only_env_vars.clone())
-    .with_rust_src_rule(
+        args.target_dir().as_deref(),
+        &config.base_dirs,
         crate::cache_key::get_rustc_sysroot_for(args, args.invocation_env()).as_deref(),
         crate::cache_key::get_rustc_commit_hash_for(&args.rustc, args.invocation_env()).as_deref(),
-    );
+    )
+    .with_path_only_env_vars(config.path_only_env_vars.clone());
     let key_ctx = KeyCtx {
         invocation_env: args.invocation_env(),
         file_hasher: &file_hasher,
@@ -7422,8 +8130,9 @@ fn owes_rederivation(predicted: bool, already_rederived: bool) -> bool {
 ///
 /// A predicted key must be re-derived before anything is stored, and the
 /// running compile writes the closure the pre-pass would. A compile that
-/// links cannot stop on a hit, so a guess is re-derived through the pre-pass
-/// first, where a lookup can still find the entry under the real key.
+/// cannot stop on a hit (one that links, off Linux) re-derives a guess
+/// through the pre-pass first, where a lookup can still find the entry under
+/// the real key.
 ///
 /// A unit that keyed first did so only so that its miss could take an
 /// incremental lane, and none did. Its key was taken before the compile, and
@@ -7513,7 +8222,8 @@ fn try_rustc_remote_hit(
         cache_key,
         hit.crate_name,
         NegativeReply::CheckConcurrentEntry,
-    )?;
+    )
+    .or_else(|| remote::acquire_legacy_entry(hit.config, store, cache_key))?;
     Some(hit.restore_and_finish(
         store,
         &meta,
@@ -7550,13 +8260,141 @@ fn try_rustc_remote_hit(
 ///
 /// Best-effort by construction — `record_verified_file_hash` drops files
 /// below the memo's size floor, which the hasher would not consult anyway.
-fn record_known_file_hashes(store: &Store, restored: &[(crate::cache_key::FileFingerprint, &str)]) {
+///
+/// `redated` are the check unit's outputs [`redate_check_outputs`] re-dated,
+/// written in the same transaction as the others.
+fn record_known_file_hashes(
+    store: &Store,
+    restored: &[(crate::cache_key::FileFingerprint, &str)],
+    redated: &[(crate::cache_key::FileFingerprint, &str)],
+) {
     let _trace = crate::phase_trace::phase("memo_restored");
-    let restored: Vec<_> = restored
+    store.record_restored_file_hashes(restored, redated);
+}
+
+/// The time Cargo will set this unit's outputs' mtime to once the unit ends,
+/// when this rustc runs a `cargo check` (or `clippy`) unit: since Cargo 1.90
+/// a check unit's outputs are re-dated to its invocation time, the mtime of
+/// `invoked.timestamp` in the unit's fingerprint folder, which Cargo writes
+/// just before it starts the unit. `None` when this is not a check unit, the
+/// folder is not where Cargo keeps it, or the stamp is not from this run.
+fn cargo_check_redate_ns(args: &RustcArgs) -> Option<i64> {
+    if args.emits_link() || !args.emit.iter().any(|kind| kind == "metadata") {
+        return None;
+    }
+    let stamp = cargo_invocation_stamp(args)?;
+    let metadata = std::fs::metadata(stamp).ok()?;
+    let invoked = kache_store::file_hash::metadata_mtime_ns(&metadata);
+    // Written for this unit's run: not in the future, and not from a run
+    // long gone (a unit waits for a job slot, but not for an hour).
+    let age = kache_store::file_hash::wall_clock_ns().saturating_sub(invoked);
+    (0..3_600_000_000_000).contains(&age).then_some(invoked)
+}
+
+/// Set `path`'s mtime to `invoked_ns`, as Cargo is about to, when it still
+/// holds the bytes `known` was observed with; returns the fingerprint after.
+/// Cargo's own call that follows then changes only the ctime, which a
+/// [`FILE_HASH_RULE_REDATED`](kache_store::file_hash::FILE_HASH_RULE_REDATED)
+/// row tolerates.
+fn redate_like_cargo(
+    path: &Path,
+    known: &crate::cache_key::FileFingerprint,
+    invoked_ns: i64,
+) -> Option<crate::cache_key::FileFingerprint> {
+    let before = crate::cache_key::FileFingerprint::from_path(path).ok()?;
+    if before != *known {
+        return None;
+    }
+    if before.mtime_ns != invoked_ns {
+        let seconds = invoked_ns.div_euclid(1_000_000_000);
+        let nanos = invoked_ns.rem_euclid(1_000_000_000) as u32;
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, nanos)).ok()?;
+    }
+    let after = crate::cache_key::FileFingerprint::from_path(path).ok()?;
+    (after.inode == before.inode && after.size == before.size && after.mtime_ns == invoked_ns)
+        .then_some(after)
+}
+
+/// Where Cargo keeps this unit's `invoked.timestamp`: in the shared layout
+/// `<profile>/deps` holds the outputs and `<profile>/.fingerprint/<package>-<hash>`
+/// the stamp; in the per-unit layout (`-Zbuild-dir-new-layout`, nightly's
+/// default) `build/<package>/<hash>/out` holds the outputs beside
+/// `build/<package>/<hash>/fingerprint`.
+fn cargo_invocation_stamp(args: &RustcArgs) -> Option<PathBuf> {
+    let out_dir = args.out_dir.as_deref()?;
+    let extra = args.extra_filename.as_deref()?;
+    let unit_hash = extra.strip_prefix('-')?;
+    let parent = out_dir.parent()?;
+    let folder = match out_dir.file_name()?.to_str()? {
+        "deps" => {
+            let package = args.invocation_env().var("CARGO_PKG_NAME").ok()?;
+            parent.join(".fingerprint").join(format!("{package}{extra}"))
+        }
+        "out" if parent.file_name()? == unit_hash => parent.join("fingerprint"),
+        _ => return None,
+    };
+    Some(folder.join("invoked.timestamp"))
+}
+
+fn is_rmeta(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rmeta")
+}
+
+/// The restores of one hit, split by the rows they earn: re-dated outputs
+/// and the rest.
+type RestoreRows<'a> = (
+    Vec<(crate::cache_key::FileFingerprint, &'a str)>,
+    Vec<(crate::cache_key::FileFingerprint, &'a str)>,
+);
+
+/// For a check unit, re-date its restored `.rmeta` files as Cargo will;
+/// returns the restores left for the ordinary rows, then the re-dated ones,
+/// for the re-date rule.
+fn redate_check_outputs<'a>(
+    args: &RustcArgs,
+    restored: Vec<(crate::cache_key::FileFingerprint, &'a str)>,
+) -> RestoreRows<'a> {
+    let Some(invoked) = cargo_check_redate_ns(args) else {
+        return (restored, Vec::new());
+    };
+    let mut redated = Vec::new();
+    let mut rest = Vec::with_capacity(restored.len());
+    for (fingerprint, hash) in restored {
+        let path = PathBuf::from(&fingerprint.path);
+        match is_rmeta(&path)
+            .then(|| redate_like_cargo(&path, &fingerprint, invoked))
+            .flatten()
+        {
+            Some(after) => redated.push((after, hash)),
+            None => rest.push((fingerprint, hash)),
+        }
+    }
+    (rest, redated)
+}
+
+/// [`redate_check_outputs`] for a check unit's freshly stored `.rmeta`
+/// files, whose hashes `Store::put` has just memoised at their stamp.
+fn redate_stored_check_outputs(store: &Store, args: &RustcArgs, files: &[(PathBuf, String)]) {
+    let Some(invoked) = cargo_check_redate_ns(args) else {
+        return;
+    };
+    let mut redated: Vec<(crate::cache_key::FileFingerprint, String)> = Vec::new();
+    for (path, _) in files.iter().filter(|(path, _)| is_rmeta(path)) {
+        let Ok(stored) = crate::cache_key::FileFingerprint::from_path(path) else {
+            continue;
+        };
+        let Some(hash) = store.file_hash_at(&stored) else {
+            continue;
+        };
+        if let Some(after) = redate_like_cargo(path, &stored, invoked) {
+            redated.push((after, hash));
+        }
+    }
+    let redated: Vec<_> = redated
         .iter()
-        .map(|(fingerprint, hash)| (fingerprint.clone(), *hash))
+        .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
         .collect();
-    store.record_verified_file_hashes(&restored);
+    store.record_redated_file_hashes(&redated);
 }
 
 /// Replay cached compiler diagnostics to the given sinks, exactly as a fresh
@@ -8072,6 +8910,7 @@ fn restore_from_cache_with_memo_store(
         if kind == ArtifactKind::DebugBundle && !wants_debug_bundle(args) {
             continue;
         }
+        let shared_rlib = restores_as_shared_rlib(args, &cached_file.name, &meta.files);
         let restored = materialize_cached_artifact(
             config.restore_max_size,
             store,
@@ -8079,6 +8918,7 @@ fn restore_from_cache_with_memo_store(
             &target_path,
             kind,
             shared_loadable,
+            shared_rlib,
             &depinfo_anchor,
             &depinfo_working_dir,
             depinfo_workspace_dir,
@@ -8086,6 +8926,7 @@ fn restore_from_cache_with_memo_store(
             &*platform,
             "rustc restore",
             extra_inputs,
+            keeps_metadata_writable(args),
         )?;
         if let RestoredBytes::ExactBlobCopy(fingerprint) = restored {
             exact_restores.push((fingerprint, &cached_file.hash));
@@ -8093,7 +8934,8 @@ fn restore_from_cache_with_memo_store(
         restored_paths.push((cached_file.name.clone(), target_path));
     }
 
-    record_known_file_hashes(memo_store, &exact_restores);
+    let (exact_restores, redated) = redate_check_outputs(args, exact_restores);
+    record_known_file_hashes(memo_store, &exact_restores, &redated);
 
     maybe_verify_restored_hit(compiler, args, &restored_paths);
 
@@ -8419,6 +9261,64 @@ fn prepare_worktree_compiler_args(
     lease.worktree_compiler_args_from(args, &donors, true)
 }
 
+/// How long a unit waits for the index's write lock to record its target
+/// root ([`register_target_root`]); not at all once the daemon took
+/// bookkeeping rows of this unit ([`crate::store::bookkeeping_wait`]).
+const TARGET_ROOT_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Record that a build wrote into `target`, owned by `workspace_root`, with
+/// at most [`TARGET_ROOT_WAIT`] for the index's write lock.
+///
+/// The row is bookkeeping (which target directories exist, for cleanup,
+/// worktree donors and seeding), and every unit of the build records it
+/// again until one finds it fresh. On a new target directory every unit of a
+/// burst finds no row; each one waiting out the busy timeout behind the
+/// misses' stores cost a tenth of a 400-unit burst five seconds. A busy index
+/// hands the row to the daemon, which records it once the index lets it;
+/// without a daemon the build's next unit records it. A late row cannot
+/// make cleanup remove anything: a target the registry does not know is one
+/// no rule touches.
+fn register_target_root(
+    config: &Config,
+    store: &Store,
+    target: &Path,
+    workspace_root: &Path,
+    rustc: Option<&str>,
+) {
+    let wait = crate::cache_key::bookkeeping_lock_wait(
+        crate::cache_key::BookkeepingWrite::TargetRoot,
+        crate::store::bookkeeping_wait(TARGET_ROOT_WAIT),
+    );
+    let Err(error) = store.remember_target_root_waiting(target, workspace_root, rustc, wait) else {
+        return;
+    };
+    if !crate::store::is_sqlite_contention(&error) {
+        tracing::warn!(
+            "failed to register target root {}: {error}",
+            target.display()
+        );
+        return;
+    }
+    let handed = store.cache_dir() == config.cache_dir
+        && crate::daemon::send_target_root(
+            &config.socket_path(),
+            &config.cache_dir,
+            kache_protocol::TargetRootRow {
+                target: target.to_string_lossy().into_owned(),
+                workspace_root: workspace_root.to_string_lossy().into_owned(),
+                rustc: rustc.map(str::to_owned),
+            },
+        );
+    if handed {
+        crate::store::note_bookkeeping_handed_off();
+    }
+    tracing::debug!(
+        handed,
+        "target root {} not recorded yet (index busy)",
+        target.display()
+    );
+}
+
 fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
     config.seed_incremental
         && args.inner_rustc.is_none()
@@ -8448,7 +9348,9 @@ fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> 
                 .as_deref(),
         )
     {
-        let _ = store.remember_target_root_built_by(
+        register_target_root(
+            config,
+            &store,
             &target,
             workspace,
             crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).as_deref(),
@@ -8479,6 +9381,16 @@ fn worktree_donor_profiles(
         .map(|entry| entry.path.join(suffix))
         .take(8)
         .collect()
+}
+
+/// After a compile under a private lease, mark what it wrote: a link that
+/// takes one of these files keys on bytes no other build writes.
+fn mark_private_outputs(exit_code: i32, artifacts: &ArtifactSet) {
+    if exit_code == 0 {
+        crate::incremental_policy::private_outputs::mark(
+            artifacts.outputs().iter().map(|artifact| artifact.path.as_path()),
+        );
+    }
 }
 
 /// Compile under the private lease; no result enters the artifact cache.
@@ -8598,6 +9510,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
     let kept = lease.finish(outcome);
+    mark_private_outputs(result.exit_code, &result.artifacts);
     tracing::debug!(
         ?kind,
         ?outcome,
@@ -9344,9 +10257,33 @@ pub(crate) fn store_error_for_event(error: &anyhow::Error) -> String {
 /// Append `event` to the event log and rotate the logs. Best-effort: nothing
 /// here may fail a build.
 pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
+    if !write_event_with(config, event, events::log_event_for_build) {
+        // The log stayed busy past the build's budget: the daemon logs it
+        // instead, or, without one, the event is dropped as before.
+        let _ = crate::daemon::send_events(
+            &config.socket_path(),
+            &config.event_log_path(),
+            vec![event.clone()],
+        );
+    }
+}
+
+/// [`write_event`] for the daemon, which logs the compiles handed to it and
+/// waits out a busy log ([`events::log_event_from_daemon`]).
+pub(crate) fn write_daemon_event(config: &Config, event: &BuildEvent) {
+    write_event_with(config, event, events::log_event_from_daemon);
+}
+
+/// Log `event` with `log` and rotate the logs. False when the event was not
+/// logged.
+fn write_event_with(
+    config: &Config,
+    event: &BuildEvent,
+    log: fn(&std::path::Path, &BuildEvent) -> anyhow::Result<()>,
+) -> bool {
     let _trace = crate::phase_trace::phase("event_log");
-    if events::log_event_for_build(&config.event_log_path(), event).is_err() {
-        return;
+    if log(&config.event_log_path(), event).is_err() {
+        return false;
     }
     let _ = events::rotate_events_if_needed(
         &config.event_log_path(),
@@ -9359,6 +10296,7 @@ pub(crate) fn write_event(config: &Config, event: &BuildEvent) {
         config.event_log_max_size,
         config.event_log_keep_lines,
     );
+    true
 }
 
 /// The parts of a rustc key's [`KeyOutputs`](crate::cache_key::KeyOutputs)
@@ -9504,6 +10442,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         dep_info_runs: crate::opcounts::dep_info_runs(),
         prediction_mismatches: u32::try_from(crate::opcounts::prediction_mismatches())
             .unwrap_or(u32::MAX),
+        prediction: crate::opcounts::prediction_outcomes(),
         flight_wait_ms: crate::opcounts::flight_wait_ms(),
         permit_wait_ms: crate::opcounts::permit_wait_ms(),
         store_output_blobs: store_put.output_blobs,
@@ -9541,6 +10480,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
                     .is_some_and(|settings| settings.daemon.is_some())
             }),
         daemon_store_ms: 0,
+        daemon_store_batch: 0,
         lookup_rejection,
         verify_compare: crate::verify_compare::take_last_report(),
         fallback,
@@ -9976,6 +10916,14 @@ fn open_session_id(content: &str, at_secs: u64) -> Option<String> {
 /// concurrent trigger. Guarded on the id still matching — if a newer build
 /// re-minted the marker between our read and this refresh, we must not
 /// resurrect the old session over it.
+///
+/// A marker touched in the last [`SESSION_REFRESH_SECS`] is left as it is.
+/// Every compile, hit and passthrough of a root ends here, and each refresh
+/// creates a file in one directory and renames it over the marker: hundreds
+/// of wrappers at once queued on that directory behind any of them waiting
+/// for a journal commit, for up to 4 s each (1,971 hits of two fresh-target
+/// builds spent 745 s here, 2026-10-18). The window then measures
+/// inactivity to within that interval.
 pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &str) {
     if root.is_empty() || session_id.is_empty() {
         return;
@@ -9983,7 +10931,11 @@ pub(crate) fn refresh_session_marker(config: &Config, root: &str, session_id: &s
     let marker = session_marker_path(config, root);
     match std::fs::read_to_string(&marker) {
         Ok(content) => match parse_session_marker(&content) {
-            Some((_, id)) if id == session_id => {}
+            Some((touched, id)) if id == session_id => {
+                if !session_refresh_due(touched, now_epoch_secs()) {
+                    return;
+                }
+            }
             _ => return, // superseded or unreadable — never clobber
         },
         Err(_) => return,
@@ -10077,6 +11029,16 @@ pub(crate) fn prune_session_markers(
 
 /// The build-session inactivity window (shared by trigger + attribution).
 pub(crate) const BUILD_SESSION_SECS: u64 = 300;
+
+/// How old a session marker's timestamp may get before an event refreshes
+/// it ([`refresh_session_marker`]).
+pub(crate) const SESSION_REFRESH_SECS: u64 = 20;
+
+/// Whether a marker last touched at `touched` is due a refresh at `now`. A
+/// timestamp in the future (another clock) is refreshed.
+fn session_refresh_due(touched: u64, now: u64) -> bool {
+    touched > now || now - touched >= SESSION_REFRESH_SECS
+}
 
 /// Remove the directory passed as `-C incremental`. Cargo passes
 /// `<profile>/incremental`, which every unit of the profile shares. Normal

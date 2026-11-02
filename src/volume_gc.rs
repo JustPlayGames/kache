@@ -128,7 +128,7 @@ mod tests {
         let configs = shard_gc_configs(&config, |_| Some(200 * GIB));
         let dirs: Vec<_> = configs.iter().map(|c| c.cache_dir.clone()).collect();
         assert_eq!(dirs, vec![live]);
-        assert_eq!(configs[0].max_size, 10 * GIB, "5% of the shard's 200GiB");
+        assert_eq!(configs[0].max_size, 40 * GIB, "20% of the shard's 200GiB");
         assert!(!missing.exists(), "skipping a shard must not create it");
     }
 

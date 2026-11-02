@@ -194,8 +194,7 @@ fn assert_build_succeeded(output: &Output) {
 }
 
 fn fixture_event_count(cache_dir: &Path) -> usize {
-    std::fs::read_to_string(cache_dir.join("events.jsonl"))
-        .unwrap_or_default()
+    common::settled_events(cache_dir)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["crate_name"] == CRATE_NAME)
@@ -203,8 +202,7 @@ fn fixture_event_count(cache_dir: &Path) -> usize {
 }
 
 fn last_fixture_event_result(cache_dir: &Path) -> Option<String> {
-    std::fs::read_to_string(cache_dir.join("events.jsonl"))
-        .ok()?
+    common::settled_events(cache_dir)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["crate_name"] == CRATE_NAME)
@@ -213,8 +211,7 @@ fn last_fixture_event_result(cache_dir: &Path) -> Option<String> {
 }
 
 fn last_fixture_passthrough_reason(cache_dir: &Path) -> Option<String> {
-    std::fs::read_to_string(cache_dir.join("events.jsonl"))
-        .ok()?
+    common::settled_events(cache_dir)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["crate_name"] == CRATE_NAME)

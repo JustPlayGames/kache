@@ -14,15 +14,29 @@
 //! The permit pool size is [`default_pool_size`]:
 //! `std::thread::available_parallelism()`, with a floor of 1. Unmeasured
 //! compiles occupy [`UNMEASURED_COMPILE_WEIGHT`] slots; unmeasured
-//! invocations that run the system linker occupy [`UNMEASURED_LINK_WEIGHT`]. After a real compile, Unix
-//! wrappers record the child's peak RSS by crate name; later invocations of
-//! that crate occupy `ceil(rss / 512 MiB)` slots, clamped to the pool.
+//! invocations that run the system linker occupy [`UNMEASURED_LINK_WEIGHT`]. After a real compile,
+//! wrappers record the child's peak RSS by crate name (on Windows, the peak
+//! memory of the job holding the compiler); later invocations of that crate
+//! occupy `ceil(rss / slot)` slots, clamped to the pool, a slot being the
+//! machine's memory shared across the pool and never less than 512 MiB.
+//!
+//! Before it takes slots, a compile passes the memory gate (see
+//! [`pressure`]): the memory available now, less what compiles admitted in
+//! the last [`ADMISSION_RAMP`] are still expected to take and less its own
+//! expected peak (its measured RSS, else [`UNMEASURED_COMPILE_BYTES`] or
+//! [`UNMEASURED_LINK_BYTES`]), must stay above a reserve, unless no other
+//! compile holds a slot. Running compiles record their expected peak under
+//! `scheduler/admitted/` for that. On Linux the available memory is bounded
+//! by the cgroup's limit.
 //!
 //! Under memory pressure (see [`pressure`]) ordinary admission keeps the
 //! slots compiles hold within a shared ceiling that falls while pressure
 //! lasts and grows back once it has cleared. After a capacity wait reaches
 //! its limit, recovery admits at most one extra compile and two extra
-//! weighted slots. Linux cgroup-v2 limits are logged for diagnostics.
+//! weighted slots: that overcommits slots, never memory, so a closed memory
+//! gate holds a recovery compile as it holds any other, until the shared
+//! coordination allowance is spent. Linux cgroup-v2 limits are logged for
+//! diagnostics.
 //!
 //! Waiters take free slots in [`queue`] order: by arrival, foreground builds
 //! ahead of background ones (see [`priority`]), and a large request is passed
@@ -62,6 +76,23 @@ pub const UNMEASURED_COMPILE_WEIGHT: u32 = 1;
 /// Permit slots occupied by an unmeasured rustc invocation that runs the
 /// system linker (see [`crate::args::RustcArgs::invokes_linker`]).
 pub const UNMEASURED_LINK_WEIGHT: u32 = 2;
+/// The peak memory the memory gate expects of a compile with no RSS sample:
+/// more than nine in ten measured compiles take less (a build machine's
+/// 3,037 recorded crates, 2026-10-25: p50 141 MiB, p90 441 MiB, p95 795 MiB).
+pub const UNMEASURED_COMPILE_BYTES: u64 = 512 * 1024 * 1024;
+/// The peak memory the gate expects of an unmeasured invocation that runs
+/// the system linker.
+pub const UNMEASURED_LINK_BYTES: u64 = 1024 * 1024 * 1024;
+/// How long an admitted compile's expected peak counts against the memory
+/// the gate sees as available, falling linearly to nothing: a compile takes
+/// its memory over seconds, so a burst of admissions would otherwise all
+/// see the memory the first ones are about to take.
+pub(crate) const ADMISSION_RAMP: Duration = Duration::from_secs(60);
+/// An admission record this old belongs to a compile that died (or one that
+/// long ago stopped counting): whoever reads it removes it.
+const ADMISSION_STALE: Duration = Duration::from_secs(600);
+/// How often a compile the memory gate holds back looks again.
+const GATE_POLL: Duration = Duration::from_millis(100);
 /// The least RSS one permit slot stands for once a crate has been measured.
 /// A slot is the machine's memory shared across the pool, never less than
 /// this (see [`slot_bytes`]).
@@ -220,7 +251,9 @@ impl FlightIdentity {
     }
 }
 
-/// Outcome of [`begin_miss`].
+/// Outcome of [`begin_miss`]. Returned once per miss and matched at once, so
+/// a large guard (Windows' lock handles) costs a move, not memory held.
+#[allow(clippy::large_enum_variant)]
 pub enum BeginMiss {
     /// This process should compile. The guard may be empty when the
     /// scheduler is off or the directory is unusable.
@@ -245,11 +278,179 @@ struct Permit {
     root: PathBuf,
     _slots: Vec<(u32, StoreLock)>,
     _recovery: Vec<StoreLock>,
+    _admission: Option<Admission>,
+}
+
+/// A compile's expected peak, recorded under `scheduler/admitted/` while it
+/// runs so that other compiles' memory gate counts it ([`pending_bytes`]).
+/// The file's name carries the bytes, then the pid and a counter, then
+/// `-m` when the peak was measured ([`unmeasured_running`]); its age, how
+/// much of the bytes still counts. Removed on drop.
+struct Admission {
+    path: PathBuf,
+}
+
+impl Admission {
+    fn record(root: &Path, expected: u64, measured: bool) -> Option<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = admitted_dir(root);
+        fs::create_dir_all(&dir).ok()?;
+        for _ in 0..4 {
+            let name = format!(
+                "{expected}-{}-{}{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                if measured { MEASURED_SUFFIX } else { "" }
+            );
+            let path = dir.join(name);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Some(Self { path }),
+                // A dead process's record under a reused pid.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn admitted_dir(root: &Path) -> PathBuf {
+    root.join("admitted")
+}
+
+/// Ends the record of a compile admitted on a measured peak. A record
+/// without it (a guessed peak, or a kache from before it) counts as
+/// unmeasured.
+const MEASURED_SUFFIX: &str = "-m";
+
+/// Whether a compile admitted under `root` on a guessed peak still runs:
+/// its record is there and not stale.
+fn unmeasured_running(root: &Path, now: std::time::SystemTime) -> bool {
+    let Ok(entries) = fs::read_dir(admitted_dir(root)) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(MEASURED_SUFFIX))
+            && entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| {
+                    now.duration_since(modified).unwrap_or_default() < ADMISSION_STALE
+                })
+    })
+}
+
+/// The bytes compiles admitted under `root` are still expected to take that
+/// the available memory does not show yet: each record's expected peak,
+/// scaled down linearly over [`ADMISSION_RAMP`] of its age. Records past
+/// [`ADMISSION_STALE`] are removed. An unreadable directory counts nothing.
+fn pending_bytes(root: &Path, now: std::time::SystemTime) -> u64 {
+    let Ok(entries) = fs::read_dir(admitted_dir(root)) else {
+        return 0;
+    };
+    let ramp = ADMISSION_RAMP.as_millis();
+    let mut pending: u64 = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(expected) = name
+            .to_str()
+            .and_then(|name| name.split('-').next())
+            .and_then(|bytes| bytes.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        // A record from the future (a clock step) counts in full.
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age >= ADMISSION_STALE {
+            let _ = fs::remove_file(entry.path());
+            continue;
+        }
+        let left = ramp.saturating_sub(age.as_millis());
+        let share = u128::from(expected) * left / ramp.max(1);
+        pending = pending.saturating_add(u64::try_from(share).unwrap_or(u64::MAX));
+    }
+    pending
+}
+
+/// Whether a compile running somewhere holds a slot of this scheduler: a
+/// held slot that no test lease marks. Unknown counts as none, so the gate
+/// fails open.
+fn others_compiling(root: &Path) -> bool {
+    let Some(held) = slots_held(root) else {
+        return false;
+    };
+    held > tests_held(root).min(held)
+}
+
+/// The memory gate for one compile: see [`pressure`]. Looked at again at
+/// most every [`GATE_POLL`] while it holds the compile back, since asking
+/// costs a directory read and a probe of every slot.
+struct MemoryGate<'a> {
+    root: &'a Path,
+    expected: u64,
+    /// Whether `expected` is the compile's measured peak.
+    measured: bool,
+    last: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl<'a> MemoryGate<'a> {
+    fn new(root: &'a Path, expected: u64, measured: bool) -> Self {
+        Self {
+            root,
+            expected,
+            measured,
+            last: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Whether the compile may take its slots now.
+    fn admits(&self) -> bool {
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last.get()
+            && now.saturating_duration_since(last) < GATE_POLL
+        {
+            return false;
+        }
+        let admits = self.decide();
+        if !admits {
+            self.last.set(Some(now));
+        }
+        admits
+    }
+
+    fn decide(&self) -> bool {
+        let Some(reading) = pressure::memory_now() else {
+            return true;
+        };
+        let now = std::time::SystemTime::now();
+        let pending = pending_bytes(self.root, now);
+        let measured = self.measured && !unmeasured_running(self.root, now);
+        pressure::fits(reading, pending, self.expected, measured) || !others_compiling(self.root)
+    }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Unlock before publishing, so a waiter that wakes can take the slot.
+        // Withdraw the admission and unlock before publishing, so a waiter
+        // that wakes finds the memory and the slot free.
+        self._admission.take();
         self._slots.clear();
         self._recovery.clear();
         permit_wait::notify(&self.root);
@@ -289,8 +490,9 @@ impl MissGuard {
 
     /// Record the waited-for compiler child's peak RSS under `crate_name`.
     ///
-    /// No-op when the scheduler did not admit this compile, on non-Unix, or
-    /// when the child never ran.
+    /// No-op when the scheduler did not admit this compile, on a platform
+    /// with no child memory sample (neither Unix nor Windows), or when the
+    /// child never ran.
     pub fn record_compile_rss(&self, crate_name: &str) {
         let Some(dir) = self.weights_dir.as_ref() else {
             return;
@@ -418,7 +620,7 @@ impl Scheduler {
                 let permit = if lease_covers(lease, &self.root) {
                     None
                 } else {
-                    self.acquire_permit(self.weight_for(crate_name, is_link))
+                    self.acquire_compile_permit(crate_name, is_link)
                 };
                 BeginMiss::Compile(MissGuard::compiling(permit, flight, self.weights_dir()))
             }
@@ -433,7 +635,7 @@ impl Scheduler {
         let permit = if lease_covers(lease, &self.root) {
             None
         } else {
-            self.acquire_permit(self.weight_for(crate_name, is_link))
+            self.acquire_compile_permit(crate_name, is_link)
         };
         MissGuard {
             _permit: permit,
@@ -493,42 +695,84 @@ impl Scheduler {
         }
     }
 
-    /// Acquire ordinary or recovery capacity within the invocation allowance.
-    /// The whole call is
+    /// The peak memory a compile of `crate_name` is expected to take: its
+    /// last measured peak, else [`UNMEASURED_COMPILE_BYTES`] or, linking,
+    /// [`UNMEASURED_LINK_BYTES`].
+    fn expected_bytes(&self, crate_name: &str, is_link: bool) -> u64 {
+        match read_weight(&self.weights_dir(), crate_name) {
+            Some(rss) => rss,
+            None if is_link => UNMEASURED_LINK_BYTES,
+            None => UNMEASURED_COMPILE_BYTES,
+        }
+    }
+
+    fn acquire_compile_permit(&self, crate_name: &str, is_link: bool) -> Option<Permit> {
+        self.acquire_permit_weighed(
+            self.weight_for(crate_name, is_link),
+            self.expected_bytes(crate_name, is_link),
+            read_weight(&self.weights_dir(), crate_name).is_some(),
+        )
+    }
+
+    /// [`Self::acquire_permit_expecting`] an unmeasured compile's peak.
+    #[cfg(test)]
+    fn acquire_permit(&self, weight: u32) -> Option<Permit> {
+        self.acquire_permit_expecting(weight, UNMEASURED_COMPILE_BYTES)
+    }
+
+    /// [`Self::acquire_permit_weighed`] a compile whose peak is guessed.
+    #[cfg(test)]
+    fn acquire_permit_expecting(&self, weight: u32, expected: u64) -> Option<Permit> {
+        self.acquire_permit_weighed(weight, expected, false)
+    }
+
+    /// Take `weight` slots for a compile expected to peak at `expected`
+    /// bytes (`measured`: its last measured peak), once the memory gate
+    /// admits it: ordinary or recovery capacity within the invocation
+    /// allowance. The whole call is
     /// attributed to `permit_wait_ms`: an immediately free pool costs
     /// microseconds, a saturated one costs the wait.
-    fn acquire_permit(&self, weight: u32) -> Option<Permit> {
+    fn acquire_permit_weighed(&self, weight: u32, expected: u64, measured: bool) -> Option<Permit> {
         let _trace = crate::phase_trace::phase("permit_wait");
         let started = std::time::Instant::now();
+        let gate = MemoryGate::new(&self.root, expected, measured);
         let wait = BudgetWait::capacity(self.wait_timeout);
         let mut bounded = self.clone();
         bounded.wait_timeout = wait.timeout;
         let request = Request::new(queue::Kind::Compile, false);
         let mut ticket = None;
-        let slots = bounded.wait_for_request(
+        let slots = bounded.wait_for_request_gated(
             &request,
             |waited, saved_for_tests| self.ordinary_need(weight, waited, saved_for_tests),
+            || gate.admits(),
             &mut ticket,
         );
         let recover = wait.scoped();
         drop(wait);
         let permit = match slots {
             Some(slots) => Some(self.keep(slots, weight)),
-            None if recover => self.acquire_recovery_permit(weight, &request, &mut ticket),
+            None if recover => self.acquire_recovery_permit(weight, &request, &gate, &mut ticket),
             None => None,
         };
         crate::opcounts::record_permit_wait(started.elapsed());
-        permit
+        let mut permit = permit?;
+        permit._admission = pressure::enabled()
+            .then(|| Admission::record(&self.root, expected, measured))
+            .flatten();
+        Some(permit)
     }
 
     /// After the ordinary wait allowance, one compiler can use recovery
     /// capacity. It may overcommit at most two weighted slots (one on a
     /// one-slot pool); a heavier compile still needs regular slots for the
-    /// rest. Other waiters keep waiting for capacity, with cancellation.
+    /// rest. Other waiters keep waiting for capacity, with cancellation. A
+    /// compile the memory gate still holds back waits here too: recovery is
+    /// for slots nobody is giving up, not for memory that is not there.
     fn acquire_recovery_permit(
         &self,
         weight: u32,
         request: &Request,
+        gate: &MemoryGate<'_>,
         ticket: &mut Option<queue::Ticket>,
     ) -> Option<Permit> {
         let wait = BudgetWait::start(WAIT_TIMEOUT);
@@ -537,7 +781,12 @@ impl Scheduler {
             crate::invocation::process::check().ok()?;
             let seen = permit_wait::snapshot(&self.root);
             let remaining = wait.timeout.saturating_sub(started.elapsed());
-            match self.try_recovery_request(weight, request, ticket, remaining) {
+            let step = if gate.admits() {
+                self.try_recovery_request(weight, request, ticket, remaining)
+            } else {
+                Ok(None)
+            };
+            match step {
                 Ok(Some(permit)) => return Some(permit),
                 Ok(None) => {
                     let remaining = wait.timeout.saturating_sub(started.elapsed());
@@ -551,7 +800,7 @@ impl Scheduler {
                         &self.root,
                         None,
                         seen,
-                        permit_wait::SATURATED_SLICE.min(remaining),
+                        permit_wait::saturated_slice().min(remaining),
                     );
                 }
                 Err(error) => {
@@ -629,6 +878,7 @@ impl Scheduler {
             root: self.root.clone(),
             _slots: slots,
             _recovery: recovery,
+            _admission: None,
         }))
     }
 
@@ -658,6 +908,7 @@ impl Scheduler {
             root: self.root.clone(),
             _slots: slots,
             _recovery: Vec::new(),
+            _admission: None,
         }
     }
 
@@ -691,13 +942,39 @@ impl Scheduler {
         need: impl Fn(bool, u32) -> u32,
         ticket: &mut Option<queue::Ticket>,
     ) -> Option<Vec<(u32, StoreLock)>> {
+        self.wait_for_request_gated(request, need, || true, ticket)
+    }
+
+    /// [`Self::wait_for_request`], taking slots only while `gate` admits.
+    fn wait_for_request_gated(
+        &self,
+        request: &Request,
+        need: impl Fn(bool, u32) -> u32,
+        gate: impl Fn() -> bool,
+        ticket: &mut Option<queue::Ticket>,
+    ) -> Option<Vec<(u32, StoreLock)>> {
         let start = std::time::Instant::now();
         let mut waited = false;
         loop {
             crate::invocation::process::check().ok()?;
             // A need of zero would never be met.
-            let asking = need(waited, request.saved_for_tests.get()).max(1);
-            match self.collect_permits(request, asking, ticket, start) {
+            // A closed memory gate takes no slots: it retries on the short
+            // poll, as an empty scan does, until memory frees or time runs
+            // out. A ticket it holds is not refreshed meanwhile, so the
+            // queue skips it after [`queue::STALE_AFTER`] and it gets its
+            // place back when the gate opens.
+            // A need of zero would never be met.
+            let mut asking = 1;
+            let step = if gate() {
+                asking = need(waited, request.saved_for_tests.get()).max(1);
+                self.collect_permits(request, asking, ticket, start)
+            } else if start.elapsed() >= self.wait_timeout {
+                tracing::debug!("scheduler permit wait timed out; running without a permit");
+                WaitStep::Stop
+            } else {
+                WaitStep::Busy(Vec::new())
+            };
+            match step {
                 WaitStep::Ready(slots) => return Some(slots),
                 WaitStep::Stop => return None,
                 WaitStep::Busy(busy) if !busy.is_empty() => {
@@ -708,7 +985,7 @@ impl Scheduler {
                         WaitStep::Stop => return None,
                         WaitStep::Busy(_) => {
                             let remaining = self.wait_timeout.saturating_sub(start.elapsed());
-                            let nap = permit_wait::SATURATED_SLICE.min(remaining);
+                            let nap = permit_wait::saturated_slice().min(remaining);
                             #[cfg(test)]
                             PERMIT_POLL_MAX.with(|max| max.set(max.get().max(nap)));
                             permit_wait::park(&self.root, armed, seen, nap);
@@ -884,8 +1161,8 @@ pub fn test_floor(cache_dir: &Path, key: &str) -> u32 {
         .map_or(1, |rss| weight_in_slots(rss, u32::MAX, slot))
 }
 
-/// Record the waited-for test child's peak RSS under `key`. No-op on
-/// non-Unix.
+/// Record the waited-for test child's peak RSS under `key`. No-op without
+/// a child memory sample.
 pub fn record_test_rss(cache_dir: &Path, key: &str) {
     if let Some(rss) = peak_child_rss_bytes() {
         let _ = write_weight(&scheduler_root(cache_dir).join("weights"), key, rss);
@@ -1185,6 +1462,61 @@ fn try_collect_slots(scheduler: &Scheduler, range: Range<u32>, need: usize) -> R
     Ok(Collect::Busy(busy))
 }
 
+/// Most flight files one GC sweep unlinks from each flight directory. A
+/// build machine leaves one compile flight per missed key and one discovery
+/// flight per discovered unit, about 80k and 50k a day on a busy shared
+/// store, and GC runs a few times a day. Each removal costs an open, a lock,
+/// two stats and an unlink (tens of microseconds on Linux, a few hundred on
+/// Windows), so a full batch takes seconds in the daemon's below-normal
+/// sweep, and a backlog of a million converges in a handful of sweeps.
+pub(crate) const FLIGHT_SWEEP_CAP: usize = 100_000;
+
+/// What [`sweep_stale_flights`] did across both flight directories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FlightSweepStats {
+    pub(crate) removed: usize,
+    pub(crate) remaining: usize,
+}
+
+/// Unlink the compile and discovery flight files nobody has held for
+/// [`crate::store::KEY_LOCK_SWEEP_GRACE`]. A flight is a lock file per
+/// missed key or discovered unit, and nothing else ever removes one, so the
+/// directories grow by every distinct key the machine has compiled. Each
+/// file is taken under its lock before it goes ([`crate::store::sweep_stale_lock_files`]):
+/// a held flight stays, and a process that opened one being removed sees
+/// it replaced and opens the new file, as with key locks. Up to
+/// [`FLIGHT_SWEEP_CAP`] per directory per sweep.
+pub(crate) fn sweep_stale_flights(cache_dir: &Path) -> FlightSweepStats {
+    sweep_stale_flights_at(
+        cache_dir,
+        crate::store::KEY_LOCK_SWEEP_GRACE,
+        FLIGHT_SWEEP_CAP,
+        std::time::SystemTime::now(),
+    )
+}
+
+fn sweep_stale_flights_at(
+    cache_dir: &Path,
+    min_age: Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+) -> FlightSweepStats {
+    let root = scheduler_root(cache_dir);
+    let mut stats = FlightSweepStats::default();
+    for dir in [root.join("flights"), root.join("discovery")] {
+        let swept = crate::store::sweep_stale_lock_files(&dir, is_flight_name, min_age, cap, now);
+        stats.removed += swept.removed;
+        stats.remaining += swept.remaining();
+    }
+    stats
+}
+
+/// A flight file's name: the 64 hex digits of a BLAKE3 digest, as
+/// [`FlightIdentity::digest`] and [`join_discovery_flight`] write it.
+fn is_flight_name(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub(crate) fn scheduler_root(cache_dir: &Path) -> PathBuf {
     cache_dir.join("scheduler")
 }
@@ -1208,8 +1540,12 @@ fn permits_dir(root: &Path) -> PathBuf {
 /// two probes never count each other and a compile polling for a slot loses
 /// at most one poll.
 pub fn permits_in_use(cache_dir: &Path) -> Option<u32> {
-    let root = scheduler_root(cache_dir);
-    let entries = match fs::read_dir(permits_dir(&root)) {
+    slots_held(&scheduler_root(cache_dir))
+}
+
+/// [`permits_in_use`] of the scheduler at `root`.
+fn slots_held(root: &Path) -> Option<u32> {
+    let entries = match fs::read_dir(permits_dir(root)) {
         Ok(entries) => entries,
         // Windows reports a file in place of `scheduler/` as not found too.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !root.is_file() => {
@@ -1320,11 +1656,29 @@ fn detected_memory() -> Option<u64> {
         {
             macos_memsize()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            windows_physical_memory()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             None
         }
     }
+}
+
+/// Physical memory on Windows. Without it every slot stood for 512 MiB, so a
+/// measured 1.5 GiB compile took three slots of a 4-slot pool on an 8 GiB
+/// machine instead of one.
+#[cfg(windows)]
+fn windows_physical_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a zeroed MEMORYSTATUSEX with its length set is what the call
+    // expects; it writes the whole structure on success.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    (unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.ullTotalPhys > 0)
+        .then_some(status.ullTotalPhys)
 }
 
 #[cfg(target_os = "macos")]
@@ -1444,6 +1798,11 @@ pub(crate) struct ResourceSnapshot {
     pub(crate) cpuset_cpus: Option<u32>,
     pub(crate) memory_current_bytes: Option<u64>,
     pub(crate) memory_headroom_bytes: Option<u64>,
+    /// Of the usage behind `memory_headroom_bytes`, the cache its cgroups
+    /// reclaim before paging anything in use (inactive file cache and
+    /// reclaimable slab, from `memory.stat`), never past a limit. 0 when
+    /// the headroom is unknown.
+    pub(crate) memory_reclaimable_bytes: u64,
     /// False when the visible cgroup mount starts below the hierarchy root,
     /// so a tighter limit may exist above it.
     pub(crate) ancestor_limits_complete: bool,
@@ -1460,6 +1819,7 @@ impl ResourceSnapshot {
             cpuset_cpus: None,
             memory_current_bytes: None,
             memory_headroom_bytes: None,
+            memory_reclaimable_bytes: 0,
             ancestor_limits_complete: false,
             current_memory_events: None,
         }
@@ -1498,6 +1858,7 @@ impl ResourceSnapshot {
             memory_limit_bytes = self.memory_limit_bytes,
             memory_current_bytes = self.memory_current_bytes,
             memory_headroom_bytes = self.memory_headroom_bytes,
+            memory_reclaimable_bytes = self.memory_reclaimable_bytes,
             ancestor_limits_complete = self.ancestor_limits_complete,
             current_memory_events_known = self.current_memory_events.is_some(),
             current_memory_low = events.low,
@@ -1509,6 +1870,26 @@ impl ResourceSnapshot {
             "scheduler resource snapshot; resource-aware admission is future work"
         );
     }
+}
+
+/// Bytes of a cgroup's `memory.current` it reclaims before paging out
+/// anything in use: its inactive file cache and reclaimable slab, from
+/// `memory.stat`. memory.current counts the page cache, and a long-running
+/// container's cache fills its limit. Active file cache (pages read more
+/// than once, the build's own rlibs among them) stays counted as used.
+/// 0 when unreadable.
+#[cfg(any(test, target_os = "linux"))]
+fn reclaimable_memory(stat: &Path) -> u64 {
+    let Ok(text) = fs::read_to_string(stat) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            matches!(name, "inactive_file" | "slab_reclaimable")
+                .then(|| value.trim().parse::<u64>().ok())?
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 /// A parsed cgroup-v2 CPU quota and period.
@@ -1590,6 +1971,8 @@ impl ResourceDomain {
     pub(crate) fn snapshot(&self) -> ResourceSnapshot {
         let mut memory_limit_bytes: Option<u64> = None;
         let mut memory_headroom_bytes: Option<u64> = None;
+        // The headroom again with each cgroup's reclaimable cache counted.
+        let mut reclaimable_headroom: Option<u64> = None;
         let mut memory_limits_complete = self.ancestor_limits_complete;
         let mut memory_headroom_complete = true;
         let mut cpu_limit: Option<CpuLimit> = None;
@@ -1608,6 +1991,13 @@ impl ResourceDomain {
                         memory_headroom_bytes = Some(match memory_headroom_bytes {
                             Some(current) => current.min(headroom),
                             None => headroom,
+                        });
+                        let with_cache = headroom
+                            .saturating_add(reclaimable_memory(&path.join("memory.stat")))
+                            .min(limit);
+                        reclaimable_headroom = Some(match reclaimable_headroom {
+                            Some(current) => current.min(with_cache),
+                            None => with_cache,
                         });
                     } else {
                         memory_headroom_complete = false;
@@ -1645,8 +2035,13 @@ impl ResourceDomain {
             .ok()
             .and_then(|text| parse_memory_events(&text));
 
+        let memory_reclaimable_bytes = match (memory_headroom_bytes, reclaimable_headroom) {
+            (Some(headroom), Some(with_cache)) => with_cache.saturating_sub(headroom),
+            _ => 0,
+        };
         ResourceSnapshot {
             memory_limit_bytes,
+            memory_reclaimable_bytes,
             cpu_limit,
             cpuset_cpus: fs::read_to_string(self.current.join("cpuset.cpus.effective"))
                 .ok()
@@ -2452,6 +2847,44 @@ mod tests {
         assert_eq!(snapshot.memory_headroom_bytes, Some(0));
     }
 
+    /// memory.current counts the page cache, which fills a long-running
+    /// container's limit: the snapshot also reports what the cgroup
+    /// reclaims before it pages anything in use, its inactive file cache and
+    /// reclaimable slab, never past the limit. Active file cache stays used.
+    #[test]
+    fn resource_snapshot_reports_the_cache_a_cgroup_reclaims_first() {
+        const MIB: u64 = 1 << 20;
+        let dir = temp_cache();
+        let domain = fixture_domain(dir.path(), "/job");
+        let current = dir.path().join("cgroup/job");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("memory.max"), format!("{}\n", 8192 * MIB)).unwrap();
+        fs::write(current.join("memory.current"), format!("{}\n", 7680 * MIB)).unwrap();
+        fs::write(
+            current.join("memory.stat"),
+            format!(
+                "anon {}\nfile {}\nactive_file {}\ninactive_file {}\nslab_reclaimable {}\n",
+                3000 * MIB,
+                4096 * MIB,
+                1024 * MIB,
+                3072 * MIB,
+                256 * MIB
+            ),
+        )
+        .unwrap();
+        let snapshot = domain.snapshot();
+        assert_eq!(snapshot.memory_headroom_bytes, Some(512 * MIB));
+        assert_eq!(snapshot.memory_reclaimable_bytes, (3072 + 256) * MIB);
+        fs::write(
+            current.join("memory.stat"),
+            format!("inactive_file {}\n", 16384 * MIB),
+        )
+        .unwrap();
+        assert_eq!(domain.snapshot().memory_reclaimable_bytes, 7680 * MIB);
+        fs::remove_file(current.join("memory.stat")).unwrap();
+        assert_eq!(domain.snapshot().memory_reclaimable_bytes, 0);
+    }
+
     #[test]
     fn resource_snapshot_uses_each_ancestor_usage_for_headroom() {
         let dir = temp_cache();
@@ -2593,6 +3026,7 @@ mod tests {
             cpuset_cpus: Some(3),
             memory_current_bytes: Some(256 << 20),
             memory_headroom_bytes: Some(768 << 20),
+            memory_reclaimable_bytes: 0,
             ancestor_limits_complete: true,
             current_memory_events: Some(MemoryEvents {
                 low: 1,
@@ -3301,54 +3735,85 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dropping_a_permit_wakes_the_waiter() {
+        // Long enough that a missed wake fails the test, however loaded the
+        // machine: the waiter would sleep its whole slice.
+        const SLICE: Duration = Duration::from_secs(120);
         let dir = temp_cache();
         let holder = test_scheduler(dir.path(), 1);
         let permit = holder
             .acquire_permit(1)
             .expect("holder takes the only slot");
         let root = dir.path().to_path_buf();
-        let waiter =
-            std::thread::spawn(move || test_scheduler(&root, 1).acquire_permit(1).is_some());
-        #[cfg(target_os = "linux")]
-        wait_until("the permit waiter to queue", || {
-            queued(dir.path()).len() == 1
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            permit_wait::force_slice(Some(SLICE));
+            pressure::force(Some(pressure::Level::Calm));
+            let waiter = Scheduler::open_with(&root, 1, SLICE, Duration::from_millis(10)).unwrap();
+            tid_tx.send(current_tid()).unwrap();
+            let started = std::time::Instant::now();
+            let taken = waiter.acquire_permit(1).is_some();
+            (taken, started.elapsed())
         });
-        // macOS observes the kernel unlock event rather than a wake counter.
-        #[cfg(not(target_os = "linux"))]
-        std::thread::sleep(Duration::from_millis(50));
+        wait_until_parked(tid_rx.recv().unwrap(), &waiter, SLICE);
         assert!(
             !waiter.is_finished(),
             "the waiter must still be blocked on the held slot"
         );
-        #[cfg(target_os = "linux")]
-        {
-            // Keep admission from removing the waiter's ticket and publishing
-            // its own wake, so only dropping this permit can move the counter.
-            let _queue = queue::lock(&holder.root, Duration::from_secs(5))
-                .unwrap()
-                .unwrap();
-            let seen = permit_wait::snapshot(&holder.root);
-            drop(permit);
-            assert_ne!(
-                permit_wait::snapshot(&holder.root),
-                seen,
-                "dropping the permit must publish a wake"
-            );
-        }
-        #[cfg(not(target_os = "linux"))]
-        let started = std::time::Instant::now();
-        #[cfg(not(target_os = "linux"))]
         drop(permit);
+        let (taken, waited) = waiter.join().unwrap();
+        assert!(taken, "the waiter must take the slot after it is released");
         assert!(
-            waiter.join().unwrap(),
-            "the waiter must take the slot after it is released"
+            waited < SLICE / 2,
+            "woke after {waited:?}; releasing a permit has to interrupt the {SLICE:?} slice"
         );
-        #[cfg(not(target_os = "linux"))]
-        assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "woke after {:?}; releasing a permit has to interrupt the wait",
-            started.elapsed()
-        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_tid() -> libc::pid_t {
+        // SAFETY: gettid takes no arguments and cannot fail.
+        unsafe { libc::gettid() }
+    }
+
+    /// No thread id is needed off Linux: see [`wait_until_parked`].
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn current_tid() -> u32 {
+        0
+    }
+
+    /// Wait until the waiter thread sleeps on the wake word (Linux: in
+    /// `futex`), so the release below is one that has to wake it. Elsewhere
+    /// there is no per-thread view of that; a short pause gets it into the
+    /// wait, and a release that comes first only makes the test easier.
+    #[cfg(target_os = "linux")]
+    fn wait_until_parked<T>(
+        tid: libc::pid_t,
+        waiter: &std::thread::JoinHandle<T>,
+        limit: Duration,
+    ) {
+        let syscall = format!("/proc/self/task/{tid}/syscall");
+        let futex = format!("{} ", libc::SYS_futex);
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            // The wait loop's own locks are futexes too: a sleep there is
+            // brief, so require the futex call to last.
+            let parked = (0..5).all(|_| {
+                std::thread::sleep(Duration::from_millis(2));
+                fs::read_to_string(&syscall).is_ok_and(|call| call.starts_with(&futex))
+            });
+            if parked || waiter.is_finished() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the waiter never parked on the held slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn wait_until_parked<T>(_: u32, _: &std::thread::JoinHandle<T>, _: Duration) {
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     #[cfg(target_os = "linux")]
@@ -3475,6 +3940,57 @@ mod tests {
         // than "not found" on Unix.
         #[cfg(unix)]
         assert_eq!(slot_is_held(&slot.join("below")), None);
+    }
+
+    #[test]
+    fn gc_unlinks_flights_nobody_held_for_the_grace() {
+        let dir = temp_cache();
+        let root = scheduler_root(dir.path());
+        let digest = |n: u8| format!("{n:064x}");
+        let flight = |sub: &str, n: u8| {
+            let path = root.join(sub).join(digest(n));
+            drop(StoreLock::try_acquire(&path).unwrap().unwrap());
+            path
+        };
+        let stale = [flight("flights", 1), flight("discovery", 2)];
+        let held_path = flight("flights", 3);
+        let held = StoreLock::try_acquire(&held_path).unwrap().unwrap();
+        let recent = flight("discovery", 4);
+        let other = root.join("flights/notes");
+        fs::write(&other, b"not a flight").unwrap();
+        let grace = Duration::from_secs(3600);
+        let now = std::time::SystemTime::now() + 2 * grace;
+        fs::File::options()
+            .write(true)
+            .open(&recent)
+            .unwrap()
+            .set_modified(now - grace / 2)
+            .unwrap();
+
+        let swept = sweep_stale_flights_at(dir.path(), grace, 100, now);
+        assert_eq!(
+            swept,
+            FlightSweepStats {
+                removed: 2,
+                remaining: 2
+            }
+        );
+        assert!(stale.iter().all(|path| !path.exists()));
+        assert!(held_path.exists() && recent.exists() && other.exists());
+
+        // The cap bounds each directory's share of one sweep: one of the
+        // three stale flights waits, beside the recent discovery flight.
+        drop(held);
+        let more = [held_path, flight("flights", 5), flight("flights", 6)];
+        let now = std::time::SystemTime::now() + 2 * grace;
+        assert_eq!(
+            sweep_stale_flights_at(dir.path(), grace, 2, now),
+            FlightSweepStats {
+                removed: 2,
+                remaining: 2
+            }
+        );
+        assert_eq!(more.iter().filter(|path| path.exists()).count(), 1);
     }
 
     #[test]
@@ -3869,6 +4385,218 @@ mod tests {
             seen.wrapping_add(1),
             "the three free slots it locked were released"
         );
+    }
+
+    /// Pin this thread's memory reading until drop (and calm pressure).
+    struct PinnedMemory;
+
+    impl PinnedMemory {
+        fn new(available_gib: u64, total_gib: u64) -> Self {
+            Self::pin(available_gib, total_gib, None)
+        }
+
+        /// A cgroup's reading: `reclaimable_gib` of its usage is cache it
+        /// reclaims before paging anything in use.
+        fn in_cgroup(available_gib: u64, total_gib: u64, reclaimable_gib: u64) -> Self {
+            Self::pin(available_gib, total_gib, Some(reclaimable_gib))
+        }
+
+        fn pin(available_gib: u64, total_gib: u64, reclaimable_gib: Option<u64>) -> Self {
+            const GIB: u64 = 1024 * 1024 * 1024;
+            pressure::force(Some(pressure::Level::Calm));
+            pressure::force_memory(Some(pressure::MemoryReading {
+                available: available_gib * GIB,
+                total: total_gib * GIB,
+                reclaimable: reclaimable_gib.map(|gib| gib * GIB),
+            }));
+            Self
+        }
+    }
+
+    impl Drop for PinnedMemory {
+        fn drop(&mut self) {
+            pressure::force_memory(None);
+            pressure::force(None);
+        }
+    }
+
+    fn gate_scheduler(dir: &Path, pool: u32) -> Scheduler {
+        Scheduler::open_with(
+            dir,
+            pool,
+            Duration::from_millis(300),
+            Duration::from_millis(5),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_memory_gate_holds_a_compile_while_another_runs_and_memory_is_short() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = temp_cache();
+        // 16 GiB, 10 available: the reserve is 4 GiB (a fifth is less).
+        let _memory = PinnedMemory::new(10, 16);
+        let scheduler = gate_scheduler(dir.path(), 8);
+        let first = scheduler
+            .acquire_permit_expecting(1, GIB / 2)
+            .expect("the first compile always runs");
+        // 10 - 0.5 still taking - 7 = 2.5 GiB left, under the reserve.
+        assert!(
+            scheduler.acquire_permit_expecting(1, 7 * GIB).is_none(),
+            "a compile that would eat into the reserve waits while another runs"
+        );
+        // A small one still fits: 10 - 0.5 - 0.5 = 9 GiB left.
+        let small = scheduler.acquire_permit_expecting(1, GIB / 2).unwrap();
+        drop((first, small));
+        let alone = scheduler
+            .acquire_permit_expecting(1, 7 * GIB)
+            .expect("with no other compile it runs whatever the memory");
+        drop(alone);
+    }
+
+    /// In a cgroup, while every compile involved has a measured peak, the
+    /// gate keeps a smaller reserve and counts the cache the cgroup reclaims
+    /// first. One compile still running on a guessed peak brings back the
+    /// full reserve with the cache counted as used, and outside a cgroup (a
+    /// desktop) the full reserve always stays.
+    /// Recovery overcommits slots, not memory: with slots free but the gate
+    /// closed, a compile past its capacity wait stays out until the shared
+    /// allowance is spent, and comes in as soon as the memory is there.
+    #[test]
+    fn a_closed_memory_gate_holds_a_recovery_compile_too() {
+        let dir = temp_cache();
+        let mut scheduler = gate_scheduler(dir.path(), 8);
+        scheduler.wait_timeout = Duration::from_millis(50);
+        let _other = StoreLock::try_acquire(&scheduler.permit_path(7))
+            .unwrap()
+            .unwrap();
+        const GIB: u64 = 1024 * 1024 * 1024;
+        {
+            let _memory = PinnedMemory::new(1, 16);
+            let _scope = InvocationWaitScope::with_budget(Duration::from_millis(300));
+            assert!(
+                scheduler.acquire_permit_expecting(1, GIB).is_none(),
+                "held back by the memory, with every other slot free"
+            );
+        }
+        let _memory = PinnedMemory::new(15, 16);
+        let _scope = InvocationWaitScope::with_budget(Duration::from_millis(300));
+        assert!(scheduler.acquire_permit_expecting(1, GIB).is_some());
+    }
+
+    #[test]
+    fn the_gate_relaxes_only_in_a_cgroup_while_every_peak_is_measured() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = temp_cache();
+        // Slots enough for every weight: only the memory gate decides.
+        let scheduler = gate_scheduler(dir.path(), 32);
+        write_weight(&scheduler.weights_dir(), "small", GIB / 2).unwrap();
+        write_weight(&scheduler.weights_dir(), "big", 6 * GIB).unwrap();
+        write_weight(&scheduler.weights_dir(), "mid", 3 * GIB).unwrap();
+        // 16 GiB, 10 available: 10 - 0.5 - 6 = 3.5 GiB left, under the full
+        // reserve (4 GiB), over the measured one (1 GiB).
+        let both_measured = |memory: PinnedMemory, then: &str| {
+            let small = scheduler.acquire_compile_permit("small", false).unwrap();
+            let admitted = scheduler.acquire_compile_permit(then, false).is_some();
+            drop(memory);
+            drop(small);
+            admitted
+        };
+        assert!(
+            !both_measured(PinnedMemory::new(10, 16), "big"),
+            "outside a cgroup the full reserve stays"
+        );
+        assert!(both_measured(PinnedMemory::in_cgroup(10, 16, 0), "big"));
+        // An 8 GiB cgroup with 2 GiB unused and 4 GiB of cache it reclaims
+        // first: 2 + 4 - 0.5 - 3 = 2.5 GiB left with the cache counted.
+        assert!(both_measured(PinnedMemory::in_cgroup(2, 8, 4), "mid"));
+        let _memory = PinnedMemory::in_cgroup(2, 8, 4);
+        let guessed = scheduler.acquire_compile_permit("never-built", false).unwrap();
+        assert!(
+            scheduler.acquire_compile_permit("mid", false).is_none(),
+            "a compile running on a guessed peak keeps the full reserve"
+        );
+        drop(guessed);
+    }
+
+    #[test]
+    fn a_burst_counts_what_compiles_admitted_moments_ago_will_take() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = temp_cache();
+        let _memory = PinnedMemory::new(8, 16);
+        let scheduler = gate_scheduler(dir.path(), 8);
+        // The reading stays at 8 GiB available: none of them has taken its
+        // memory yet.
+        let first = scheduler.acquire_permit_expecting(1, 3 * GIB / 2).unwrap();
+        let second = scheduler.acquire_permit_expecting(1, 3 * GIB / 2).unwrap();
+        // 8 - 3 pending - 1.5 = 3.5 GiB: under the reserve.
+        assert!(scheduler.acquire_permit_expecting(1, 3 * GIB / 2).is_none());
+        drop(second);
+        let third = scheduler.acquire_permit_expecting(1, 3 * GIB / 2).unwrap();
+        drop((first, third));
+        assert_eq!(
+            fs::read_dir(admitted_dir(&scheduler.root)).unwrap().count(),
+            0,
+            "a finished compile's record goes"
+        );
+    }
+
+    #[test]
+    fn unmeasured_compiles_expect_a_default_peak_and_measured_ones_theirs() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 8);
+        assert_eq!(
+            scheduler.expected_bytes("unknown", false),
+            UNMEASURED_COMPILE_BYTES
+        );
+        assert_eq!(
+            scheduler.expected_bytes("unknown", true),
+            UNMEASURED_LINK_BYTES
+        );
+        write_weight(&scheduler.weights_dir(), "windows", 5 << 30).unwrap();
+        assert_eq!(scheduler.expected_bytes("windows", false), 5 << 30);
+    }
+
+    #[test]
+    fn admissions_count_less_as_they_age_and_stale_ones_go() {
+        let dir = temp_cache();
+        let root = scheduler_root(dir.path());
+        let admitted = admitted_dir(&root);
+        fs::create_dir_all(&admitted).unwrap();
+        let now = std::time::SystemTime::now();
+        let aged = |name: &str, age: Duration| {
+            let path = admitted.join(name);
+            fs::write(&path, b"").unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(now - age).unwrap();
+        };
+        aged("1000-1-0", Duration::ZERO);
+        aged("1000-1-1", ADMISSION_RAMP / 2);
+        aged("1000-1-2", ADMISSION_RAMP);
+        aged("1000-1-3", ADMISSION_STALE);
+        aged("junk", Duration::ZERO);
+        assert_eq!(pending_bytes(&root, now), 1500);
+        assert!(!admitted.join("1000-1-3").exists(), "a stale record goes");
+        assert!(admitted.join("1000-1-2").exists());
+        assert_eq!(pending_bytes(&dir.path().join("missing"), now), 0);
+    }
+
+    #[test]
+    fn the_memory_gate_is_off_with_the_pressure_switch() {
+        let _guard = crate::test_support::process_state_test_lock();
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = temp_cache();
+        let _memory = PinnedMemory::new(1, 16);
+        let scheduler = gate_scheduler(dir.path(), 8);
+        let _scope = pressure::InvocationPressureScope::enter(false);
+        let first = scheduler.acquire_permit_expecting(1, GIB).unwrap();
+        let second = scheduler.acquire_permit_expecting(1, GIB);
+        assert!(second.is_some(), "off: the pool alone decides");
+        assert!(
+            !admitted_dir(&scheduler.root).exists(),
+            "and nothing is recorded"
+        );
+        drop((first, second));
     }
 
     #[test]

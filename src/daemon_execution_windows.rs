@@ -153,6 +153,22 @@ impl Prepared {
     }
 }
 
+/// Counts a handed-over compile in [`Daemon::compiles_in_flight`] while held.
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl InFlight {
+    fn begin(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 struct CancelOnDrop(Cancellation);
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -183,12 +199,13 @@ async fn decline(stream: &TokioStream, reason: impl ToString) -> Result<()> {
 }
 
 pub(super) async fn handle(
-    stream: &TokioStream,
+    connection: &Arc<TokioStream>,
     reader: &mut BufReader<&TokioStream>,
     request: ExecutionRequest,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
 ) -> Result<()> {
+    let stream: &TokioStream = connection;
     let trusted_pipeline = request
         .channels
         .trusted_pipeline(daemon.config.trust_daemon_execution);
@@ -235,6 +252,8 @@ pub(super) async fn handle(
         write_reply(stream, &ExecutionReply::Accepted),
     )
     .await??;
+    // Read before the broker takes the peer: the pipeline runs at its priority.
+    let client_class = peer.priority_class().ok();
     let cancellation = Cancellation::default();
     let _cancel = CancelOnDrop(cancellation.clone());
     let (send, mut calls) = tokio::sync::mpsc::channel(8);
@@ -242,7 +261,7 @@ pub(super) async fn handle(
     // can happen on this async task, so cleanup has a nonblocking channel.
     let (finish, mut finished) = tokio::sync::mpsc::unbounded_channel();
     // The pinned handle cannot name another process, whatever its PID.
-    let priority = crate::scheduler::Priority::of_windows_class(peer.priority_class());
+    let priority = crate::scheduler::Priority::of_windows_class(client_class.unwrap_or(0));
     let broker = Arc::new(Broker::new(send, finish, peer, prepared.env.clone()));
     let context = InvocationContext {
         daemon: Some(Arc::clone(daemon)),
@@ -259,9 +278,19 @@ pub(super) async fn handle(
         priority: Some(priority),
     };
     let activity = daemon.request_clock.begin_activity();
+    // From Accepted until the worker returns: shutdown waits for it, and its
+    // client's connection stays open as long as the worker runs, even when a
+    // drain past its bound cancels this task. A client that sees the
+    // connection close after Commit therefore knows nothing of this compile
+    // is still running here, and may run it again itself.
+    let in_flight = InFlight::begin(&daemon.compiles_in_flight);
+    let held_open = Arc::clone(connection);
     let mut worker = tokio::task::spawn_blocking(move || {
+        let _in_flight = in_flight;
+        let _held_open = held_open;
         let _activity = activity;
         let _permit = permit;
+        let _priority = client_class.map(crate::platform::run_at_client_priority);
         match prepared.entry {
             ExecutionEntry::Compiler => crate::run_compiler_invocation(&prepared.args, context),
             ExecutionEntry::Original => crate::run_original_compiler_invocation(

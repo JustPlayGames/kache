@@ -57,12 +57,33 @@ pub fn build_kache() {
 }
 
 /// Path to the `kache` binary under test, building it on first call.
+///
+/// Every test that starts a kache process asks for this path first, as the
+/// program or as the `RUSTC_WRAPPER` it hands cargo. So this is also where the
+/// test process claims the daemons its children start: the first call names
+/// this process in [`DAEMON_OWNER_PID_ENV`], which every child inherits, and a
+/// daemon started anywhere below drains within seconds of this process
+/// ending, a test killed by a timeout too, whatever folder it leaves behind.
 pub fn kache_binary() -> PathBuf {
-    match KACHE_BIN.get_or_init(bootstrap_kache) {
+    let path = match KACHE_BIN.get_or_init(bootstrap_kache) {
         Ok(path) => path.clone(),
         Err(message) => panic!("{message}"),
-    }
+    };
+    OWNS_DAEMONS.call_once(|| {
+        // SAFETY: written once per process, after the bootstrap build and
+        // before this process starts its first kache child. std's own
+        // environment reads (Command, env::var) take the same lock; only a
+        // C library reading the environment on another thread at this
+        // moment could race, and no test starts one before this call.
+        unsafe { std::env::set_var(DAEMON_OWNER_PID_ENV, std::process::id().to_string()) };
+    });
+    path
 }
+
+/// The variable that ties a daemon to the process that (indirectly) started
+/// it: kache's `KACHE_DAEMON_OWNER_PID`.
+pub const DAEMON_OWNER_PID_ENV: &str = "KACHE_DAEMON_OWNER_PID";
+static OWNS_DAEMONS: std::sync::Once = std::sync::Once::new();
 
 fn bootstrap_kache() -> Result<PathBuf, String> {
     if reuse_outer_build() {
@@ -78,6 +99,11 @@ fn bootstrap_kache() -> Result<PathBuf, String> {
             "kache-engine",
             "--target-dir",
             target_dir.to_str().expect("bootstrap target dir is utf-8"),
+            // A test build, as the outer one is through the dev-dependencies:
+            // it keeps the default cache folder (kache.log, probe memos) out
+            // of the developer's own (`KACHE_TEST_USER_CACHE_DIR`).
+            "--features",
+            "kache-config/test-support",
             "--config",
             "build.rustc-wrapper=\"\"",
         ])
@@ -157,6 +183,14 @@ pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
 /// A test that wants a host file calls `.env("KACHE_HOST_CONFIG", path)` on
 /// the returned command.
 ///
+/// A daemon the child starts belongs to this test process
+/// ([`DAEMON_OWNER_PID_ENV`]) and drains within seconds of it ending, killed
+/// or not, whatever runtime directory it leaves. It also gets a one-minute
+/// idle timeout (the default is none) unless the caller sets its own. Both
+/// are backstops, not the cleanup: a fixture's [`DaemonGuard`] stops the
+/// daemon, and a daemon stops by itself once the test's temporary runtime
+/// directory is removed, on a panic too.
+///
 /// Not every test binary spawns children, so the rest see it as dead.
 #[allow(dead_code)]
 pub fn hermetic_command(
@@ -190,6 +224,8 @@ pub fn hermetic_command(
         // build script). A child compile would inherit it and look like a
         // unit with an OUT_DIR.
         .env_remove("OUT_DIR")
+        .env("KACHE_DAEMON_IDLE_TIMEOUT", "60")
+        .env(DAEMON_OWNER_PID_ENV, std::process::id().to_string())
         .env("KACHE_HOST_CONFIG", "");
     match config {
         Some(path) => command.env("KACHE_CONFIG", path),
@@ -322,6 +358,100 @@ fn wait_for_daemon_lock_release(lock_path: &Path, timeout: Duration) -> Result<(
 
 /// Stops a fixture's daemon before its runtime directory is removed.
 /// Declare after the TempDir, or before it in a fixture's field list.
+/// `<cache_dir>/events.jsonl` once the daemon serving `cache_dir` has
+/// stored and logged every compile handed to it
+/// ([`wait_for_daemon_publishes`]), or empty when there is none.
+#[allow(dead_code)]
+pub fn settled_events(cache_dir: &Path) -> String {
+    wait_for_daemon_publishes(cache_dir);
+    std::fs::read_to_string(cache_dir.join("events.jsonl")).unwrap_or_default()
+}
+
+/// Wait until the daemon serving `cache_dir` has stored and logged every
+/// compile its wrappers handed it. The daemon is the one of
+/// `<cache_dir>/config.toml`'s `runtime_dir`, or of `cache_dir` itself when
+/// that file names none (or there is no such file).
+///
+/// A rustc miss may hand its store to the daemon, which writes the miss's
+/// event once the entry is committed: after the wrapper, and maybe Cargo,
+/// exited. A test that reads the event log or the store right after a build
+/// waits here first. The wait asks `kache daemon status` until the daemon
+/// reports nothing pending, and ends at once when no daemon runs; past two
+/// minutes it fails the test with the daemon's last answer.
+#[allow(dead_code)]
+pub fn wait_for_daemon_publishes(cache_dir: &Path) {
+    let config = isolated_config_path(cache_dir);
+    let runtime_dir = configured_runtime_dir(&config).unwrap_or_else(|| cache_dir.to_owned());
+    let run_lock = daemon_run_lock_path(&runtime_dir);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if !daemon_run_lock_is_held(&run_lock) {
+            return;
+        }
+        let answer = daemon_status(cache_dir, &config, &runtime_dir);
+        if let Ok(status) = serde_json::from_str::<serde_json::Value>(&answer)
+            && (status["daemon_running"] == false
+                || status["publishes_pending"].as_u64() == Some(0))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon for {} still had hand-offs to store after 120 s: {answer}",
+            cache_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `kache --json daemon status` for the daemon serving `cache_dir` (its
+/// `config` and `runtime_dir`, as [`wait_for_daemon_publishes`] finds
+/// them): the answer, or why there was none.
+fn daemon_status(cache_dir: &Path, config: &Path, runtime_dir: &Path) -> String {
+    hermetic_command(status_binary(), cache_dir, Some(config))
+        .env("KACHE_RUNTIME_DIR", runtime_dir)
+        .args(["--json", "daemon", "status"])
+        .env("KACHE_LOG", "off")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|error| error.to_string())
+}
+
+/// How many compiles the daemon serving `cache_dir` has taken from its
+/// wrappers and not yet stored (`publishes_pending`), or `None` when no
+/// daemon answers.
+#[allow(dead_code)]
+pub fn daemon_publishes_pending(cache_dir: &Path) -> Option<u64> {
+    let config = isolated_config_path(cache_dir);
+    let runtime_dir = configured_runtime_dir(&config).unwrap_or_else(|| cache_dir.to_owned());
+    let answer = daemon_status(cache_dir, &config, &runtime_dir);
+    let status = serde_json::from_str::<serde_json::Value>(&answer).ok()?;
+    status["publishes_pending"].as_u64()
+}
+
+/// A kache to ask the daemon with: the bootstrap build when this test made
+/// one, else the one Cargo built for the tests. A test that runs Cargo's
+/// build does not pay for a bootstrap build just to wait.
+fn status_binary() -> PathBuf {
+    match KACHE_BIN.get() {
+        Some(Ok(path)) => path.clone(),
+        _ => PathBuf::from(env!("CARGO_BIN_EXE_kache")),
+    }
+}
+
+/// The `[cache] runtime_dir` a test's config file sets, if it sets one.
+fn configured_runtime_dir(config: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(config).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    value
+        .get("cache")?
+        .get("runtime_dir")?
+        .as_str()
+        .map(PathBuf::from)
+}
+
 #[allow(dead_code)]
 pub struct DaemonGuard {
     program: PathBuf,

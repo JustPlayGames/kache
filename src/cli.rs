@@ -729,32 +729,66 @@ fn otel_snapshot_from_stats(config: &Config, snap: &StatsSnapshot) -> crate::ote
 
 // ── kache stats ────────────────────────────────────────────────────────────
 
-fn cloned_targets_row(disk: &crate::machine::DiskView) -> Option<StatsRow> {
+/// The store's bytes split by who holds them: `Exclusive`, the store's own
+/// blocks, which eviction frees, and `Shared`, blocks a target directory
+/// hardlinks or clones too, which the limit leaves out and only cleaning
+/// those targets frees (lane KACHE-W21: the Cache row and the sweep log name
+/// the sum, which read as a store far over its cap). None while no block is
+/// shared and no snapshot holds one: then Cache is all exclusive.
+fn cloned_targets_rows(disk: &crate::machine::DiskView) -> Vec<StatsRow> {
     let cloned = disk.cloned_into_targets_bytes;
     let snapshot = disk.snapshot_retained_bytes;
     if cloned == 0 && snapshot == 0 {
-        return None;
+        return Vec::new();
     }
-    let mut notes = vec!["private".to_string()];
-    if cloned > 0 {
-        // Evicting a blob a target still holds frees nothing, so a size
-        // sweep leaves these out, and the Cache size can stay above Limit.
-        notes.push(format!(
-            "{} cloned into target/, which the limit leaves out",
-            term::bytes(cloned)
-        ));
-    }
+    let mut exclusive = vec!["the store's own blocks, which eviction frees".to_string()];
     if snapshot > 0 {
-        notes.push(format!(
-            "{} held only by filesystem snapshots",
+        exclusive.push(format!(
+            "and {} held only by filesystem snapshots",
             term::bytes(snapshot)
         ));
     }
-    Some((
-        "On disk",
+    let mut rows = vec![(
+        "Exclusive",
         term::bytes(disk.disk_private_bytes),
-        notes.join(", "),
-    ))
+        exclusive.join(", "),
+    )];
+    if cloned > 0 {
+        // Evicting a blob a target still holds frees nothing, so a size
+        // sweep leaves these out, and the Cache size can stay above Limit.
+        // Say so where it does: a store reading over its cap looks broken.
+        let over = disk.store_bytes.saturating_sub(disk.store_limit_bytes);
+        let why = match over {
+            _ if disk.store_limit_bytes == 0 => String::new(),
+            0 => String::new(),
+            over if over <= cloned => format!(
+                ": it is why Cache reads {} over Limit, and only cleaning those targets frees it",
+                term::bytes(over)
+            ),
+            over => {
+                // The rest is the store's own bytes past Limit. A sweep
+                // starts below Limit and evicts further below it, so this is
+                // what a running sweep has not reached yet.
+                let trigger = crate::wrapper::auto_gc_threshold(disk.store_limit_bytes);
+                let rest = format!(
+                    ", the other {} past the sweep's start at {}: the next check sweeps it",
+                    term::bytes(over - cloned),
+                    term::bytes(trigger)
+                );
+                format!(
+                    "; Cache reads {} over Limit, {} of it held there{rest}",
+                    term::bytes(over),
+                    term::bytes(cloned)
+                )
+            }
+        };
+        rows.push((
+            "Shared",
+            term::bytes(cloned),
+            format!("hardlinked or cloned into target/, which the limit leaves out{why}"),
+        ));
+    }
+    rows
 }
 
 /// The volume holding the cache: its size, what is free, and the free-space
@@ -981,7 +1015,7 @@ pub fn stats(
         lifetime: lifetime_rows(lifetime.as_ref(), chrono::Local::now().date_naive()),
         ..Default::default()
     };
-    extras.cache.extend(cloned_targets_row(&disk));
+    extras.cache.extend(cloned_targets_rows(&disk));
     extras.cache.extend(volume.as_ref().map(volume_row));
     let mut compact_machine = machine.clone();
     compact_machine.rowid_high_water.clear();
@@ -1284,7 +1318,7 @@ fn build_rows(snap: &StatsSnapshot) -> Vec<StatsRow> {
 /// Parenthetical for a cap that is the disk-share budget, matching
 /// [`crate::config::describe_max_size`].
 ///
-/// One store whose cap equals that budget says `5% of <disk>, floor 5.0 GiB,
+/// One store whose cap equals that budget says `20% of <disk>, floor 10.0 GiB,
 /// cap 100.0 GiB`, or `default; disk size unknown` when the probe failed. Any
 /// other cap, and a summary that covers more than one store, stays unlabeled.
 fn cache_limit_note(store_count: usize, max_size: u64, filesystem_bytes: Option<u64>) -> String {
@@ -2583,6 +2617,11 @@ fn extern_chain_lines(diagnosis: &MissDiagnosis) -> Vec<String> {
             crate::miss_chain::RootKind::PathOnly => format!(
                 "  root: {name}{via}, same key in both build trees but its artifact differs \
                  (its output is not reproducible across build trees)"
+            ),
+            crate::miss_chain::RootKind::Unreproducible => format!(
+                "  root: {name}{via}, same cache key as before but its artifact differs: its \
+                 compile is not reproducible (e.g. rustc's -Zthreads above 1), so the crates \
+                 above it miss whenever it is compiled again"
             ),
             crate::miss_chain::RootKind::NothingRecorded => format!(
                 "  root: {name}{via}, dependencies stable and no traced input group changed \
@@ -4253,7 +4292,11 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
         print!("Running eviction...");
         std::io::Write::flush(&mut std::io::stdout()).ok();
     }
-    let evict_stats = store.evict_for(mode.sweep_origin())?;
+    // An automatic sweep goes on past its byte target while builds keep
+    // the disk low; a requested one stops there.
+    let evict_stats = store.evict_for_free_space(mode.sweep_origin(), || {
+        mode == GcMode::Background && crate::disk_recovery::low_on_disk(config)
+    })?;
     add_gc_stats(&mut combined, &evict_stats);
     if verbose {
         let over_limit = store_over_limit(
@@ -4268,17 +4311,42 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
 
     // Key lock files and input predictions grow with every distinct key and
     // eviction removes neither (#1126).
-    let housekeeping = store.sweep_housekeeping();
+    let mut housekeeping = store.sweep_housekeeping();
+    // Flight files grow the same way, one per missed key (scheduler/).
+    if !store.is_read_only() {
+        let flights = crate::scheduler::sweep_stale_flights(&config.cache_dir);
+        housekeeping.flights_removed = flights.removed;
+        housekeeping.flights_remaining = flights.remaining;
+    }
+    // Probe memos grow with every tool, checkout and environment.
+    let memos = crate::probe_memo::sweep_idle_memos(&crate::probe_memo::memo_sweep_roots(
+        &config.cache_dir,
+        !store.is_read_only(),
+    ));
+    housekeeping.memos_removed = memos.removed;
+    housekeeping.memos_remaining = memos.remaining;
     combined.housekeeping = Some(housekeeping);
     if verbose {
         println!(
-            "Housekeeping: removed {} ({} remain), {}, {}.",
+            "Housekeeping: removed {} ({} remain), {} ({} remain), {} ({} remain), {}, {}.",
             term::counted(
                 housekeeping.key_locks_removed as u64,
                 "stale key lock",
                 "stale key locks"
             ),
             housekeeping.key_locks_remaining,
+            term::counted(
+                housekeeping.flights_removed as u64,
+                "stale flight",
+                "stale flights"
+            ),
+            housekeeping.flights_remaining,
+            term::counted(
+                housekeeping.memos_removed as u64,
+                "unused probe memo",
+                "unused probe memos"
+            ),
+            housekeeping.memos_remaining,
             term::counted(
                 housekeeping.predictions_pruned as u64,
                 "unused input prediction",
@@ -4404,6 +4472,10 @@ pub fn run_auto_gc_worker(config: &Config, retry_delay: std::time::Duration) {
         return;
     };
     match Store::open(config).and_then(|store| store.physical_size()) {
+        // Stopped at its walk budget: more can go, so nothing backs off.
+        Ok(size) if last.cut_short => {
+            crate::wrapper::record_auto_gc_cut_short(config, size, last.bytes_held)
+        }
         Ok(size) => crate::wrapper::record_auto_gc_outcome(config, size, last.bytes_held),
         Err(e) => tracing::debug!("auto-gc: store size after the sweep unknown: {e:#}"),
     }
@@ -4437,33 +4509,7 @@ fn skipped_gc_stats() -> crate::store::GcStats {
 }
 
 fn add_gc_stats(total: &mut crate::store::GcStats, part: &crate::store::GcStats) {
-    total.entries_evicted = total.entries_evicted.saturating_add(part.entries_evicted);
-    total.bytes_freed = total.bytes_freed.saturating_add(part.bytes_freed);
-    total.blobs_removed = total.blobs_removed.saturating_add(part.blobs_removed);
-    total.duration_ms = total.duration_ms.saturating_add(part.duration_ms);
-    total.entries_pinned = total.entries_pinned.saturating_add(part.entries_pinned);
-    total.entries_unreclaimable = total
-        .entries_unreclaimable
-        .saturating_add(part.entries_unreclaimable);
-    total.disk_bytes_reclaimed = total
-        .disk_bytes_reclaimed
-        .saturating_add(part.disk_bytes_reclaimed);
-    total.entries_failed = total.entries_failed.saturating_add(part.entries_failed);
-    total.entries_locked = total.entries_locked.saturating_add(part.entries_locked);
-    total.entries_busy_snapshot = total
-        .entries_busy_snapshot
-        .saturating_add(part.entries_busy_snapshot);
-    total.entries_recent_prefiltered = total
-        .entries_recent_prefiltered
-        .saturating_add(part.entries_recent_prefiltered);
-    total.entries_import_pinned = total
-        .entries_import_pinned
-        .saturating_add(part.entries_import_pinned);
-    total.evict_write_ms = total.evict_write_ms.saturating_add(part.evict_write_ms);
-    // A measurement of the store, not work done: two sweeps probing the same
-    // held bytes must not add up to twice as many.
-    total.bytes_held = total.bytes_held.max(part.bytes_held);
-    total.skipped |= part.skipped;
+    total.add(part);
 }
 
 fn compile_time_backfill_message(result: Result<usize>) -> String {
@@ -4578,10 +4624,30 @@ fn evict_older_than_recorded(
 }
 
 /// Run garbage collection via the daemon.
+/// `kache gc --stale-targets <days> [--apply]`: the store blob hardlinks in
+/// tracked targets no build used for `days` days, unlinked only with `apply`.
+pub fn gc_stale_targets(config: &Config, days: u64, apply: bool, json: bool) -> Result<()> {
+    let report = crate::stale_target_links::run(config, days, apply)?;
+    if json {
+        return crate::machine::emit("gc", &report, Vec::new());
+    }
+    for line in crate::stale_target_links::lines(&report) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// How long `kache gc --stale-schema` keeps a row a key bridge of this
+/// release still adopts, counted from its last use: a cache the upgrade
+/// found is not discarded before the builds that need it ran once.
+const BRIDGED_ROW_GRACE: std::time::Duration = std::time::Duration::from_secs(14 * 86_400);
+
+/// `limit` caps a `--stale-schema` run's removals.
 pub fn gc(
     config: &Config,
     max_age_hours: Option<u64>,
     stale_schema: bool,
+    limit: Option<usize>,
     json: bool,
 ) -> Result<()> {
     if stale_schema {
@@ -4597,7 +4663,20 @@ pub fn gc(
             }
         };
         let started = std::time::Instant::now();
-        let mut stats = store.evict_stale_key_schemas(crate::cache_key::CACHE_KEY_VERSION)?;
+        let bridged = crate::cache_key::bridged_key_versions();
+        let kept_for_bridge = if bridged.is_empty() {
+            0
+        } else {
+            store
+                .stale_key_schema_keys(&bridged, std::time::Duration::ZERO)?
+                .len()
+                .saturating_sub(
+                    store
+                        .stale_key_schema_keys(&bridged, BRIDGED_ROW_GRACE)?
+                        .len(),
+                )
+        };
+        let mut stats = store.evict_stale_key_schemas(&bridged, BRIDGED_ROW_GRACE, limit)?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
         record_manual_gc_run(config, &stats);
         if json {
@@ -4608,6 +4687,29 @@ pub fn gc(
             describe_eviction(&stats, false),
             crate::cache_key::CACHE_KEY_VERSION,
         );
+        if limit.is_some() {
+            let left = store
+                .stale_key_schema_keys(&bridged, BRIDGED_ROW_GRACE)?
+                .len();
+            if left > 0 {
+                println!(
+                    "{} left: run it again to remove more.",
+                    term::counted(left as u64, "stale entry", "stale entries")
+                );
+            }
+        }
+        if kept_for_bridge > 0 {
+            println!(
+                "Kept {} of key version {} for this release to adopt, until idle {} days.",
+                term::counted(kept_for_bridge as u64, "entry", "entries"),
+                bridged
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                BRIDGED_ROW_GRACE.as_secs() / 86_400
+            );
+        }
         let total_size = store.physical_size()?;
         let entry_count = store.entry_count()?;
         println!(
@@ -5149,7 +5251,7 @@ pub fn clean_cache(
         CacheAction::Gc {
             max_age_hours,
             stale_schema,
-        } => gc(config, max_age_hours, stale_schema, json),
+        } => gc(config, max_age_hours, stale_schema, None, json),
         CacheAction::Purge {
             crate_name,
             question,
@@ -6459,6 +6561,7 @@ impl TrackedPlan {
             bytes: store.physical_size()?,
             limit: config.max_size,
             entries: store.entry_count()? as u64,
+            held: crate::wrapper::recent_auto_gc_held(&config.cache_dir),
         };
         let remove: std::collections::HashSet<String> = remove
             .iter()
@@ -6580,6 +6683,33 @@ struct CacheLine {
     bytes: u64,
     limit: u64,
     entries: u64,
+    /// Bytes of `bytes` the last automatic sweep found still linked from
+    /// target directories. No sweep can free them, so the limit leaves them
+    /// out and the store can read over it while they stay.
+    held: u64,
+}
+
+impl CacheLine {
+    /// The preview's Cache line. Over the limit because of held bytes, it
+    /// says so: "kept under its limit" next to a size over it reads broken.
+    fn text(&self) -> String {
+        let size = format!(
+            "Cache    {} of {} · {}",
+            term::bytes(self.bytes),
+            term::bytes(self.limit),
+            term::counted(self.entries, "entry", "entries")
+        );
+        let tail = "`kache clean --cache` empties it";
+        if self.held == 0 || self.bytes <= self.limit {
+            return format!("{size} · kept under its limit automatically; {tail}");
+        }
+        format!(
+            "{size} · {} of it still linked from target/, which the limit leaves out \
+             (cleaning those targets frees it); the rest is kept under its limit \
+             automatically; {tail}",
+            term::bytes(self.held.min(self.bytes))
+        )
+    }
 }
 
 /// What a tracked clean selects, in words.
@@ -6679,12 +6809,7 @@ fn plan_lines(
         });
     }
     lines.push(String::new());
-    lines.push(format!(
-        "Cache    {} of {} · {} · kept under its limit automatically; `kache clean --cache` empties it",
-        term::bytes(cache.bytes),
-        term::bytes(cache.limit),
-        term::counted(cache.entries, "entry", "entries")
-    ));
+    lines.push(cache.text());
     lines.push(String::new());
     lines.push(match end {
         PlanEnd::DryRun => "Dry run, nothing removed.".to_string(),

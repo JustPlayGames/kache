@@ -79,16 +79,20 @@ const ACTION_SUFFIX: &str = ".kache-real.action";
 /// up to the profile directory (`../../`, or `../../../../` in Cargo's
 /// per-unit layout), each NUL-terminated. The launcher reads it instead of
 /// listing the directory.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) const LAUNCH_RECORD: &str = ".kache-launch";
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(crate) const SHIM_DIR: &str = ".kache-build-script-shims";
-/// The launcher binary for this target, built from `launcher/build_script.rs`.
-#[cfg(unix)]
+/// The launcher binary for this target, built from `launcher/build_script.rs`
+/// (`launcher/build_script_windows.rs` on Windows).
+#[cfg(any(unix, windows))]
 const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-launcher"));
 // Version 1 could omit whitespace-padded Cargo declarations.
 const PREDICTION_SCHEMA: u32 = 2;
 const PREDICTION_PREFIX: &str = "build-script:";
+/// The variables Cargo sets that pick the configuration a script runs in;
+/// a prediction is kept per binary and configuration ([`Run::identity_in`]).
+const PREDICTION_CONFIGURATION: &[&str] = &["TARGET", "HOST", "PROFILE", "OPT_LEVEL", "DEBUG"];
 /// A v2 key could replay a search path in a sibling Cargo build unit without
 /// restoring its library. Version 3 refuses those runs unless a dependency
 /// handed down the path and keys the dependency contents. Version 4 keys
@@ -98,7 +102,7 @@ const ACTION_KIND: &[u8] = b"kache-build-script-action-v4";
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
 const OUT_PREFIX: &str = "out/";
-pub(crate) const CRATE_NAME: &str = "build_script_run";
+pub(crate) const CRATE_NAME: &str = kache_format::BUILD_SCRIPT_RUN_CRATE_NAME;
 /// Above this an `OUT_DIR` is left uncached: a directory this size is a build
 /// tree, not a build-script product, and restoring it would not be cheaper
 /// than the run.
@@ -145,10 +149,13 @@ fn build_script_output_for(args: &RustcArgs, cargo_bin: bool) -> Option<PathBuf>
     if !crate::cargo_layout::is_build_script_dir(out_dir) {
         return None;
     }
-    let stem = crate::args::format_crate_output_stem(
+    let mut stem = crate::args::format_crate_output_stem(
         crate_name,
         args.extra_filename.as_deref().unwrap_or(""),
     );
+    // A build script runs on this host: `build_script_build-<hash>.exe` on
+    // Windows.
+    stem.push_str(std::env::consts::EXE_SUFFIX);
     Some(out_dir.join(stem))
 }
 
@@ -156,23 +163,140 @@ fn build_script_output_for(args: &RustcArgs, cargo_bin: bool) -> Option<PathBuf>
 ///
 /// Best-effort: any failure leaves the real binary where Cargo expects it and
 /// the script simply runs uncached.
-pub fn install_shim(args: &RustcArgs) {
-    if !enabled() || !cfg!(unix) {
+pub fn install_shim(config: &Config, args: &RustcArgs) {
+    if !enabled() || !launchers_supported() {
         return;
     }
     let Some(executable) = compiled_build_script(args) else {
         return;
     };
-    if let Err(error) = install(&executable) {
+    let installed = kache_store::file_hash::hash_file(&executable).and_then(|binary_hash| {
+        if leaves_bound_runs_to_cargo(config, &executable, &binary_hash) {
+            return Ok(());
+        }
+        install_hashed(&executable, &binary_hash)
+    });
+    if let Err(error) = installed {
         log_bypass(&error.context("installing the build-script launcher"));
     }
 }
 
-#[cfg(unix)]
-pub(crate) fn install(executable: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
+/// Whether a build script compiled to `executable` runs without a launcher
+/// because its runs are bound to another checkout (see
+/// [`skips_bound_runs`]).
+fn leaves_bound_runs_to_cargo(config: &Config, executable: &Path, binary_hash: &str) -> bool {
+    if !skips_bound_runs() {
+        return false;
+    }
+    let Some(target) = executable
+        .parent()
+        .and_then(crate::cargo_layout::build_script_dir_profile)
+        .and_then(Path::parent)
+    else {
+        return false;
+    };
+    let bound = bound_elsewhere(&config.cache_dir, binary_hash, target);
+    if bound {
+        tracing::debug!(
+            "build script {} runs uncached: its runs name another checkout",
+            executable.display()
+        );
+    }
+    bound
+}
 
+/// Whether runs bound to their checkout are left to Cargo outside the target
+/// directories they were recorded in: on Windows.
+///
+/// A run whose recorded outputs name its `OUT_DIR` or target directory (a C
+/// library's objects and archives name the paths they were compiled at) is
+/// keyed on them, so it can only hit in the target directory it was
+/// recorded in. In every other checkout it misses, runs and is recorded
+/// again for nothing: on Windows that cost 0.6-1.2 s per run on top of the
+/// script (27 such runs in a fresh large-workspace checkout), plus the launcher's
+/// start. Once a run of a script binary was recorded bound, other target
+/// directories get no launcher for it and Cargo runs it directly; the
+/// target directories it was recorded in keep theirs, where it can hit.
+/// Leaving a run uncached is never wrong, only slower when it would have hit.
+fn skips_bound_runs() -> bool {
+    cfg!(windows)
+}
+
+/// Where kache keeps the target directories in which runs of the build
+/// script whose binary hashes to `binary_hash` were recorded bound to their
+/// checkout, one per line.
+fn bound_record(cache_dir: &Path, binary_hash: &str) -> PathBuf {
+    let name: String = binary_hash
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(32)
+        .collect();
+    cache_dir
+        .join("probes")
+        .join(format!("build-script-bound-{name}.txt"))
+}
+
+/// Whether runs of this binary were recorded bound to a checkout, in target
+/// directories other than `target`.
+fn bound_elsewhere(cache_dir: &Path, binary_hash: &str, target: &Path) -> bool {
+    std::fs::read_to_string(bound_record(cache_dir, binary_hash))
+        .is_ok_and(|text| !text.lines().any(|line| Path::new(line) == target))
+}
+
+/// Note that a run of this binary was recorded bound to `target`.
+fn remember_bound(cache_dir: &Path, binary_hash: &str, target: &Path) -> Result<()> {
+    let record = bound_record(cache_dir, binary_hash);
+    let mut text = std::fs::read_to_string(&record).unwrap_or_default();
+    if text.lines().any(|line| Path::new(line) == target) {
+        return Ok(());
+    }
+    let target = target
+        .to_str()
+        .context("the target directory is not valid Unicode")?;
+    text.push_str(target);
+    text.push('\n');
+    let directory = record.parent().context("the record has no directory")?;
+    std::fs::create_dir_all(directory)?;
+    // A concurrent writer may win the rename: its directory is recorded,
+    // and this one records its run again next time.
+    let temporary = tempfile::NamedTempFile::new_in(directory)?;
+    std::fs::write(temporary.path(), text)?;
+    temporary.persist(&record)?;
+    Ok(())
+}
+
+/// Whether this build of kache installs build-script launchers: Unix, and
+/// Windows when built for MSVC (the launcher is built only there).
+fn launchers_supported() -> bool {
+    cfg!(unix) || (cfg!(windows) && !LAUNCHER.is_empty())
+}
+
+/// The bytes of a path in a launch record: the OS's own on Unix, UTF-8 on
+/// Windows (a path that is not valid Unicode is refused).
+#[cfg(any(unix, windows))]
+fn record_bytes(path: &OsStr) -> Result<&[u8]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Ok(path.as_bytes())
+    }
+    #[cfg(windows)]
+    {
+        path.to_str()
+            .map(str::as_bytes)
+            .context("a launcher path is not valid Unicode")
+    }
+}
+
+/// [`install_shim`]'s launcher for one binary, hashed here.
+#[cfg(all(test, unix))]
+pub(crate) fn install(executable: &Path) -> Result<()> {
+    install_hashed(executable, &kache_store::file_hash::hash_file(executable)?)
+}
+
+/// [`install`], given the binary's hash.
+#[cfg(any(unix, windows))]
+fn install_hashed(executable: &Path, binary_hash: &str) -> Result<()> {
     let metadata = std::fs::metadata(executable)?;
     let modified = metadata.modified()?;
     let real = with_suffix(executable, REAL_SUFFIX);
@@ -181,7 +305,6 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
         .parent()
         .context("build script has no parent directory")?
         .join(LAUNCH_RECORD);
-    let binary_hash = kache_store::file_hash::hash_file(executable)?;
 
     // The profile directory is what the launcher can reach relatively when
     // the target directory moves.
@@ -201,14 +324,14 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
     let _ = std::fs::remove_file(&real);
     std::fs::rename(executable, &real).context("preserving the build script")?;
     let installed = (|| -> Result<()> {
-        std::fs::write(&action, &binary_hash)?;
+        std::fs::write(&action, binary_hash)?;
         let real_name = real.file_name().context("preserved script has no name")?;
         std::fs::write(
             &record,
             [
-                real_name.as_bytes(),
+                record_bytes(real_name)?,
                 b"\0",
-                relative.as_os_str().as_bytes(),
+                record_bytes(relative.as_os_str())?,
                 b"\0",
                 to_profile.as_bytes(),
                 b"\0",
@@ -217,7 +340,11 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
         )?;
         let temporary = with_suffix(executable, ".kache-launcher");
         std::fs::write(&temporary, LAUNCHER)?;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+        }
         // Cargo compares this path's mtime with its inputs when deciding
         // whether the compilation is fresh; keep the binary's.
         std::fs::OpenOptions::new()
@@ -237,13 +364,13 @@ pub(crate) fn install(executable: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn install(_executable: &Path) -> Result<()> {
-    anyhow::bail!("build-script launchers are only installed on Unix")
+#[cfg(not(any(unix, windows)))]
+fn install_hashed(_executable: &Path, _binary_hash: &str) -> Result<()> {
+    anyhow::bail!("build-script launchers are only installed on Unix and Windows")
 }
 
 /// `../` once for each level `ancestor` sits above `directory`.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn relative_to_ancestor(directory: &Path, ancestor: &Path) -> Option<String> {
     let depth = directory.strip_prefix(ancestor).ok()?.components().count();
     Some("../".repeat(depth))
@@ -252,10 +379,8 @@ fn relative_to_ancestor(directory: &Path, ancestor: &Path) -> Option<String> {
 /// One independent copy of the running kache per profile directory, addressed
 /// by the binary's identity so an upgrade pins a new copy and old launchers keep
 /// working until the target directory is cleaned.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-
     // macOS current_exe can name a relative symlink. Copy its target.
     let kache = kache
         .canonicalize()
@@ -273,23 +398,74 @@ fn pin_kache(kache: &Path, profile: &Path) -> Result<PathBuf> {
     let directory = profile
         .join(SHIM_DIR)
         .join(&identity.finalize().to_hex()[..32]);
-    let pinned = directory.join("kache");
-    if std::fs::symlink_metadata(&pinned)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
-    {
+    let pinned = directory.join(PINNED_NAME);
+    if pinned_in_place(&pinned) {
         return Ok(pinned);
     }
     std::fs::create_dir_all(&directory)?;
     let temporary = tempfile::TempDir::new_in(&directory)?;
-    let staged = temporary.path().join("kache");
-    if kache_fs::try_reflink(&kache, &staged).is_err() {
-        kache_fs::copy_writable(&kache, &staged, true)?;
-    }
-    kache_fs::set_writable_permissions(&staged, true)?;
+    let staged = temporary.path().join(PINNED_NAME);
+    stage_pin(&kache, &staged, cfg!(windows))?;
     wait_for_no_writers(&staged);
     // Replace old symlink pins atomically. Concurrent installers pin the same bytes.
-    std::fs::rename(&staged, &pinned)?;
+    if let Err(error) = std::fs::rename(&staged, &pinned) {
+        // Windows refuses to replace an image that is running: a launcher
+        // another build started runs the copy a concurrent installer pinned.
+        if cfg!(windows) && pinned_in_place(&pinned) {
+            return Ok(pinned);
+        }
+        return Err(error.into());
+    }
     Ok(pinned)
+}
+
+/// Put the pinned copy of `kache` at `staged`: a hard link when `link`
+/// (Windows), else a copy of its own.
+///
+/// Windows pays a large cost on the first start of a freshly written image:
+/// a fresh 35 MB engine copy took 0.7-2.4 s to start once, four started at
+/// once 4.3 s, against 50-170 ms for a hard link to the installed binary,
+/// an image it has already loaded. Every fresh target directory pinned such
+/// a copy per profile, and the first wave of build scripts queued behind
+/// it. A link is safe there: an image cannot be written while it runs, and
+/// an upgrade replaces the installed file (a new identity, so a new pin)
+/// while the link keeps the old bytes. On Unix a pin stays a file of its
+/// own (see [`pinned_in_place`]). A link that cannot be made (another
+/// volume) falls back to the copy.
+#[cfg(any(unix, windows))]
+fn stage_pin(kache: &Path, staged: &Path, link: bool) -> Result<()> {
+    if link && std::fs::hard_link(kache, staged).is_ok() {
+        return Ok(());
+    }
+    if kache_fs::try_reflink(kache, staged).is_err() {
+        kache_fs::copy_writable(kache, staged, true)?;
+    }
+    kache_fs::set_writable_permissions(staged, true)?;
+    Ok(())
+}
+
+/// The pinned copy's file name: an image on Windows needs its extension to
+/// be started by name.
+#[cfg(unix)]
+const PINNED_NAME: &str = "kache";
+#[cfg(windows)]
+const PINNED_NAME: &str = "kache.exe";
+
+/// Whether a pinned copy is in place as a file of its own (on Unix not a
+/// symlink and not a hard link another pin could rewrite).
+#[cfg(any(unix, windows))]
+fn pinned_in_place(pinned: &Path) -> bool {
+    std::fs::symlink_metadata(pinned).is_ok_and(|metadata| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            metadata.is_file() && metadata.nlink() == 1
+        }
+        #[cfg(windows)]
+        {
+            metadata.is_file()
+        }
+    })
 }
 
 /// Longest [`wait_for_no_writers`] waits for children to drop a file.
@@ -379,9 +555,13 @@ fn wait_for_read_lease(
     }
 }
 
-/// No leases outside Linux; macOS has no ETXTBSY for these files.
-#[cfg(all(unix, not(target_os = "linux")))]
-fn wait_for_no_writers(_path: &Path) {}
+/// No leases outside Linux; macOS has no ETXTBSY for these files, and on
+/// Windows a child inherits only handles made inheritable, which kache's
+/// files are not.
+#[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+fn wait_for_no_writers(_path: &Path) -> bool {
+    false
+}
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -539,7 +719,8 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     }
     let environment = Environment::capture()?;
     let options = crate::store::StoreOptions::from_env(|name| std::env::var(name).ok());
-    let store = Store::open_with_options(&config, options.clone())?;
+    let mut store = Store::open_with_options(&config, options.clone())?;
+    crate::wrapper::send_hit_stamps_to_daemon(&config, &mut store);
     // Same directory as the local store, or unset: no second store, and the
     // lookup below is the local one this function has always done.
     let readonly = crate::wrapper::open_readonly_store(&config, options);
@@ -554,6 +735,7 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
 
     let local_prediction = run.prediction()?;
     if let Some(prediction) = &local_prediction
+        && cfg!(unix)
         && run.config.build_script_hermetic
         && let Some(code) = hermetic::run(&run, real, argv, prediction)?
     {
@@ -571,36 +753,53 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
     };
     // Everything below writes into `OUT_DIR` itself.
     detach_out_dir(&run.environment.out_dir)?;
+    let mut missed_key = None;
     if let Some(prediction) = &prediction {
-        let key_start = std::time::Instant::now();
-        let key = run.action_key(prediction)?;
-        let key_ms = key_start.elapsed().as_millis() as u64;
-        let lookup_start = std::time::Instant::now();
-        let found = lookup_recorded_run(&run.store, readonly.as_ref(), &key)?;
-        let lookup_ms = lookup_start.elapsed().as_millis() as u64;
-        if let Some((blobs, meta)) = found {
-            let restore_start = std::time::Instant::now();
-            match run.restore_from(blobs, &meta) {
-                Ok(size) => {
-                    let restore_ms = restore_start.elapsed().as_millis() as u64;
-                    run.log(
-                        EventResult::LocalHit,
-                        &key,
-                        key_ms,
-                        lookup_ms,
-                        restore_ms,
-                        0,
-                        StorePutResult::default(),
-                        size,
-                        meta.compile_time_ms,
-                    );
-                    return Ok(0);
-                }
-                Err(error) => continue_after_restore_failure(error)?,
+        match run.restore_recorded(prediction, readonly.as_ref())? {
+            Lookup::Hit => return Ok(0),
+            Lookup::Miss(key) => missed_key = Some(key),
+        }
+    }
+    // Checkouts building the same commit at once all reach the same script
+    // with nothing stored yet, and each ran it: a slow one (a C library's
+    // build) took a minute and a half in every checkout. As crate compiles
+    // do, the first takes a flight, here for the key it missed, or with no
+    // prediction yet for the script and its configuration; the others wait
+    // for it, then look again and restore what it recorded. The flight is
+    // held until the run is recorded. A waiter that still misses (the owner
+    // could not record its run, or its inputs differ here) runs at once,
+    // without the flight, so such scripts are not run one after another.
+    let flight = run.config.scheduler.then(|| {
+        let identity = match &missed_key {
+            Some(key) => format!("build-script-run:{key}"),
+            None => format!("build-script-identity:{}", run.identity()),
+        };
+        crate::scheduler::join_discovery_flight(&run.config.cache_dir, &identity)
+    });
+    let mut _flight = None;
+    let mut prediction = prediction;
+    if let Some(flight) = flight {
+        if flight.waited {
+            // The owner recorded its run in the local store; a prediction
+            // taken from the read-only store stays when it recorded none.
+            if let Some(local) = run.prediction()? {
+                prediction = Some(local);
             }
+            if let Some(prediction) = &prediction
+                && let Lookup::Hit = run.restore_recorded(prediction, readonly.as_ref())?
+            {
+                return Ok(0);
+            }
+        } else {
+            _flight = flight.lock;
         }
     }
 
+    if let Some(prediction) = &prediction
+        && let Some(code) = run.run_bound_elsewhere(real, argv, prediction)
+    {
+        return Ok(code);
+    }
     // Only a run that starts from an empty OUT_DIR produces a state worth
     // recording: a rerun over leftovers would snapshot the leftovers too.
     let out_dir_was_empty = directory_is_empty(&run.environment.out_dir);
@@ -643,6 +842,14 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
         run.log_unrecorded(&format!("{error:#}"), second.compile_ms);
     }
     Ok(0)
+}
+
+/// What [`Run::restore_recorded`] found under a prediction's key.
+enum Lookup {
+    /// Restored into `OUT_DIR`, logged and replayed.
+    Hit,
+    /// Nothing usable stored under this key.
+    Miss(String),
 }
 
 /// One execution of the real build script, its output held back from Cargo
@@ -819,6 +1026,27 @@ struct Prediction {
     rewrites_text: bool,
 }
 
+impl Prediction {
+    /// Whether a run recorded under this prediction can hit only in its own
+    /// checkout: its outputs name the `OUT_DIR`, the target directory or the
+    /// declared base directory, roots that differ between checkouts. A
+    /// prediction from before `embedded_roots` binds a result that is not
+    /// portable to its `OUT_DIR`.
+    fn binds_checkout(&self) -> bool {
+        match &self.embedded_roots {
+            Some(embedded) => embedded.iter().any(|placeholder| {
+                [
+                    OUT_DIR_PLACEHOLDER,
+                    TARGET_DIR_PLACEHOLDER,
+                    BASE_DIR_PLACEHOLDER,
+                ]
+                .contains(&placeholder.as_str())
+            }),
+            None => !self.portable_out_dir,
+        }
+    }
+}
+
 /// The prediction a run records, given where its outputs name roots.
 fn recorded_prediction(
     inputs: Vec<String>,
@@ -886,7 +1114,7 @@ impl Environment {
         let target = std::env::var_os("TARGET");
         let ownership_roots = ownership_target_roots(&out_dir, target.as_deref());
         let mut mappings = vec![
-            (out_dir.clone(), "${KACHE_OUT_DIR}"),
+            (out_dir.clone(), OUT_DIR_PLACEHOLDER),
             (manifest_dir.clone(), "${KACHE_MANIFEST_DIR}"),
         ];
         if let Some(target_dir) = target_dir_for(&out_dir, target.as_deref()) {
@@ -1005,7 +1233,7 @@ impl Environment {
     /// The placeholders of the roots `contents` spells.
     fn spelled_roots(&self, contents: &[u8]) -> BTreeSet<&'static str> {
         self.roots()
-            .filter(|(root, _)| find_bytes(contents, root.as_os_str().as_encoded_bytes()).is_some())
+            .filter(|(root, _)| spells_root(contents, root))
             .map(|(_, placeholder)| placeholder)
             .collect()
     }
@@ -1032,7 +1260,7 @@ impl Environment {
         if !self
             .spellings
             .iter()
-            .any(|(root, _)| find_bytes(contents, root.as_os_str().as_encoded_bytes()).is_some())
+            .any(|(root, _)| spells_root(contents, root))
         {
             return None;
         }
@@ -1044,10 +1272,12 @@ impl Environment {
                 placeholder.as_bytes(),
             );
         }
-        // A root that is not a whole path (inside a URL) was not replaced.
-        let unreplaced = self.spellings.iter().any(|(root, _)| {
-            find_bytes(&normalized, root.as_os_str().as_encoded_bytes()).is_some()
-        });
+        // A root that is not a whole path (inside a URL), or one spelled
+        // otherwise than Cargo did, was not replaced.
+        let unreplaced = self
+            .spellings
+            .iter()
+            .any(|(root, _)| spells_root(&normalized, root));
         (normalized != contents && !unreplaced && only_placeholder_paths(&normalized))
             .then_some(normalized)
     }
@@ -1074,6 +1304,14 @@ impl Environment {
                 stored.push((path, name));
                 continue;
             }
+            if spelled.contains(OUT_DIR_PLACEHOLDER)
+                && let Some(rest) = self.without_recorded_out_dir(&contents)
+            {
+                // Bound only by the roots it spells besides `OUT_DIR`.
+                embedded.extend(self.spelled_roots(&rest));
+                stored.push((path, name));
+                continue;
+            }
             if let Some(normalized) = self.rewrite_text(&contents) {
                 // What the mappings do not cover (a base dir outside them)
                 // still binds the result.
@@ -1095,6 +1333,37 @@ impl Environment {
         })
     }
 
+    /// `contents` without this run's `OUT_DIR`, when it is a COFF archive or
+    /// object (`cl.exe` and `lib.exe` output, through `cc`) that spells it
+    /// only where the tools record where they ran: `lib.exe`'s member names,
+    /// `cl.exe`'s `S_OBJNAME` and `-Z7` build records. Such a file restores
+    /// in another `OUT_DIR` with the same code: what it names there is where
+    /// another target directory built it, as for the debug paths kept out of
+    /// keys before, and a crate that bundles or links the archive keys it
+    /// without that directory ([`crate::coff_archive::digest_dir`]). `None`
+    /// when `OUT_DIR` occurs anywhere else, or the file is anything else.
+    fn without_recorded_out_dir(&self, contents: &[u8]) -> Option<Vec<u8>> {
+        let mut spelled: Vec<&[u8]> = self
+            .root_values(OUT_DIR_PLACEHOLDER)
+            .into_iter()
+            .filter(|value| find_bytes(contents, value).is_some())
+            .collect();
+        if spelled.is_empty()
+            || !spelled
+                .iter()
+                .all(|value| crate::coff_archive::spells_dir_only_in_build_records(contents, value))
+        {
+            return None;
+        }
+        // Longest first, so a spelling inside another is cut after it.
+        spelled.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        let mut rest = contents.to_vec();
+        for value in spelled {
+            rest = crate::coff_archive::without_dir(&rest, value);
+        }
+        Some(rest)
+    }
+
     /// The values of a root, every spelling, in a stable order.
     fn root_values(&self, placeholder: &str) -> Vec<&[u8]> {
         let mut values: Vec<&[u8]> = self
@@ -1107,6 +1376,53 @@ impl Environment {
     }
 }
 
+/// Whether `contents` names `root`. On Windows a tool may spell a root
+/// otherwise than Cargo did: `cl.exe` records an `OUT_DIR` Cargo spelled
+/// `C:\w\target/x\debug\build\ring-1\out` with backslashes only, a
+/// tool may change the drive letter's case, and a PE file or a PDB holds
+/// paths in UTF-16. Any of them names the root as surely, so each counts.
+fn spells_root(contents: &[u8], root: &Path) -> bool {
+    spells_root_with(contents, root.as_os_str().as_encoded_bytes(), cfg!(windows))
+}
+
+/// [`spells_root`], with the Windows spellings when `windows`.
+fn spells_root_with(contents: &[u8], root: &[u8], windows: bool) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    if find_bytes(contents, root).is_some() {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
+    let same = |a: u8, b: u8| {
+        let separator = |c: u8| c == b'/' || c == b'\\';
+        a.eq_ignore_ascii_case(&b) || (separator(a) && separator(b))
+    };
+    // Narrow: one byte per byte of the root.
+    if contents
+        .windows(root.len())
+        .any(|window| window.iter().zip(root).all(|(&a, &b)| same(a, b)))
+    {
+        return true;
+    }
+    // UTF-16LE: each byte of the root (ASCII or not) followed by a zero
+    // byte. A root with non-ASCII characters is matched narrow only.
+    if !root.is_ascii() || contents.len() < root.len() * 2 {
+        return false;
+    }
+    contents.windows(root.len() * 2).any(|window| {
+        window
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(root)
+            .all(|(unit, &b)| unit[1] == 0 && same(unit[0], b))
+    })
+}
+
+const OUT_DIR_PLACEHOLDER: &str = "${KACHE_OUT_DIR}";
 const BASE_DIR_PLACEHOLDER: &str = "${KACHE_BASE_DIR}";
 const TARGET_DIR_PLACEHOLDER: &str = "${KACHE_TARGET_DIR}";
 
@@ -1241,6 +1557,14 @@ fn replace_whole_paths(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Ve
 /// reference: each `/` belongs to a word that begins with `${`, or to a web
 /// or Git URL (a pkg-config `URL:` line), which names no local path.
 fn only_placeholder_paths(text: &[u8]) -> bool {
+    only_placeholder_paths_with(text, cfg!(windows))
+}
+
+/// [`only_placeholder_paths`], with `\` a path separator too when
+/// `backslash` (Windows): `C:\w\include` names a path there. A backslash
+/// that is no separator (a C string's `\n`) then keeps the text bound to
+/// its roots, which costs a hit in another checkout, never a wrong one.
+fn only_placeholder_paths_with(text: &[u8], backslash: bool) -> bool {
     let mut word_start = 0;
     let mut url_end = 0;
     for (index, &byte) in text.iter().enumerate() {
@@ -1251,7 +1575,9 @@ fn only_placeholder_paths(text: &[u8]) -> bool {
             word_start = index + 1;
         } else if byte == b'/' && is_url_authority(text, index) {
             url_end = end_of_url(text, index);
-        } else if byte == b'/' && !text[word_start..].starts_with(b"${") {
+        } else if (byte == b'/' || (backslash && byte == b'\\'))
+            && !text[word_start..].starts_with(b"${")
+        {
             return false;
         }
     }
@@ -1455,9 +1781,29 @@ fn fold_dependency_inputs(
 
 impl Run {
     fn identity(&self) -> String {
+        self.identity_in(|name| std::env::var_os(name))
+    }
+
+    /// [`Self::identity`], reading the configuration through `var`. One
+    /// script binary runs in several configurations (a build script's binary
+    /// is the same for the host and a cross target, for `check` and `build`,
+    /// and often for dev and release), and each can declare other inputs: cc
+    /// declares `CC_<target>`-style variables, and a run whose objects spell
+    /// `OUT_DIR` binds other roots. One row per binary made each
+    /// configuration overwrite the other's, and the next lookup in the other
+    /// configuration computed its key from the wrong declarations and missed
+    /// a result the store held. A row per configuration keeps each one's.
+    fn identity_in(&self, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> String {
         let mut hasher = blake3::Hasher::new();
         fold(&mut hasher, "kind", b"kache-build-script-v1");
         fold(&mut hasher, "binary", self.binary_hash.as_bytes());
+        for name in PREDICTION_CONFIGURATION {
+            fold(&mut hasher, "configuration", name.as_bytes());
+            match var(name) {
+                Some(value) => fold(&mut hasher, "value", value.as_encoded_bytes()),
+                None => fold(&mut hasher, "absent", b""),
+            }
+        }
         format!("{PREDICTION_PREFIX}{}", hasher.finalize().to_hex())
     }
 
@@ -1509,7 +1855,9 @@ impl Run {
         fold(
             &mut hasher,
             "key_version",
-            kache_format::CACHE_KEY_VERSION.to_string().as_bytes(),
+            crate::cache_key::BUILD_SCRIPT_KEY_VERSION
+                .to_string()
+                .as_bytes(),
         );
         fold(&mut hasher, "binary", self.binary_hash.as_bytes());
         fold(&mut hasher, "os", std::env::consts::OS.as_bytes());
@@ -1638,7 +1986,7 @@ impl Run {
         let manifest: Manifest =
             serde_json::from_slice(&std::fs::read(blobs.blob_path(&manifest.hash))?)?;
         anyhow::ensure!(
-            matches!(manifest.version, 1..=rooted_links::MANIFEST_VERSION),
+            matches!(manifest.version, 1..=BYTES_MANIFEST_VERSION),
             "unsupported build-script manifest"
         );
         // Also guard legacy entries before touching the current output tree.
@@ -1731,9 +2079,10 @@ impl Run {
         }
         rooted_links::validate_restored_relative(&self.environment, &manifest.symlinks)?;
         size += outside::restore(blobs, &self.environment, meta, manifest, &rewritten)?;
+        let (stdout, stderr) = manifest.streams()?;
         replay(
-            &self.environment.denormalize(manifest.stdout.as_bytes()),
-            &self.environment.denormalize(manifest.stderr.as_bytes()),
+            &self.environment.denormalize(&stdout),
+            &self.environment.denormalize(&stderr),
         );
         Ok(size)
     }
@@ -1796,6 +2145,87 @@ impl Run {
         );
     }
 
+    /// This run's target directory.
+    fn target_dir(&self) -> Option<PathBuf> {
+        target_dir_for(
+            &self.environment.out_dir,
+            self.environment.target.as_deref(),
+        )
+    }
+
+    /// Run the script uncached when the last run recorded for it was bound
+    /// to its checkout and that was another target directory (see
+    /// [`skips_bound_runs`]): a launcher installed before the run was
+    /// recorded (another build at the same time, a seeded target directory)
+    /// gets here. `None` when the run may be recorded.
+    /// Look up the run `prediction` keys and restore it when stored, in the
+    /// local store first, then in `readonly`. A restore that fails is cleaned
+    /// up and reported as a miss.
+    fn restore_recorded(
+        &self,
+        prediction: &Prediction,
+        readonly: Option<&Store>,
+    ) -> Result<Lookup> {
+        let key_start = std::time::Instant::now();
+        let key = self.action_key(prediction)?;
+        let key_ms = key_start.elapsed().as_millis() as u64;
+        let lookup_start = std::time::Instant::now();
+        let found = lookup_recorded_run(&self.store, readonly, &key)?;
+        let lookup_ms = lookup_start.elapsed().as_millis() as u64;
+        if let Some((blobs, meta)) = found {
+            let restore_start = std::time::Instant::now();
+            match self.restore_from(blobs, &meta) {
+                Ok(size) => {
+                    let restore_ms = restore_start.elapsed().as_millis() as u64;
+                    self.log(
+                        EventResult::LocalHit,
+                        &key,
+                        key_ms,
+                        lookup_ms,
+                        restore_ms,
+                        0,
+                        StorePutResult::default(),
+                        size,
+                        meta.compile_time_ms,
+                    );
+                    return Ok(Lookup::Hit);
+                }
+                Err(error) => continue_after_restore_failure(error)?,
+            }
+        }
+        Ok(Lookup::Miss(key))
+    }
+
+    fn run_bound_elsewhere(
+        &self,
+        real: &Path,
+        argv: &[std::ffi::OsString],
+        prediction: &Prediction,
+    ) -> Option<i32> {
+        if !skips_bound_runs() || !prediction.binds_checkout() {
+            return None;
+        }
+        let target = self.target_dir()?;
+        if !bound_elsewhere(&self.config.cache_dir, &self.binary_hash, &target) {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let code = match real_command(real, argv).status() {
+            Ok(status) => status.code().unwrap_or(1),
+            Err(error) => {
+                eprintln!("kache: failed to run {}: {error}", real.display());
+                1
+            }
+        };
+        if code == 0 {
+            self.log_unrecorded(
+                "its outputs name its checkout, recorded in another",
+                started.elapsed().as_millis() as u64,
+            );
+        }
+        Some(code)
+    }
+
     fn unsettled_identity(&self) -> String {
         format!("{UNSETTLED_PREFIX}{}", self.identity())
     }
@@ -1819,8 +2249,10 @@ impl Run {
         started: std::time::SystemTime,
         tools: &ToolSnapshot,
     ) -> Result<()> {
-        let stdout_text =
-            std::str::from_utf8(stdout).context("build-script stdout is not UTF-8")?;
+        // What Cargo reads of it: a compiler's warnings in the system code
+        // page (CP852 on Czech Windows) are lines Cargo skips.
+        let stdout_text = cargo_readable_lines(stdout);
+        let stdout_text = stdout_text.as_ref();
         let Some((inputs, env, default_package)) =
             parse_declarations(stdout_text, &self.environment)
         else {
@@ -1879,11 +2311,16 @@ impl Run {
             return Err(InputsChanged.into());
         }
         let key_ms = key_start.elapsed().as_millis() as u64;
+        let (stdout, stdout_bytes) = recorded_stream(&self.environment.normalize(stdout));
+        let (stderr, stderr_bytes) = recorded_stream(&self.environment.normalize(stderr));
         let manifest = Manifest {
             // Version 1 would restore placeholders verbatim, version 2 would
-            // leave symlinks out, and version 3 would replay a link search
-            // without the files it names outside OUT_DIR.
-            version: if rooted_symlinks.is_empty() {
+            // leave symlinks out, version 3 would replay a link search
+            // without the files it names outside OUT_DIR, and version 5
+            // would replay text in place of the bytes the script wrote.
+            version: if stdout_bytes.is_some() || stderr_bytes.is_some() {
+                BYTES_MANIFEST_VERSION
+            } else if rooted_symlinks.is_empty() {
                 outside::manifest_version(!symlinks.is_empty(), !rewritten.is_empty(), has_outside)
             } else {
                 rooted_links::MANIFEST_VERSION
@@ -1892,8 +2329,10 @@ impl Run {
             empty_files,
             symlinks,
             rooted_symlinks,
-            stdout: String::from_utf8_lossy(&self.environment.normalize(stdout)).into_owned(),
-            stderr: String::from_utf8_lossy(&self.environment.normalize(stderr)).into_owned(),
+            stdout,
+            stderr,
+            stdout_bytes,
+            stderr_bytes,
             rewritten,
             outside_directories: outside_outputs.directories,
             outside_empty_files: outside_outputs.empty_files,
@@ -1923,6 +2362,13 @@ impl Run {
         )?;
         let store_ms = store_start.elapsed().as_millis() as u64;
         self.record_prediction(&prediction)?;
+        if skips_bound_runs()
+            && prediction.binds_checkout()
+            && let Some(target) = self.target_dir()
+            && let Err(error) = remember_bound(&self.config.cache_dir, &self.binary_hash, &target)
+        {
+            tracing::debug!("cannot note a run bound to its checkout: {error:#}");
+        }
         self.log(
             EventResult::Miss,
             &key,
@@ -1996,14 +2442,29 @@ fn unrecorded_reason(why: &str) -> String {
     format!("refused|build-script run not recorded: {why}")
 }
 
+/// The manifest version of a run whose stdout or stderr is not UTF-8 (a
+/// compiler's warnings in the system code page, as cl.exe prints them on a
+/// Windows in another language), kept as written in `stdout_bytes` and
+/// `stderr_bytes`. Older readers refuse it and run the script.
+const BYTES_MANIFEST_VERSION: u32 = 6;
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Manifest {
     version: u32,
     /// Every directory under `OUT_DIR`, so empty ones come back too.
     directories: Vec<String>,
     empty_files: Vec<EmptyFile>,
+    /// What the script printed, or with `stdout_bytes` the lines of it that
+    /// Cargo reads.
     stdout: String,
     stderr: String,
+    /// The script's stdout as it wrote it, in hex, when it is not UTF-8
+    /// (version 6). Replayed instead of `stdout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_bytes: Option<String>,
+    /// Its stderr, the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_bytes: Option<String>,
     /// Files stored with their roots as placeholders (version 2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rewritten: Vec<String>,
@@ -2022,6 +2483,51 @@ struct Manifest {
     outside_empty_files: Vec<EmptyFile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     outside_symlinks: Vec<Symlink>,
+}
+
+impl Manifest {
+    /// The stdout and stderr to replay, byte for byte as the run wrote them
+    /// (with the run's roots as placeholders).
+    fn streams(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let stream = |text: &str, bytes: Option<&str>| -> Result<Vec<u8>> {
+            match bytes {
+                Some(hex) => hex::decode(hex).context("a recorded stream is not hex"),
+                None => Ok(text.as_bytes().to_vec()),
+            }
+        };
+        Ok((
+            stream(&self.stdout, self.stdout_bytes.as_deref())?,
+            stream(&self.stderr, self.stderr_bytes.as_deref())?,
+        ))
+    }
+}
+
+/// A stream for the manifest: the text itself when it is UTF-8, else the
+/// lines of it Cargo reads beside the bytes in hex.
+fn recorded_stream(bytes: &[u8]) -> (String, Option<String>) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), None),
+        Err(_) => (
+            cargo_readable_lines(bytes).into_owned(),
+            Some(hex::encode(bytes)),
+        ),
+    }
+}
+
+/// The lines of a build script's stdout that Cargo reads: it splits the
+/// output at newlines and skips every line that is not UTF-8.
+fn cargo_readable_lines(stdout: &[u8]) -> std::borrow::Cow<'_, str> {
+    if let Ok(text) = std::str::from_utf8(stdout) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut text = String::new();
+    for line in stdout.split(|byte| *byte == b'\n') {
+        if let Ok(line) = std::str::from_utf8(line) {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    std::borrow::Cow::Owned(text)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -3062,9 +3568,10 @@ mod tests {
             None,
             "the binary has to exist before it can be shimmed"
         );
-        let binary = unit.join(crate::args::format_crate_output_stem(
-            "build_script_build",
-            "-1",
+        let binary = unit.join(format!(
+            "{}{}",
+            crate::args::format_crate_output_stem("build_script_build", "-1"),
+            std::env::consts::EXE_SUFFIX
         ));
         std::fs::write(&binary, "elf").unwrap();
         assert_eq!(compiled_build_script(&good), Some(binary));
@@ -3146,7 +3653,10 @@ mod tests {
         ]);
         assert_eq!(
             build_script_output(&args),
-            Some(unit.join("build_script_build-1"))
+            Some(unit.join(format!(
+                "build_script_build-1{}",
+                std::env::consts::EXE_SUFFIX
+            )))
         );
         assert_eq!(compiled_build_script(&args), None);
 
@@ -3164,7 +3674,10 @@ mod tests {
         ]);
         assert_eq!(
             build_script_output_for(&args, false),
-            Some(out.join("build_script_build"))
+            Some(out.join(format!(
+                "build_script_build{}",
+                std::env::consts::EXE_SUFFIX
+            )))
         );
         assert_eq!(
             build_script_output_for(&args, true),
@@ -3404,6 +3917,38 @@ mod tests {
         (roots, stored)
     }
 
+    /// `cl.exe` and `lib.exe` record `OUT_DIR` in member names and debug
+    /// records only: such an archive is not bound to it. One that spells it
+    /// where the code reads it stays bound.
+    #[cfg(unix)]
+    #[test]
+    fn a_coff_archive_naming_out_dir_only_in_build_records_is_not_bound_to_it() {
+        const SHORT: &[u8] = include_bytes!("coff_archive/fixtures/gen-short.lib");
+        const Z7: &[u8] = include_bytes!("coff_archive/fixtures/gen-z7-short.lib");
+        let dir = tempfile::tempdir().unwrap();
+        let bound_to = |out_dir: &[u8], contents: &[u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            let mut env = environment(
+                Path::new(std::ffi::OsStr::from_bytes(out_dir)),
+                Path::new("/src/pkg"),
+            );
+            env.out_dir = dir.path().to_path_buf();
+            let (roots, stored) = classify_one(&env, "gen.lib", contents);
+            assert_eq!(stored, contents, "kept as it is");
+            assert!(roots.rewritten.is_empty());
+            roots.embedded
+        };
+        let short = r"C:\Users\User\ko2\tA\debug\build\gen-2f3778baca245d4f\out";
+        let z7 = r"C:\Users\User\ko2\tF\debug\build\gen-2f3778baca245d4f\out";
+        assert!(bound_to(short.as_bytes(), SHORT).is_empty());
+        assert!(bound_to(z7.as_bytes(), Z7).is_empty());
+        // `.text$mn`'s bytes stand in for an `OUT_DIR` the code reads.
+        assert_eq!(
+            bound_to(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3], SHORT),
+            vec!["${KACHE_OUT_DIR}".to_string()]
+        );
+    }
+
     /// Older kache reads `portable_out_dir` alone: it must be true only for
     /// a result it could restore verbatim anywhere.
     #[test]
@@ -3442,6 +3987,38 @@ mod tests {
             b"prefix=${KACHE_OUT_DIR}\nlibdir=${prefix}/lib\n"
         ));
         assert!(only_placeholder_paths(b"Cflags: -I${includedir}"));
+        // A root spelled otherwise than Cargo did still names it on Windows:
+        // backslashes only, another drive-letter case, UTF-16.
+        let root: &[u8] = br"C:\w\target/x\debug\build\ring-1\out";
+        let obj: &[u8] = br"..c:\w\target\x\debug\build\ring-1\out\a.obj..";
+        assert!(spells_root_with(obj, root, true));
+        assert!(!spells_root_with(obj, root, false));
+        let wide: Vec<u8> = br"C:\w\target\x\debug\build\ring-1\out\a.pdb"
+            .iter()
+            .flat_map(|&b| [b, 0])
+            .collect();
+        assert!(spells_root_with(&wide, root, true));
+        assert!(!spells_root_with(&wide, root, false));
+        assert!(!spells_root_with(
+            br"C:\w\target\x\debug\build\ring-2\out",
+            root,
+            true
+        ));
+        assert!(spells_root_with(b"/w/out/gen.rs", b"/w/out", false));
+        // Windows spells paths with backslashes; elsewhere one is a byte.
+        assert!(!only_placeholder_paths_with(
+            br"Cflags: -IC:\w\include",
+            true
+        ));
+        assert!(!only_placeholder_paths_with(
+            br"${KACHE_OUT_DIR} D:\opt",
+            true
+        ));
+        assert!(only_placeholder_paths_with(
+            br"${KACHE_OUT_DIR}\gen.rs",
+            true
+        ));
+        assert!(only_placeholder_paths_with(br"a\b", false));
         assert!(!only_placeholder_paths(b"Cflags: -I/usr/include"));
         assert!(!only_placeholder_paths(b"${KACHE_OUT_DIR} /opt"));
     }
@@ -3721,6 +4298,48 @@ mod tests {
         assert!(set_executable(&dir.path().join("absent"), true).is_err());
     }
 
+    #[test]
+    fn a_pin_links_the_installed_kache_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let kache = dir.path().join("kache-engine");
+        std::fs::write(&kache, b"engine bytes").unwrap();
+        let source = kache_fs::file_identity(&kache).unwrap();
+
+        let linked = dir.path().join("linked");
+        stage_pin(&kache, &linked, true).unwrap();
+        assert_eq!(kache_fs::file_identity(&linked).unwrap(), source);
+
+        let copied = dir.path().join("copied");
+        stage_pin(&kache, &copied, false).unwrap();
+        assert_ne!(kache_fs::file_identity(&copied).unwrap(), source);
+        assert_eq!(std::fs::read(&copied).unwrap(), b"engine bytes");
+        assert_eq!(std::fs::read(&linked).unwrap(), b"engine bytes");
+
+        // A link that cannot be made (here: the name is taken) copies.
+        let taken = dir.path().join("taken");
+        std::fs::write(&taken, b"older").unwrap();
+        stage_pin(&kache, &taken, true).unwrap();
+        assert_ne!(kache_fs::file_identity(&taken).unwrap(), source);
+        assert_eq!(std::fs::read(&taken).unwrap(), b"engine bytes");
+    }
+
+    /// Windows pins the installed binary itself: a fresh copy of an image
+    /// costs seconds on its first start there.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_pin_is_a_link_to_the_installed_kache() {
+        let dir = tempfile::tempdir().unwrap();
+        let kache = dir.path().join("kache-engine.exe");
+        std::fs::write(&kache, b"engine bytes").unwrap();
+        let profile = dir.path().join("target/debug");
+        let pinned = pin_kache(&kache, &profile).unwrap();
+        assert_eq!(
+            kache_fs::file_identity(&pinned).unwrap(),
+            kache_fs::file_identity(&kache).unwrap()
+        );
+        assert_eq!(pin_kache(&kache, &profile).unwrap(), pinned);
+    }
+
     #[cfg(unix)]
     #[test]
     fn pinned_kache_resolves_a_relative_executable_symlink() {
@@ -3877,8 +4496,9 @@ mod tests {
         )
         .unwrap();
         // SAFETY: the process-state lock serialises environment edits.
+        let config = crate::test_support::test_config(dir.path().join("cache"));
         unsafe { std::env::set_var(ENABLE_ENV, "0") };
-        install_shim(&args);
+        install_shim(&config, &args);
         unsafe { std::env::remove_var(ENABLE_ENV) };
         assert_eq!(
             std::fs::read_to_string(&executable).unwrap(),
@@ -3886,7 +4506,7 @@ mod tests {
             "the binary is left alone"
         );
         assert!(!with_suffix(&executable, REAL_SUFFIX).exists());
-        install_shim(&args);
+        install_shim(&config, &args);
         assert!(
             with_suffix(&executable, REAL_SUFFIX).is_file(),
             "the same invocation installs once the switch is back on"
@@ -3912,6 +4532,22 @@ mod tests {
         assert!(identity.len() > PREDICTION_PREFIX.len() + 32);
         assert_eq!(identity, a.identity(), "stable across calls");
         assert_ne!(identity, run("bbbb").identity());
+        // One binary, two configurations: a row each.
+        let target = |value: &'static str| {
+            move |name: &str| (name == "TARGET").then(|| std::ffi::OsString::from(value))
+        };
+        assert_eq!(
+            a.identity_in(target("x86_64-unknown-linux-gnu")),
+            a.identity_in(target("x86_64-unknown-linux-gnu"))
+        );
+        assert_ne!(
+            a.identity_in(target("x86_64-unknown-linux-gnu")),
+            a.identity_in(target("x86_64-pc-windows-msvc"))
+        );
+        assert_ne!(
+            a.identity_in(|name| (name == "DEBUG").then(|| "true".into())),
+            a.identity_in(|name| (name == "DEBUG").then(|| "false".into()))
+        );
         // The unsettled marker is its own row, per binary.
         assert_eq!(
             a.unsettled_identity(),
@@ -4199,6 +4835,74 @@ mod tests {
             embedded_roots,
             rewrites_text: false,
         }
+    }
+
+    #[test]
+    fn a_prediction_binds_its_checkout_through_out_dir_target_or_base_dir() {
+        for placeholder in [
+            OUT_DIR_PLACEHOLDER,
+            TARGET_DIR_PLACEHOLDER,
+            BASE_DIR_PLACEHOLDER,
+        ] {
+            let roots = vec!["${KACHE_CARGO_HOME}".to_string(), placeholder.to_string()];
+            assert!(prediction_with(Some(roots), false).binds_checkout());
+        }
+        // A registry package's directory and Cargo's home are the same in
+        // every checkout on the machine.
+        let shared = vec![
+            "${KACHE_MANIFEST_DIR}".to_string(),
+            "${KACHE_CARGO_HOME}".to_string(),
+        ];
+        assert!(!prediction_with(Some(shared), false).binds_checkout());
+        assert!(!prediction_with(Some(Vec::new()), true).binds_checkout());
+        // Written before the roots were: keyed on its OUT_DIR unless portable.
+        assert!(prediction_with(None, false).binds_checkout());
+        assert!(!prediction_with(None, true).binds_checkout());
+    }
+
+    #[test]
+    fn bound_runs_are_remembered_per_target_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let first = dir.path().join("first/target");
+        let second = dir.path().join("second/target");
+        // Nothing recorded: every target directory may record.
+        assert!(!bound_elsewhere(&cache, "abc123", &first));
+
+        remember_bound(&cache, "abc123", &first).unwrap();
+        remember_bound(&cache, "abc123", &first).unwrap();
+        assert!(!bound_elsewhere(&cache, "abc123", &first));
+        assert!(bound_elsewhere(&cache, "abc123", &second));
+        // Another binary (a new version of the script) records anew.
+        assert!(!bound_elsewhere(&cache, "def456", &second));
+        let record = bound_record(&cache, "abc123");
+        assert_eq!(std::fs::read_to_string(&record).unwrap().lines().count(), 1);
+
+        remember_bound(&cache, "abc123", &second).unwrap();
+        assert!(!bound_elsewhere(&cache, "abc123", &second));
+        assert_eq!(std::fs::read_to_string(&record).unwrap().lines().count(), 2);
+        assert!(record.starts_with(cache.join("probes")));
+    }
+
+    /// On Windows a build script whose runs were recorded bound to another
+    /// checkout gets no launcher; one recorded here keeps it.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_script_bound_to_another_checkout_gets_no_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let target = dir.path().join("checkout/target");
+        let script = target.join(r"debug\build\ring-0123456789abcdef\build_script_build-1.exe");
+        assert!(!leaves_bound_runs_to_cargo(&config, &script, "abc123"));
+        remember_bound(
+            &config.cache_dir,
+            "abc123",
+            &dir.path().join("other/target"),
+        )
+        .unwrap();
+        assert!(leaves_bound_runs_to_cargo(&config, &script, "abc123"));
+        remember_bound(&config.cache_dir, "abc123", &target).unwrap();
+        assert!(!leaves_bound_runs_to_cargo(&config, &script, "abc123"));
     }
 
     #[test]
@@ -5200,6 +5904,54 @@ mod tests {
         (make("a/target"), make("b/target"))
     }
 
+    /// cl.exe on a Czech Windows prints its warnings in CP852, so a script
+    /// that relays them (cc's `cargo:warning=` lines) writes stdout that is
+    /// not UTF-8. The run is recorded all the same, its declarations read
+    /// from the lines Cargo reads, and another target directory replays the
+    /// bytes it wrote, its own paths in place of the first one's.
+    #[test]
+    fn a_run_whose_output_is_not_utf8_is_recorded_and_replayed_byte_for_byte() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (a, b) = two_targets(dir.as_path());
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        // "upozorněn" and "neplatný" in CP852 (0xD8 = ě, 0xEC = ý): not UTF-8.
+        let warning: &[u8] = b"cargo:warning=vp8l.c(12): upozorn\xd8n\xa1 C4244: neplatn\xec";
+        let stdout_for = |run: &Run| -> Vec<u8> {
+            let mut out = b"cargo:rerun-if-changed=build.rs\n".to_vec();
+            out.extend_from_slice(warning);
+            out.extend_from_slice(
+                format!(
+                    "\ncargo:rustc-link-search=native={}\n",
+                    run.environment.out_dir.display()
+                )
+                .as_bytes(),
+            );
+            out
+        };
+        let stderr: &[u8] = b"cl : P\xd8\xa1kazov\xa0 \xa9\xa0dka\n";
+        assert!(std::str::from_utf8(&stdout_for(&a)).is_err());
+        a.record(&stdout_for(&a), stderr, 5, after).unwrap();
+
+        let prediction = b.prediction().unwrap().expect("the run is recorded");
+        let meta = b
+            .store
+            .get(&b.action_key(&prediction).unwrap())
+            .unwrap()
+            .unwrap();
+        let manifest = stored_manifest(&b, &meta);
+        assert_eq!(manifest.version, BYTES_MANIFEST_VERSION);
+        let (out, err) = manifest.streams().unwrap();
+        assert_eq!(b.environment.denormalize(&out), stdout_for(&b));
+        assert_eq!(b.environment.denormalize(&err), stderr);
+        assert!(
+            !manifest.stdout.contains("warning"),
+            "the text names only what Cargo reads: {}",
+            manifest.stdout
+        );
+        b.restore(&meta).unwrap();
+    }
+
     /// A library the script names under the target directory, beside `OUT_DIR`,
     /// is restored in the next checkout at that checkout's path. Cargo's `deps`
     /// directory and a system directory named in the same stdout are not.
@@ -5458,7 +6210,7 @@ mod tests {
             ),
             start: std::time::Instant::now(),
         };
-        for version in [0, 6] {
+        for version in [0, BYTES_MANIFEST_VERSION + 1] {
             let meta = put_manifest(
                 &run,
                 &format!("v{version}"),
@@ -5623,6 +6375,8 @@ mod tests {
             empty_files: Vec::new(),
             stdout: String::new(),
             stderr: String::new(),
+            stdout_bytes: None,
+            stderr_bytes: None,
             rewritten: Vec::new(),
             symlinks: vec![link("d/a", ".."), link("d/a/c", "../x")],
             rooted_symlinks: Vec::new(),

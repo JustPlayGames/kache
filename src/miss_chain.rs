@@ -150,6 +150,13 @@ pub enum RootKind {
     /// its artifact moved. The compile's output is not reproducible across
     /// checkouts.
     PathOnly,
+    /// Only in one build tree: this unit had the same cache key when the
+    /// consumer's previous build read its artifact and when the consumer's
+    /// compile read it, yet the artifact moved. Nothing it is keyed on changed;
+    /// its compile does not reproduce its output (rustc's parallel front end,
+    /// `-Zthreads` above 1, on nightlies before 2026-10-22, for one), so every
+    /// crate above it misses once each time it is compiled again.
+    Unreproducible,
 }
 
 impl RootKind {
@@ -158,7 +165,10 @@ impl RootKind {
     pub fn is_resolved(&self) -> bool {
         matches!(
             self,
-            RootKind::Groups(_) | RootKind::NothingRecorded | RootKind::PathOnly
+            RootKind::Groups(_)
+                | RootKind::NothingRecorded
+                | RootKind::PathOnly
+                | RootKind::Unreproducible
         )
     }
 }
@@ -365,6 +375,47 @@ fn dependency_baseline(
     last_baseline_index(events, &events[dep_index], baseline_root, bound)
 }
 
+/// In one build tree: whether the unit compiled at `dep_index` had the same
+/// non-empty key when the consumer's baseline read its artifact (its last keyed
+/// event before `consumer_baseline`) and when the consumer's compile at
+/// `consumer` read it (its last keyed event before that), two different
+/// events. The walk only asks this of a dependency whose digest moved between
+/// those two reads, so its bytes changed under an unchanged key.
+///
+/// Both states are taken by position, as everywhere here: a crate reads the
+/// artifact its dependency's latest event left in the tree. A key that moved in
+/// between, even if it came back, makes this false and leaves the reading to
+/// the groups.
+fn same_key_new_bytes(
+    events: &[BuildEvent],
+    dep_index: usize,
+    consumer: usize,
+    consumer_baseline: usize,
+) -> bool {
+    let producer = &events[dep_index];
+    let root = events[consumer].root.as_str();
+    let read_then = last_baseline_index(events, producer, root, consumer_baseline);
+    let read_now = last_baseline_index(events, producer, root, consumer);
+    let (Some(then), Some(now)) = (read_then, read_now) else {
+        return false;
+    };
+    then != now
+        && events[then + 1..now]
+            .iter()
+            .chain([&events[now]])
+            .filter(|e| same_root(e, root) && is_producer_event(e, producer) && is_keyed(e))
+            .all(|e| same_key(&events[then], e))
+}
+
+/// Whether `event` is a keyed event of the same unit as `producer`: by unit id
+/// when `producer` has one, else by name (as [`last_baseline_index`] pairs).
+fn is_producer_event(event: &BuildEvent, producer: &BuildEvent) -> bool {
+    match unit_of(producer) {
+        Some(unit) => unit_of(event) == Some(unit),
+        None => event.crate_name == producer.crate_name,
+    }
+}
+
 /// Both compiles computed the same, non-empty final key.
 fn same_key(baseline: &BuildEvent, compiled: &BuildEvent) -> bool {
     !compiled.cache_key.is_empty() && compiled.cache_key == baseline.cache_key
@@ -508,13 +559,22 @@ pub fn analyze(events: &[BuildEvent], miss_index: usize) -> Option<Chain> {
                 }
                 // Compared cleanly and stable: this is a genuine endpoint.
                 // `classify_at` derives the same identity from the same event.
-                Some((dep_baseline, _)) => roots.push(classify_at(
-                    events,
-                    dep_index,
-                    Some(dep_baseline),
-                    cross_checkout,
-                    next_path,
-                )),
+                Some((dep_baseline, _)) => {
+                    let mut root = classify_at(
+                        events,
+                        dep_index,
+                        Some(dep_baseline),
+                        cross_checkout,
+                        next_path,
+                    );
+                    if root.kind == RootKind::NothingRecorded
+                        && !cross_checkout
+                        && same_key_new_bytes(events, dep_index, index, baseline)
+                    {
+                        root.kind = RootKind::Unreproducible;
+                    }
+                    roots.push(root);
+                }
                 // Not comparable. NOT the same as stable — saying so would
                 // invent a root out of missing data.
                 None => {
@@ -2247,8 +2307,9 @@ mod tests {
     }
 
     /// `PathOnly` is a claim about two checkouts agreeing on a key. In one tree
-    /// the same evidence keeps its old reading, and across checkouts a key
-    /// that differs with no group to show for it is not path-only either.
+    /// the same evidence reads as a compile that does not reproduce its output,
+    /// and across checkouts a key that differs with no group to show for it is
+    /// not path-only either.
     #[test]
     fn path_only_needs_another_checkout_and_the_same_key() {
         let same_tree = builds(vec![
@@ -2257,7 +2318,7 @@ mod tests {
         ]);
         let chain = analyze(&same_tree, same_tree.len() - 1).unwrap();
         assert_eq!(chain.roots[0].crate_name, "leaf");
-        assert_eq!(chain.roots[0].kind, RootKind::NothingRecorded);
+        assert_eq!(chain.roots[0].kind, RootKind::Unreproducible);
 
         let mut other_key = builds(vec![
             project_build("/a", 0, "e1", "L1", MISSES),
@@ -2280,5 +2341,82 @@ mod tests {
         let app = events.len() - 1;
         events[app].root.clear();
         assert!(compare_checkout(&events, app).is_none());
+    }
+    /// A crate compiled again under the key it had (its entry evicted, or a
+    /// second store) writes other bytes, as rustc's parallel front end did
+    /// before nightly-2026-10-22, and every crate above it misses. The walk names
+    /// it as the root and says its output is not reproducible, rather than
+    /// guessing at a key salt.
+    #[test]
+    fn a_dependency_rebuilt_under_its_old_key_with_new_bytes_is_unreproducible() {
+        let events = builds(vec![
+            project_build("/w", 0, "e1", "L1", MISSES),
+            project_build("/w", 10, "e1", "L2", MISSES),
+        ]);
+        let chain = analyze(&events, events.len() - 1).unwrap();
+        assert_eq!(chain.roots.len(), 1);
+        let root = &chain.roots[0];
+        assert_eq!(root.crate_name, "leaf");
+        assert_eq!(root.kind, RootKind::Unreproducible);
+        assert!(root.kind.is_resolved());
+        assert!(chain.has_resolved_root());
+        assert_eq!(
+            root.path.iter().map(|h| h.crate_name.as_str()).collect::<Vec<_>>(),
+            ["app", "mid"]
+        );
+        assert_eq!(
+            serde_json::to_value(&root.kind).unwrap(),
+            serde_json::json!({ "kind": "unreproducible" })
+        );
+
+        // Hits in between that restored the same key change nothing.
+        let mut with_hits = events.clone();
+        let mut hit = with_hits[position_of(&with_hits, "/w", "leaf")].clone();
+        hit.result = EventResult::LocalHit;
+        let first_mid = with_hits.iter().position(|e| e.crate_name == "mid").unwrap();
+        with_hits.insert(first_mid + 1, hit);
+        let chain = analyze(&with_hits, with_hits.len() - 1).unwrap();
+        assert_eq!(chain.roots[0].kind, RootKind::Unreproducible);
+    }
+
+    /// Unreproducible claims the key never moved between the two reads. A key
+    /// that moved and came back, a key change the groups show, and another
+    /// checkout (`PathOnly`'s case) keep their readings.
+    #[test]
+    fn unreproducible_needs_one_tree_and_a_key_that_never_moved() {
+        let base = builds(vec![
+            project_build("/w", 0, "e1", "L1", MISSES),
+            project_build("/w", 10, "e1", "L2", MISSES),
+        ]);
+        // The leaf compiled once under another key in between (nothing read
+        // it), then under the old key again.
+        let mut came_back = base.clone();
+        let second_leaf = position_of(&came_back, "/w", "leaf");
+        let mut other = came_back[second_leaf].clone();
+        other.cache_key = "leaf-salted".to_string();
+        other.ts = ts(5);
+        came_back.insert(second_leaf, other);
+        let chain = analyze(&came_back, came_back.len() - 1).unwrap();
+        assert_eq!(chain.roots[0].crate_name, "leaf");
+        assert_eq!(chain.roots[0].kind, RootKind::NothingRecorded);
+
+        // A key change the groups explain is that change.
+        let changed = builds(vec![
+            project_build("/w", 0, "e1", "L1", MISSES),
+            project_build("/w", 10, "e2", "L2", MISSES),
+        ]);
+        let chain = analyze(&changed, changed.len() - 1).unwrap();
+        assert_eq!(
+            chain.roots[0].kind,
+            RootKind::Groups(vec!["env_deps".to_string()])
+        );
+
+        // Across checkouts the same evidence is `PathOnly`.
+        let across = builds(vec![
+            project_build("/a", 0, "e1", "L1", MISSES),
+            project_build("/b", 10, "e1", "L2", MISSES),
+        ]);
+        let chain = analyze(&across, across.len() - 1).unwrap();
+        assert_eq!(chain.roots[0].kind, RootKind::PathOnly);
     }
 }

@@ -211,6 +211,10 @@ mod tests {
         TofuStore::with_path(directory.path().join("known.json"))
     }
 
+    #[cfg_attr(
+        windows,
+        ignore = "kunobi-auth locks under the real AppData\\Roaming\\kunobi; nothing moves it on Windows"
+    )]
     #[test]
     fn retrust_moves_a_changed_issuer() {
         let _config = crate::test_support::KunobiConfigGuard::new();
@@ -238,6 +242,10 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg_attr(
+        windows,
+        ignore = "kunobi-auth locks under the real AppData\\Roaming\\kunobi; nothing moves it on Windows"
+    )]
     #[test]
     fn retrust_moves_a_changed_audience() {
         let _config = crate::test_support::KunobiConfigGuard::new();
@@ -256,6 +264,10 @@ mod tests {
         assert!(change.contains("audience"), "{change}");
     }
 
+    #[cfg_attr(
+        windows,
+        ignore = "kunobi-auth locks under the real AppData\\Roaming\\kunobi; nothing moves it on Windows"
+    )]
     #[test]
     fn retrust_is_silent_when_the_pin_matches_or_is_new() {
         let _config = crate::test_support::KunobiConfigGuard::new();
@@ -322,6 +334,10 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[cfg_attr(
+        windows,
+        ignore = "kunobi-auth locks under the real AppData\\Roaming\\kunobi; nothing moves it on Windows"
+    )]
     #[tokio::test]
     async fn a_changed_issuer_needs_retrust() {
         let _config = crate::test_support::KunobiConfigGuard::new();

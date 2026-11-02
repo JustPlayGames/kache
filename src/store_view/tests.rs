@@ -317,11 +317,10 @@ fn volume_inventory_reaches_direct_stats_daemon_stats_and_reports() {
     assert_eq!(snapshot.max_size, 3000);
     assert_eq!(snapshot.entries.len(), 2);
     let lines = crate::cli::render_stats(&snapshot, &config, window);
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains(&shard_config.cache_dir.display().to_string()))
-    );
+    // The store's line names it as users see it: under their home as `~/…`
+    // (a temporary folder there, as on a machine whose TMPDIR is in $HOME).
+    let shown = crate::wrapper_config::display_path(&shard_config.cache_dir);
+    assert!(lines.iter().any(|line| line.contains(&shown)), "{lines:#?}");
     let daemon = crate::daemon::Daemon::new(config.clone());
     let req: crate::daemon::StatsRequest = serde_json::from_value(serde_json::json!({
         "include_entries": true, "sort_by": "size", "event_hours": null

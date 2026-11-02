@@ -1,5 +1,6 @@
 mod compiler_gc_tests;
 mod cost_backfill_tests;
+mod key_bridge_tests;
 
 fn connection_synchronous(db: &Connection) -> i64 {
     db.query_row("PRAGMA synchronous", [], |row| row.get(0))
@@ -516,6 +517,66 @@ fn an_older_release_reopening_the_index_does_not_empty_the_file_hash_memo() {
     assert_eq!(served(&db, "/older-release"), None);
 }
 
+/// A newer release stamps a higher schema generation; when this release
+/// opens that index (a build-script launcher keeps running the kache that
+/// installed it, so two releases open one store for a while), it neither
+/// runs its own DDL again nor stamps its older generation over the newer
+/// one, which would make the newer release run its DDL on its next open.
+#[test]
+fn index_from_a_newer_release_keeps_its_generation_and_skips_the_ddl() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    let newer = INDEX_SCHEMA_GENERATION + 1;
+    db.pragma_update(None, "user_version", newer).unwrap();
+    // Gone so a DDL pass shows: it would create the table again.
+    db.execute_batch("DROP TABLE incremental_dirs").unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, newer, "the newer generation was stamped down");
+    let tables: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'incremental_dirs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0, "the DDL ran on an index a newer release keeps");
+}
+
+/// Even when a newer index lacks what [`crate::file_hash::has_rule_columns`]
+/// checks (an older GC rebuilt the table), the DDL that puts the columns
+/// back keeps the newer generation.
+#[test]
+fn ddl_on_a_newer_index_never_stamps_its_generation_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    let newer = INDEX_SCHEMA_GENERATION + 1;
+    db.execute_batch(
+        "DROP TABLE file_hashes;
+         CREATE TABLE file_hashes (
+             path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+             ctime_ns INTEGER NOT NULL DEFAULT 0, inode INTEGER NOT NULL DEFAULT 0,
+             hash TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         ) WITHOUT ROWID;",
+    )
+    .unwrap();
+    db.pragma_update(None, "user_version", newer).unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    assert!(crate::file_hash::has_rule_columns(&db).unwrap());
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, newer, "the newer generation was stamped down");
+}
+
 /// GC in releases 0.27 to 1.0 opens the index when it starts and rebuilds
 /// a rowid `file_hashes` table, without `rule`, when it ends. If this
 /// release opened the index in between, the rebuild leaves generation 9 in
@@ -703,7 +764,7 @@ impl ArtifactPolicy for TestPolicy {
             std::path::Path::new(name)
                 .extension()
                 .and_then(|ext| ext.to_str()),
-            Some("rlib" | "o" | "obj" | "a" | "lib" | "pdb" | "dwo" | "tar" | "unknown")
+            Some("rlib" | "rmeta" | "o" | "obj" | "a" | "lib" | "pdb" | "dwo" | "tar" | "unknown")
         )
     }
     fn allow_empty(name: &str, kinds: &[String]) -> bool {
@@ -831,7 +892,13 @@ fn hardlink_eligibility_mirrors_restore_strategy_with_insert_exclusions() {
     let gate_open = !cfg!(windows);
 
     // Immutable kinds the restore side hardlinks: eligible.
-    for name in ["libserde-abc123.rlib", "foo.rcgu.o", "foo.obj", "foo.dwo"] {
+    for name in [
+        "libserde-abc123.rlib",
+        "libserde-abc123.rmeta",
+        "foo.rcgu.o",
+        "foo.obj",
+        "foo.dwo",
+    ] {
         assert_eq!(
             hardlink_eligible::<TestPolicy>(name, false),
             gate_open,
@@ -839,11 +906,7 @@ fn hardlink_eligibility_mirrors_restore_strategy_with_insert_exclusions() {
         );
     }
 
-    // Mutable kinds (independent copies on restore): never eligible.
-    assert!(!hardlink_eligible::<TestPolicy>(
-        "libserde-abc123.rmeta",
-        false
-    ));
+    // Mutable kinds (Copy strategy on restore): never eligible.
     assert!(!hardlink_eligible::<TestPolicy>("libfoo.dylib", false));
     assert!(!hardlink_eligible::<TestPolicy>("libfoo.so", false));
     assert!(!hardlink_eligible::<TestPolicy>("foo.exe", false));
@@ -1206,52 +1269,6 @@ fn materialize_blob_without_hardlink_permission_does_not_share_inode() {
     assert_eq!(fs::metadata(&source).unwrap().nlink(), 1);
 }
 
-#[cfg(unix)]
-#[test]
-fn metadata_put_without_reflink_keeps_outputs_writable() {
-    use std::os::unix::fs::MetadataExt;
-
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(test_config(dir.path())).unwrap();
-    let _force = ForceStoreHardlink::enable();
-    for name in ["foo.rmeta", "foo.rlib"] {
-        let output = dir.path().join(name);
-        // The second put finds an already-present blob.
-        for key in ["first", "existing"] {
-            if output.exists() {
-                fs::remove_file(&output).unwrap();
-            }
-            fs::write(&output, name).unwrap();
-            store
-                .put(
-                    key,
-                    "foo",
-                    &[],
-                    &[],
-                    "",
-                    "",
-                    &[(output.clone(), name.into())],
-                    "",
-                    "",
-                )
-                .unwrap();
-            let entry = store.get(key).unwrap().unwrap();
-            let blob = store.blob_path(&entry.files[0].hash);
-            let output_meta = fs::metadata(&output).unwrap();
-            let blob_meta = fs::metadata(&blob).unwrap();
-            assert!(blob_meta.permissions().readonly());
-            if name.ends_with(".rmeta") {
-                assert!(!output_meta.permissions().readonly());
-                assert_ne!(output_meta.ino(), blob_meta.ino());
-                fs::write(&output, b"fixed metadata").unwrap();
-                assert_eq!(fs::read(&blob).unwrap(), name.as_bytes());
-            } else if key == "first" {
-                assert_eq!(output_meta.ino(), blob_meta.ino());
-            }
-        }
-    }
-}
-
 #[test]
 fn materialize_blob_errors_when_source_cannot_be_copied() {
     // Covers materialize_blob copy-fallback error branch.
@@ -1378,6 +1395,16 @@ fn put_stores_snapshot_bytes_matching_recorded_digest() {
 }
 
 /// A completed put must leave nothing behind in the staging area.
+/// The files in the store's `staging/` folder. This fork stages a put's
+/// snapshot beside its blob, so the folder may never be made: none then.
+fn staging_paths(store: &Store) -> Vec<PathBuf> {
+    match fs::read_dir(store.staging_dir()) {
+        Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("reading the staging folder: {error}"),
+    }
+}
+
 #[test]
 fn successful_put_leaves_staging_dir_empty() {
     let dir = tempfile::tempdir().unwrap();
@@ -1400,10 +1427,7 @@ fn successful_put_leaves_staging_dir_empty() {
         )
         .unwrap();
 
-    let leftovers = fs::read_dir(store.staging_dir())
-        .unwrap()
-        .collect::<std::io::Result<Vec<_>>>()
-        .unwrap();
+    let leftovers = staging_paths(&store);
     assert!(leftovers.is_empty(), "staging litter: {leftovers:?}");
 }
 
@@ -1459,11 +1483,228 @@ fn zero_byte_refusal_cleans_up_staged_snapshot() {
         "",
     );
     assert!(result.is_err(), "zero-byte rlib must be refused");
-    let leftovers = fs::read_dir(store.staging_dir())
-        .unwrap()
-        .collect::<std::io::Result<Vec<_>>>()
-        .unwrap();
+    let leftovers = staging_paths(&store);
     assert!(leftovers.is_empty(), "refused put left staging litter");
+}
+
+/// Snapshots staged beside their blob that are still in the shards.
+fn shard_stage_leftovers(store: &Store) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Ok(shards) = fs::read_dir(store.config.store_dir().join("blobs")) {
+        for shard in shards.flatten() {
+            for file in fs::read_dir(shard.path()).unwrap().flatten() {
+                if file.file_name().to_string_lossy().starts_with(SHARD_STAGE_PREFIX) {
+                    found.push(file.path());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// A put stages each output in the shard its blob goes to, so publishing
+/// is a rename within that directory: nothing goes through `staging/`,
+/// whose renames into a shard take the filesystem-wide rename lock.
+#[test]
+fn put_stages_beside_the_blob_and_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let rlib = dir.path().join("libout.rlib");
+    fs::write(&rlib, b"rlib bytes staged beside their blob").unwrap();
+    let rmeta = dir.path().join("libout.rmeta");
+    fs::write(&rmeta, b"rmeta bytes staged beside their blob").unwrap();
+    store
+        .put(
+            "beside_key",
+            "out",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[
+                (rlib.clone(), "libout.rlib".to_string()),
+                (rmeta, "libout.rmeta".to_string()),
+            ],
+            "",
+            "",
+        )
+        .unwrap();
+
+    assert!(
+        !store.staging_dir().exists(),
+        "a put whose outputs are readable never stages in staging/"
+    );
+    assert!(shard_stage_leftovers(&store).is_empty());
+    let hash = crate::file_hash::hash_file(&rlib).unwrap();
+    assert_eq!(
+        fs::read(store.blob_path(&hash)).unwrap(),
+        b"rlib bytes staged beside their blob"
+    );
+}
+
+/// An output whose bytes are already a blob is neither staged nor
+/// published: the entry references the blob, and the output keeps its
+/// inode and mode (staging it hardlinked it, made it read-only and then
+/// writable for everyone when the lost race discarded the snapshot).
+#[cfg(unix)]
+#[test]
+fn put_of_bytes_already_in_the_store_stages_nothing() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let put = |key: &str, path: &Path| {
+        store
+            .put(
+                key,
+                "out",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(path.to_path_buf(), "libout.rlib".to_string())],
+                "",
+                "",
+            )
+            .unwrap()
+    };
+
+    let first = dir.path().join("first.rlib");
+    fs::write(&first, b"the same output twice").unwrap();
+    put("first_key", &first);
+
+    let second = dir.path().join("second.rlib");
+    fs::write(&second, b"the same output twice").unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).unwrap();
+    let result = put("second_key", &second);
+    assert_eq!((result.duplicate_blobs, result.new_blobs), (1, 0));
+
+    let meta = fs::metadata(&second).unwrap();
+    assert_eq!(meta.nlink(), 1, "the output was linked into the store");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+    assert!(shard_stage_leftovers(&store).is_empty());
+    let hash = crate::file_hash::hash_file(&second).unwrap();
+    assert_eq!(
+        fs::read(store.blob_path(&hash)).unwrap(),
+        b"the same output twice"
+    );
+}
+
+/// An output that changes between the digest read up front and its
+/// snapshot is staged in the wrong shard. The snapshot's own digest still
+/// decides where it is published, and the wrong shard keeps nothing.
+#[test]
+fn a_snapshot_staged_in_the_wrong_shard_is_published_under_its_own_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let source = dir.path().join("out.rlib");
+    fs::write(&source, b"changed after its digest was read").unwrap();
+    let stale = "ab".repeat(32);
+    let (staged, ingest) = store.stage_blob_beside(&source, false, &stale).unwrap();
+    assert_eq!(staged.parent(), store.blob_path(&stale).parent());
+    assert!(
+        staged
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(SHARD_STAGE_PREFIX)
+    );
+
+    let hash = crate::file_hash::hash_file(&staged).unwrap();
+    assert_ne!(hash, stale);
+    let size = fs::metadata(&staged).unwrap().len();
+    assert!(store.publish_staged_blob(&staged, ingest, &hash, size).unwrap());
+    assert_eq!(
+        fs::read(store.blob_path(&hash)).unwrap(),
+        b"changed after its digest was read"
+    );
+    assert!(!store.blob_path(&stale).exists());
+    assert!(shard_stage_leftovers(&store).is_empty());
+}
+
+/// A put killed between staging beside its blob and publishing leaves a
+/// dot-named snapshot in the shard. The staging sweep reclaims it once it
+/// is past the grace; blobs, other temps and fresh snapshots stay.
+#[test]
+fn staging_sweep_reclaims_old_snapshots_in_the_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let hash = "cd".repeat(32);
+    let blob = store.blob_path(&hash);
+    let shard = blob.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&shard).unwrap();
+    fs::write(&blob, b"a blob").unwrap();
+    let stale = shard.join(format!("{SHARD_STAGE_PREFIX}1-0.tmp"));
+    let fresh = shard.join(format!("{SHARD_STAGE_PREFIX}1-1.tmp"));
+    let other = shard.join(format!(".{hash}.1.0.tmp"));
+    for path in [&stale, &fresh, &other] {
+        fs::write(path, b"snapshot").unwrap();
+    }
+    let old = filetime::FileTime::from_unix_time(0, 0);
+    for path in [&stale, &other] {
+        filetime::set_file_mtime(path, old).unwrap();
+    }
+    filetime::set_file_mtime(&blob, old).unwrap();
+
+    let stats = store.sweep_stale_staging(Duration::from_secs(3600));
+    assert_eq!(stats.removed, 1);
+    assert!(!stale.exists());
+    assert!(fresh.exists(), "an in-flight snapshot survives");
+    assert!(other.exists(), "only staged snapshots are the staging sweep's");
+    assert!(blob.exists(), "blobs are never the staging sweep's");
+}
+
+/// A staged snapshot is never a blob to the orphan sweep: its name is not
+/// a hash, so an in-flight put's snapshot is not reclaimed under it.
+#[test]
+fn orphan_sweep_leaves_snapshots_staged_in_the_shards() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let shard = store.blob_path(&"ef".repeat(32)).parent().unwrap().to_path_buf();
+    fs::create_dir_all(&shard).unwrap();
+    let staged = shard.join(format!("{SHARD_STAGE_PREFIX}1-0.tmp"));
+    fs::write(&staged, b"snapshot").unwrap();
+    filetime::set_file_mtime(&staged, filetime::FileTime::from_unix_time(0, 0)).unwrap();
+
+    store.sweep_orphan_blobs(Duration::ZERO).unwrap();
+    assert!(staged.exists());
+}
+
+/// A leftover that shares an inode with a blob (a hardlink ingest of an
+/// output that was itself restored from the store) is removed without
+/// making the blob writable.
+#[cfg(unix)]
+#[test]
+fn staging_sweep_leaves_a_blob_sharing_a_leftover_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+
+    let source = dir.path().join("out.rlib");
+    fs::write(&source, b"restored then staged").unwrap();
+    let (staged, _ingest) = store.stage_blob_from_source(&source, false).unwrap();
+    let hash = crate::file_hash::hash_file(&staged).unwrap();
+    let blob = store.blob_path(&hash);
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::hard_link(&staged, &blob).unwrap();
+    set_blob_readonly(&blob);
+
+    let stats = store.sweep_stale_staging(Duration::ZERO);
+    assert_eq!(stats.removed, 1);
+    assert!(!staged.exists());
+    assert!(
+        fs::metadata(&blob).unwrap().permissions().readonly(),
+        "the sweep made a published blob writable"
+    );
 }
 
 /// Publishing onto an already-present blob discards the staged snapshot
@@ -1735,6 +1976,77 @@ fn publish_rename_fails_on_a_settled_error_or_an_obstructed_name() {
     assert_eq!(calls, crate::atomic::TRANSIENT_ATTEMPTS);
 }
 
+/// The no-replace publish's `AlreadyExists` is a race to retry on every
+/// platform, beside Windows' own transient codes; other errors are not.
+#[test]
+fn a_taken_name_is_a_transient_publish_error() {
+    assert!(is_transient_publish_error(&std::io::Error::from(
+        std::io::ErrorKind::AlreadyExists
+    )));
+    assert!(!is_transient_publish_error(&std::io::Error::from(
+        std::io::ErrorKind::NotFound
+    )));
+    assert!(!is_transient_publish_error(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
+}
+
+/// The race behind `publish_racing_an_unlink_never_errors`, in order: the
+/// link finds another put's blob at the name (`AlreadyExists`), and a
+/// remover unlinks that blob before the probe looks. The name is vacant, so
+/// the next attempt publishes instead of failing the put.
+#[cfg(unix)]
+#[test]
+fn a_winner_unlinked_after_the_link_failed_is_published_on_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob");
+    let staged = dir.path().join("staged");
+    fs::write(&blob, b"same-bytes").unwrap();
+    fs::write(&staged, b"same-bytes").unwrap();
+    set_blob_readonly(&blob);
+
+    let calls = std::cell::Cell::new(0u32);
+    let outcome = publish_rename(
+        || {
+            calls.set(calls.get() + 1);
+            let linked = publish_without_replacing(&staged, &blob);
+            if calls.get() == 1 {
+                assert_eq!(
+                    linked.as_ref().unwrap_err().kind(),
+                    std::io::ErrorKind::AlreadyExists
+                );
+                // The remover, between the failed link and the probe.
+                unlink_blob(&blob);
+            }
+            linked
+        },
+        || publish_dest_state(&blob),
+        is_transient_publish_error,
+    )
+    .unwrap();
+    assert_eq!(outcome, PublishRename::Published);
+    assert_eq!(calls.get(), 2);
+    assert_eq!(fs::read(&blob).unwrap(), b"same-bytes");
+    assert!(!staged.exists(), "the staged name is gone once linked");
+}
+
+/// A name some other put keeps taking back, vacant after every failed
+/// link: the budget ends deferred to the locked phase, not as an error.
+#[test]
+fn a_name_freed_after_every_failed_link_defers_the_publish() {
+    let calls = std::cell::Cell::new(0u32);
+    let outcome = publish_rename(
+        || {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        },
+        || PublishDest::Vacant,
+        is_transient_publish_error,
+    );
+    assert_eq!(outcome.unwrap(), PublishRename::Deferred);
+    assert_eq!(calls.get(), crate::atomic::TRANSIENT_ATTEMPTS);
+}
+
 /// The real rename onto a read-only winner, past the early `is_file`
 /// check the way a lost race gets there. Unix replaces the identical
 /// blob; Windows refuses with ERROR_ACCESS_DENIED. Either way one rename
@@ -1892,39 +2204,47 @@ fn cas_publication_keeps_a_flushed_winner_after_the_initial_absence_check() {
     assert_eq!(peer.pending_durability().unwrap(), 0);
 }
 
+/// Production's publish never replaces a file at the content address, so a
+/// winner another put published (and maybe flushed) meanwhile keeps its
+/// inode, and the publish needs no index lock (another connection may hold
+/// the writer lock throughout).
+#[cfg(unix)]
 #[test]
-fn cas_publication_holds_the_writer_lock_through_rename() {
+fn cas_publication_never_replaces_a_published_blob_and_takes_no_index_lock() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     let peer = Store::open(&config).unwrap();
-    peer.db.busy_timeout(Duration::ZERO).unwrap();
+    let held = rusqlite::Transaction::new_unchecked(
+        &peer.db,
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
     let source = write_temp_file(dir.path(), "locked-publish.rlib", b"published bytes");
     let (staged, _) = store.stage_blob_from_source(&source, false).unwrap();
     let hash = crate::file_hash::hash_file(&staged).unwrap();
     let blob = store.blob_path(&hash);
-    let outcome = store.publish_staged_blob_with(
-        &staged,
-        &blob,
-        || {
-            let competing = rusqlite::Transaction::new_unchecked(
-                &peer.db, rusqlite::TransactionBehavior::Immediate,
-            );
-            assert!(matches!(
-                competing,
-                Err(SqlError::SqliteFailure(code, _)) if code.code == ErrorCode::DatabaseBusy
-            ), "a second connection must not publish between the check and rename");
-            fs::rename(&staged, &blob)
-        },
-        |_| false,
-    ).unwrap();
+    fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    fs::write(&blob, b"published bytes").unwrap();
+    let winner = kache_fs::file_identity(&blob).unwrap();
+    let error = publish_without_replacing(&staged, &blob).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(kache_fs::file_identity(&blob).unwrap(), winner);
+    assert!(staged.exists(), "a refused publish leaves the staged file to its caller");
+
+    fs::remove_file(&blob).unwrap();
+    let outcome = store
+        .publish_staged_blob_with(
+            &staged,
+            &blob,
+            || publish_without_replacing(&staged, &blob),
+            |_| false,
+        )
+        .unwrap();
     assert_eq!(outcome, PublishRename::Published);
+    assert!(!staged.exists());
     assert_eq!(fs::read(&blob).unwrap(), b"published bytes");
-    assert!(
-        rusqlite::Transaction::new_unchecked(&peer.db, rusqlite::TransactionBehavior::Immediate,)
-            .is_ok(),
-        "the publication lock must be released"
-    );
+    drop(held);
 }
 
 /// The grace both sweepers share (daemon GC and `doctor --repair`) must
@@ -2841,15 +3161,19 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                 .unwrap()
         };
         put();
+        let meta_path = store.entry_dir("many-artifacts").join("meta.json");
         let mut calls = 0;
         assert!(
             store
                 .flush_entry_durability_with(
                     "many-artifacts",
                     |file| {
-                        let metadata_sync = calls == count;
                         calls += 1;
-                        let must_hold_writer = count == 65 || metadata_sync;
+                        // A metadata flush under the lock kept every build's
+                        // index write waiting for the journal.
+                        let metadata_sync = kache_fs::file_identity(&meta_path).ok()
+                            == kache_fs::handle_identity(file).ok();
+                        let must_hold_writer = count == 65 && !metadata_sync;
                         let competing = rusqlite::Transaction::new_unchecked(
                             &peer.db,
                             rusqlite::TransactionBehavior::Immediate,
@@ -2867,7 +3191,8 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                             {
                                 assert!(
                                     must_hold_writer,
-                                    "ordinary blob IO must run outside the writer lock"
+                                    "ordinary blob IO and the metadata flush must run outside \
+                                     the writer lock"
                                 );
                             }
                             Err(error) => panic!("unexpected writer probe: {error}"),
@@ -3333,6 +3658,7 @@ fn test_config(dir: &Path) -> Config {
         cache_dir: dir.to_path_buf(),
         max_size: 1024 * 1024,
         gc_evict_shared: false,
+        gc_spare_young_hours: 0,
         upload_spool_max_jobs: 65_536,
         deferred_durability: false,
         index_mode: IndexMode::default(),
@@ -4623,7 +4949,7 @@ fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budge
     assert_eq!(store.evict().unwrap().entries_evicted, 0);
     assert_eq!(
         store
-            .evict_for_disk_pressure(|| true)
+            .evict_for_disk_pressure(|_| true)
             .unwrap()
             .entries_evicted,
         0
@@ -4632,7 +4958,7 @@ fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budge
 
     let mut checks = 0;
     let stats = store
-        .evict_for_disk_pressure(|| {
+        .evict_for_disk_pressure(|_| {
             checks += 1;
             checks >= 3
         })
@@ -4642,7 +4968,7 @@ fn disk_pressure_stops_before_scanning_and_between_removals_below_the_size_budge
     assert_eq!(store.list_entries("last_accessed").unwrap().len(), 1);
     assert_eq!(
         store
-            .evict_for_disk_pressure(|| false)
+            .evict_for_disk_pressure(|_| false)
             .unwrap()
             .entries_evicted,
         1
@@ -4808,7 +5134,7 @@ fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
     assert!(store.contains("kept"), "entry remains restorable");
     assert!(blob.is_file(), "store name remains");
 
-    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    let pressure = store.evict_for_disk_pressure(|_| false).unwrap();
     assert_eq!(pressure.entries_evicted, 0);
     assert_eq!(pressure.entries_unreclaimable, 1);
     assert!(store.contains("kept"));
@@ -4824,6 +5150,295 @@ fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
         retainer.is_file(),
         "compatibility mode drops the store name, not the retained blocks"
     );
+}
+
+/// Disk recovery passes over an entry a target directory still hardlinks
+/// without waiting for the index's write lock: removing it frees nothing,
+/// and on a disk filling up builds hold that lock most of the time. The
+/// removal used to find it held only once it had the lock.
+#[test]
+fn disk_pressure_skips_a_hardlinked_entry_without_the_write_lock() {
+    static WAITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    fn give_up(_: i32) -> bool {
+        WAITED.store(true, Ordering::SeqCst);
+        false
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (store, config) = store_with_one_evictable_entry(dir.path(), "held");
+    let meta = store.get("held").unwrap().unwrap();
+    let retainer = dir.path().join("target-copy.rlib");
+    std::fs::hard_link(store.blob_path(&meta.files[0].hash), &retainer).unwrap();
+    store.set_last_accessed_for_test("held", "-1 hour");
+    store.db.busy_handler(Some(give_up)).unwrap();
+    let build = Connection::open(config.index_db_path()).unwrap();
+    build.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let stats = store.evict_for_disk_pressure(|_| false).unwrap();
+    build.execute_batch("ROLLBACK").unwrap();
+
+    assert!(
+        !WAITED.load(Ordering::SeqCst),
+        "asked for the lock: {stats:?}"
+    );
+    assert_eq!(stats.entries_unreclaimable, 1, "{stats:?}");
+    assert_eq!(stats.entries_failed, 0, "{stats:?}");
+    assert!(store.contains("held") && retainer.is_file());
+}
+
+/// Builds keep writing while a sweep runs: on 2026-10-26 one reached its
+/// byte target while the disk fell from 91 to 15 GiB free. A sweep that
+/// reaches its target on a disk still short of space keeps evicting, and
+/// stops once the space is back.
+#[test]
+fn a_sweep_reaching_its_target_goes_on_while_the_disk_is_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 500;
+    let store = Store::open(&config).unwrap();
+    for (key, idle) in [
+        ("oldest", "-3 hours"),
+        ("older", "-2 hours"),
+        ("newest", "-1 hour"),
+    ] {
+        put_idle_entry(&store, dir.path(), key, 200);
+        store.set_last_accessed_for_test(key, idle);
+    }
+
+    // 600 bytes over a 500-byte limit: removing "older" too reaches the
+    // 390-byte target. The disk stays short until "older" has gone.
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || store.contains("older"))
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 2, "{stats:?}");
+    assert!(!store.contains("oldest") && !store.contains("older"));
+    assert!(store.contains("newest"), "space came back: {stats:?}");
+}
+
+/// On a low disk a sweep starts removing at once: it checks each entry
+/// for a target directory's hardlink as it reaches it, instead of
+/// probing the whole store first (about three minutes on a 12 GB index,
+/// with the disk filling at 3 GiB a minute). Here the hardlink goes
+/// away after the first removal, as a build's target directory might:
+/// a probe made before that removal would have kept the entry.
+#[test]
+fn a_sweep_on_a_low_disk_checks_hardlinks_as_it_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 300;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "plain", 200);
+    store.set_last_accessed_for_test("plain", "-2 hours");
+    let blob = put_idle_entry(&store, dir.path(), "linked", 200);
+    let retainer = dir.path().join("target-copy.rlib");
+    std::fs::hard_link(&blob, &retainer).unwrap();
+
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || {
+            if !store.contains("plain") && retainer.exists() {
+                std::fs::remove_file(&retainer).unwrap();
+            }
+            true
+        })
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 2, "{stats:?}");
+    assert!(!store.contains("plain") && !store.contains("linked"));
+}
+
+/// Once the space is back, a sweep that started on a low disk stops at
+/// the byte target a sweep on a roomy disk stops at: the bytes target
+/// directories hold among the entries it never reached count apart
+/// (#1206), instead of being evicted for (a quarter of the store here).
+#[test]
+fn a_low_disk_sweep_stops_at_the_usual_target_once_space_is_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 500;
+    let store = Store::open(&config).unwrap();
+    put_idle_entry(&store, dir.path(), "first", 200);
+    store.set_last_accessed_for_test("first", "-4 hours");
+    put_idle_entry(&store, dir.path(), "second", 200);
+    store.set_last_accessed_for_test("second", "-3 hours");
+    let blob = put_idle_entry(&store, dir.path(), "linked", 400);
+    std::fs::hard_link(&blob, dir.path().join("target-copy.rlib")).unwrap();
+
+    // 800 bytes, 400 of them linked: 400 of its own against a 390-byte
+    // target. The disk is short until "first" goes.
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || store.contains("first"))
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(store.contains("second") && store.contains("linked"));
+    assert_eq!(stats.bytes_held, 400, "{stats:?}");
+}
+
+/// A sweep ranks the store once, at its start, so what changed since
+/// (entries used or written meanwhile) it ranks as it was. On 2026-10-26
+/// the 18:22 sweep was still walking its ranking, down to entries of a
+/// few MB, half an hour later with builds taking 3 GiB a minute; the
+/// sweep that ranked afresh at 19:18 freed 27 GiB a minute. On a low disk
+/// a sweep whose ranking has aged ranks again once it has removed
+/// something. Here the second entry was in use when the sweep ranked.
+#[test]
+fn a_sweep_on_a_low_disk_ranks_again_once_its_ranking_ages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 300;
+    let mut store = Store::open(&config).unwrap();
+    store.ranking_fresh_for = Duration::ZERO;
+    put_idle_entry(&store, dir.path(), "old", 200);
+    put_idle_entry(&store, dir.path(), "in-use", 200);
+    store.set_last_accessed_for_test("in-use", "+0 seconds");
+
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || {
+            if !store.contains("old") {
+                store.set_last_accessed_for_test("in-use", "-2 hours");
+            }
+            store.contains("in-use")
+        })
+        .unwrap();
+
+    assert_eq!(stats.entries_evicted, 2, "{stats:?}");
+    assert!(!store.contains("in-use"), "{stats:?}");
+}
+
+/// An automatic size sweep used to walk its whole ranking under
+/// `gc.lock`, however long its rows took: the first one after an upgrade
+/// would walk every row of a dead key version. Past its walk budget it
+/// stops, once it has removed something, and says so; a sweep someone
+/// asked for, or one on a disk short of space, goes on to its target.
+/// Builds write on between the size check and a sweep's first removal, so an
+/// automatic sweep starts under the cap to keep the store under it
+/// (2026-10-31: from 110 % of a 483 GB cap the store's own part reached
+/// 533 GB). A requested one keeps its 100 % to 90 %.
+#[test]
+fn an_automatic_sweep_starts_at_88_percent_and_stops_at_78() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    for (key, size) in [("a", 430), ("b", 100), ("c", 350)] {
+        put_idle_entry(&store, dir.path(), key, size);
+    }
+    assert_eq!(store.physical_size().unwrap(), 880);
+    let at_the_trigger = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert_eq!(at_the_trigger.entries_evicted, 0, "{at_the_trigger:?}");
+
+    put_idle_entry(&store, dir.path(), "d", 1);
+    let requested = store
+        .evict_for_free_space(SweepOrigin::Requested, || false)
+        .unwrap();
+    assert_eq!(requested.entries_evicted, 0, "under the cap: {requested:?}");
+
+    let automatic = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert!(automatic.entries_evicted >= 1, "{automatic:?}");
+    assert!(store.physical_size().unwrap() <= 780);
+}
+
+/// An automatic sweep ranks a young entry slow to compile (used within the
+/// hours, 30 s or more to compile) with ten times its score: colder entries go
+/// before it, even when the plain ranking puts it first, and hotter ones still
+/// after it. Replaying the build machine's sweeps of 2026-11-01/02, this cut
+/// the compile time re-misses of evicted entries cost by 77 %.
+#[test]
+fn an_automatic_sweep_values_young_entries_slow_to_compile_ten_times() {
+    // (key, size, idle, compile seconds, hits)
+    let sweep = |entries: &[(&str, usize, &str, i64, i64)]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100_000;
+        config.gc_spare_young_hours = 12;
+        let store = Store::open(&config).unwrap();
+        for &(key, size, idle, compile_secs, hits) in entries {
+            put_idle_entry(&store, dir.path(), key, size);
+            store.set_last_accessed_for_test(key, idle);
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET compile_time_ms = ?2, hit_count = ?3 WHERE cache_key = ?1",
+                    params![key, compile_secs * 1000, hits],
+                )
+                .unwrap();
+        }
+        store
+            .evict_for_free_space(SweepOrigin::Automatic, || false)
+            .unwrap();
+        let kept: Vec<&str> = entries
+            .iter()
+            .map(|&(key, ..)| key)
+            .filter(|key| store.contains(key))
+            .collect();
+        kept.join(" ")
+    };
+
+    // 110 kB down to the 78 kB target. Plain scores: young 21, p 37, o 61,
+    // hot 6,300; "young" counts 210, so the day-old "p" and "o" go instead.
+    // (Sizes stay past the ranking's 1 KiB clamp, under which every entry
+    // ranks alike.)
+    assert_eq!(
+        sweep(&[
+            ("young", 50_000, "-1 hour", 60, 0),
+            ("p", 25_000, "-1 day", 60, 20),
+            ("o", 15_000, "-1 day", 60, 20),
+            ("hot", 20_000, "-3 minutes", 1, 5),
+        ]),
+        "young hot"
+    );
+    // 100 kB: with "o2" gone the store is still over the target, and every
+    // other entry is hotter than ten times "young"'s score: "young" goes.
+    assert_eq!(
+        sweep(&[
+            ("young", 50_000, "-1 hour", 60, 0),
+            ("hot", 45_000, "-3 minutes", 1, 5),
+            ("o2", 5_000, "-1 day", 60, 20),
+        ]),
+        "hot"
+    );
+}
+
+#[test]
+fn an_automatic_size_sweep_stops_at_its_walk_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 300;
+    let fill = |store: &Store| {
+        for key in ["a", "b", "c"] {
+            put_idle_entry(store, dir.path(), key, 200);
+        }
+    };
+    let mut store = Store::open(&config).unwrap();
+    store.size_sweep_walk_budget = Duration::ZERO;
+    fill(&store);
+
+    let stats = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert!(stats.cut_short, "{stats:?}");
+
+    // Short of space until it gets back under the cap: past its budget
+    // it goes on to the target (400 -> 200 bytes).
+    let short = store
+        .evict_for_free_space(SweepOrigin::Automatic, || {
+            store.physical_size().unwrap() > 300
+        })
+        .unwrap();
+    assert_eq!(short.entries_evicted, 1, "{short:?}");
+    assert!(!short.cut_short, "{short:?}");
+
+    fill(&store);
+    let requested = store
+        .evict_for_free_space(SweepOrigin::Requested, || false)
+        .unwrap();
+    assert_eq!(requested.entries_evicted, 2, "{requested:?}");
+    assert!(!requested.cut_short, "{requested:?}");
 }
 
 #[test]
@@ -4961,7 +5576,7 @@ fn durable_upload_intent_pins_payload_across_every_eviction_policy_until_retired
     assert!(size.entries_pinned >= 1);
     assert!(store.contains(&pending_key));
 
-    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    let pressure = store.evict_for_disk_pressure(|_| false).unwrap();
     assert!(pressure.entries_pinned >= 1);
     assert!(store.contains(&pending_key));
 
@@ -5165,6 +5780,7 @@ fn tombstones_are_pruned_by_age_and_re_eviction_resets_the_record() {
         committed: true,
         compile_time_ms: 10,
         reclaimable_bytes: None,
+        shared_share_bytes: 0,
         recently_accessed: false,
         recently_imported: false,
     };
@@ -5727,7 +6343,7 @@ fn an_automatic_sweep_keeps_what_the_remote_just_delivered() {
     assert_eq!(automatic.entries_import_pinned, 1);
     assert_eq!(automatic.entries_pinned, 1, "counted as held back too");
 
-    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    let pressure = store.evict_for_disk_pressure(|_| false).unwrap();
     assert_eq!(pressure.entries_import_pinned, 1);
     assert!(store.contains("imported_key"));
 
@@ -5865,6 +6481,46 @@ fn remove_entry_ignores_recency_guard() {
     // …but the unguarded public path removes it regardless of recency.
     store.remove_entry("rk").unwrap();
     assert!(!store.contains("rk"));
+}
+
+/// A directory registered moments ago is not written again: the second call
+/// reads its fresh row and returns without the index's write lock, so it
+/// succeeds even while another connection holds that lock.
+#[test]
+fn a_freshly_registered_incremental_dir_is_not_written_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let incremental_dir = dir.path().join("target/debug/incremental");
+    std::fs::create_dir_all(&incremental_dir).unwrap();
+    store.remember_incremental_dir(&incremental_dir).unwrap();
+
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let _ = store.db.busy_timeout(std::time::Duration::from_millis(10));
+    store
+        .remember_incremental_dir(&incremental_dir)
+        .expect("a fresh row needs no write");
+    writer.execute_batch("COMMIT").unwrap();
+
+    // A stale row is written again.
+    store
+        .db
+        .execute(
+            "UPDATE incremental_dirs SET last_seen = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    store.remember_incremental_dir(&incremental_dir).unwrap();
+    let fresh: bool = store
+        .db
+        .query_row(
+            "SELECT last_seen > datetime('now', '-60 seconds') FROM incremental_dirs",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(fresh);
 }
 
 #[test]
@@ -6383,6 +7039,229 @@ fn claim_build_rechecks_entry_after_acquiring_lock() {
         waiter.try_lock(cache_key).unwrap().is_some(),
         "serving the committed entry must release the claim"
     );
+}
+
+/// A key claimed without the index ([`try_lock_key_in`]) is the key a
+/// store claims: held, it is contended for a store; its `meta.json` says
+/// whether the index must be asked; and the re-check under that lock finds
+/// what a claim finds.
+#[test]
+fn a_key_claimed_without_the_index_is_the_stores_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "claimed_without_the_index";
+
+    let lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    assert!(matches!(
+        store.claim_build(cache_key).unwrap(),
+        BuildClaim::Contended
+    ));
+    assert!(try_lock_key_in(&store_dir, cache_key).unwrap().is_none());
+    assert!(!entry_meta_exists_in(&store_dir, cache_key));
+    let output = dir.path().join("lib.rlib");
+    fs::write(&output, b"output").unwrap();
+    store
+        .put(
+            cache_key,
+            "c",
+            &["rlib".to_string()],
+            &[],
+            "host",
+            "dev",
+            &[(output, "lib.rlib".to_string())],
+            "",
+            "",
+        )
+        .unwrap();
+    assert!(entry_meta_exists_in(&store_dir, cache_key));
+    assert!(matches!(
+        store.claim_build_locked(cache_key, lock).unwrap(),
+        BuildClaim::Committed(_)
+    ));
+    assert!(
+        try_lock_key_in(&store_dir, cache_key).unwrap().is_some(),
+        "the committed entry released the claim"
+    );
+}
+
+/// Only a held lock marked as storing is a store in flight: a plain claim
+/// (a compile) is not, nor is a mark left in a lock nobody holds, nor a key
+/// that was never locked (whose lock file the check does not create).
+#[test]
+fn only_a_held_lock_marked_storing_is_a_store_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let _store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "store_in_flight";
+
+    assert!(!key_store_in_flight(&store_dir, cache_key));
+    assert!(!store_dir.join(cache_key).with_extension("lock").exists());
+
+    let mut lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    assert!(!key_store_in_flight(&store_dir, cache_key), "a compile");
+    lock.mark_storing();
+    assert!(key_store_in_flight(&store_dir, cache_key));
+    assert!(
+        try_lock_key_in(&store_dir, cache_key).unwrap().is_none(),
+        "the check left the holder's lock alone"
+    );
+    drop(lock);
+    assert!(!key_store_in_flight(&store_dir, cache_key), "a stale mark");
+    assert!(try_lock_key_in(&store_dir, cache_key).unwrap().is_some());
+}
+
+/// The storing mark is a file beside the lock (Windows refuses other
+/// handles a read of a locked file), goes with the lock, and one a killed
+/// holder left behind never reads as a store in flight: not while its
+/// process is gone, and not after the next holder took the lock.
+#[test]
+fn a_storing_mark_goes_with_its_lock_and_a_dead_holders_mark_never_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let _store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "storing_mark";
+    let mark = store_dir.join(cache_key).with_extension("storing");
+
+    let mut lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    lock.mark_storing();
+    assert_eq!(
+        fs::read_to_string(&mark).unwrap(),
+        std::process::id().to_string()
+    );
+    drop(lock);
+    assert!(!mark.exists(), "released with its lock");
+
+    // A holder that was killed while storing: its mark stays, naming a
+    // process that has exited, while someone else holds the key's lock.
+    let mut child = if cfg!(windows) {
+        std::process::Command::new("cmd").args(["/C", "exit"]).spawn()
+    } else {
+        std::process::Command::new("true").spawn()
+    }
+    .unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let held = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    fs::write(&mark, dead.to_string()).unwrap();
+    assert!(!key_store_in_flight(&store_dir, cache_key), "a dead holder");
+    fs::write(&mark, std::process::id().to_string()).unwrap();
+    assert!(key_store_in_flight(&store_dir, cache_key), "a live one");
+    fs::write(&mark, "").unwrap();
+    assert!(key_store_in_flight(&store_dir, cache_key), "one being written");
+    drop(held);
+
+    // Nobody holds the lock: the check takes it, which clears the mark.
+    fs::write(&mark, std::process::id().to_string()).unwrap();
+    assert!(!key_store_in_flight(&store_dir, cache_key));
+    assert!(!mark.exists(), "the next holder clears a stale mark");
+}
+
+/// The lock sweep takes a stale storing mark with its lock file.
+#[test]
+fn the_lock_sweep_removes_a_stale_storing_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "ab".repeat(32);
+    drop(try_lock_key_in(&store_dir, &cache_key).unwrap().unwrap());
+    let mark = store_dir.join(&cache_key).with_extension("storing");
+    fs::write(&mark, "1").unwrap();
+    let later = std::time::SystemTime::now() + Duration::from_secs(7200);
+    let stats = store
+        .sweep_stale_key_locks_at(KEY_LOCK_SWEEP_GRACE, KEY_LOCK_SWEEP_CAP, later)
+        .unwrap();
+    assert_eq!(stats.removed, 1);
+    assert!(!mark.exists());
+    assert!(!store_dir.join(&cache_key).with_extension("lock").exists());
+}
+
+/// A unit's in-flight note lasts as long as its guard, one per key, and
+/// names that could leave the notes' directory are never written.
+#[test]
+fn a_unit_is_in_flight_while_its_note_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    let key = |n: u8| format!("{n:02x}").repeat(32);
+    assert!(!unit_in_flight_in(&store_dir, "serde", "0123abcd"));
+    let first = mark_unit_in_flight_in(&store_dir, "serde", "0123abcd", &key(1)).unwrap();
+    let second = mark_unit_in_flight_in(&store_dir, "serde", "0123abcd", &key(2)).unwrap();
+    assert!(unit_in_flight_in(&store_dir, "serde", "0123abcd"));
+    assert!(!unit_in_flight_in(&store_dir, "serde", "4567"), "another unit");
+    assert!(!unit_in_flight_in(&store_dir, "serde_json", "0123abcd"));
+    drop(first);
+    assert!(unit_in_flight_in(&store_dir, "serde", "0123abcd"), "one key left");
+    drop(second);
+    assert!(!unit_in_flight_in(&store_dir, "serde", "0123abcd"));
+    for (krate, unit, cache_key) in [
+        ("../x", "0123", key(3)),
+        ("serde", "../x", key(3)),
+        ("serde", "", key(3)),
+        ("serde", "0123", "../x".to_string()),
+    ] {
+        assert!(mark_unit_in_flight_in(&store_dir, krate, unit, &cache_key).is_none());
+    }
+    assert!(!dir.path().join("x").exists());
+}
+
+/// A lookup that finds a store in flight and waits gets the entry the
+/// holder commits, and a bounded wait on a holder that never commits ends
+/// with nothing.
+#[test]
+fn a_wait_on_a_store_in_flight_sees_its_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let store_dir = config.store_dir();
+    let cache_key = "committed_while_waiting";
+
+    let mut lock = try_lock_key_in(&store_dir, cache_key).unwrap().unwrap();
+    lock.mark_storing();
+    let output = dir.path().join("lib.rlib");
+    fs::write(&output, b"output").unwrap();
+    let holder = {
+        let config = config.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            Store::open(&config)
+                .unwrap()
+                .put(
+                    cache_key,
+                    "c",
+                    &["rlib".to_string()],
+                    &[],
+                    "host",
+                    "dev",
+                    &[(output, "lib.rlib".to_string())],
+                    "",
+                    "",
+                )
+                .unwrap();
+            drop(lock);
+        })
+    };
+    assert!(store.get(cache_key).unwrap().is_none());
+    assert!(key_store_in_flight(&store_dir, cache_key));
+    assert!(
+        store
+            .wait_for_committed_with_timeout(cache_key, Duration::from_secs(30))
+            .unwrap()
+    );
+    assert!(store.get(cache_key).unwrap().is_some());
+    holder.join().unwrap();
+
+    let mut lock = try_lock_key_in(&store_dir, "never_committed").unwrap().unwrap();
+    lock.mark_storing();
+    assert!(
+        !store
+            .wait_for_committed_with_timeout("never_committed", Duration::from_millis(50))
+            .unwrap()
+    );
+    drop(lock);
 }
 
 #[test]
@@ -7681,31 +8560,119 @@ fn removing_an_uncounted_mapping_keeps_the_other_owners_blob() {
 }
 
 #[test]
-fn floor_raises_only_this_keys_blobs_and_only_up_to_their_mappings() {
+fn floor_raises_only_blobs_the_release_could_empty_up_to_the_other_owners() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();
     store
         .db
         .execute_batch(
             "INSERT INTO blobs (hash, size, refcount) VALUES
-                     ('low', 1, 1), ('exact', 1, 5), ('high', 1, 9), ('foreign', 1, 1);
+                     ('low', 1, 1), ('exact', 1, 5), ('high', 1, 9), ('under', 1, 2),
+                     ('drifted', 1, 1), ('foreign', 1, 1);
                  INSERT INTO entry_blobs (cache_key, hash, refs) VALUES
                      ('k', 'low', 2), ('other', 'low', 1),
                      ('k', 'exact', 2), ('other', 'exact', 3),
                      ('k', 'high', 1),
+                     ('k', 'under', 1), ('other', 'under', 4),
+                     ('k', 'drifted', 1), ('other', 'drifted', 2),
                      ('k', 'norow', 1),
                      ('other', 'foreign', 4);",
         )
         .unwrap();
+    // What k's release subtracts. 'drifted' loses more than k's mapping
+    // says, as a meta.json listing a file twice would take.
+    let releases = [
+        ("low", 2),
+        ("exact", 2),
+        ("high", 1),
+        ("under", 1),
+        ("drifted", 3),
+        ("norow", 1),
+    ];
 
-    // Three rows match; 'norow' has none to raise.
-    assert_eq!(floor_blob_refs_at_mappings(&store.db, "k").unwrap(), 3);
+    assert_eq!(
+        floor_blob_refs_before_release(&store.db, "k", releases).unwrap(),
+        2
+    );
 
-    assert_eq!(blob_refcount(&store, "low"), Some(3));
+    assert_eq!(
+        blob_refcount(&store, "low"),
+        Some(3),
+        "other's 1 + the release's 2"
+    );
+    assert_eq!(
+        blob_refcount(&store, "drifted"),
+        Some(5),
+        "other's 2 + the release's 3, not the mapped 3: the release must leave other's 2"
+    );
     assert_eq!(blob_refcount(&store, "exact"), Some(5));
     assert_eq!(blob_refcount(&store, "high"), Some(9), "never lowered");
+    assert_eq!(
+        blob_refcount(&store, "under"),
+        Some(2),
+        "above the release: it stays above zero, so it waits for a release that could empty it"
+    );
     assert_eq!(blob_refcount(&store, "norow"), None);
-    assert_eq!(blob_refcount(&store, "foreign"), Some(1), "not this key's");
+    assert_eq!(
+        blob_refcount(&store, "foreign"),
+        Some(1),
+        "not this release's"
+    );
+}
+
+/// A blob most entries share (on a real store the empty file's: 503k
+/// mappings). A floor that summed every mapping of each blob a removal
+/// touches cost ~0.2 s under the write lock per removal. A count above
+/// what the removal gives back stays above zero, so the removal reads
+/// none of the other mappings: an under-counted shared blob keeps its
+/// count (the reconcile's to correct) instead of being raised to the sum.
+/// Once a removal could empty it, the floor still protects the others.
+#[test]
+fn removing_from_a_heavily_shared_blob_floors_it_only_when_it_could_reach_zero() {
+    const SHARERS: i64 = 20_000;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    put_outputs(&store, dir.path(), "a", "one", &[("a.rlib", b"shared")]);
+    put_outputs(&store, dir.path(), "b", "one", &[("b.rlib", b"shared")]);
+    let hash = content_hash(b"shared");
+    // Twenty thousand other entries map the blob; its count has drifted
+    // below their sum.
+    store
+        .db
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+             INSERT INTO entry_blobs (cache_key, hash, refs) SELECT 'sharer' || i, ?1, 1 FROM n",
+            params![hash, SHARERS],
+        )
+        .unwrap();
+    store
+        .db
+        .execute(
+            "UPDATE blobs SET refcount = 1000 WHERE hash = ?1",
+            params![hash],
+        )
+        .unwrap();
+
+    store.remove_entry("a").unwrap();
+    assert_eq!(
+        blob_refcount(&store, &hash),
+        Some(999),
+        "a floor summing the mappings would have left {}",
+        SHARERS + 1
+    );
+
+    // Drifted down to this removal's one reference: now it could reach
+    // zero, so it is floored to the sharers' references first.
+    store
+        .db
+        .execute(
+            "UPDATE blobs SET refcount = 1 WHERE hash = ?1",
+            params![hash],
+        )
+        .unwrap();
+    store.remove_entry("b").unwrap();
+    assert_eq!(blob_refcount(&store, &hash), Some(SHARERS));
+    assert!(store.blob_path(&hash).is_file());
 }
 
 #[test]
@@ -7976,71 +8943,127 @@ fn test_store_evict_older_than_keeps_recent() {
     assert!(store.contains("k1"));
 }
 
+/// `kache gc --stale-schema` removes what no key of the running recipe
+/// reaches: an earlier rustc version and unrecorded (`0`) rows. It keeps
+/// rows of components whose own key version did not move (a C compile, a
+/// build-script run), and an earlier version a key bridge still adopts until
+/// it has been idle for the grace (lane KACHE-W22).
 #[test]
 fn evict_stale_key_schemas_keeps_only_the_running_schema() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
+    let prior = kache_format::CACHE_KEY_VERSION - 1;
 
-    for (key, content) in [
-        ("current", b"current artifact".as_slice()),
-        ("old", b"old artifact".as_slice()),
-        ("legacy", b"legacy artifact".as_slice()),
-    ] {
-        let output = dir.path().join(format!("{key}.rlib"));
-        std::fs::write(&output, content).unwrap();
+    // (key, crate name, crate types, key_schema)
+    let rows: &[(&str, &str, &[&str], u32)] = &[
+        (
+            "current",
+            "current",
+            &["lib"],
+            kache_format::CACHE_KEY_VERSION,
+        ),
+        ("old", "old", &["lib"], prior),
+        ("legacy", "legacy", &["lib"], 0),
+        ("bridged", "bridged", &["lib"], prior),
+        ("cc", "foo.c", &[], kache_format::CC_KEY_VERSION),
+        (
+            "build_script",
+            kache_format::BUILD_SCRIPT_RUN_CRATE_NAME,
+            &["build-script"],
+            kache_format::BUILD_SCRIPT_KEY_VERSION,
+        ),
+    ];
+    for (key, crate_name, crate_types, schema) in rows {
+        let output = dir.path().join(format!("{key}.out"));
+        std::fs::write(&output, format!("{key} artifact")).unwrap();
+        let crate_types: Vec<String> = crate_types.iter().map(|t| t.to_string()).collect();
         store
             .put(
                 key,
-                key,
-                &["lib".into()],
+                crate_name,
+                &crate_types,
                 &[],
                 "",
                 "dev",
-                &[(output.clone(), format!("{key}.rlib"))],
+                &[(output.clone(), format!("{key}.out"))],
                 "",
                 "",
             )
             .unwrap();
         store.remove_clone_for_test(&output);
+        store
+            .db
+            .execute(
+                "UPDATE entries SET key_schema = ?2, last_accessed = datetime('now', '-1 day')
+                 WHERE cache_key = ?1",
+                params![key, schema],
+            )
+            .unwrap();
     }
+    let day = std::time::Duration::from_secs(86_400);
 
-    let prior_schema = kache_format::CACHE_KEY_VERSION.saturating_sub(1);
+    // A capped run takes the longest unused first (lane KACHE-W24).
     store
         .db
         .execute(
-            "UPDATE entries
-                 SET key_schema = ?1, last_accessed = datetime('now', '-1 day')
-                 WHERE cache_key = 'old'",
-            params![prior_schema],
-        )
-        .unwrap();
-    store
-        .db
-        .execute(
-            "UPDATE entries
-                 SET key_schema = 0, last_accessed = datetime('now', '-1 day')
-                 WHERE cache_key = 'legacy'",
+            "UPDATE entries SET last_accessed = datetime('now', '-3 days')
+             WHERE cache_key = 'legacy'",
             [],
         )
         .unwrap();
-
-    let stats = store
-        .evict_stale_key_schemas(kache_format::CACHE_KEY_VERSION)
-        .unwrap();
-    assert_eq!(stats.entries_evicted, 2);
-    assert!(stats.bytes_freed > 0);
-    assert_eq!(stats.blobs_removed, 2);
-    assert_eq!(stats.entries_pinned, 0);
-    assert!(store.contains("current"));
-    assert!(!store.contains("old"));
+    let capped = store.evict_stale_key_schemas(&[], day, Some(1)).unwrap();
+    assert_eq!(capped.entries_evicted, 1);
     assert!(!store.contains("legacy"));
-    assert_eq!(store.entry_count().unwrap(), 1);
+    assert!(store.contains("old"));
 
-    let second = store
-        .evict_stale_key_schemas(kache_format::CACHE_KEY_VERSION)
-        .unwrap();
+    // Not bridged: the earlier rustc rows go, as the unrecorded one did.
+    let stats = store.evict_stale_key_schemas(&[], day, None).unwrap();
+    assert_eq!(stats.entries_evicted, 2, "old, bridged");
+    assert_eq!(stats.blobs_removed, 2);
+    assert!(stats.bytes_freed > 0);
+    for key in ["current", "cc", "build_script"] {
+        assert!(store.contains(key), "{key}");
+    }
+    assert_eq!(store.entry_count().unwrap(), 3);
+    let second = store.evict_stale_key_schemas(&[], day, None).unwrap();
     assert_eq!(second.entries_evicted, 0);
+
+    // Bridged: kept while used within the grace, then removed.
+    let output = dir.path().join("bridged.out");
+    std::fs::write(&output, "bridged artifact").unwrap();
+    store
+        .put(
+            "bridged",
+            "bridged",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(output.clone(), "bridged.out".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&output);
+    store
+        .db
+        .execute(
+            "UPDATE entries SET key_schema = ?1, last_accessed = datetime('now', '-1 day')
+             WHERE cache_key = 'bridged'",
+            params![prior],
+        )
+        .unwrap();
+    let kept = store
+        .evict_stale_key_schemas(&[prior], 14 * day, None)
+        .unwrap();
+    assert_eq!(kept.entries_evicted, 0);
+    assert!(store.contains("bridged"));
+    let gone = store
+        .evict_stale_key_schemas(&[prior], std::time::Duration::from_secs(3600), None)
+        .unwrap();
+    assert_eq!(gone.entries_evicted, 1);
+    assert!(!store.contains("bridged"));
 }
 
 #[test]
@@ -10023,6 +11046,71 @@ fn republication_during_removal_cleanup_is_never_stranded() {
     assert_eq!(refcount, 1, "B's refcounts must be intact");
 }
 
+/// Once a removal has committed the row's deletion, its cleanup pass is all
+/// that removes the entry's directory and the blobs it held last: nothing
+/// counts them any more. An index that stays busy past one busy timeout must
+/// delay that pass, not skip it (a sweep under load left 3 of 21 entries'
+/// files behind with "skipping eviction ... database is locked").
+#[test]
+fn a_busy_index_delays_an_evicted_entry_s_file_cleanup_without_skipping_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    store.set_busy_timeout_for_test(Duration::from_secs(1));
+    let src = dir.path().join("a.rlib");
+    std::fs::write(&src, b"bytes only this entry holds").unwrap();
+    store
+        .put(
+            "key",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src, "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    let blob = store.blob_path(&store.get("key").unwrap().unwrap().files[0].hash);
+    assert!(blob.is_file());
+
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let mut holder = None;
+    let outcome = store.remove_entry_guarded_with_all_hooks(
+        "key",
+        None,
+        || {},
+        || {
+            // Another writer takes the lock between the two transactions and
+            // keeps it past one busy timeout of the cleanup pass.
+            let config = config.clone();
+            let held_tx = held_tx.clone();
+            holder = Some(std::thread::spawn(move || {
+                let other = Store::open(&config).unwrap();
+                other.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1500));
+                other.db.execute_batch("COMMIT").unwrap();
+            }));
+            held_rx.recv().unwrap();
+        },
+        || {},
+    );
+    holder.take().unwrap().join().unwrap();
+
+    assert!(
+        matches!(outcome, Ok(GuardedRemoval::Reclaimed(_))),
+        "the cleanup pass waited for the lock: {outcome:?}"
+    );
+    assert!(!store.contains("key"));
+    assert!(
+        !store.entry_dir("key").exists(),
+        "the evicted entry's directory is removed"
+    );
+    assert!(!blob.exists(), "the blob only that entry held is removed");
+}
+
 /// kunobi-ninja/kache#510: directory-cleanup tolerance is for the
 /// lost-the-race case ONLY — a cleanup failure while the directory still
 /// exists (permissions, open handles) must surface as an error, not be
@@ -10644,6 +11732,7 @@ fn shadow_only_victims_skip_what_the_sweep_protects() {
         committed: true,
         compile_time_ms: 1,
         reclaimable_bytes: Some(1),
+        shared_share_bytes: 0,
         recently_accessed: key == "recent",
         recently_imported: key == "imported",
     };
@@ -10759,6 +11848,60 @@ fn backfill_entry_blobs_reconstructs_marginal_bytes() {
     assert_eq!(by_key["shared_a"].reclaimable_bytes, Some(0));
     assert_eq!(by_key["shared_b"].reclaimable_bytes, Some(0));
     assert_eq!(by_key["solo"].reclaimable_bytes, Some(100));
+    assert_eq!(by_key["shared_a"].shared_share_bytes, 50);
+    assert_eq!(by_key["solo"].shared_share_bytes, 0);
+}
+
+/// A sweep evicts twins whose blob has gone cold before an entry in use, and
+/// the blob's bytes come back once the last twin goes.
+#[test]
+fn a_size_sweep_frees_a_cold_blob_its_entries_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 2_000_000;
+    let store = Store::open(&config).unwrap();
+
+    for (key, byte, size) in [
+        ("twin_a", b'x', 1_500_000),
+        ("twin_b", b'x', 1_500_000),
+        ("warm", b'y', 1_000_000),
+    ] {
+        let src = dir.path().join(format!("{key}.rlib"));
+        std::fs::write(&src, vec![byte; size]).unwrap();
+        store
+            .put(
+                key,
+                "c",
+                &["lib".into()],
+                &[],
+                "",
+                "dev",
+                &[(src.clone(), "lib.rlib".into())],
+                "",
+                "",
+            )
+            .unwrap();
+        store.remove_clone_for_test(&src);
+    }
+    for (key, hours) in [("twin_a", 100), ("twin_b", 100), ("warm", 1)] {
+        store
+            .db
+            .execute(
+                "UPDATE entries SET last_accessed = datetime('now', ?1) WHERE cache_key = ?2",
+                rusqlite::params![format!("-{hours} hours"), key],
+            )
+            .unwrap();
+    }
+
+    let stats = store.evict().unwrap();
+
+    let left = |key: &str| store.get(key).unwrap().is_some();
+    assert!(!left("twin_a") && !left("twin_b"), "the cold twins go first");
+    assert!(left("warm"), "the entry in use stays");
+    assert!(
+        stats.bytes_freed >= 1_500_000,
+        "the shared blob is freed with its last twin: {stats:?}"
+    );
 }
 
 #[test]
@@ -11335,8 +12478,11 @@ fn key_lock_sweep_removes_a_stale_lock_whose_key_has_no_entry() {
     assert!(stale.exists());
 }
 
+/// An evicted key's lock goes with its entry when it is idle, by the
+/// sweep's rules: eviction left nearly every lock without an entry (177k of
+/// 178k on a shared store), which only the full GC's capped sweep removed.
 #[test]
-fn key_lock_sweep_removes_the_lock_of_an_evicted_key() {
+fn removing_an_entry_removes_its_idle_key_lock() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
@@ -11356,14 +12502,52 @@ fn key_lock_sweep_removes_the_lock_of_an_evicted_key() {
     assert!(lock_path.exists());
 
     store.remove_entry(&k).unwrap();
+    assert!(!lock_path.exists(), "the idle lock went with the entry");
     assert_eq!(
         sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
         KeyLockSweepStats {
-            seen: 1,
-            removed: 1
+            seen: 0,
+            removed: 0
         }
     );
-    assert!(!lock_path.exists());
+}
+
+/// A removal leaves a lock that a claimant holds or claimed within the
+/// sweep's grace: unlinking a held lock would let a second claimant in, and
+/// locking a fresh one would read as contention to its next claimant.
+#[test]
+fn removing_an_entry_keeps_a_held_or_recently_claimed_key_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let held_key = put_entry(&store, dir.path(), 1, "held", b"payload one");
+    let young_key = put_entry(&store, dir.path(), 2, "young", b"payload two");
+    let held = store.try_lock(&held_key).unwrap().expect("claim the key");
+    let held_path = config.store_dir().join(format!("{held_key}.lock"));
+    let held_identity = kache_fs::file_identity(&held_path).unwrap();
+    set_age(&held_path, TWO_HOURS);
+    drop(store.try_lock(&young_key).unwrap().expect("claim the key"));
+    let young_path = config.store_dir().join(format!("{young_key}.lock"));
+
+    // Removed from another thread, as the daemon would from another process.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let remover = Store::open(&config).unwrap();
+                remover.remove_entry(&held_key).unwrap();
+                remover.remove_entry(&young_key).unwrap();
+            })
+            .join()
+            .unwrap()
+    });
+
+    assert_eq!(kache_fs::file_identity(&held_path).unwrap(), held_identity);
+    assert!(
+        store.try_lock(&held_key).unwrap().is_none(),
+        "the holder still excludes every other claimant"
+    );
+    assert!(young_path.exists(), "a lock claimed within the grace stays");
+    drop(held);
 }
 
 #[test]
@@ -11630,6 +12814,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
             key_locks_remaining: 1,
             predictions_pruned: 1,
             file_hashes_pruned: 1,
+            ..Default::default()
         }
     );
     assert!(!stale.exists());
@@ -14049,9 +15234,8 @@ fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf 
             "",
         )
         .unwrap();
-    let leftovers: Vec<_> = fs::read_dir(store.staging_dir())
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
+    let leftovers: Vec<_> = staging_paths(store)
+        .into_iter()
         .filter(|path| !staging_before.contains(path))
         .collect();
     assert!(
@@ -14148,7 +15332,12 @@ fn a_shared_blob_held_outside_is_no_entrys_held_bytes() {
     let candidates = store
         .eviction_candidates_for(SweepOrigin::Requested)
         .unwrap();
-    assert!(store.held_by_live_files(&candidates).unwrap().is_empty());
+    assert!(
+        store
+            .held_by_live_files(candidates.iter().map(|entry| entry.key.as_str()))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Only a sweep with a byte budget probes: the others remove what their
@@ -14495,7 +15684,7 @@ fn read_only_store_serves_hits_and_writes_nothing() {
         "evict must be refused on a read-only store"
     );
     assert!(
-        ro.evict_for_disk_pressure(|| false).is_err(),
+        ro.evict_for_disk_pressure(|_| false).is_err(),
         "evict_for_disk_pressure must be refused on a read-only store"
     );
     assert!(
@@ -14503,7 +15692,8 @@ fn read_only_store_serves_hits_and_writes_nothing() {
         "evict_older_than must be refused on a read-only store"
     );
     assert!(
-        ro.evict_stale_key_schemas(0).is_err(),
+        ro.evict_stale_key_schemas(&[], std::time::Duration::ZERO, None)
+            .is_err(),
         "evict_stale_key_schemas must be refused on a read-only store"
     );
     assert!(
@@ -15056,6 +16246,441 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
     );
 }
 
+/// A burst of builds can write more than 64 MiB to the log between two of
+/// the daemon's checkpoints, whose readers keep it from being reset. A
+/// deferring connection must not checkpoint inside its commit then (an
+/// fsync on a compiler wrapper's path, and every commit after it tried
+/// again): the threshold leaves the daemon's tick a burst's worth of room.
+#[test]
+fn a_deferring_commit_leaves_a_72_mib_burst_to_the_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    db.pragma_update(None, "wal_autocheckpoint", crate::DEFERRED_AUTOCHECKPOINT_PAGES)
+        .unwrap();
+    db.execute_batch("CREATE TABLE burst (x BLOB)").unwrap();
+    db.execute_batch("BEGIN").unwrap();
+    for _ in 0..18_000 {
+        db.execute("INSERT INTO burst (x) VALUES (zeroblob(4000))", [])
+            .unwrap();
+    }
+    db.execute_batch("COMMIT").unwrap();
+    // The wal-index header's nBackfill (offset 96): frames a checkpoint
+    // has copied into the index.
+    let shm = std::fs::read(dir.path().join("index.db-shm")).unwrap();
+    let backfilled = u32::from_ne_bytes(shm[96..100].try_into().unwrap());
+    assert_eq!(backfilled, 0, "the commit checkpointed the log itself");
+}
+
+/// A process that defers WAL checkpoints (a compiler wrapper) opens its
+/// index connections with the larger threshold; the daemon's passive
+/// checkpoint copies the log into the index.
+#[test]
+fn deferred_checkpoints_raise_the_threshold_and_the_daemon_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let before = Store::open(&config).unwrap();
+    let default: i64 = before
+        .db
+        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(default, 1000);
+
+    crate::defer_wal_checkpoints();
+    let wrapper = Store::open(&config).unwrap();
+    let deferred: i64 = wrapper
+        .db
+        .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(deferred, crate::DEFERRED_AUTOCHECKPOINT_PAGES);
+
+    wrapper
+        .db
+        .execute(
+            "INSERT INTO entries (cache_key, crate_name) VALUES ('ck', 'c')",
+            [],
+        )
+        .unwrap();
+    let (frames, copied) = before.checkpoint_wal().unwrap();
+    assert!(frames > 0);
+    assert_eq!(frames, copied);
+}
+
+/// The stamp of an hour-old entry, read back.
+fn access_of(store: &Store, key: &str) -> (i64, i64) {
+    store
+        .db
+        .query_row(
+            "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), hit_count \
+             FROM entries WHERE cache_key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+/// N3: a hit whose stamp is due hands it to the sink and writes nothing, so
+/// a writer holding the index's write lock does not hold the hit (it waited
+/// up to `HIT_STAMP_BUSY_WAIT`, 2.8-6.2 % of hits in busy minutes, and then
+/// lost the stamp).
+#[test]
+fn a_hit_hands_its_due_stamp_to_the_sink_and_waits_for_no_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, config) = store_with_one_evictable_entry(dir.path(), "sunk");
+    let taken = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink_taken = std::sync::Arc::clone(&taken);
+    store.send_hit_stamps_to(Box::new(move |key| {
+        sink_taken.lock().unwrap().push(key.to_string());
+        true
+    }));
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let started = std::time::Instant::now();
+    let meta = store.get("sunk").unwrap().expect("served");
+    let waited = started.elapsed();
+    writer.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(meta.cache_key, "sunk");
+    assert!(
+        waited < HIT_STAMP_BUSY_WAIT / 2,
+        "the hit waited {waited:?} for the writer"
+    );
+    assert_eq!(*taken.lock().unwrap(), vec!["sunk".to_string()]);
+    let (age, hits) = access_of(&store, "sunk");
+    assert!(age >= 3500, "the hit wrote its own stamp (age {age} s)");
+    assert_eq!(hits, 0);
+}
+
+/// A stamp the sink refuses (no daemon, an older one) is written by the
+/// hit, as without a sink; a fresh stamp is not handed off at all.
+#[test]
+fn a_hit_stamps_the_index_itself_when_the_sink_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _config) = store_with_one_evictable_entry(dir.path(), "refused");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink_calls = std::sync::Arc::clone(&calls);
+    store.send_hit_stamps_to(Box::new(move |_| {
+        sink_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        false
+    }));
+
+    store.get("refused").unwrap().expect("served");
+    let (age, hits) = access_of(&store, "refused");
+    assert!(age < 60, "stamped by the hit (age {age} s)");
+    assert_eq!(hits, 1);
+
+    store.get("refused").unwrap().expect("served");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a fresh stamp is not due, so nothing is handed off"
+    );
+    assert_eq!(access_of(&store, "refused").1, 1);
+}
+
+#[test]
+fn stamp_hits_writes_access_times_and_adds_the_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _config) = store_with_one_evictable_entry(dir.path(), "batched");
+
+    store
+        .stamp_hits(&[("batched".to_string(), 3), ("gone".to_string(), 1)])
+        .unwrap();
+
+    let (age, hits) = access_of(&store, "batched");
+    assert!(age < 60, "stamped (age {age} s)");
+    assert_eq!(hits, 3);
+    assert!(!store.contains("gone"), "a key no longer stored stays absent");
+}
+
+/// A stamp taken and not yet written pins its entry against eviction like
+/// a written one: the hit may be restoring the entry's blobs right now.
+#[test]
+fn eviction_keeps_an_entry_whose_stamp_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _config) = store_with_one_evictable_entry(dir.path(), "pending");
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(vec!["pending".to_string()]));
+    let pins = std::sync::Arc::clone(&pending);
+    store.pin_entries_with(std::sync::Arc::new(move |key: &str| {
+        pins.lock().unwrap().iter().any(|k| k == key)
+    }));
+
+    let stats = store.evict().unwrap();
+    assert_eq!(stats.entries_evicted, 0, "a pending stamp pins the entry");
+    assert!(store.contains("pending"));
+
+    pending.lock().unwrap().clear();
+    let stats = store.evict().unwrap();
+    assert_eq!(stats.entries_evicted, 1, "unpinned, the old entry goes");
+    assert!(!store.contains("pending"));
+}
+
+// ── test binaries stored by hardlink (tasty.17) ─────────────────────
+
+/// [`TestPolicy`], plus executables that may share their inode with their
+/// blob: an entry with no crate type, as Cargo compiles a test. Unix only,
+/// as the hardlinked test binaries its tests check.
+#[cfg(unix)]
+struct TestBinaryPolicy;
+#[cfg(unix)]
+impl ArtifactPolicy for TestBinaryPolicy {
+    fn allow_hardlink(name: &str) -> bool {
+        TestPolicy::allow_hardlink(name)
+    }
+    fn allow_empty(name: &str, kinds: &[String]) -> bool {
+        TestPolicy::allow_empty(name, kinds)
+    }
+    fn emit_kind(name: &str) -> Option<&'static str> {
+        TestPolicy::emit_kind(name)
+    }
+    fn stable_after_store(name: &str) -> bool {
+        TestPolicy::stable_after_store(name)
+    }
+    fn allow_executable_hardlink(name: &str, crate_types: &[String]) -> bool {
+        crate_types.is_empty() && !name.contains('.')
+    }
+}
+#[cfg(unix)]
+type TestBinaryStore = ArtifactStore<TestBinaryPolicy>;
+
+#[cfg(unix)]
+fn put_executable(store: &TestBinaryStore, key: &str, output: &Path, crate_types: &[String]) {
+    store
+        .put(
+            key,
+            "tbin",
+            crate_types,
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(
+                output.to_path_buf(),
+                output.file_name().unwrap().to_str().unwrap().to_string(),
+            )],
+            "",
+            "",
+        )
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_test_binary_is_stored_by_hardlink_and_keeps_its_execute_bits() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("tbin-0123456789abcdef");
+    fs::write(&output, b"\x7fELF test binary bytes").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let _force = ForceStoreHardlink::enable();
+    let copied = crate::opcounts::store_copied_bytes();
+    put_executable(&store, "tbin-entry", &output, &[]);
+
+    let meta = store.get("tbin-entry").unwrap().unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    assert!(meta.files[0].executable);
+    assert_eq!(
+        fs::metadata(&blob).unwrap().ino(),
+        fs::metadata(&output).unwrap().ino(),
+        "a test binary must be stored by hardlink, not copied"
+    );
+    assert_eq!(crate::opcounts::store_copied_bytes(), copied);
+    let mode = fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode & 0o222,
+        0,
+        "the shared inode must be read-only: {mode:o}"
+    );
+    assert_eq!(mode & 0o111, 0o111, "the test must still run: {mode:o}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_executable_with_a_crate_type_is_still_copied() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("app-0123456789abcdef");
+    fs::write(&output, b"\x7fELF a binary that ships").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let _force = ForceStoreHardlink::enable();
+    put_executable(&store, "bin-entry", &output, &["bin".to_string()]);
+
+    let meta = store.get("bin-entry").unwrap().unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    assert_ne!(
+        fs::metadata(&blob).unwrap().ino(),
+        fs::metadata(&output).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+/// A writer that ignores the read-only bit (root, or anyone after a chmod)
+/// rewrites a test binary in place while its blob shares the inode. The hit
+/// must not serve those bytes under the old address.
+#[cfg(unix)]
+#[test]
+fn a_hit_evicts_a_test_binary_whose_shared_blob_was_rewritten_in_place() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("tbin-fedcba9876543210");
+    fs::write(&output, b"\x7fELF original test bytes").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+    put_executable(&store, "rewritten-entry", &output, &[]);
+    let meta = store.stored_meta("rewritten-entry").unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+
+    // The shared state, however the store took the snapshot: a name outside
+    // the store on the blob's inode, then an in-place write of the same size.
+    let outside = dir.path().join("strip-target");
+    fs::hard_link(&blob, &outside).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut file = fs::OpenOptions::new().write(true).open(&outside).unwrap();
+    file.write_all(b"\x7fELF stripped test bytes").unwrap();
+    drop(file);
+
+    assert!(
+        store.get("rewritten-entry").unwrap().is_none(),
+        "a blob rewritten through a shared inode must not be served"
+    );
+    assert!(!store.contains("rewritten-entry"), "the entry is evicted");
+}
+
+/// Once a hit has read a shared test binary's blob and found its bytes, the
+/// memo vouches for that exact fingerprint, so later hits skip the read.
+#[cfg(unix)]
+#[test]
+fn a_shared_test_binary_blob_read_once_is_vouched_for_by_the_memo() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = TestBinaryStore::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("tbin-00112233445566778899");
+    // Past the memo's size floor.
+    fs::write(&output, vec![7u8; 128 * 1024]).unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
+    let _force = ForceStoreHardlink::enable();
+    put_executable(&store, "vouched-entry", &output, &[]);
+    let meta = store.stored_meta("vouched-entry").unwrap();
+    let blob = store.blob_path(&meta.files[0].hash);
+    let fingerprint = crate::file_hash::FileFingerprint::from_path(&blob).unwrap();
+    assert_eq!(store.file_hash_at(&fingerprint), None);
+
+    // Unsettled (changed just now): read, but not recorded. A loaded machine
+    // can take the whole settle window to get here; the read is then settled
+    // and may be recorded, so only a read that ended inside it is checked.
+    assert!(store.get("vouched-entry").unwrap().is_some());
+    if !crate::file_hash::stamp_is_settled(&fingerprint, crate::file_hash::wall_clock_ns()) {
+        assert_eq!(store.file_hash_at(&fingerprint), None);
+    }
+
+    std::thread::sleep(std::time::Duration::from_nanos(
+        crate::file_hash::HASH_SETTLE_NS as u64 + 100_000_000,
+    ));
+    assert!(store.get("vouched-entry").unwrap().is_some());
+    assert_eq!(
+        store.file_hash_at(&fingerprint).as_deref(),
+        Some(meta.files[0].hash.as_str())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unpublished_hardlinked_snapshot_gives_the_output_its_own_mode_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("tbin-out");
+    fs::write(&output, b"bytes").unwrap();
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o750)).unwrap();
+    let before = fs::metadata(&output).unwrap().permissions();
+    // Read-only through the snapshot, then writable for everyone by the
+    // discard (`unlink_blob`), as a lost race leaves it.
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let blob = dir.path().join("blob");
+    fs::write(&blob, b"bytes").unwrap();
+    restore_source_permissions_if_unshared(&output, Some(&blob), &before);
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+
+    // Still sharing the published blob: read-only stays.
+    let shared = dir.path().join("shared-blob");
+    fs::hard_link(&output, &shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o550)).unwrap();
+    restore_source_permissions_if_unshared(&output, Some(&shared), &before);
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o550
+    );
+}
+
+/// Removing an entry whose blob a build output still links (a test binary
+/// stored by hardlink, an rlib restored by one) must not leave that output
+/// writable for everyone: the mode is the inode's, shared by both names.
+#[cfg(unix)]
+#[test]
+fn unlinking_a_blob_leaves_the_mode_of_an_output_sharing_its_inode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let blob = dir.path().join("blob");
+    fs::write(&blob, b"shared bytes").unwrap();
+    let output = dir.path().join("output");
+    fs::hard_link(&blob, &output).unwrap();
+    fs::set_permissions(&blob, fs::Permissions::from_mode(0o555)).unwrap();
+
+    unlink_blob(&blob);
+
+    assert!(!blob.exists());
+    assert_eq!(
+        fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+        0o555
+    );
+}
+
+/// A store's write lock held past one busy timeout (a burst of stores on a
+/// stalled journal) is asked for again, so registering the entry waits for
+/// it instead of failing the store; held past every attempt, it fails.
+#[test]
+fn entry_registration_asks_again_for_a_lock_held_past_one_busy_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    store.set_busy_timeout_for_test(Duration::from_millis(60));
+    let hold = |held: Duration| {
+        let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (taken, wait) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            taken.send(()).unwrap();
+            std::thread::sleep(held);
+            writer.execute_batch("COMMIT").unwrap();
+        });
+        wait.recv().unwrap();
+        holder
+    };
+
+    let holder = hold(Duration::from_millis(150));
+    let tx = store.begin_entry_registration();
+    assert!(tx.is_ok(), "held for 2.5 timeouts: {:?}", tx.err());
+    tx.unwrap().commit().unwrap();
+    holder.join().unwrap();
+
+    let holder = hold(Duration::from_millis(60 * u64::from(STORE_LOCK_ATTEMPTS) + 400));
+    let refused = store.begin_entry_registration();
+    assert!(refused.as_ref().is_err_and(is_sqlite_busy), "{:?}", refused.err());
+    drop(refused);
+    holder.join().unwrap();
+}
+
 /// An index stamped 10 by a release from before the header-scan memo
 /// (#1638) has no `cc_header_scans`: opening it must add the table, or
 /// every C/C++ preprocess memo read (which joins it) and the memo pruning
@@ -15114,4 +16739,742 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
     let memo = cache.get_cc_preprocess_memo("existing").unwrap().unwrap();
     assert_eq!(memo.preprocessed_hash, "preprocessed");
     assert_eq!(memo.header_scans, vec![Some((7, "[]".into()))]);
+}
+
+fn memo_row_for(path: &Path, redated: bool) -> MemoRow {
+    MemoRow {
+        fingerprint: crate::file_hash::FileFingerprint::from_path(path).unwrap(),
+        hash: crate::file_hash::hash_file(path).unwrap(),
+        redated,
+    }
+}
+
+/// A store with a sink hands its memo rows over when the index is busy,
+/// rather than waiting for the lock and then dropping them.
+#[test]
+fn busy_memo_rows_go_to_the_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(test_config(dir.path())).unwrap();
+    let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&handed);
+    store.send_busy_memo_rows_to(Box::new(move |rows| {
+        sink.lock().unwrap().extend_from_slice(rows);
+        true
+    }));
+    let file = dir.path().join("libdep.rlib");
+    fs::write(&file, vec![b'l'; 128 * 1024]).unwrap();
+    let row = memo_row_for(&file, false);
+
+    let writer = Connection::open(dir.path().join("index.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.record_verified_file_hashes(&[(row.fingerprint.clone(), row.hash.as_str())]);
+    writer.execute_batch("ROLLBACK").unwrap();
+
+    assert_eq!(*handed.lock().unwrap(), vec![row.clone()]);
+    assert_eq!(store.file_hash_at(&row.fingerprint), None);
+    assert_eq!(store.write_handed_memo_rows(std::slice::from_ref(&row)).unwrap(), 1);
+    assert_eq!(store.file_hash_at(&row.fingerprint), Some(row.hash));
+}
+
+/// A free index takes the rows at once; nothing is handed over.
+#[test]
+fn memo_rows_are_written_in_place_when_the_index_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(test_config(dir.path())).unwrap();
+    store.send_busy_memo_rows_to(Box::new(|_| panic!("the index was free")));
+    let plain = dir.path().join("libdep.rlib");
+    let redated = dir.path().join("libdep.rmeta");
+    fs::write(&plain, vec![b'l'; 128 * 1024]).unwrap();
+    fs::write(&redated, vec![b'm'; 128 * 1024]).unwrap();
+    let plain = memo_row_for(&plain, false);
+    let redated = memo_row_for(&redated, true);
+
+    store.record_restored_file_hashes(
+        &[(plain.fingerprint.clone(), plain.hash.as_str())],
+        &[(redated.fingerprint.clone(), redated.hash.as_str())],
+    );
+
+    assert_eq!(store.file_hash_at(&plain.fingerprint), Some(plain.hash));
+    assert_eq!(
+        store.file_hash_at(&redated.fingerprint),
+        Some(redated.hash.clone())
+    );
+    assert!(
+        store
+            .file_hash_cache()
+            .redated_pin(&redated.fingerprint, &redated.hash),
+        "the re-dated row keeps its rule"
+    );
+}
+
+/// A handed-over row is written only while it still describes its file. A
+/// re-dated row also survives Cargo's re-date, which moves only the ctime.
+#[cfg(unix)]
+#[test]
+fn handed_memo_rows_are_written_only_while_they_describe_their_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let plain_path = dir.path().join("libdep.rlib");
+    let redated_path = dir.path().join("libdep.rmeta");
+    fs::write(&plain_path, vec![b'l'; 128 * 1024]).unwrap();
+    fs::write(&redated_path, vec![b'm'; 128 * 1024]).unwrap();
+    let plain = memo_row_for(&plain_path, false);
+    let redated = memo_row_for(&redated_path, true);
+
+    // The same mtime set again, as Cargo's re-date does: only the ctime moves.
+    std::thread::sleep(Duration::from_millis(30));
+    for path in [&plain_path, &redated_path] {
+        let mtime = filetime::FileTime::from_last_modification_time(&fs::metadata(path).unwrap());
+        filetime::set_file_mtime(path, mtime).unwrap();
+    }
+    let gone = MemoRow {
+        fingerprint: crate::file_hash::FileFingerprint {
+            path: dir.path().join("gone.rlib").to_string_lossy().into_owned(),
+            ..plain.fingerprint.clone()
+        },
+        ..plain.clone()
+    };
+
+    assert_eq!(
+        store
+            .write_handed_memo_rows(&[plain.clone(), redated.clone(), gone])
+            .unwrap(),
+        1,
+        "only the re-dated row still applies"
+    );
+    let current = crate::file_hash::FileFingerprint::from_path(&redated_path).unwrap();
+    assert!(store.file_hash_cache().redated_pin(&current, &redated.hash));
+    let current = crate::file_hash::FileFingerprint::from_path(&plain_path).unwrap();
+    assert_eq!(store.file_hash_at(&current), None);
+}
+
+/// A handed-off put of an output (a link to the compiler's file) that still
+/// holds the bytes the wrapper hashed stores it, and the output then shares
+/// the read-only blob as after a synchronous put.
+#[cfg(unix)]
+#[test]
+fn a_handed_off_snapshot_is_stored_under_the_digest_the_wrapper_read() {
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("libfoo.rlib");
+    fs::write(&output, vec![7u8; 100 << 10]).unwrap();
+    let snapshot = dir.path().join("snapshot.rlib");
+    fs::hard_link(&output, &snapshot).unwrap();
+    let digest = crate::file_hash::hash_file(&snapshot).unwrap();
+    store
+        .put_handed_off(
+            "handed_off_key",
+            "foo",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(snapshot.clone(), "libfoo.rlib".to_string())],
+            std::slice::from_ref(&digest),
+            "",
+            "",
+            0,
+            None,
+        )
+        .unwrap();
+    let meta = store.get("handed_off_key").unwrap().expect("committed");
+    assert_eq!(meta.files[0].hash, digest);
+    assert!(
+        paths_share_inode(&output, &store.blob_path(&digest)),
+        "the output shares the blob, as after a synchronous put"
+    );
+    // The snapshot path is temporary: no memo row is written for it.
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&snapshot),
+        crate::file_hash::FileHashLookup::NeedsHash(_)
+    ));
+    assert!(store.record_shared_output_hash(&output, &digest, false));
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&output),
+        crate::file_hash::FileHashLookup::Hit(hash) if hash == digest
+    ));
+}
+
+/// An output rewritten in place after the wrapper hashed it (and returned to
+/// Cargo) is never stored under the compile's key: the put fails, commits
+/// nothing and publishes no blob of the new bytes, and the output gets its
+/// mode back.
+#[cfg(unix)]
+#[test]
+fn a_handed_off_snapshot_rewritten_after_the_compile_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    for (label, size) in [("small", 100usize), ("large", 300 << 10)] {
+        let key = format!("rewritten_{label}");
+        let output = dir.path().join(format!("lib{label}.rlib"));
+        fs::write(&output, vec![1u8; size]).unwrap();
+        let snapshot = dir.path().join(format!("{label}.snapshot"));
+        fs::hard_link(&output, &snapshot).unwrap();
+        let digest = crate::file_hash::hash_file(&snapshot).unwrap();
+        // Same length, new bytes, same inode: what an in-place post-processor
+        // would leave behind.
+        fs::write(&output, vec![2u8; size]).unwrap();
+        let rewritten = crate::file_hash::hash_file(&output).unwrap();
+        let error = store
+            .put_handed_off(
+                &key,
+                label,
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(snapshot.clone(), format!("lib{label}.rlib"))],
+                std::slice::from_ref(&digest),
+                "",
+                "",
+                0,
+                None,
+            )
+            .expect_err("a rewritten output must not be stored");
+        assert!(
+            format!("{error:#}").contains("changed after the compile"),
+            "{label}: {error:#}"
+        );
+        assert!(
+            store.get(&key).unwrap().is_none(),
+            "{label}: nothing committed"
+        );
+        assert!(!store.contains(&key), "{label}");
+        assert!(
+            !store.blob_path(&rewritten).exists(),
+            "{label}: no blob of the new bytes"
+        );
+        assert!(
+            !store.blob_path(&digest).exists(),
+            "{label}: no blob under the old address"
+        );
+        let mode = fs::metadata(&output).unwrap().permissions().mode();
+        assert_ne!(mode & 0o200, 0, "{label}: the output is writable again");
+        assert!(!store.record_shared_output_hash(&output, &digest, false));
+    }
+}
+
+/// The memo is seeded only for an output that is still the blob's inode: a
+/// replaced output (a new file renamed over it), or one stored by copy, keeps
+/// no row under the stored digest.
+#[cfg(unix)]
+#[test]
+fn a_replaced_output_is_never_seeded_with_the_stored_digest() {
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("libbar.rlib");
+    fs::write(&output, vec![3u8; 100 << 10]).unwrap();
+    let snapshot = dir.path().join("bar.snapshot");
+    fs::hard_link(&output, &snapshot).unwrap();
+    let digest = crate::file_hash::hash_file(&snapshot).unwrap();
+    store
+        .put_handed_off(
+            "replaced_key",
+            "bar",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &[(snapshot, "libbar.rlib".to_string())],
+            std::slice::from_ref(&digest),
+            "",
+            "",
+            0,
+            None,
+        )
+        .unwrap();
+    let replacement = dir.path().join("libbar.rlib.new");
+    fs::write(&replacement, vec![4u8; 100 << 10]).unwrap();
+    fs::rename(&replacement, &output).unwrap();
+    assert!(!store.record_shared_output_hash(&output, &digest, false));
+    assert!(!store.record_shared_output_hash(&output, &digest, true));
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&output),
+        crate::file_hash::FileHashLookup::NeedsHash(_)
+    ));
+    let copy = dir.path().join("copy.rlib");
+    fs::copy(store.blob_path(&digest), &copy).unwrap();
+    assert!(!store.record_shared_output_hash(&copy, &digest, false));
+}
+
+/// A handed-off put needs a digest for every file.
+#[test]
+fn a_handed_off_put_without_a_digest_per_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let output = dir.path().join("libbaz.rlib");
+    fs::write(&output, b"baz").unwrap();
+    assert!(
+        store
+            .put_handed_off(
+                "no_digest_key",
+                "baz",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output, "libbaz.rlib".to_string())],
+                &[],
+                "",
+                "",
+                0,
+                None,
+            )
+            .is_err()
+    );
+    assert!(store.get("no_digest_key").unwrap().is_none());
+}
+
+/// One rlib of `fill` bytes in `dir`, as `(output, store name)`.
+fn staged_put_output(dir: &Path, fill: u8) -> (PathBuf, String) {
+    let output = dir.join("libstaged.rlib");
+    fs::write(&output, vec![fill; 100 << 10]).unwrap();
+    (output, "libstaged.rlib".to_string())
+}
+
+fn put_unless_busy(store: &Store, key: &str, files: &[(PathBuf, String)]) -> PutAttempt {
+    store
+        .put_with_compile_time_unless_busy(
+            key,
+            "staged",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            files,
+            "",
+            "warning: kept\n",
+            3,
+            None,
+            Duration::from_millis(5),
+        )
+        .unwrap()
+}
+
+/// Stage `files` while another connection holds the index's write lock.
+fn put_while_the_index_is_busy(
+    store: &Store,
+    config: &Config,
+    key: &str,
+    files: &[(PathBuf, String)],
+) -> Box<StagedPut> {
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let attempt = put_unless_busy(store, key, files);
+    let waited = started.elapsed();
+    writer.execute_batch("ROLLBACK").unwrap();
+    let PutAttempt::Busy(staged) = attempt else {
+        panic!("a busy index registers nothing: {attempt:?}");
+    };
+    // A put waits up to four busy timeouts of 5 s for the lock.
+    assert!(
+        waited < Duration::from_secs(4),
+        "the put did not wait out the lock ({waited:?})"
+    );
+    staged
+}
+
+/// On a free index the put registers the entry at once, as a put does.
+#[test]
+fn a_put_unless_busy_on_a_free_index_registers_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let files = [staged_put_output(dir.path(), 4)];
+    let attempt = put_unless_busy(&store, "free_index", &files);
+    assert!(matches!(attempt, PutAttempt::Stored(result) if result.new_blobs == 1));
+    let meta = store.get("free_index").unwrap().expect("registered");
+    assert_eq!(meta.stderr, "warning: kept\n");
+    assert_eq!(
+        meta.files[0].hash,
+        crate::file_hash::hash_file(&files[0].0).unwrap()
+    );
+}
+
+/// With the index's write lock held elsewhere, the put stages and publishes
+/// the outputs, registers nothing a lookup could find, and hands the staged
+/// entry back; registering it later stores the entry a put would have.
+#[test]
+fn a_put_unless_busy_on_a_busy_index_registers_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 5)];
+    let staged = put_while_the_index_is_busy(&store, &config, "busy_index", &files);
+    assert_eq!(staged.cache_key(), "busy_index");
+    assert_eq!(staged.result().new_blobs, 1);
+    let hash = staged.files()[0].hash.clone();
+    assert!(store.blob_path(&hash).is_file(), "the blob is published");
+    assert!(
+        store.get("busy_index").unwrap().is_none(),
+        "nothing registered"
+    );
+    assert!(!store.contains("busy_index"));
+
+    let result = store.register_staged_put(&staged).unwrap();
+    assert_eq!(result.new_blobs, 1);
+    let meta = store.get("busy_index").unwrap().expect("registered");
+    assert_eq!(meta.files[0].hash, hash);
+    assert_eq!(meta.compile_time_ms, 3);
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&files[0].0),
+        crate::file_hash::FileHashLookup::Hit(seeded) if seeded == hash
+    ));
+}
+
+/// A link to each blob of a busy put, as a wrapper hands it over.
+#[cfg(unix)]
+fn link_staged_blobs(store: &Store, staged: &StagedPut, dir: &Path) -> Vec<PathBuf> {
+    fs::create_dir_all(dir).unwrap();
+    staged
+        .files()
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let link = dir.join(format!("{index}-{}", file.name));
+            fs::hard_link(store.blob_path(&file.hash), &link).unwrap();
+            link
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn put_staged_links(
+    store: &Store,
+    staged: &StagedPut,
+    links: &[PathBuf],
+) -> Result<StorePutResult> {
+    store.put_staged_handed_off(
+        staged.cache_key(),
+        "staged",
+        &["lib".to_string()],
+        &[],
+        "x86_64-unknown-linux-gnu",
+        "dev",
+        links,
+        staged.files(),
+        staged.result(),
+        "",
+        "warning: kept\n",
+        3,
+        None,
+    )
+}
+
+/// Another process registers a busy put from links to its blobs, without
+/// staging anything again: the entry is the one the put staged, and the
+/// output still shares its read-only blob.
+#[cfg(unix)]
+#[test]
+fn a_staged_put_handed_over_registers_from_links_to_its_blobs() {
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 6)];
+    let staged = put_while_the_index_is_busy(&store, &config, "handed_staged", &files);
+    let links = link_staged_blobs(&store, &staged, &dir.path().join("handoff"));
+
+    let daemon = Store::open(config).unwrap();
+    let result = put_staged_links(&daemon, &staged, &links).unwrap();
+    assert_eq!(result, staged.result(), "what the staging put found");
+    let meta = store.get("handed_staged").unwrap().expect("registered");
+    assert_eq!(meta.files, staged.files());
+    assert_eq!(meta.stderr, "warning: kept\n");
+    assert!(paths_share_inode(
+        &files[0].0,
+        &store.blob_path(&meta.files[0].hash)
+    ));
+    // The links are temporary: no memo row is written for them.
+    assert!(matches!(
+        store.file_hash_cache().lookup_cached(&links[0]),
+        crate::file_hash::FileHashLookup::NeedsHash(_)
+    ));
+}
+
+/// A blob that shares its inode with an output a writer changed in place
+/// before the entry was registered (ignoring the read-only bit) commits
+/// nothing, and the blob is unlinked so no later put adopts it.
+#[cfg(unix)]
+#[test]
+fn a_staged_blob_changed_before_it_was_handed_over_is_refused_and_unlinked() {
+    use std::os::unix::fs::PermissionsExt;
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 7)];
+    let staged = put_while_the_index_is_busy(&store, &config, "changed_staged", &files);
+    let hash = staged.files()[0].hash.clone();
+    let links = link_staged_blobs(&store, &staged, &dir.path().join("handoff"));
+    assert!(paths_share_inode(&files[0].0, &store.blob_path(&hash)));
+    fs::set_permissions(&files[0].0, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&files[0].0, vec![8u8; 100 << 10]).unwrap();
+
+    let error = put_staged_links(&store, &staged, &links).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed after the compile"),
+        "{error:#}"
+    );
+    assert!(store.get("changed_staged").unwrap().is_none());
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "the blob no longer holding its digest is gone"
+    );
+}
+
+/// A busy put whose blobs the orphan sweep reclaimed before anyone
+/// registered it (a daemon that died with it queued, then a sweep) is
+/// re-materialized from the links when it is registered after all.
+#[cfg(unix)]
+#[test]
+fn a_staged_put_whose_blobs_were_swept_registers_from_its_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 9)];
+    let staged = put_while_the_index_is_busy(&store, &config, "swept_staged", &files);
+    let hash = staged.files()[0].hash.clone();
+    let links = link_staged_blobs(&store, &staged, &dir.path().join("handoff"));
+    assert_eq!(store.sweep_orphan_blobs(Duration::ZERO).unwrap().removed, 1);
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "an unregistered blob is an orphan"
+    );
+
+    put_staged_links(&store, &staged, &links).unwrap();
+    let meta = store.get("swept_staged").unwrap().expect("registered");
+    assert_eq!(
+        crate::file_hash::hash_file(&store.blob_path(&meta.files[0].hash)).unwrap(),
+        hash
+    );
+}
+
+/// Check a busy put's links as the daemon does before it batches them.
+#[cfg(unix)]
+fn check_staged_links(store: &Store, staged: &StagedPut, links: &[PathBuf]) -> CheckedHandoff {
+    store.check_staged_handed_off(
+        staged.cache_key(),
+        "staged",
+        &["lib".to_string()],
+        &[],
+        "x86_64-unknown-linux-gnu",
+        "dev",
+        links,
+        staged.files(),
+        staged.result(),
+        "",
+        "warning: kept\n",
+        3,
+        "unit-of-staged",
+        None,
+    )
+}
+
+/// A busy put of `fill` bytes in a directory of its own under `dir`, with
+/// links to its blobs: what a wrapper hands the daemon.
+#[cfg(unix)]
+fn busy_put_handed_over(
+    store: &Store,
+    config: &Config,
+    dir: &Path,
+    key: &str,
+    fill: u8,
+) -> (Box<StagedPut>, Vec<PathBuf>, PathBuf) {
+    let own = dir.join(key);
+    fs::create_dir_all(&own).unwrap();
+    let files = [staged_put_output(&own, fill)];
+    let staged = put_while_the_index_is_busy(store, config, key, &files);
+    let links = link_staged_blobs(store, &staged, &own.join("handoff"));
+    (staged, links, files[0].0.clone())
+}
+
+/// Hand-offs checked while the index is busy wait for it together: a busy
+/// lock gives the whole batch back with nothing registered, and once it is
+/// free every entry registers in one go, each with its unit.
+#[cfg(unix)]
+#[test]
+fn handed_off_entries_register_together_once_the_index_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let handed: Vec<_> = (0..4)
+        .map(|index| {
+            busy_put_handed_over(
+                &store,
+                &config,
+                dir.path(),
+                &format!("batch_{index}"),
+                index,
+            )
+        })
+        .collect();
+    let daemon = Store::open(config.clone()).unwrap();
+    let batch: Vec<CheckedHandoff> = handed
+        .iter()
+        .map(|(staged, links, _)| check_staged_links(&daemon, staged, links))
+        .collect();
+    assert!(batch.iter().all(CheckedHandoff::is_ready));
+
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let BatchAttempt::Busy(batch) =
+        daemon.register_handed_off_batch(batch, Duration::from_millis(5))
+    else {
+        panic!("a busy index registers nothing");
+    };
+    assert_eq!(batch.len(), 4, "the whole batch comes back");
+    assert!(
+        handed
+            .iter()
+            .all(|(staged, _, _)| !store.contains(staged.cache_key()))
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+
+    let BatchAttempt::Registered(results) =
+        daemon.register_handed_off_batch(batch, Duration::from_millis(5))
+    else {
+        panic!("a free index registers the batch");
+    };
+    assert_eq!(results.len(), 4);
+    for ((staged, _, _), result) in handed.iter().zip(results) {
+        assert_eq!(result.unwrap(), staged.result());
+        let meta = store.get(staged.cache_key()).unwrap().expect("registered");
+        assert_eq!(meta.files, staged.files());
+    }
+    assert!(
+        store
+            .file_hash_cache()
+            .has_entry_for_unit("staged", "unit-of-staged")
+            .unwrap(),
+        "the unit is registered with the entry"
+    );
+}
+
+/// A blob changed in place after its compile returned costs the entries
+/// that name it, and only those: one whose check read the blob before the
+/// change is refused too, the blob is unlinked, and the rest of the batch
+/// registers.
+#[cfg(unix)]
+#[test]
+fn a_changed_blob_refuses_only_the_entries_of_a_batch_that_name_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let _force = ForceStoreHardlink::enable();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let (changed, changed_links, output) =
+        busy_put_handed_over(&store, &config, dir.path(), "changed", 9);
+    // The same bytes: the same blob, checked before the writer got to it.
+    let (twin, twin_links, _) = busy_put_handed_over(&store, &config, dir.path(), "twin", 9);
+    let (other, other_links, _) = busy_put_handed_over(&store, &config, dir.path(), "other", 10);
+    let hash = changed.files()[0].hash.clone();
+    assert_eq!(twin.files()[0].hash, hash);
+    assert!(paths_share_inode(&output, &store.blob_path(&hash)));
+
+    let daemon = Store::open(config).unwrap();
+    let twin_checked = check_staged_links(&daemon, &twin, &twin_links);
+    assert!(twin_checked.is_ready());
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&output, vec![8u8; 100 << 10]).unwrap();
+    let changed_checked = check_staged_links(&daemon, &changed, &changed_links);
+    assert!(!changed_checked.is_ready());
+    let other_checked = check_staged_links(&daemon, &other, &other_links);
+
+    let BatchAttempt::Registered(results) = daemon.register_handed_off_batch(
+        vec![changed_checked, twin_checked, other_checked],
+        Duration::from_millis(5),
+    ) else {
+        panic!("a free index registers the batch");
+    };
+    let errors: Vec<String> = results
+        .iter()
+        .map(|result| {
+            result
+                .as_ref()
+                .err()
+                .map_or(String::new(), |error| format!("{error:#}"))
+        })
+        .collect();
+    assert!(
+        errors[0].contains("changed after the compile"),
+        "{errors:?}"
+    );
+    assert!(
+        errors[1].contains("changed after its compile"),
+        "{errors:?}"
+    );
+    assert!(errors[2].is_empty(), "{errors:?}");
+    assert!(store.get("changed").unwrap().is_none());
+    assert!(store.get("twin").unwrap().is_none());
+    assert!(store.get("other").unwrap().is_some());
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "the blob no longer holding its digest is gone"
+    );
+}
+
+/// A wrapper's key hands over the rows of small files too: the tree guard
+/// reads a workspace file's hash from its memo row whatever its size, so a
+/// handed row of a small file is written like any other.
+#[test]
+fn a_handed_memo_row_of_a_small_file_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let file = dir.path().join("lib.rs");
+    fs::write(&file, "pub fn f() {}\n").unwrap();
+    let row = memo_row_for(&file, false);
+    assert!(row.fingerprint.size < crate::file_hash::MIN_PERSISTED_HASH_BYTES);
+
+    assert_eq!(
+        store
+            .write_handed_memo_rows(std::slice::from_ref(&row))
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.file_hash_at(&row.fingerprint), Some(row.hash));
+}
+
+/// A call that waits for the index lock with a timeout of its own gives the
+/// connection back the timeout it had, not a fixed one: a connection given
+/// longer (test_concurrent_put_remove_never_dangles' 60 s) kept it only
+/// until its first hit stamp, then failed busy after 5 s under load.
+#[test]
+fn store_calls_give_back_the_connections_own_busy_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    store.set_busy_timeout_for_test(Duration::from_secs(60));
+    let busy_ms = |store: &Store| -> i64 {
+        store
+            .db
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap()
+    };
+
+    let src = dir.path().join("out.rlib");
+    std::fs::write(&src, b"kept wait").unwrap();
+    store
+        .put(
+            "k",
+            "c",
+            &["lib".into()],
+            &[],
+            "tgt",
+            "dev",
+            &[(src, "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    assert_eq!(busy_ms(&store), 60_000, "after a put");
+    store.set_last_accessed_for_test("k", "-1 day");
+    assert!(store.get("k").unwrap().is_some());
+    assert_eq!(busy_ms(&store), 60_000, "after a hit that stamps the entry");
+    store.remove_entry("k").unwrap();
+    assert_eq!(busy_ms(&store), 60_000, "after a removal");
 }

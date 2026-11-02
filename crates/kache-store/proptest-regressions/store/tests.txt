@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 74a2010534d24984c9271ebf491f94c30b854aaa10ba3a826802f6b558ab1248 # shrinks to specs = [EntrySpec { size: 32, idle_hours: 1, hits: 0, recent: false, held: false }], evict_shared = false, max_percent = 1

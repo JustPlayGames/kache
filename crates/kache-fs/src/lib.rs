@@ -9,6 +9,8 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(any(windows, test))]
+mod block_clone;
 pub mod paths;
 #[cfg(feature = "testing")]
 pub mod process_state_test;
@@ -24,8 +26,13 @@ pub use clock::sample_write_clock;
 
 mod copy;
 #[cfg(windows)]
+mod windows_clone;
+#[cfg(windows)]
 pub use copy::windows_cluster_size;
 pub use copy::{copy_writable, set_writable_permissions, try_clone_extents_into, try_reflink};
+
+mod shared;
+pub use shared::{group_store_gid, share_in_group_store, share_with_group};
 
 mod identity;
 pub use identity::{directory_identity, file_identity, handle_identity};
@@ -33,7 +40,7 @@ pub use identity::{directory_identity, file_identity, handle_identity};
 #[cfg(feature = "staging")]
 mod staging;
 #[cfg(feature = "staging")]
-pub use staging::{StagedFile, private_clone_directory};
+pub use staging::StagedFile;
 
 mod ledger;
 pub use ledger::{InodeId, InodeLedger};

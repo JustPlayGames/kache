@@ -1,0 +1,82 @@
+@echo off
+rem nextest's run-wrapper on Windows (.config/nextest.toml): runs one test
+rem process with a temporary folder of its own, and removes that folder once
+rem the test has ended. See nextest-own-temp.sh for why.
+rem
+rem Windows keeps what a TempDir could not delete: a folder a daemon the test
+rem started still has open (its index.db, its lock files), and files with the
+rem read-only attribute that the store gives its blobs. When a removal
+rem leaves something, the attribute is cleared everywhere (attrib is a
+rem process of its own, so only then) and the removal is tried again for
+rem up to two minutes while the test's daemons drain
+rem (KACHE_DAEMON_OWNER_PID); a folder still there after that is named on
+rem stderr and kept.
+rem
+rem With NEXTEST_OWN_TEMP_LOG set, every folder that took a retry or was
+rem left gets a line in that file: the seconds waited, the outcome and the
+rem test.
+rem
+rem The folder's name starts with the test's nextest slot
+rem (NEXTEST_TEST_GLOBAL_SLOT), which no other running test has until this
+rem script exits: %RANDOM% alone repeats in every cmd started in the same
+rem second, so a test could take the name of a folder another test's clean-up
+rem was still retrying, and that retry then removed the new test's folder
+rem while it ran (16 unit tests failed so on one Windows run).
+rem
+rem A test that runs past nextest's terminate-after (.config/nextest.toml)
+rem is ended with its whole job object, this script included, so its
+rem clean-up never runs and its folder stays. The name therefore also
+rem carries the run (the start of NEXTEST_RUN_ID), and before it makes its
+rem own folder the script removes the folders an earlier test of the same
+rem run left in its slot: the slot is not given out again until the script
+rem that held it has ended, so nothing still uses them. When the test ended
+rem so is the last of the run in its slot, its folder stays (nextest runs
+rem nothing after the run). Other runs' folders are never touched.
+rem
+rem The test's exit status is passed on unchanged.
+setlocal EnableExtensions DisableDelayedExpansion
+set "KT_BASE=%TEMP%"
+if not defined KT_BASE set "KT_BASE=%TMP%"
+set "KT_RUN=0"
+if defined NEXTEST_RUN_ID set "KT_RUN=%NEXTEST_RUN_ID:~0,8%"
+set "KT_PREFIX=%KT_BASE%\kt%NEXTEST_TEST_GLOBAL_SLOT%_%KT_RUN%_"
+if not defined NEXTEST_TEST_GLOBAL_SLOT goto sweep_done
+if not defined NEXTEST_RUN_ID goto sweep_done
+for /d %%D in ("%KT_PREFIX%*") do (
+    rd /s /q "%%~fD" >nul 2>&1
+    if exist "%%~fD\" attrib -R "%%~fD\*" /S /D >nul 2>&1
+    if exist "%%~fD\" rd /s /q "%%~fD" >nul 2>&1
+)
+:sweep_done
+set /a KT_TRIES=0
+:pick
+set "KT_DIR=%KT_PREFIX%%RANDOM%%RANDOM%"
+mkdir "%KT_DIR%" 2>nul && goto run
+set /a KT_TRIES+=1
+if %KT_TRIES% lss 100 goto pick
+%*
+exit /b %ERRORLEVEL%
+:run
+set "TEMP=%KT_DIR%"
+set "TMP=%KT_DIR%"
+set "TMPDIR=%KT_DIR%"
+%*
+set "KT_STATUS=%ERRORLEVEL%"
+set /a KT_WAIT=0
+:clean
+rd /s /q "%KT_DIR%" >nul 2>&1
+if not exist "%KT_DIR%\" goto done
+attrib -R "%KT_DIR%\*" /S /D >nul 2>&1
+rd /s /q "%KT_DIR%" >nul 2>&1
+if not exist "%KT_DIR%\" goto done
+set /a KT_WAIT+=1
+if %KT_WAIT% geq 120 goto stuck
+ping -n 2 127.0.0.1 >nul
+goto clean
+:stuck
+echo nextest-own-temp: %KT_DIR% is still in use after the test; left in place 1>&2
+if defined NEXTEST_OWN_TEMP_LOG echo %KT_DIR%	%KT_WAIT%s	left	%*>> "%NEXTEST_OWN_TEMP_LOG%"
+exit /b %KT_STATUS%
+:done
+if %KT_WAIT% gtr 0 if defined NEXTEST_OWN_TEMP_LOG echo %KT_DIR%	%KT_WAIT%s	removed	%*>> "%NEXTEST_OWN_TEMP_LOG%"
+exit /b %KT_STATUS%

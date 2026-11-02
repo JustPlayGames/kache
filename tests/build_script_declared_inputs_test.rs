@@ -22,6 +22,7 @@ use std::process::Command;
 mod common;
 use common::{
     build_kache, hermetic_command, isolated_config_path, kache_binary, settle_writes, stop_daemon,
+    wait_for_daemon_publishes,
 };
 
 /// The units whose keys the declared inputs reach.
@@ -192,6 +193,8 @@ fn build_units(
         "Cargo failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // A miss handed to the daemon is logged once the daemon stored it.
+    wait_for_daemon_publishes(cache);
     let mut latest = BTreeMap::new();
     for line in std::fs::read_to_string(log).unwrap()[before..].lines() {
         let event: Value = serde_json::from_str(line).unwrap();
@@ -451,7 +454,7 @@ fn what_cargo_writes_in_a_home_inside_the_package_is_not_one_of_its_files() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let log = std::fs::read_to_string(cache.join("events.jsonl")).unwrap();
+        let log = common::settled_events(&cache);
         let event = log
             .lines()
             .rev()

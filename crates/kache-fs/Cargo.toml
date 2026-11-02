@@ -1,6 +1,6 @@
 [package]
 name = "kache-fs"
-version = "2.0.0"
+version = "1.2.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Filesystem measurements, file identity, native cloning and copying."
@@ -35,4 +35,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Ioctl",
+    # FILE_SUPPORTS_BLOCK_REFCOUNTING: probe a volume before cloning to it.
+    "Win32_System_SystemServices",
 ] }

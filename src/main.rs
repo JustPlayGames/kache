@@ -12,6 +12,7 @@ mod cargo_layout;
 mod cargo_proxy;
 mod checked_regions;
 mod cli;
+mod coff_archive;
 mod compile;
 mod compiler;
 mod config;
@@ -35,6 +36,7 @@ mod init_completions;
 #[cfg(unix)]
 mod init_shell;
 mod invocation;
+mod key_bridge;
 mod key_env;
 use kache_store::link;
 mod cache_remote;
@@ -70,6 +72,7 @@ mod run_diff;
 mod savings;
 mod scheduler;
 mod service;
+mod session_tree;
 mod shards;
 mod since;
 mod windows_manifest;
@@ -82,6 +85,7 @@ mod windows_manifest;
 use kache_store::sharing;
 mod compiler_store;
 use compiler_store as store;
+mod stale_target_links;
 mod store_view;
 mod target_cleanup;
 mod target_dedup;
@@ -390,6 +394,17 @@ fn diagnostic_log_path_for(env: &invocation::InvocationEnv) -> PathBuf {
     }
 }
 
+/// The file the log's file layer writes: `KACHE_LOG_FILE_PATH` when set
+/// (relative to the invocation's directory), else [`diagnostic_log_path_for`].
+/// `None` when a relative path has no directory to resolve against.
+pub(crate) fn log_file_path_for(env: &invocation::InvocationEnv) -> Option<PathBuf> {
+    let path = env
+        .var_os("KACHE_LOG_FILE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| diagnostic_log_path_for(env));
+    env.resolve(&path)
+}
+
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,7 +488,8 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
     // File layer: persistent log at info level (overridable via KACHE_LOG_FILE).
     //
     // CLI/daemon mode: always enabled at the default `kache.log` path — these
-    // run rarely, so 2 syscalls (stat + open) per invocation is fine.
+    // run rarely. The file is opened on the first line written (see
+    // [`LazyLogFile`]), so a command that logs nothing writes nothing.
     //
     // Wrapper mode: cargo can fan out hundreds of `kache rustc …` processes
     // per build, so the file layer is OFF by default to avoid the per-crate
@@ -489,27 +505,11 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
             None
         } else {
             (|| -> Option<_> {
-                let path = env
-                    .var_os("KACHE_LOG_FILE_PATH")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| diagnostic_log_path_for(env));
-                let path = env.resolve(&path)?;
-                std::fs::create_dir_all(path.parent()?).ok()?;
-
-                // Simple rotation: truncate if file exceeds 5 MB.
-                // Skipped when a custom path is provided — the caller owns
-                // the file lifecycle (e.g. the bench wipes it per phase).
-                if env.var_os("KACHE_LOG_FILE_PATH").is_none()
-                    && std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES)
-                {
-                    let _ = std::fs::write(&path, b"--- log rotated ---\n");
-                }
-
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)
-                    .ok()?;
+                let path = log_file_path_for(env)?;
+                // Rotation is skipped for a custom path: the caller owns the
+                // file lifecycle (e.g. the bench wipes it per phase).
+                let rotate = env.var_os("KACHE_LOG_FILE_PATH").is_none();
+                let file = LazyLogFile::new(path, rotate);
 
                 let file_filter = env
                     .var("KACHE_LOG_FILE")
@@ -532,6 +532,62 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
             .with(stderr_layer)
             .with(file_layer),
     )
+}
+
+/// The log file, opened on the first line written. A command that logs
+/// nothing (`kache --help`, `kache --version`, most read-only commands)
+/// creates neither the file nor its folder. The first write creates the
+/// folder, truncates a file past [`MAX_LOG_BYTES`] when `rotate` is set, and
+/// opens it for appending; if that fails, lines are dropped, as before when
+/// the file could not be opened.
+struct LazyLogFile {
+    path: PathBuf,
+    rotate: bool,
+    file: Option<std::fs::File>,
+    failed: bool,
+}
+
+impl LazyLogFile {
+    fn new(path: PathBuf, rotate: bool) -> Self {
+        Self {
+            path,
+            rotate,
+            file: None,
+            failed: false,
+        }
+    }
+
+    fn open(&self) -> Option<std::fs::File> {
+        std::fs::create_dir_all(self.path.parent()?).ok()?;
+        if self.rotate && std::fs::metadata(&self.path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+            let _ = std::fs::write(&self.path, b"--- log rotated ---\n");
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok()
+    }
+}
+
+impl std::io::Write for LazyLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.file.is_none() && !self.failed {
+            self.file = self.open();
+            self.failed = self.file.is_none();
+        }
+        match &mut self.file {
+            Some(file) => file.write(buf),
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.file {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
 }
 
 /// How main reads argv, decided before any of it is parsed.
@@ -633,6 +689,9 @@ fn run_main() -> Result<()> {
     // installed. Decided on the environment alone: argv is the script's own.
     if build_script::is_shim_invocation() {
         init_logging(LogMode::Wrapper);
+        // On Cargo's path like a compiler wrapper: its build-script cache
+        // commits leave routine checkpoints to the daemon too.
+        kache_store::defer_wal_checkpoints();
         std::process::exit(build_script::run_shim());
     }
 
@@ -818,10 +877,17 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             json,
         ),
         Some(Commands::Gc {
+            stale_targets: Some(days),
+            apply,
+            ..
+        }) => cli::gc_stale_targets(&config, days, apply, json),
+        Some(Commands::Gc {
             max_age,
             stale_schema,
+            limit,
             rustc_version,
             dry_run,
+            ..
         }) => {
             if let Some(version) = rustc_version {
                 return cli::compiler_gc::clean(&config, &version, dry_run, true, json, "gc");
@@ -830,7 +896,7 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                 .as_deref()
                 .map(|value| parse_age_hours("--max-age", value))
                 .transpose()?;
-            cli::gc(&config, hours, stale_schema, json)
+            cli::gc(&config, hours, stale_schema, limit, json)
         }
         Some(Commands::Purge { crate_name }) => cli::purge(&config, crate_name.as_deref()),
         Some(Commands::Clean {
@@ -1455,7 +1521,7 @@ enum WrapperTarget {
 }
 
 fn run_wrapper_mode(args: &[String]) -> Result<()> {
-    let context = invocation::InvocationContext {
+    let mut context = invocation::InvocationContext {
         daemon: None,
         env: invocation::InvocationEnv::capture(),
         io: invocation::io::InvocationIo::capture(),
@@ -1472,31 +1538,58 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
             })
             .unwrap_or_else(|| "kache".to_owned()),
     };
+    // The frontend already asked the daemon, which declined: asking again,
+    // or starting one, only adds a round trip to a busy daemon.
+    let declined = context
+        .env
+        .var_os(kache_client::FRONTEND_DECLINED_ENV)
+        .is_some();
+    context.env.remove(kache_client::FRONTEND_DECLINED_ENV);
+    // The frontend handed this compile to a daemon that went away after
+    // taking it: compile it here, once, and ask no daemon again.
+    #[cfg_attr(not(any(unix, windows)), allow(unused_mut))]
+    let mut lost = context
+        .env
+        .var_os(kache_client::FRONTEND_DAEMON_LOST_ENV)
+        .is_some();
+    context.env.remove(kache_client::FRONTEND_DAEMON_LOST_ENV);
     #[cfg(any(unix, windows))]
-    let config = if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
+    let config = if declined || lost {
+        Some(config::Config::load_for(&context.env)?)
+    } else if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
+        use invocation::execution::Attempt;
         let config = config::Config::load_for(&context.env)?;
-        if let Some(exit) = invocation::execution::try_execute_with_trust(
+        match invocation::execution::try_execute_attempt(
             &config.socket_path(),
             args,
             &context,
             config.trust_daemon_execution,
         )? {
-            std::process::exit(exit);
+            Attempt::Completed(exit) => std::process::exit(exit),
+            Attempt::Lost => lost = true,
+            Attempt::Declined | Attempt::Unavailable => {}
         }
-        // A held run lock can belong to the release we just upgraded from.
-        // The coordinator checks its version and drains it before replacing it.
-        if !cfg!(test) && !config.disabled {
+        // Upstream #1718 starts the coordinator after every declined request
+        // (to replace a daemon of the release just upgraded from); this fork
+        // starts it only when no daemon runs, so a busy daemon's decline
+        // costs one request, not a health probe and a second request
+        // (Windows declines every hand-off). Updates restart the daemon.
+        if !lost
+            && !cfg!(test)
+            && !config.disabled
+            && daemon::is_running(&config).is_ok_and(|running| !running)
+        {
             match daemon::start(&config) {
-                Ok(_) => {
-                    if let Some(exit) = invocation::execution::try_execute_with_trust(
-                        &config.socket_path(),
-                        args,
-                        &context,
-                        config.trust_daemon_execution,
-                    )? {
-                        std::process::exit(exit);
-                    }
-                }
+                Ok(_) => match invocation::execution::try_execute_attempt(
+                    &config.socket_path(),
+                    args,
+                    &context,
+                    config.trust_daemon_execution,
+                )? {
+                    Attempt::Completed(exit) => std::process::exit(exit),
+                    Attempt::Lost => lost = true,
+                    Attempt::Declined | Attempt::Unavailable => {}
+                },
                 Err(error) => tracing::debug!(%error, "compiler daemon did not start"),
             }
         }
@@ -1506,8 +1599,48 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     };
     #[cfg(not(any(unix, windows)))]
     let config = None;
+    if lost {
+        recover_from_lost_handoff(args, &context.env);
+    }
     let exit = run_compiler_invocation_with_config(args, context, config)?;
     std::process::exit(exit);
+}
+
+/// Before compiling again what a daemon took and then lost (it was stopped,
+/// restarted or killed after Commit): say so, and remove the outputs the
+/// lost attempt may have left half written.
+///
+/// Nothing of that attempt still runs (see `Attempt::Lost`). Of a rustc
+/// unit's outputs, every one but the `.rmeta` is removed: Cargo reads none of
+/// them before this compile ends, and this compile writes each again. The
+/// `.rmeta` stays: rustc and kache's restore only ever put a whole one in
+/// place (a rename, a link to a stored blob), and Cargo may already have
+/// started dependent compiles that read it. Other compilers' outputs are
+/// rewritten by the compile itself.
+fn recover_from_lost_handoff(args: &[String], env: &invocation::InvocationEnv) {
+    let parsed = rustc_args_for_direct_preclean_for(args, env)
+        .is_some()
+        .then(|| args::RustcArgs::parse_for(args, env).ok())
+        .flatten();
+    let unit = parsed
+        .as_ref()
+        .and_then(|parsed| parsed.crate_name.as_deref())
+        .unwrap_or("this unit");
+    notice::show(&format!(
+        "kache: the daemon stopped while compiling {unit}; compiling it again here"
+    ));
+    let Some(parsed) = parsed.as_ref() else {
+        return;
+    };
+    let resolve = |path: Option<&std::path::Path>| path.and_then(|path| env.resolve(path));
+    let removed = compile::remove_outputs_except_metadata(
+        resolve(parsed.output.as_deref()).as_deref(),
+        resolve(parsed.out_dir.as_deref()).as_deref(),
+        parsed.crate_name.as_deref(),
+        parsed.extra_filename.as_deref(),
+        &parsed.emit,
+    );
+    tracing::info!(unit, removed, "compiling a unit the daemon lost again");
 }
 
 /// Decide whether raw argv can enter the compiler pipeline without probing a
@@ -1683,6 +1816,9 @@ fn run_compiler_invocation_inner(
             args.first()
         );
     };
+    // A wrapper's commits are on Cargo's critical path: leave routine WAL
+    // checkpoints (and their fsync) to the daemon.
+    kache_store::defer_wal_checkpoints();
     let exit_code = match wrapper_target(adapter) {
         Some(WrapperTarget::Rustc) => {
             // Cargo's first call for a target directory it has not built:
@@ -2062,10 +2198,8 @@ mod tests {
         assert!(!second.contains("own-warning"));
         assert!(!second.contains("own-debug"));
         assert!(!second.contains("first"));
-        assert_eq!(
-            std::fs::read(root.path().join("first/logs/wrapper.log")).unwrap(),
-            b""
-        );
+        // Its filter let nothing through, so its file was never opened.
+        assert!(!root.path().join("first/logs/wrapper.log").exists());
         let log = std::fs::read_to_string(root.path().join("second/logs/wrapper.log")).unwrap();
         assert_eq!(log.matches("own-warning").count(), 2);
         assert_eq!(log.matches("own-error").count(), 2);

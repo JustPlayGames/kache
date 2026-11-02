@@ -1,6 +1,6 @@
 [package]
 name = "kache-ipc"
-version = "2.0.0"
+version = "1.2.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Local sockets, endpoint naming, and peer checks for Kache."
@@ -14,8 +14,8 @@ default = []
 async = ["interprocess/tokio", "kunobi-daemon/local-async", "dep:tokio"]
 
 [dependencies]
-kache-protocol = { version = "2.0.0", path = "../kache-protocol" }
-kache-fs = { version = "2.0.0", path = "../kache-fs", features = ["staging"] }
+kache-protocol = { version = "1.2.2", path = "../kache-protocol" }
+kache-fs = { version = "1.2.2", path = "../kache-fs", features = ["staging"] }
 serde = "1"
 serde_json = "1"
 tracing = "0.1"
@@ -35,6 +35,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The AppContainer refusal test creates a profile.
+windows-sys = { version = "0.61", features = ["Win32_Security_Isolation"] }
 
 [lints.rust]
 warnings = "deny"

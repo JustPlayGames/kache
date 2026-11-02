@@ -422,3 +422,69 @@ fn killing_a_client_stops_its_native_compiler() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// A daemon that is running but declines a compile (its compiler workers
+/// busy) is asked once: the frontend's refusal reaches the engine, which
+/// compiles on its own without asking the busiest daemon a second time.
+#[test]
+fn a_declining_daemon_is_asked_once_per_compile() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(&fixture.runtime).unwrap();
+    // The run lock held here reads as a running daemon to every client.
+    let run_lock = std::fs::File::create(fixture.runtime.join("daemon.run.lock")).unwrap();
+    run_lock.try_lock().unwrap();
+    let listener = UnixListener::bind(fixture.runtime.join("daemon.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut child = fixture
+        .command(FRONTEND)
+        .arg(&fixture.compiler)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(fixture.root.path().join("stdout")).unwrap())
+        .stderr(std::fs::File::create(fixture.root.path().join("stderr")).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut requests = Vec::new();
+    let status = loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut line = String::new();
+                let _ = std::io::BufReader::new(&stream).read_line(&mut line);
+                let request = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|request| request.as_object()?.keys().next().cloned())
+                    .unwrap_or_default();
+                if request == "execute_v1" {
+                    let mut decline =
+                        serde_json::to_vec(&kache_protocol::execution::ExecutionReply::Declined {
+                            reason: "compiler workers busy".to_owned(),
+                        })
+                        .unwrap();
+                    decline.push(b'\n');
+                    let _ = (&stream).write_all(&decline);
+                }
+                requests.push(request);
+                continue;
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("compile did not finish; requests {requests:?}");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    fixture.assert_compiler_output(status);
+    assert_eq!(requests, ["execute_v1"], "requests the daemon received");
+}

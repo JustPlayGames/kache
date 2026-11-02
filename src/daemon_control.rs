@@ -266,11 +266,22 @@ fn connect(path: &Path, deadline: Instant) -> Result<Local> {
         .grant(&credentials)
         .context("authenticating lifecycle peer")?;
     let remaining = deadline.saturating_duration_since(Instant::now());
-    anyhow::ensure!(!remaining.is_zero(), "lifecycle deadline expired");
+    if remaining.is_zero() {
+        return Err(deadline_passed("lifecycle deadline expired").into());
+    }
     stream
         .set_read_deadline(Some(remaining))
         .context("setting lifecycle setup deadline")?;
     Ok(stream)
+}
+
+/// A legacy exchange that ran out of its deadline, however the time ran out:
+/// a read that timed out, a connection made with no time left, or an answer
+/// that came after the deadline. All three are the same unanswered probe, so
+/// all three are a timeout the readiness checks retry
+/// ([`super::lifecycle_client::transient`]), never an error that ends them.
+fn deadline_passed(what: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, what.to_owned())
 }
 
 /// Bounded compatibility exchange on the existing JSON endpoint. Only callers
@@ -305,7 +316,9 @@ fn legacy_exchange(path: &Path, request: &Request, deadline: Instant) -> Result<
         })
         .into());
     }
-    anyhow::ensure!(Instant::now() < deadline, "late legacy lifecycle response");
+    if Instant::now() >= deadline {
+        return Err(deadline_passed("late legacy lifecycle response").into());
+    }
     Ok(response)
 }
 
@@ -345,7 +358,9 @@ async fn legacy_exchange_windows(
             })
             .into());
         }
-        anyhow::ensure!(Instant::now() < deadline, "late legacy lifecycle response");
+        if Instant::now() >= deadline {
+            return Err(deadline_passed("late legacy lifecycle response").into());
+        }
         Ok(response)
     })
     .await

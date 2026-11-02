@@ -245,8 +245,7 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
         String::from_utf8_lossy(&warm.stderr)
     );
 
-    let events: Vec<Value> = std::fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap()
+    let events: Vec<Value> = common::settled_events(&cache)
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .filter(|event: &Value| event["crate_name"] == "proxy_fixture")
@@ -317,8 +316,7 @@ fn collapsed_rustflags_stay_out_of_the_environment_cargo_passes_on() {
         );
     }
 
-    let events: Vec<Value> = std::fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap()
+    let events: Vec<Value> = common::settled_events(&cache)
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .filter(|event: &Value| event["crate_name"] == "proxy_key_fixture")
@@ -664,7 +662,11 @@ fn proxied_shared_target_build(project: &Path, home: &Path, cache: &Path, target
         .current_dir(project)
         .env("KACHE_REAL_CARGO", env!("CARGO"))
         .env("KACHE_CACHE_EXECUTABLES", "1");
-    command.output().unwrap()
+    let output = command.output().unwrap();
+    // Each build's events are logged before the next build's: the test
+    // reads them in build order.
+    common::wait_for_daemon_publishes(cache);
+    output
 }
 
 fn run_shared_target_binary(target: &Path) -> String {
@@ -737,8 +739,7 @@ fn cargo_proxy_isolates_fingerprints_while_sharing_final_target_and_kache() {
         "the shared final target must not contain Cargo fingerprint state"
     );
 
-    let events: Vec<Value> = std::fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap()
+    let events: Vec<Value> = common::settled_events(&cache)
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
         .filter(|event: &Value| event["crate_name"] == "proxy_shared_target")
@@ -840,8 +841,7 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
         .collect();
     assert!(!artifacts.is_empty());
     assert!(artifacts.iter().all(|a| a["fresh"] == true), "{records:?}");
-    let events: Vec<Value> = std::fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap()
+    let events: Vec<Value> = common::settled_events(&cache)
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();

@@ -63,11 +63,18 @@ pub const DEFAULT_MIN_STORE_COMPILE_MS: u64 = 0;
 pub const DEFAULT_GC_MAX_AGE_HOURS: u64 = 0;
 
 /// Disk-share store budget when `KACHE_MAX_SIZE` / `[cache] local_max_size`
-/// are unset. 5% of the volume that holds the store, rounded to the nearest
-/// GiB, then clamped to 5GiB..=100GiB. A failed size probe falls back to
+/// are unset. 20% of the volume that holds the store, rounded to the nearest
+/// GiB, then clamped to 10GiB..=100GiB. A failed size probe falls back to
 /// 50GiB so the store stays bounded.
-pub const DISK_SHARE_PERCENT: u64 = 5;
-pub const DISK_SHARE_FLOOR: u64 = 5 * 1024 * 1024 * 1024;
+///
+/// One debug build of a large workspace stores about 10GiB (a 190-crate GUI
+/// app with its server: 9.9GiB), and its tests, clippy and a wasm build each
+/// store as much again. At 5% with a 5GiB floor, a disk under 200GiB evicted
+/// entries of the build that was running, and a 256GiB one kept less than two
+/// builds. The free-space floor (`auto_recover_min_free_bytes`, 10GiB) still
+/// evicts before the disk fills, whatever this budget allows.
+pub const DISK_SHARE_PERCENT: u64 = 20;
+pub const DISK_SHARE_FLOOR: u64 = 10 * 1024 * 1024 * 1024;
 pub const DISK_SHARE_CAP: u64 = 100 * 1024 * 1024 * 1024;
 pub const DISK_SHARE_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
 
@@ -268,6 +275,12 @@ pub struct Config {
     /// disabled). Set via `KACHE_GC_MAX_AGE_HOURS` or
     /// `[cache] gc_max_age_hours`.
     pub gc_max_age_hours: u64,
+    /// Entries idle under this many hours, and slow to compile, that an
+    /// automatic size sweep ranks with ten times their score; `0` turns it
+    /// off.
+    /// Default [`DEFAULT_GC_SPARE_YOUNG_HOURS`]. Set via
+    /// `KACHE_GC_SPARE_YOUNG_HOURS` or `[cache] gc_spare_young_hours`.
+    pub gc_spare_young_hours: u64,
     /// Permit GC to evict an entry even when its last store blob is still
     /// hardlinked or block-cloned into a build target. Off by default because
     /// that eviction frees no disk and destroys a usable cache hit. Enable it
@@ -275,7 +288,9 @@ pub struct Config {
     /// reclamation. Set via `KACHE_GC_EVICT_SHARED=1`/`=true` or
     /// `[cache] gc_evict_shared = true`.
     pub gc_evict_shared: bool,
-    /// Daemon idle timeout in seconds (default 0 = no timeout).
+    /// Daemon idle timeout in seconds (default 0 = no timeout). Unset, a
+    /// daemon a build starts by itself (no login service) stops after an hour
+    /// without work; set it to 0 to keep such a daemon running.
     pub daemon_idle_timeout_secs: u64,
     /// How long an idle TCP/TLS connection is kept in the S3 client's pool, in
     /// seconds (default 300). Tuned higher than hyper's 90s default so that
@@ -530,6 +545,19 @@ pub struct Config {
     /// `KACHE_NATIVE_RUNTIME_WARMUP=0` or `[cache] native_runtime_warmup = false`
     /// to wait for the hashes before compiling.
     pub native_runtime_warmup: bool,
+    /// Let the daemon finish a rustc store when the index is busy. The
+    /// wrapper stages, hashes and publishes the outputs as a store always
+    /// does, then waits a few milliseconds at most for the index's write
+    /// lock: granted, it registers the entry itself, so on a quiet index the
+    /// entry is there when the wrapper returns. Held longer by another
+    /// writer, the wrapper links the staged blobs into the store's staging
+    /// area, hands the entry to the daemon and returns to Cargo; the daemon
+    /// registers it once the index lets it, refusing any blob whose bytes
+    /// changed since. On by default on Unix; `KACHE_DAEMON_PUBLISH_RUSTC=0`
+    /// or `[cache] daemon_publish_rustc = false` makes the wrapper wait for
+    /// the lock itself. Without a reachable daemon, and on Windows, it waits
+    /// either way.
+    pub daemon_publish_rustc: bool,
     /// Permit a trusted daemon's pipeline to access the workspace under its
     /// own restrictions. Native children and restores still run in the client.
     /// Disabled unless `KACHE_TRUST_DAEMON_EXECUTION=1` or
@@ -608,6 +636,11 @@ pub struct Config {
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
     /// `[cache] auto_clean_unused_units_days`.
     pub auto_clean_unused_units_days: u64,
+    /// Let the daemon drop adaptive incremental state no compile used for
+    /// this many hours (`0`, the default, disables it). Set via
+    /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` or `[cache]
+    /// auto_clean_adaptive_idle_hours`.
+    pub auto_clean_adaptive_idle_hours: u64,
     /// Copy another checkout's registry build units into a target directory
     /// Cargo has not built yet, before Cargo checks freshness. On by
     /// default. Set via `KACHE_SEED_NEW_TARGETS=0`/`=false` or `[cache]
@@ -981,6 +1014,8 @@ pub struct CacheFileConfig {
     pub daemon_publish: Option<bool>,
     /// Background MSVC runtime hashing. See [`Config::native_runtime_warmup`].
     pub native_runtime_warmup: Option<bool>,
+    /// Rustc daemon hand-off toggle. See [`Config::daemon_publish_rustc`].
+    pub daemon_publish_rustc: Option<bool>,
     pub trust_daemon_execution: Option<bool>,
     /// See [`Config::daemon_execution_concurrency`].
     pub daemon_execution_concurrency: Option<usize>,
@@ -1003,6 +1038,8 @@ pub struct CacheFileConfig {
     pub scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub auto_clean_unused_units_days: Option<u64>,
+    /// See [`Config::auto_clean_adaptive_idle_hours`].
+    pub auto_clean_adaptive_idle_hours: Option<u64>,
     /// See [`Config::seed_new_targets`].
     pub seed_new_targets: Option<bool>,
     /// See [`Config::build_script_hermetic`].
@@ -1052,6 +1089,8 @@ pub struct CacheFileConfig {
     pub min_store_compile_ms: Option<u64>,
     /// Automatic GC age retention. See [`Config::gc_max_age_hours`].
     pub gc_max_age_hours: Option<u64>,
+    /// Young entries an automatic sweep spares. See [`Config::gc_spare_young_hours`].
+    pub gc_spare_young_hours: Option<u64>,
     pub daemon_idle_timeout_secs: Option<u64>,
     pub s3_pool_idle_secs: Option<u64>,
     /// Restore deadline. See [`Config::remote_restore_timeout_secs`].
@@ -1404,6 +1443,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_REMOTE_NEGATIVE_TTL_SECS",
     "KACHE_MIN_STORE_COMPILE_MS",
     "KACHE_GC_MAX_AGE_HOURS",
+    "KACHE_GC_SPARE_YOUNG_HOURS",
     "KACHE_DAEMON_IDLE_TIMEOUT",
     "KACHE_S3_POOL_IDLE_SECS",
     "KACHE_FALLBACK",
@@ -1428,6 +1468,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_DEFERRED_DISCOVERY",
     "KACHE_DAEMON_PUBLISH",
     "KACHE_NATIVE_RUNTIME_WARMUP",
+    "KACHE_DAEMON_PUBLISH_RUSTC",
     "KACHE_TRUST_DAEMON_EXECUTION",
     "KACHE_DAEMON_EXECUTION_CONCURRENCY",
     "KACHE_OUT_DIR_ALIAS",
@@ -1443,6 +1484,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
+    "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
@@ -1512,6 +1554,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("KACHE_MIN_STORE_COMPILE_MS", "cache.min_store_compile_ms"),
     ("KACHE_GC_MAX_AGE_HOURS", "cache.gc_max_age_hours"),
+    ("KACHE_GC_SPARE_YOUNG_HOURS", "cache.gc_spare_young_hours"),
     ("KACHE_GC_EVICT_SHARED", "cache.gc_evict_shared"),
     (
         "KACHE_DAEMON_IDLE_TIMEOUT",
@@ -1547,6 +1590,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_INDEX_MODE", "cache.index_mode"),
     ("KACHE_DAEMON_PUBLISH", "cache.daemon_publish"),
     ("KACHE_NATIVE_RUNTIME_WARMUP", "cache.native_runtime_warmup"),
+    ("KACHE_DAEMON_PUBLISH_RUSTC", "cache.daemon_publish_rustc"),
     (
         "KACHE_TRUST_DAEMON_EXECUTION",
         "cache.trust_daemon_execution",
@@ -1581,6 +1625,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
         "cache.auto_clean_unused_units_days",
+    ),
+    (
+        "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
+        "cache.auto_clean_adaptive_idle_hours",
     ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_BUILD_SCRIPT_HERMETIC", "cache.build_script_hermetic"),
@@ -2019,6 +2067,18 @@ impl Config {
                     .and_then(|c| c.gc_max_age_hours)
             })
             .unwrap_or(DEFAULT_GC_MAX_AGE_HOURS);
+        let gc_spare_young_hours =
+            env_or_ignored_for(invocation, "KACHE_GC_SPARE_YOUNG_HOURS", ignore_env)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.gc_spare_young_hours)
+                })
+                .unwrap_or(DEFAULT_GC_SPARE_YOUNG_HOURS);
 
         let s3_concurrency = env_or_ignored_for(invocation, "KACHE_S3_CONCURRENCY", ignore_env)
             .ok()
@@ -2308,6 +2368,7 @@ impl Config {
         let daemon_publish = Self::daemon_publish_enabled_for(invocation, &file_config);
         let native_runtime_warmup =
             Self::native_runtime_warmup_enabled_for(invocation, &file_config);
+        let daemon_publish_rustc = Self::daemon_publish_rustc_enabled_for(invocation, &file_config);
         let trust_daemon_execution = Self::trust_daemon_execution_for(invocation, &file_config);
         let daemon_execution_concurrency =
             Self::daemon_execution_concurrency_for(invocation, &file_config)?;
@@ -2327,6 +2388,8 @@ impl Config {
             Self::scheduler_memory_pressure_enabled_for(invocation, &file_config);
         let auto_clean_unused_units_days =
             Self::auto_clean_unused_units_days_for(invocation, &file_config);
+        let auto_clean_adaptive_idle_hours =
+            Self::auto_clean_adaptive_idle_hours_for(invocation, &file_config);
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
         let build_script_hermetic =
             Self::build_script_hermetic_enabled_for(invocation, &file_config);
@@ -2459,6 +2522,7 @@ impl Config {
             index_mode,
             daemon_publish,
             native_runtime_warmup,
+            daemon_publish_rustc,
             trust_daemon_execution,
             daemon_execution_concurrency,
             project_rules,
@@ -2471,6 +2535,7 @@ impl Config {
             auto_recover_targets,
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
+            auto_clean_adaptive_idle_hours,
             seed_new_targets,
             build_script_hermetic,
             gc_evict_shared,
@@ -2519,6 +2584,7 @@ impl Config {
             prefetch_deadline_secs,
             min_store_compile_ms,
             gc_max_age_hours,
+            gc_spare_young_hours,
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
             remote_restore_timeout_secs,
@@ -2557,6 +2623,11 @@ impl Config {
     #[cfg(test)]
     fn deferred_discovery_enabled(file_config: &Result<FileConfig>) -> bool {
         Self::deferred_discovery_enabled_for(&InvocationEnv::capture(), file_config)
+    }
+
+    #[cfg(test)]
+    fn daemon_publish_rustc_enabled(file_config: &Result<FileConfig>) -> bool {
+        Self::daemon_publish_rustc_enabled_for(&InvocationEnv::capture(), file_config)
     }
 
     #[cfg(test)]
@@ -3119,6 +3190,22 @@ impl Config {
             .unwrap_or(true)
     }
 
+    fn daemon_publish_rustc_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) = env_or_ignored_for(invocation, "KACHE_DAEMON_PUBLISH_RUSTC", ignore_env) {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.daemon_publish_rustc)
+            .unwrap_or(true)
+    }
+
     fn daemon_publish_enabled_for(
         invocation: &InvocationEnv,
         file_config: &Result<FileConfig>,
@@ -3419,6 +3506,27 @@ impl Config {
                     .and_then(|c| c.auto_clean_unused_units_days)
             })
             .unwrap_or(DEFAULT_UNUSED_UNITS_DAYS)
+    }
+
+    /// Adaptive incremental idle window in hours, off (`0`) by default.
+    /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` (env wins), else `[cache]
+    /// auto_clean_adaptive_idle_hours`.
+    fn auto_clean_adaptive_idle_hours_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored_for(invocation, "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.auto_clean_adaptive_idle_hours)
+            })
+            .unwrap_or(0)
     }
 
     /// Memory-pressure admission, on by default.
@@ -4061,9 +4169,22 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 ///   the entry; restore materializes it next to the binary, where `lldb`
 ///   prefers it over the stale debug map. Source-level debugging of restored
 ///   executables works, so on by default.
-/// - **Windows**: off by default. When enabled, the Rust adapter checks PE
-///   outputs against their named PDBs and refuses debug records it cannot
-///   restore with the executable.
+/// - **Windows**: an MSVC `.exe` names its `.pdb` in a CodeView record (GUID,
+///   age, path), but rustc links with `/PDBALTPATH:%_PDB%`, so the path is
+///   the bare file name (`foo-<hash>.pdb`) and the same in every target
+///   directory. The `.pdb` is one of the unit's outputs (`{stem}.pdb`) and is
+///   stored and restored with the `.exe`, so a debugger finds the matching
+///   pair next to it, as after a fresh link. A store checks that pairing (the
+///   engine's `pe_pdb` module) and keeps out of the cache any `.exe` that
+///   names its `.pdb` by path, or whose `.pdb` is missing or does not match.
+///   Cargo's uplift into `target/<profile>` (and of the `.pdb`) runs after
+///   rustc and is unchanged. A restore over an `.exe` that is still running
+///   fails to remove it, as link.exe would fail to open it; the unit then
+///   compiles instead and meets the same error. One thing a debugger sees
+///   changes: a passthrough compile kept real source paths, and a cached one
+///   is remapped (`/kache/workspace/...`), so stepping through the binary's
+///   or the test harness's own crate needs the source mapping every cached
+///   library crate already needs on Windows. On by default.
 ///
 /// A split-debuginfo configuration (`-Csplit-debuginfo=unpacked`) moves Linux
 /// into the same external-reference shape, but the sidecars are themselves
@@ -4073,7 +4194,7 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
 /// Override either way with `KACHE_CACHE_EXECUTABLES` or
 /// `[cache] cache_executables`.
 pub fn default_cache_executables() -> bool {
-    cfg!(target_os = "linux") || cfg!(target_os = "macos")
+    cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows")
 }
 
 /// Where probe memos (CRT placements, build-script tree digests) live: under
@@ -4101,7 +4222,7 @@ pub fn probe_memo_dir_for(invocation: &InvocationEnv) -> Result<PathBuf> {
 }
 
 pub fn default_cache_dir() -> PathBuf {
-    dirs::cache_dir()
+    crate::invocation::user_cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("kache")
 }
@@ -5139,7 +5260,7 @@ pub fn describe_max_size(max_size: u64, filesystem_bytes: Option<u64>) -> String
     }
 }
 
-/// `5% of 1.8 TiB, floor 5.0 GiB, cap 100.0 GiB`: how the disk-share default
+/// `20% of 1.8 TiB, floor 10.0 GiB, cap 100.0 GiB`: how the disk-share default
 /// was derived for a volume of `total` bytes.
 pub fn disk_share_note(total: u64) -> String {
     format!(
@@ -5246,12 +5367,20 @@ fn isolate_cache_dir_for_trust_domain(base: PathBuf, domain: Option<&str>) -> Pa
     }
 }
 
+/// How long an entry that took 30 s or more to compile stays young for an
+/// automatic size sweep, in hours: the sweep ranks it with ten times its score
+/// (see `kache_store::eviction::SizePressureSparingYoungPolicy`). Replaying the
+/// build machine's sweeps of 2026-11-01/02, 12 h cut the compile time lost to
+/// re-misses of evicted entries by 77 %.
+pub const DEFAULT_GC_SPARE_YOUNG_HOURS: u64 = 12;
+
 impl From<&Config> for kache_core::store_config::Config {
     fn from(config: &Config) -> Self {
         Self {
             cache_dir: config.cache_dir.clone(),
             max_size: config.max_size,
             gc_evict_shared: config.gc_evict_shared,
+            gc_spare_young_hours: config.gc_spare_young_hours,
             upload_spool_max_jobs: UPLOAD_SPOOL_MAX_JOBS,
             deferred_durability: config.deferred_durability,
             index_mode: config.index_mode,
@@ -5386,6 +5515,9 @@ pull_request_prefix = "pr/42"
             &[
                 ("KACHE_HOST_CONFIG", ""),
                 ("KACHE_KEY_SALT", "second"),
+                // Both set explicitly, so each snapshot resolves its own
+                // value whatever the default.
+                ("KACHE_SEED_INCREMENTAL", "1"),
                 ("KACHE_TRUST_DOMAIN", "two"),
             ],
         );

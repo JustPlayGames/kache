@@ -75,6 +75,24 @@ Run `kache daemon restart` to switch right away, or when the binary you switched
 
 Use one release at a time. When both stay in use, for example because one project pins 1.0.x, and the 1.0.x binary is newer on disk, each release's commands replace the other's daemon: 1.0.x by modification time, later releases by version. With a `kache monitor` from each release open, that happens on every poll. Remove the old binary or stop using it.
 
+## Stopping during builds
+
+A stop, restart, config reload or idle exit stops taking new work at once:
+compiles that arrive meanwhile run in the local engine. Compiles a build already
+handed to the daemon run to their end, for up to 10 minutes from the start of
+the stop; other requests get 30 seconds. `kache daemon stop` and
+`kache daemon restart` wait for that, and the units `kache daemon install`
+writes give the daemon 12 minutes to stop (`TimeoutStopSec`, launchd's
+`ExitTimeOut`). Before restarting by hand, `kache --json daemon status` shows
+`compiles_in_flight`, the compiles handed over and still running.
+
+A compile still running at that bound, or one whose daemon was killed, is not
+lost to the build: the daemon keeps the compile's connection open until its
+worker returns, so once the connection closes nothing of that compile runs any
+more. The client then removes the outputs the compile may have left half
+written (all but the `.rmeta`, which dependent compiles may already read) and
+compiles once more in the local engine, saying so on the terminal.
+
 ## Shared lifecycle
 
 Kache uses `kunobi-daemon` for process locks, verified readiness, request drain,
@@ -127,8 +145,9 @@ compile and use the local store. On that fallback path:
 - a later daemon replays queued uploads before retiring their files
 
 After the first Commit write attempt, execution belongs to the daemon pipeline.
-A later disconnect fails the invocation rather than starting a second compiler.
-See [Architecture](/docs/how-it-works/architecture) for admission and process
+A failed compile the daemon reports is final. A daemon that goes away without
+answering is covered in [Stopping during builds](#stopping-during-builds). See
+[Architecture](/docs/how-it-works/architecture) for admission and process
 restriction checks.
 
 The monitor falls back to direct store and event-log reads. When the daemon stays offline, run `kache daemon status`: it shows where the daemon logs and where a failed start left its error.

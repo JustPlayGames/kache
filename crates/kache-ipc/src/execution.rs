@@ -1,4 +1,5 @@
-//! Synchronous compiler handoff with fallback rights ending at the first Commit write.
+//! Synchronous compiler handoff with fallback rights ending at the first Commit write,
+//! except when the daemon goes away after it (see [`Attempt::Lost`]).
 
 #[cfg(all(test, windows))]
 use crate::prelude::*;
@@ -34,6 +35,117 @@ use unix::Connection;
 #[cfg(unix)]
 mod unix_client;
 
+/// How long every client runs its compiles locally once a daemon let one
+/// request wait out [`PREPARE_TIMEOUT`] (stopped, swapping, or stuck in IO).
+/// Without it each compile of a build waits the timeout again, one after the
+/// other: a few seconds per unit instead of none.
+const UNRESPONSIVE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A request that failed only after waiting this long found the daemon there
+/// but not answering; quicker failures (no daemon, a refused or reset
+/// connection, an older daemon declining) say nothing about its health.
+const UNRESPONSIVE_AFTER: Duration = Duration::from_secs(2);
+
+/// The marker beside the daemon's endpoint that tells clients it did not
+/// answer: its modification time is when that was last seen.
+pub fn unresponsive_marker(socket: &Path) -> std::path::PathBuf {
+    let mut name = socket.file_name().unwrap_or_default().to_owned();
+    name.push(".unresponsive");
+    socket.with_file_name(name)
+}
+
+/// Whether clients should leave the daemon behind `socket` alone for now: it
+/// did not answer a request less than [`UNRESPONSIVE_BACKOFF`] ago.
+pub fn daemon_unresponsive(socket: &Path) -> bool {
+    marker_age(&unresponsive_marker(socket)).is_some_and(|age| age < UNRESPONSIVE_BACKOFF)
+}
+
+fn marker_age(marker: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(marker).ok()?.modified().ok()?;
+    // A time in the future (a clock step) counts as fresh.
+    Some(modified.elapsed().unwrap_or_default())
+}
+
+/// Note that the daemon did not answer (or that this client is the one that
+/// tries it again once the backoff is over): the marker's time becomes now.
+fn mark_unresponsive(marker: &Path) {
+    let touched = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(marker)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+    if let Err(error) = touched {
+        tracing::debug!(%error, marker = %marker.display(), "could not mark the daemon unresponsive");
+    }
+}
+
+/// How a hand-off ended when it permits local execution, or the exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// The daemon ran the compiler.
+    Completed(i32),
+    /// A running daemon answered and declined (its compiler workers were
+    /// busy): starting a daemon would only find this one.
+    Declined,
+    /// No daemon took the request: none listens, it did not answer, or the
+    /// request could not be made. A daemon may be worth starting.
+    Unavailable,
+    /// The daemon took the compile (Commit was sent) and then went away
+    /// without an answer: its connection closed (it was stopped, restarted
+    /// or killed). Nothing of that attempt is still running: this client's
+    /// own compiler children were killed and reaped before this returns,
+    /// and a daemon keeps the connection open until its worker for the
+    /// compile has returned, so the connection closing means the worker or
+    /// the whole daemon is gone. The caller may run the compiler locally,
+    /// once, instead of failing the build.
+    Lost,
+}
+
+/// The daemon's end of a committed compile closed before its answer: the
+/// connection ended (EOF, reset, broken pipe), not a reply that said the
+/// compile failed.
+#[derive(Debug)]
+struct DaemonLost(String);
+
+impl std::fmt::Display for DaemonLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the daemon went away during the compile: {}", self.0)
+    }
+}
+
+impl std::error::Error for DaemonLost {}
+
+/// Whether a failure after Commit means the daemon went away (its
+/// connection ended) rather than an answer it gave: an end of stream where
+/// a reply should be, or a reset or broken connection on any read or write.
+fn daemon_lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<DaemonLost>().is_some()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                )
+            })
+    })
+}
+
+/// A running daemon's refusal of a request before Commit.
+#[derive(Debug)]
+struct DaemonDeclined(String);
+
+impl std::fmt::Display for DaemonDeclined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the daemon declined the compiler request: {}", self.0)
+    }
+}
+
+impl std::error::Error for DaemonDeclined {}
+
 /// `None` permits local execution. An error means Commit may have reached the
 /// daemon and the caller must not run the compiler again.
 pub fn try_execute(
@@ -41,18 +153,76 @@ pub fn try_execute(
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
 ) -> Result<Option<i32>> {
+    Ok(
+        match try_execute_attempt(
+            socket,
+            request,
+            #[cfg(unix)]
+            descriptors,
+        )? {
+            Attempt::Completed(exit) => Some(exit),
+            Attempt::Declined | Attempt::Unavailable | Attempt::Lost => None,
+        },
+    )
+}
+
+/// [`try_execute`], telling a running daemon's refusal apart from no daemon.
+///
+/// A daemon that did not answer one client in [`PREPARE_TIMEOUT`] is skipped
+/// by every client for [`UNRESPONSIVE_BACKOFF`]; then one client tries it
+/// again (it renews the marker first, so the others keep going locally
+/// meanwhile) and clears the marker once it answers.
+pub fn try_execute_attempt(
+    socket: &Path,
+    request: &ExecutionRequest,
+    #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
+) -> Result<Attempt> {
+    let marker = unresponsive_marker(socket);
+    let marked = match marker_age(&marker) {
+        Some(age) if age < UNRESPONSIVE_BACKOFF => {
+            tracing::debug!("daemon did not answer {age:?} ago; compiling locally");
+            return Ok(Attempt::Unavailable);
+        }
+        Some(_) => {
+            mark_unresponsive(&marker);
+            true
+        }
+        None => false,
+    };
+    let started = std::time::Instant::now();
     let mut committed = false;
-    match exchange(
+    let result = exchange(
         socket,
         request,
         #[cfg(unix)]
         descriptors,
         &mut committed,
-    ) {
-        Ok(exit) => Ok(Some(exit)),
+    );
+    if committed || result.is_ok() {
+        if marked {
+            let _ = std::fs::remove_file(&marker);
+        }
+    } else if started.elapsed() >= UNRESPONSIVE_AFTER {
+        mark_unresponsive(&marker);
+    } else if marked {
+        // Not a hang: the daemon is gone or declined. Nothing to wait out.
+        let _ = std::fs::remove_file(&marker);
+    }
+    match result {
+        Ok(exit) => Ok(Attempt::Completed(exit)),
+        Err(error) if !committed && error.downcast_ref::<DaemonDeclined>().is_some() => {
+            tracing::debug!(%error, "daemon declined compiler execution");
+            Ok(Attempt::Declined)
+        }
         Err(error) if !committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
-            Ok(None)
+            Ok(Attempt::Unavailable)
+        }
+        // `exchange` has returned, so the client-owned compiler children of
+        // this attempt are killed and reaped (its broker's drop).
+        Err(error) if daemon_lost(&error) => {
+            tracing::warn!(%error, "daemon went away during a committed compile");
+            Ok(Attempt::Lost)
         }
         Err(error) => Err(error.context(
             "daemon compilation did not complete; the compiler will not be run again locally",
@@ -88,6 +258,9 @@ fn exchange(
     )?;
     let mut reader = std::io::BufReader::new(&stream);
     let ready = read_reply(&mut reader)?;
+    if let ExecutionReply::Declined { reason } = &ready {
+        return Err(DaemonDeclined(reason.clone()).into());
+    }
     #[cfg(unix)]
     {
         let ticket = match ready {
@@ -191,11 +364,23 @@ fn exchange(
     }
 }
 
+/// The pause before the `attempt`-th retry of [`retry_until`]: 1 ms for the
+/// first eight, then doubling every eight to at most 16 ms. A reply that is
+/// already on its way is still picked up within a millisecond or two, while
+/// a client waiting seconds on a busy daemon polls about 60 times a second
+/// instead of a thousand (each poll a PeekNamedPipe or open on Windows,
+/// across every compile waiting at once).
+#[cfg(any(test, windows))]
+fn retry_pause(attempt: u32) -> Duration {
+    Duration::from_millis(1u64 << (attempt / 8).min(4))
+}
+
 #[cfg(any(test, windows))]
 fn retry_until<T>(
     deadline: Option<std::time::Instant>,
     mut operation: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
+    let mut attempt = 0u32;
     loop {
         match operation() {
             Err(error)
@@ -207,7 +392,8 @@ fn retry_until<T>(
                 if deadline.is_some_and(|until| std::time::Instant::now() >= until) {
                     return Err(std::io::ErrorKind::TimedOut.into());
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(retry_pause(attempt));
+                attempt = attempt.saturating_add(1);
             }
             result => return result,
         }
@@ -231,10 +417,14 @@ fn write_message(writer: &mut impl Write, message: &impl serde::Serialize) -> Re
 fn read_reply(reader: &mut impl BufRead) -> Result<ExecutionReply> {
     let mut frame = Vec::new();
     reader.take(MAX_REPLY_BYTES).read_until(b'\n', &mut frame)?;
-    ensure!(
-        frame.last() == Some(&b'\n'),
-        "incomplete compiler execution response"
-    );
+    if frame.last() != Some(&b'\n') {
+        ensure!(
+            (frame.len() as u64) < MAX_REPLY_BYTES,
+            "compiler execution response exceeds {MAX_REPLY_BYTES} bytes"
+        );
+        // The stream ended before a whole reply: the daemon's end closed.
+        return Err(DaemonLost("incomplete compiler execution response".into()).into());
+    }
     Ok(serde_json::from_slice(&frame)?)
 }
 
@@ -389,10 +579,13 @@ mod tests {
     enum Disconnect {
         BeforeReady,
         LegacyDaemon,
+        Declined,
         BeforePrepared,
         AfterPrepared,
         AfterCommit,
         AfterAccepted,
+        FailedAfterAccepted,
+        GarbageAfterAccepted,
     }
 
     struct Fixture {
@@ -436,6 +629,13 @@ mod tests {
     }
 
     fn disconnected_exchange(stage: Disconnect) -> Result<Option<i32>> {
+        Ok(match attempted_exchange(stage)? {
+            Attempt::Completed(exit) => Some(exit),
+            Attempt::Declined | Attempt::Unavailable | Attempt::Lost => None,
+        })
+    }
+
+    fn attempted_exchange(stage: Disconnect) -> Result<Attempt> {
         let root = tempfile::tempdir_in("/tmp").unwrap();
         let path = root.path().join("control");
         let listener = UnixListener::bind(&path).unwrap();
@@ -462,6 +662,16 @@ mod tests {
                 assert_eq!(request.entry, ExecutionEntry::Compiler);
                 assert_eq!(request.argv[0].decode().unwrap(), "/bin/true");
                 if matches!(stage, Disconnect::BeforeReady) {
+                    return;
+                }
+                if matches!(stage, Disconnect::Declined) {
+                    write_message(
+                        &mut stream,
+                        &ExecutionReply::Declined {
+                            reason: "compiler workers are busy".into(),
+                        },
+                    )
+                    .unwrap();
                     return;
                 }
                 if matches!(stage, Disconnect::LegacyDaemon) {
@@ -520,8 +730,20 @@ mod tests {
                     return;
                 }
                 write_message(&mut stream, &ExecutionReply::Accepted).unwrap();
+                if matches!(stage, Disconnect::FailedAfterAccepted) {
+                    write_message(
+                        &mut stream,
+                        &ExecutionReply::Failed {
+                            message: "compiler worker failed".into(),
+                        },
+                    )
+                    .unwrap();
+                }
+                if matches!(stage, Disconnect::GarbageAfterAccepted) {
+                    std::io::Write::write_all(&mut stream, b"not a reply\n").unwrap();
+                }
             });
-            let result = try_execute(
+            let result = try_execute_attempt(
                 &path,
                 &context.request,
                 &context.files.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
@@ -531,21 +753,68 @@ mod tests {
         })
     }
 
+    /// A client that may start a daemon (Windows) starts one only when none
+    /// answered: a running daemon that declined would only be found again.
+    #[test]
+    fn a_running_daemons_refusal_is_told_apart_from_no_daemon() {
+        assert_eq!(
+            attempted_exchange(Disconnect::Declined).unwrap(),
+            Attempt::Declined
+        );
+        for stage in [
+            Disconnect::BeforeReady,
+            Disconnect::LegacyDaemon,
+            Disconnect::BeforePrepared,
+        ] {
+            assert_eq!(
+                attempted_exchange(stage).unwrap(),
+                Attempt::Unavailable,
+                "{stage:?}"
+            );
+        }
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let context = fixture(root.path());
+        assert_eq!(
+            try_execute_attempt(
+                &root.path().join("absent"),
+                &context.request,
+                &context.files.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            Attempt::Unavailable
+        );
+    }
+
     #[test]
     fn execution_disconnects_before_commit_allow_local_fallback() {
         for stage in [
             Disconnect::BeforeReady,
             Disconnect::LegacyDaemon,
+            Disconnect::Declined,
             Disconnect::BeforePrepared,
         ] {
             assert_eq!(disconnected_exchange(stage).unwrap(), None, "{stage:?}");
         }
     }
 
+    /// A daemon stopped or killed after Commit closes its connection with
+    /// no answer: the build compiles locally instead of failing. An answer
+    /// the daemon did give (a failed compile, a reply that is not one) still
+    /// ends the attempt with an error and no second compile.
     #[test]
-    fn execution_commit_and_completion_failures_never_allow_local_fallback() {
+    fn a_daemon_gone_after_commit_is_lost_and_its_answers_stay_final() {
         for stage in [Disconnect::AfterCommit, Disconnect::AfterAccepted] {
-            let error = disconnected_exchange(stage).unwrap_err();
+            assert_eq!(
+                attempted_exchange(stage).unwrap(),
+                Attempt::Lost,
+                "{stage:?}"
+            );
+        }
+        for stage in [
+            Disconnect::FailedAfterAccepted,
+            Disconnect::GarbageAfterAccepted,
+        ] {
+            let error = attempted_exchange(stage).unwrap_err();
             assert!(
                 error.to_string().contains("will not be run again locally"),
                 "{stage:?}: {error:#}"
@@ -555,12 +824,12 @@ mod tests {
 
     #[test]
     fn execution_disconnect_after_prepared_cannot_report_completion() {
-        // The peer can close before the timeout is cleared (safe fallback),
-        // or after the first Commit write is attempted (final failure).
-        match disconnected_exchange(Disconnect::AfterPrepared) {
-            Ok(None) => {}
-            Err(error) => assert!(error.to_string().contains("will not be run again locally")),
-            Ok(Some(exit)) => panic!("disconnected peer reported completion: {exit}"),
+        // The peer can close before the timeout is cleared (Unavailable), or
+        // after the first Commit write is attempted (Lost): both compile
+        // locally, and neither reports a completion.
+        match attempted_exchange(Disconnect::AfterPrepared) {
+            Ok(Attempt::Unavailable | Attempt::Lost) => {}
+            other => panic!("disconnected peer after Prepared: {other:?}"),
         }
     }
 }
@@ -609,6 +878,24 @@ mod protocol_tests {
     }
 
     #[test]
+    fn a_long_wait_polls_tens_of_times_a_second_not_a_thousand() {
+        // A client waiting on a busy daemon retries until its deadline; at a
+        // fixed 1 ms that was about 500 polls in half a second per waiting
+        // compile.
+        let mut attempts = 0u32;
+        let started = std::time::Instant::now();
+        let error = retry_until::<()>(Some(started + Duration::from_millis(500)), || {
+            attempts += 1;
+            Err(std::io::ErrorKind::WouldBlock.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(attempts < 100, "{attempts} polls in 500 ms");
+        assert_eq!(retry_pause(0), Duration::from_millis(1));
+        assert_eq!(retry_pause(100), Duration::from_millis(16));
+    }
+
+    #[test]
     fn execution_commit_write_and_flush_failures_are_always_irrevocable() {
         struct BrokenWriter {
             remaining: usize,
@@ -645,6 +932,112 @@ mod protocol_tests {
         let mut source = &large[..];
         assert!(read_reply(&mut source).is_err());
         assert_eq!(source.len(), 10);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unresponsive_tests {
+    use super::*;
+    use kache_protocol::execution::{ExecutionChannels, ExecutionEntry, NativeString};
+    use std::os::unix::net::UnixListener;
+
+    fn request(root: &Path) -> ExecutionRequest {
+        let native = |value: &std::ffi::OsStr| NativeString::capture(value);
+        ExecutionRequest {
+            version: EXECUTION_VERSION,
+            entry: ExecutionEntry::Compiler,
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            client_pid: std::process::id(),
+            creation_mask: Some(0o022),
+            argv: vec![native("/bin/true".as_ref())],
+            env: vec![],
+            cwd: native(root.as_os_str()),
+            home: None,
+            temp: native(root.as_os_str()),
+            cache: None,
+            executable: native(std::env::current_exe().unwrap().as_os_str()),
+            startup_micros: 0,
+            channels: ExecutionChannels::Unix {
+                terminal: false,
+                jobserver: vec![],
+            },
+        }
+    }
+
+    fn set_age(marker: &Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(marker)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// A daemon that accepts but never answers (stopped, stuck in IO) costs
+    /// one client the timeout; the next ones compile locally at once, and
+    /// after the backoff one client tries it again.
+    #[test]
+    fn a_daemon_that_does_not_answer_is_skipped_by_the_next_clients() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = root.path().join("daemon.sock");
+        // Bound and listening, never accepted: connects succeed, replies never come.
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let request = request(root.path());
+        let marker = unresponsive_marker(&socket);
+        assert_eq!(marker.file_name().unwrap(), "daemon.sock.unresponsive");
+        assert!(!daemon_unresponsive(&socket));
+
+        let started = std::time::Instant::now();
+        assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        assert!(started.elapsed() >= UNRESPONSIVE_AFTER);
+        assert!(daemon_unresponsive(&socket), "the timeout is remembered");
+
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Past the backoff, one client tries again: it renews the marker first,
+        // so the others keep compiling locally while it waits.
+        set_age(&marker, UNRESPONSIVE_BACKOFF + Duration::from_secs(1));
+        assert!(!daemon_unresponsive(&socket));
+        std::thread::scope(|threads| {
+            let prober = threads.spawn(|| try_execute(&socket, &request, &[]).unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !daemon_unresponsive(&socket) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the prober did not renew the marker"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(prober.join().unwrap(), None);
+        });
+        assert!(daemon_unresponsive(&socket), "still not answering");
+    }
+
+    /// No daemon at all is no hang: nothing is remembered, and a stale marker
+    /// goes once a quick failure shows there is nothing to wait out.
+    #[test]
+    fn a_missing_daemon_leaves_no_marker() {
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = root.path().join("daemon.sock");
+        let request = request(root.path());
+        let marker = unresponsive_marker(&socket);
+        assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        assert!(!marker.exists());
+        std::fs::write(&marker, b"").unwrap();
+        set_age(&marker, UNRESPONSIVE_BACKOFF * 2);
+        assert_eq!(try_execute(&socket, &request, &[]).unwrap(), None);
+        assert!(!marker.exists());
     }
 }
 

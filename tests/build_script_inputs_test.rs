@@ -186,3 +186,69 @@ fn absolute_file_declarations_do_not_replay_another_checkouts_inputs() {
 fn relative_directory_declarations_follow_the_current_checkout() {
     check_declarations("relative");
 }
+
+/// Checkouts that build the same commit at once run a build script once:
+/// the others wait for its run and restore it, as crate compiles wait for a
+/// compile in flight.
+#[test]
+fn concurrent_checkouts_run_a_build_script_once() {
+    build_kache();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let cache = root.join("cache");
+    let _daemon = CacheGuard(cache.clone());
+    let runs = root.join("runs.log");
+    for checkout in ["one", "two"] {
+        let dir = root.join(checkout);
+        write(
+            &dir.join("Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(
+            &dir.join("build.rs"),
+            r#"use std::io::Write;
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RUNS_LOG");
+    let log = std::env::var("RUNS_LOG").unwrap();
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();
+    log.write_all(b"run\n").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/gen.rs"), "pub const ANSWER: u32 = 42;\n").unwrap();
+}
+"#,
+        );
+        write(
+            &dir.join("src/main.rs"),
+            "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\nfn main() { assert_eq!(ANSWER, 42); }\n",
+        );
+    }
+    // SAFETY: set before any thread of this test starts; each test is its
+    // own process under nextest, and `build` passes the environment on.
+    unsafe { std::env::set_var("RUNS_LOG", &runs) };
+    std::thread::scope(|threads| {
+        for checkout in ["one", "two"] {
+            let (root, cache) = (&root, &cache);
+            threads.spawn(move || {
+                let target = root.join(format!("{checkout}-target"));
+                build(&root.join(checkout), &target, cache, "relative");
+                assert_current(&target);
+            });
+        }
+    });
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["crate_name"] == "build_script_run")
+        .collect();
+    assert_eq!(
+        std::fs::read_to_string(&runs).unwrap().lines().count(),
+        1,
+        "the script ran in both checkouts: {events:?}"
+    );
+    let results: Vec<_> = events.iter().map(|event| event["result"].clone()).collect();
+    assert!(results.contains(&"miss".into()), "{events:?}");
+    assert!(results.contains(&"local_hit".into()), "{events:?}");
+}

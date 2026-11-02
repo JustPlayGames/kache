@@ -373,6 +373,15 @@ impl RustcArgs {
             && crate::compiler::is_clippy_driver(&self.rustc.to_string_lossy())
     }
 
+    /// The compiler Cargo probes for this unit (`rustc -vV`, its target
+    /// info): the inner rustc of a `RUSTC_WORKSPACE_WRAPPER` chain such as
+    /// `clippy-driver <rustc>`, else the compiler itself. Cargo probes
+    /// through `RUSTC_WRAPPER` only, never the workspace wrapper, so this is
+    /// the version a target directory's seeding compares.
+    pub fn probed_rustc(&self) -> &Path {
+        self.inner_rustc.as_deref().unwrap_or(&self.rustc)
+    }
+
     /// Parse RUSTC_WRAPPER-style arguments.
     /// In RUSTC_WRAPPER mode, argv[0] = kache, argv[1] = rustc path, argv[2..] = rustc args.
     #[cfg(test)]
@@ -742,7 +751,8 @@ impl RustcArgs {
         })
     }
 
-    /// Exclude one valid terminal width when lint warnings are silenced.
+    /// Exclude one valid terminal width from every key (this fork: warning
+    /// crates too, as before #1708; upstream only when lints are capped).
     /// Preserve malformed and repeated options so a
     /// cached success cannot hide rustc's argument errors.
     pub(crate) fn cache_key_diagnostic_flags(&self) -> impl Iterator<Item = &String> {
@@ -754,35 +764,10 @@ impl RustcArgs {
             .and_then(|flag| flag.strip_prefix("--diagnostic-width="))
             .and_then(|value| value.parse::<u16>().ok())
             .is_some_and(|columns| columns > 0);
-        let omit_width = valid_width && widths.next().is_none() && self.lints_silenced();
+        let omit_width = valid_width && widths.next().is_none();
         self.diagnostic_flags
             .iter()
             .filter(move |flag| !omit_width || !flag.starts_with("--diagnostic-width="))
-    }
-
-    fn lints_silenced(&self) -> bool {
-        let mut cap = None;
-        let mut flags = self.outcome_lint_flags.iter();
-        while let Some(flag) = flags.next() {
-            if flag == "--force-warn" || flag.starts_with("--force-warn=") {
-                return false;
-            }
-            let value = if flag == "--cap-lints" {
-                flags.next().map(String::as_str)
-            } else if let Some(value) = flag.strip_prefix("--cap-lints=") {
-                Some(value)
-            } else {
-                if OUTCOME_AFFECTING_VALUE_FLAGS.contains(&flag.as_str()) {
-                    let _ = flags.next();
-                }
-                continue;
-            };
-            if cap.is_some() {
-                return false;
-            }
-            cap = value;
-        }
-        cap == Some("allow")
     }
 
     /// Original compact argv. This differs from [`Self::all_args`] only after
@@ -840,9 +825,17 @@ impl RustcArgs {
     /// non-byte-identical `.dylib` outputs → downstream crates that
     /// `--extern` them get unstable cache keys (the e422e55 relocate
     /// failure mode).
+    ///
+    /// Only a compile that emits `link` produces one: `cargo check` and
+    /// `cargo clippy` build a binary or a test with `--emit=dep-info,metadata`,
+    /// which writes no executable (and no `.pdb`), only metadata like any
+    /// library's check, so it is cached whatever `cache_executables` says.
     pub fn is_user_facing_executable(&self) -> bool {
         // An omitted crate type can produce rustc's default binary.
-        self.is_test || self.crate_types.is_empty() || self.crate_types.iter().any(|t| t == "bin")
+        let executable = self.is_test
+            || self.crate_types.is_empty()
+            || self.crate_types.iter().any(|t| t == "bin");
+        executable && self.emits_link()
     }
 
     /// The codegen backend dylib this compile loads, when `-Zcodegen-backend`
@@ -855,6 +848,19 @@ impl RustcArgs {
     /// `-Zcodegen-backend` selects one (see [`codegen_backend_name`]).
     pub fn codegen_backend_name(&self) -> Option<&str> {
         codegen_backend_name(&self.unstable_flags)
+    }
+
+    /// Does this compile run rustc's parallel frontend (`-Z threads=N`, the
+    /// last one winning, any N but 1; 0 means one thread per CPU)? Its
+    /// threads take jobserver tokens long before codegen, and a compile
+    /// killed then never gives them back: Cargo loses that much of `-j` for
+    /// the rest of the build.
+    pub fn runs_parallel_frontend(&self) -> bool {
+        self.unstable_flags
+            .iter()
+            .rev()
+            .find_map(|flag| flag.strip_prefix("threads="))
+            .is_some_and(|threads| threads.trim() != "1")
     }
 
     /// Derive the workspace root from `--out-dir`. Cargo invokes
@@ -2178,6 +2184,32 @@ mod tests {
         );
     }
 
+    /// A check (`cargo check`, `cargo clippy`) of a binary or a test emits
+    /// metadata only: no executable, so nothing user-facing to keep out of
+    /// the cache. Builds of the same units still are.
+    #[test]
+    fn a_metadata_only_compile_is_not_a_user_facing_executable() {
+        let parse = |line: &str| {
+            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+            RustcArgs::parse(&args).unwrap()
+        };
+        for line in [
+            "rustc --crate-name app --crate-type bin --emit=dep-info,metadata src/main.rs",
+            "rustc --crate-name app --test --emit=dep-info,metadata src/lib.rs",
+            "rustc --crate-name smoke --test --emit=metadata tests/smoke/main.rs",
+            "rustc --crate-name app --emit=dep-info,metadata src/main.rs",
+        ] {
+            assert!(!parse(line).is_user_facing_executable(), "{line}");
+        }
+        for line in [
+            "rustc --crate-name app --crate-type bin --emit=dep-info,link src/main.rs",
+            "rustc --crate-name app --test --emit=dep-info,link src/lib.rs",
+            "rustc --crate-name app --crate-type bin src/main.rs",
+        ] {
+            assert!(parse(line).is_user_facing_executable(), "{line}");
+        }
+    }
+
     #[test]
     fn omitted_crate_type_is_a_user_facing_executable() {
         let args = ["rustc", "--crate-name", "default_binary", "src/main.rs"].map(String::from);
@@ -2242,6 +2274,26 @@ mod tests {
         let dep = parse_extern("noprelude:std=/path/to/libstd.rlib");
         assert_eq!(dep.name, "std");
         assert!(dep.path.is_some());
+    }
+
+    #[test]
+    fn parallel_frontend_follows_the_last_threads_option() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["rustc", "--crate-name", "foo", "src/lib.rs"];
+            argv.extend_from_slice(extra);
+            RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+        };
+        assert!(!parse(&[]).runs_parallel_frontend());
+        assert!(!parse(&["-Zthreads=1"]).runs_parallel_frontend());
+        assert!(parse(&["-Zthreads=8"]).runs_parallel_frontend());
+        assert!(parse(&["-Z", "threads=8"]).runs_parallel_frontend());
+        assert!(
+            parse(&["-Zthreads=0"]).runs_parallel_frontend(),
+            "0 is one per CPU"
+        );
+        assert!(!parse(&["-Zthreads=8", "-Zthreads=1"]).runs_parallel_frontend());
+        assert!(parse(&["-Zthreads=1", "-Z", "threads=4"]).runs_parallel_frontend());
+        assert!(!parse(&["-Zshare-generics=y"]).runs_parallel_frontend());
     }
 
     #[test]
@@ -3064,8 +3116,10 @@ mod tests {
         ]);
         assert!(chain.inner_rustc.is_some());
         assert!(chain.is_clippy_chain());
+        assert_eq!(chain.probed_rustc(), Path::new("/toolchain/bin/rustc"));
         let plain = parse(&["/toolchain/bin/rustc", "--crate-name", "kt", "src/lib.rs"]);
         assert!(plain.inner_rustc.is_none());
+        assert_eq!(plain.probed_rustc(), Path::new("/toolchain/bin/rustc"));
         assert!(!plain.is_clippy_chain(), "no inner rustc");
         let other_wrapper = parse(&[
             "/toolchain/bin/dylint-driver",

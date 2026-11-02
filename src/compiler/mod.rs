@@ -252,15 +252,14 @@ pub enum ArtifactKind {
 
 impl ArtifactKind {
     /// Link strategy for restoring this kind. Mutable artifacts (executables,
-    /// dynamic libraries, and Rust metadata rewritten by cargo fix) must end
-    /// up as independent files without CoW reflink, so mutations cannot reach the
+    /// dynamic libraries) must end up as independent files on filesystems
+    /// without CoW reflink, so post-build mutations don't propagate into the
     /// cache blob. Immutable kinds may share an inode (hardlink fallback).
     pub fn link_strategy(self) -> LinkStrategy {
         match self {
             ArtifactKind::Executable | ArtifactKind::DynamicLibrary | ArtifactKind::WasmModule => {
                 LinkStrategy::Copy
             }
-            ArtifactKind::Metadata => LinkStrategy::WritableCopy,
             _ => LinkStrategy::Hardlink,
         }
     }
@@ -809,10 +808,28 @@ pub(crate) fn is_kache_subcommand_or_flag(s: &str) -> bool {
     if s.starts_with('-') {
         return true;
     }
-    use clap::CommandFactory;
-    let mut cmd = crate::Cli::command();
-    cmd.build();
-    cmd.find_subcommand(s).is_some()
+    kache_subcommand_names().contains(s)
+}
+
+/// The names and aliases of kache's subcommands, as `Command::find_subcommand`
+/// matches them, collected once per process. Every compiler invocation asks
+/// (detection runs before the cache decision), and building the whole CLI took
+/// most of an invocation's start: ~0.4 ms of allocation-heavy CPU each time,
+/// which the daemon's worker threads paid in one process at once.
+fn kache_subcommand_names() -> &'static std::collections::HashSet<String> {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        cmd.get_subcommands()
+            .flat_map(|sub| {
+                std::iter::once(sub.get_name().to_owned())
+                    .chain(sub.get_all_aliases().map(str::to_owned))
+            })
+            .collect()
+    })
 }
 
 /// Do these compiler args (argv after the program) form a pure version/info
@@ -1078,6 +1095,30 @@ mod tests {
         assert!(is_kache_subcommand_or_flag("gc"));
         assert!(is_kache_subcommand_or_flag("list"));
         assert!(!is_kache_subcommand_or_flag("not-a-subcommand"));
+    }
+
+    #[test]
+    fn the_subcommand_names_match_what_clap_finds() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        cmd.build();
+        let mut names = Vec::new();
+        for sub in cmd.get_subcommands() {
+            names.push(sub.get_name().to_owned());
+            names.extend(sub.get_all_aliases().map(str::to_owned));
+        }
+        assert!(names.len() > 10, "{names:?}");
+        for name in names
+            .iter()
+            .map(String::as_str)
+            .chain(["rustc", "cc", "clippy-driver", "cargo", "gcc"])
+        {
+            assert_eq!(
+                is_kache_subcommand_or_flag(name),
+                cmd.find_subcommand(name).is_some(),
+                "{name}"
+            );
+        }
     }
 
     fn s(args: &[&str]) -> Vec<String> {
@@ -1982,10 +2023,6 @@ mod tests {
             classify_by_filename("foo.tar"),
             ArtifactKind::Other("unknown-ext")
         );
-        assert_eq!(
-            ArtifactKind::Metadata.link_strategy(),
-            LinkStrategy::WritableCopy
-        );
         // DebugBundle restores via hardlink like every immutable kind — the
         // tar is never mutated in place (the unpack writes siblings).
         assert_eq!(
@@ -2127,9 +2164,24 @@ pub(crate) mod shim {
     }
 
     fn invoked_as_compiler_for(arg0: &str, env: &super::InvocationEnv) -> bool {
+        if names_kache(arg0) {
+            return false;
+        }
         let argv = [arg0.to_owned()];
         super::rustdoc::RustdocCompiler::recognizes(&argv)
             || super::cc::CcCompiler::recognizes_for(&argv, env)
+    }
+
+    /// Whether `arg0` is kache's own frontend or engine by name: kache run as
+    /// itself, never a compiler. Without this every `kache <command>`, even
+    /// `kache --help`, ran the C-family probe on kache and left its negative
+    /// memo in the default cache folder.
+    pub(crate) fn names_kache(arg0: &str) -> bool {
+        super::command_basename(arg0)
+            .map(super::strip_windows_exe_suffix)
+            .is_some_and(|name| {
+                name.eq_ignore_ascii_case("kache") || name.eq_ignore_ascii_case("kache-engine")
+            })
     }
 
     /// The real compiler behind a shim: the first `name` on `PATH` that is not
