@@ -4775,10 +4775,21 @@ fn compute_key_into(
         }
     }
 
+    // A double-wrapper invocation (`clippy-driver rustc ...`) reports the
+    // outer driver's banner, which has no `host:` line. The inner rustc's
+    // verbose version (file-cached) names the host the unit compiles for;
+    // without it every host clippy unit would read as a possible Apple target.
+    let inner_rustc_version = match args.inner_rustc.as_deref() {
+        Some(inner) if args.target.is_none() && rustc_host_triple(&rustc_version).is_none() => {
+            get_rustc_version_for(inner, invocation).ok()
+        }
+        _ => None,
+    };
     let compiler_target = args
         .target
         .as_deref()
-        .or_else(|| rustc_host_triple(&rustc_version));
+        .or_else(|| rustc_host_triple(&rustc_version))
+        .or_else(|| inner_rustc_version.as_deref().and_then(rustc_host_triple));
 
     // Pre-audit clients can store an EXE-only entry under the old key. Keep
     // those entries out of every local/remote lookup and committed-peer
