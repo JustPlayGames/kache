@@ -1895,7 +1895,9 @@ fn main() {
     );
     assert_eq!(std::fs::read_link(out_dir_of(&second)).unwrap(), shared);
 
-    // A changed declared timestamp selects a different sealed run.
+    // A changed declared timestamp alone reruns the script for Cargo, and the
+    // fork's content keys link the same sealed run again (upstream's #1779
+    // keys the time and seals another run).
     touch_build_rs();
     let mark = event_count(&fx.cache);
     let output = run(&mut cargo(
@@ -1909,9 +1911,9 @@ fn main() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "consistent");
     assert_eq!(
         results_for(&events_since(&fx.cache, mark), "build_script_run"),
-        vec!["miss"]
+        vec!["local_hit"]
     );
-    assert_ne!(std::fs::read_link(out_dir_of(&second)).unwrap(), shared);
+    assert_eq!(std::fs::read_link(out_dir_of(&second)).unwrap(), shared);
     assert_eq!(std::fs::read(shared.join("derived.rs")).unwrap(), sealed);
 
     touch_build_rs();

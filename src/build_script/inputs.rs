@@ -1,6 +1,7 @@
 //! The state of a declared build-script input: a file's content, a
 //! directory's listing, a symlink's target and referent, or its absence.
-//! Run-cache keys also include modification times; compiler keys do not.
+//! Upstream's run-cache keys also include modification times; the fork's
+//! keep contents only, as compiler keys do (see `RUN_KEYS_INPUT_TIMES`).
 //! Large directories are digested once per stamp of their entries' metadata.
 //!
 //! The run cache walks a tree leaving out only the paths it names, and
@@ -138,8 +139,17 @@ pub(super) fn input_state_as(
     input_state_with_walk(path, &walk, file_hasher, budget, symlink_depth, text)
 }
 
-/// Declared inputs also carry observable modification times. The implicit
-/// package dependency follows Cargo's file list and omits directory times.
+/// Fork (tasty): whether build-script run keys include the modification
+/// times of declared inputs, as upstream #1779 does. They do not: Git gives
+/// every checkout new file times, so keyed times made each new worktree run
+/// a workspace's build scripts again, where content keys share one run
+/// between all of them. A script that writes an input's time into what it
+/// outputs can replay another checkout's time, as before #1779; `true` brings
+/// back upstream's rule (and needs a new `ACTION_KIND`).
+const RUN_KEYS_INPUT_TIMES: bool = false;
+
+/// The state of a build script's declared input in its run key: its content
+/// only, unless [`RUN_KEYS_INPUT_TIMES`] keys times too.
 pub(super) fn run_input_state(
     path: &Path,
     excluded: &[PathBuf],
@@ -148,12 +158,35 @@ pub(super) fn run_input_state(
     symlink_depth: usize,
     default_package: bool,
 ) -> Result<String> {
+    timed_run_input_state(
+        path,
+        excluded,
+        file_hasher,
+        budget,
+        symlink_depth,
+        default_package,
+        RUN_KEYS_INPUT_TIMES,
+    )
+}
+
+/// Upstream's rule when `keyed_times`: declared inputs also carry observable
+/// modification times. The implicit package dependency follows Cargo's file
+/// list and omits directory times.
+fn timed_run_input_state(
+    path: &Path,
+    excluded: &[PathBuf],
+    file_hasher: &crate::cache_key::FileHasher<'_>,
+    budget: &mut usize,
+    symlink_depth: usize,
+    default_package: bool,
+    keyed_times: bool,
+) -> Result<String> {
     let walk = Walk {
         excluded,
-        input_times: if default_package {
-            InputTimes::Files
-        } else {
-            InputTimes::FilesAndDirectories
+        input_times: match (keyed_times, default_package) {
+            (false, _) => InputTimes::ContentOnly,
+            (true, true) => InputTimes::Files,
+            (true, false) => InputTimes::FilesAndDirectories,
         },
         ..Walk::default()
     };
@@ -625,6 +658,73 @@ fn record_tree_digest_memo(
 mod tests {
     use super::*;
 
+    /// Upstream's rule (#1779), which the fork keeps but does not use, so its
+    /// tests still guard the timed walks.
+    fn upstream_run_input_state(
+        path: &Path,
+        excluded: &[PathBuf],
+        file_hasher: &crate::cache_key::FileHasher<'_>,
+        budget: &mut usize,
+        symlink_depth: usize,
+        default_package: bool,
+    ) -> Result<String> {
+        timed_run_input_state(
+            path,
+            excluded,
+            file_hasher,
+            budget,
+            symlink_depth,
+            default_package,
+            true,
+        )
+    }
+
+    #[test]
+    fn fork_run_keys_hold_contents_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("package");
+        let input = package.join("data/input");
+        write(&input, "same bytes");
+        let hasher = crate::cache_key::FileHasher::new();
+        let stamp = |path: &Path, seconds| {
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
+        };
+        for path in [&input, &package.join("data"), &package] {
+            stamp(path, 1_700_000_000);
+        }
+        let keys = || {
+            [&input, &package.join("data")]
+                .map(|path| run_input_state(path, &[], &hasher, &mut 20, 0, false).unwrap())
+                .into_iter()
+                .chain([run_input_state(&package, &[], &hasher, &mut 20, 0, true).unwrap()])
+                .collect::<Vec<_>>()
+        };
+        let before = keys();
+        assert_eq!(
+            before[0],
+            input_state(&input, &[], &hasher, &mut 20, 0).unwrap(),
+            "a run key's input state is the content key"
+        );
+        // A new checkout: equal bytes, new times on files and directories.
+        for (path, seconds) in [
+            (&input, 1_700_000_100),
+            (&package.join("data"), 1_700_000_200),
+        ] {
+            stamp(path, seconds);
+        }
+        stamp(&package, 1_700_000_300);
+        assert_eq!(keys(), before, "times alone never change a run key");
+        write(&input, "other bytes");
+        stamp(&input, 1_700_000_100);
+        let changed = keys();
+        for (index, key) in changed.iter().enumerate() {
+            assert_ne!(
+                key, &before[index],
+                "content changes every run key ({index})"
+            );
+        }
+    }
+
     #[test]
     fn run_keys_track_seconds_and_nanoseconds_without_changing_content_keys() {
         let temp = tempfile::tempdir().unwrap();
@@ -636,7 +736,7 @@ mod tests {
                 .unwrap();
         };
         let content = || input_state(&file, &[], &hasher, &mut 10, 0).unwrap();
-        let run = || run_input_state(&file, &[], &hasher, &mut 10, 0, false).unwrap();
+        let run = || upstream_run_input_state(&file, &[], &hasher, &mut 10, 0, false).unwrap();
         stamp(1_700_000_000, 100);
         let original = run();
         let content_key = content();
@@ -707,8 +807,10 @@ mod tests {
         filetime::set_file_mtime(&package, old).unwrap();
         let excluded = [package.join("target"), package.join(".git")];
         let hasher = crate::cache_key::FileHasher::new();
-        let implicit = || run_input_state(&package, &excluded, &hasher, &mut 20, 0, true).unwrap();
-        let explicit = || run_input_state(&package, &[], &hasher, &mut 20, 0, false).unwrap();
+        let implicit =
+            || upstream_run_input_state(&package, &excluded, &hasher, &mut 20, 0, true).unwrap();
+        let explicit =
+            || upstream_run_input_state(&package, &[], &hasher, &mut 20, 0, false).unwrap();
         let before = implicit();
         let explicit_before = explicit();
         filetime::set_file_mtime(&package, newer).unwrap();
@@ -804,7 +906,7 @@ mod tests {
         filetime::set_file_mtime(&file, old).unwrap();
         filetime::set_symlink_file_times(&link, old, old).unwrap();
         let hasher = crate::cache_key::FileHasher::new();
-        let key = || run_input_state(&link, &[], &hasher, &mut 10, 0, false).unwrap();
+        let key = || upstream_run_input_state(&link, &[], &hasher, &mut 10, 0, false).unwrap();
         let before = key();
         filetime::set_file_mtime(&file, newer).unwrap();
         assert_ne!(key(), before);
@@ -827,7 +929,7 @@ mod tests {
             filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1_700_000_001, 0))
                 .unwrap();
         })));
-        let result = run_input_state(&file, &[], &hasher, &mut 10, 0, false);
+        let result = upstream_run_input_state(&file, &[], &hasher, &mut 10, 0, false);
         crate::cache_key::set_before_read(None);
         assert!(
             result

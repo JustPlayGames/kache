@@ -95,9 +95,11 @@ const PREDICTION_PREFIX: &str = "build-script:";
 const PREDICTION_CONFIGURATION: &[&str] = &["TARGET", "HOST", "PROFILE", "OPT_LEVEL", "DEBUG"];
 /// A v2 key could replay a search path in a sibling Cargo build unit without
 /// restoring its library. Version 3 refuses those runs unless a dependency
-/// handed down the path and keys the dependency contents. Version 4 keys
-/// modification times of declared inputs too.
-const ACTION_KIND: &[u8] = b"kache-build-script-action-v4";
+/// handed down the path and keys the dependency contents. Upstream's
+/// version 4 keys modification times of declared inputs too; the fork keys
+/// contents only (`inputs::RUN_KEYS_INPUT_TIMES`), so its runs are version 3
+/// runs and the ones already stored keep hitting.
+const ACTION_KIND: &[u8] = b"kache-build-script-action-v3";
 /// Marks a script binary that writes into its inputs on every run.
 const UNSETTLED_PREFIX: &str = "unsettled:";
 const MANIFEST_NAME: &str = "kache-build-script.json";
@@ -2839,13 +2841,11 @@ fn modified_since(path: &Path, excluded: &[PathBuf], since: std::time::SystemTim
 }
 
 fn package_exclusions(package: &Path, environment: &Environment) -> Vec<PathBuf> {
-    // Cargo's extraction markers are not source inputs (cargo package --list).
-    let mut excluded = vec![
-        package.join(".git"),
-        package.join("target"),
-        package.join(".cargo-ok"),
-        package.join(".cargo-checksum.json"),
-    ];
+    // Fork: upstream (#1779) also leaves out Cargo's extraction markers,
+    // `.cargo-ok` and `.cargo-checksum.json`. Their bytes never change once a
+    // package is extracted, and leaving them out would change the version 3
+    // key of every registry script keyed by its whole package.
+    let mut excluded = vec![package.join(".git"), package.join("target")];
     for (root, placeholder) in &environment.mappings {
         if *placeholder == TARGET_DIR_PLACEHOLDER && root.starts_with(package) {
             excluded.push(root.clone());
@@ -3102,8 +3102,6 @@ mod tests {
             vec![
                 PathBuf::from("/src/pkg/.git"),
                 PathBuf::from("/src/pkg/target"),
-                PathBuf::from("/src/pkg/.cargo-ok"),
-                PathBuf::from("/src/pkg/.cargo-checksum.json"),
                 PathBuf::from("/src/pkg/target/debug"),
             ],
             "only target roots under the package are excluded, never the manifest root"

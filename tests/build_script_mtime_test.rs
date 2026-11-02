@@ -1,4 +1,6 @@
-//! Build-script timestamp inputs must not turn a cache hit into stale code.
+//! Build-script inputs and their timestamps. Upstream (#1779) keys declared
+//! inputs' times; the fork keys their contents only, so these tests pin that
+//! times alone share a run and new content does not.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -121,6 +123,10 @@ fn script(events: &[serde_json::Value]) -> &serde_json::Value {
         .expect("a build-script event")
 }
 
+/// The fork keys declared inputs by content only (`RUN_KEYS_INPUT_TIMES` in
+/// src/build_script/inputs.rs): a new checkout gives every file a new time,
+/// and its scripts must still share the runs stored from other checkouts.
+/// Upstream (#1779) keys the times and these steps miss there.
 fn changed_timestamp(hermetic: bool, directory: bool) {
     build_kache();
     let temp = tempfile::tempdir().unwrap();
@@ -130,44 +136,55 @@ fn changed_timestamp(hermetic: bool, directory: bool) {
     let cache = root.join("cache");
     configure(&cache);
     let _daemon = DaemonGuard::new(kache_binary(), &cache);
-    let old = OLD.to_string();
-    build(&source, &root.join("t0"), &cache, hermetic, true, &old);
+    let step = |target: &str| {
+        build(
+            &source,
+            &root.join(target),
+            &cache,
+            hermetic,
+            false,
+            "constant",
+        )
+    };
+    step("t0");
     // Hermetic mode needs one run with known declarations to seal its output.
     if hermetic {
-        build(&source, &root.join("t1"), &cache, true, true, &old);
+        step("t1");
     }
-    let warm = build(&source, &root.join("t2"), &cache, hermetic, true, &old);
+    let warm = step("t2");
     assert_eq!(script(&warm)["result"], "local_hit");
     let old_key = script(&warm)["cache_key"].clone();
 
     timestamp(&source.join("data/input.txt"), OLD + 60);
-    let new = (OLD + 60).to_string();
-    let changed = build(&source, &root.join("t3"), &cache, hermetic, true, &new);
-    assert_eq!(script(&changed)["result"], "miss");
-    let new_key = script(&changed)["cache_key"].clone();
-    assert_ne!(old_key, new_key);
-    let again = build(&source, &root.join("t4"), &cache, hermetic, true, &new);
-    assert_eq!(script(&again)["result"], "local_hit");
-    assert_eq!(script(&again)["cache_key"], new_key);
+    timestamp(&source.join("data"), OLD + 60);
+    let retimed = step("t3");
+    assert_eq!(script(&retimed)["result"], "local_hit", "times alone");
+    assert_eq!(script(&retimed)["cache_key"], old_key);
 
-    timestamp(&source.join("data/input.txt"), OLD);
-    let reverted = build(&source, &root.join("t5"), &cache, hermetic, true, &old);
+    std::fs::write(source.join("data/input.txt"), "other bytes\n").unwrap();
+    timestamp(&source.join("data/input.txt"), OLD + 60);
+    let changed = step("t4");
+    assert_eq!(script(&changed)["result"], "miss", "new content");
+    assert_ne!(script(&changed)["cache_key"], old_key);
+
+    std::fs::write(source.join("data/input.txt"), "identical bytes\n").unwrap();
+    let reverted = step("t5");
     assert_eq!(script(&reverted)["result"], "local_hit");
     assert_eq!(script(&reverted)["cache_key"], old_key);
 }
 
 #[test]
-fn declared_file_timestamp_changes_do_not_replay_stale_outputs() {
+fn declared_file_timestamp_changes_share_the_run() {
     changed_timestamp(false, false);
 }
 
 #[test]
-fn declared_directory_tracks_its_child_timestamps() {
+fn declared_directory_timestamp_changes_share_the_run() {
     changed_timestamp(false, true);
 }
 
 #[test]
-fn hermetic_runs_track_declared_input_timestamps() {
+fn hermetic_runs_share_across_declared_input_timestamps() {
     changed_timestamp(true, false);
 }
 
@@ -182,9 +199,12 @@ fn a_script_rerun_with_unchanged_outputs_keeps_the_rust_hit() {
     configure(&cache);
     let _daemon = DaemonGuard::new(kache_binary(), &cache);
     build(&source, &root.join("t0"), &cache, false, false, "constant");
+    // Cargo reruns the script for a new time; the fork's content key replays
+    // the stored run (upstream's timed key runs it again), and the crate
+    // that reads its output hits either way.
     timestamp(&source.join("data/input.txt"), OLD + 60);
     let events = build(&source, &root.join("t1"), &cache, false, false, "constant");
-    assert_eq!(script(&events)["result"], "miss");
+    assert_eq!(script(&events)["result"], "local_hit");
     assert!(
         events
             .iter()
@@ -310,8 +330,10 @@ fn restoring_a_header_does_not_hide_its_change_from_incremental_native_builds() 
     }
 }
 
+/// The fork keys Cargo's extraction markers as before #1779 (they never change
+/// once a package is extracted), so only a target directory is left out here.
 #[test]
-fn implicit_package_reuse_survives_directory_and_cargo_marker_changes() {
+fn implicit_package_reuse_survives_directory_and_time_changes() {
     build_kache();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
@@ -328,8 +350,6 @@ fn implicit_package_reuse_survives_directory_and_cargo_marker_changes() {
     build(&source, &root.join("t0"), &cache, false, false, "constant");
     std::fs::create_dir(source.join("target")).unwrap();
     std::fs::write(source.join("target/ignored"), "ignored").unwrap();
-    std::fs::write(source.join(".cargo-ok"), "{}").unwrap();
-    std::fs::write(source.join(".cargo-checksum.json"), "{}").unwrap();
     let events = build(&source, &root.join("t1"), &cache, false, false, "constant");
     assert_eq!(script(&events)["result"], "local_hit");
     std::fs::remove_dir_all(source.join("target")).unwrap();
@@ -337,5 +357,8 @@ fn implicit_package_reuse_survives_directory_and_cargo_marker_changes() {
     assert_eq!(script(&events)["result"], "local_hit");
     timestamp(&source.join("data/input.txt"), OLD + 60);
     let events = build(&source, &root.join("t3"), &cache, false, false, "constant");
-    assert_eq!(script(&events)["result"], "miss");
+    assert_eq!(script(&events)["result"], "local_hit", "times alone");
+    std::fs::write(source.join("data/input.txt"), "other bytes\n").unwrap();
+    let events = build(&source, &root.join("t4"), &cache, false, false, "constant");
+    assert_eq!(script(&events)["result"], "miss", "new content");
 }

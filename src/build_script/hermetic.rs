@@ -363,7 +363,9 @@ fn fold_declared_env(
 /// the sandbox repeats it.
 pub(super) fn key(run: &Run, prediction: &Prediction, below_target: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
-    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v3");
+    // Fork: upstream's v3 keys input times (#1779); the fork keys contents,
+    // as v2 runs did.
+    fold(&mut hasher, "kind", b"kache-build-script-hermetic-v2");
     fold(
         &mut hasher,
         "key_version",
