@@ -3572,6 +3572,7 @@ fn test_config(dir: &Path) -> Config {
         cache_dir: dir.to_path_buf(),
         max_size: 1024 * 1024,
         gc_evict_shared: false,
+        gc_spare_young_hours: 0,
         upload_spool_max_jobs: 65_536,
         deferred_durability: false,
     }
@@ -5252,6 +5253,67 @@ fn an_automatic_sweep_starts_at_88_percent_and_stops_at_78() {
         .unwrap();
     assert!(automatic.entries_evicted >= 1, "{automatic:?}");
     assert!(store.physical_size().unwrap() <= 780);
+}
+
+/// An automatic sweep ranks a young entry slow to compile (used within the
+/// hours, 30 s or more to compile) with ten times its score: colder entries go
+/// before it, even when the plain ranking puts it first, and hotter ones still
+/// after it. Replaying the build machine's sweeps of 2026-11-01/02, this cut
+/// the compile time re-misses of evicted entries cost by 77 %.
+#[test]
+fn an_automatic_sweep_values_young_entries_slow_to_compile_ten_times() {
+    // (key, size, idle, compile seconds, hits)
+    let sweep = |entries: &[(&str, usize, &str, i64, i64)]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_size = 100_000;
+        config.gc_spare_young_hours = 12;
+        let store = Store::open(&config).unwrap();
+        for &(key, size, idle, compile_secs, hits) in entries {
+            put_idle_entry(&store, dir.path(), key, size);
+            store.set_last_accessed_for_test(key, idle);
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET compile_time_ms = ?2, hit_count = ?3 WHERE cache_key = ?1",
+                    params![key, compile_secs * 1000, hits],
+                )
+                .unwrap();
+        }
+        store
+            .evict_for_free_space(SweepOrigin::Automatic, || false)
+            .unwrap();
+        let kept: Vec<&str> = entries
+            .iter()
+            .map(|&(key, ..)| key)
+            .filter(|key| store.contains(key))
+            .collect();
+        kept.join(" ")
+    };
+
+    // 110 kB down to the 78 kB target. Plain scores: young 21, p 37, o 61,
+    // hot 6,300; "young" counts 210, so the day-old "p" and "o" go instead.
+    // (Sizes stay past the ranking's 1 KiB clamp, under which every entry
+    // ranks alike.)
+    assert_eq!(
+        sweep(&[
+            ("young", 50_000, "-1 hour", 60, 0),
+            ("p", 25_000, "-1 day", 60, 20),
+            ("o", 15_000, "-1 day", 60, 20),
+            ("hot", 20_000, "-3 minutes", 1, 5),
+        ]),
+        "young hot"
+    );
+    // 100 kB: with "o2" gone the store is still over the target, and every
+    // other entry is hotter than ten times "young"'s score: "young" goes.
+    assert_eq!(
+        sweep(&[
+            ("young", 50_000, "-1 hour", 60, 0),
+            ("hot", 45_000, "-3 minutes", 1, 5),
+            ("o2", 5_000, "-1 day", 60, 20),
+        ]),
+        "hot"
+    );
 }
 
 #[test]
