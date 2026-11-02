@@ -1,4 +1,6 @@
 mod hit;
+mod memo_flush;
+mod restore_memo;
 mod rustc_hit;
 
 use super::*;
@@ -234,6 +236,9 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     };
     let (relocatable, _) =
         crate::cache_key::relocatable_record(&args, &reads_out_dir, Some("tree")).unwrap();
+    let (home_free, _) =
+        crate::cache_key::registry_relocatable_record(&args, &reads_out_dir, Some("tree"))
+            .expect("a registry unit's relocated row is filed for every Cargo home too");
 
     let key = |dep_info, tree: &str| crate::cache_key::KeyOutputs {
         dep_info: Some(dep_info),
@@ -249,8 +254,16 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
     );
     let hasher = store.file_hasher();
     assert!(hasher.input_prediction(&shared).is_none());
-    let record = hasher.portable_prediction(&relocatable).unwrap();
+    let record = hasher.portable_prediction_under(&relocatable, "tree").unwrap();
     assert_eq!(record.tree, "tree");
+    let home_free = hasher.portable_prediction_under(&home_free, "tree").unwrap();
+    assert_eq!(home_free.tree, "tree");
+    assert!(
+        !serde_json::to_string(&home_free)
+            .unwrap()
+            .contains(&*dir.path().to_string_lossy()),
+        "the row for every home names no path of this one: {home_free:?}"
+    );
 
     let package_only = crate::cache_key::DepInfo {
         source_files: vec![lib],
@@ -267,6 +280,70 @@ fn a_registry_unit_reading_its_out_dir_records_a_relocated_row() {
         hasher.input_prediction(&shared).unwrap().sources,
         package_only.source_files
     );
+}
+
+/// A registry unit's closure is also filed with the Cargo home cut out, so
+/// another home over the same registry finds it: the row names neither home.
+#[test]
+fn a_registry_units_closure_is_filed_for_every_cargo_home() {
+    if std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no rustc");
+        return;
+    }
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.input_predictions = true;
+    let store = Store::open(&config).unwrap();
+    let _out = crate::config::tests::set_env_for_test("OUT_DIR", None);
+    // Parsed after the environment is set: the arguments capture it.
+    let unit = |home: &str, checkout: &str| {
+        let package = dir.path().join(home).join("registry/src/index-1/kt-1.0.0");
+        let lib = package.join("src/lib.rs");
+        let deps = dir.path().join(checkout).join("target/debug/deps");
+        let _manifest =
+            crate::config::tests::set_env_for_test("CARGO_MANIFEST_DIR", Some(package.as_os_str()));
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "kt",
+            lib.to_str().unwrap(),
+            "--out-dir",
+            deps.to_str().unwrap(),
+        ]);
+        (lib, args)
+    };
+    let (_, args_two) = unit("h2", "b");
+    let registry_identity = crate::cache_key::rustc_registry_prediction_identity(&args_two)
+        .expect("a registry unit has a home-free identity");
+    let (lib, args) = unit("h1", "a");
+    assert_eq!(
+        crate::cache_key::rustc_registry_prediction_identity(&args).as_deref(),
+        Some(registry_identity.as_str())
+    );
+    let key = crate::cache_key::KeyOutputs {
+        dep_info: Some(crate::cache_key::DepInfo {
+            source_files: vec![lib],
+            env_deps: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    record_input_prediction(&config, Some(&store), &args, true, &key);
+    let row = store
+        .file_hasher()
+        .input_prediction(&registry_identity)
+        .expect("filed for every home");
+    assert_eq!(row.sources.len(), 1);
+    assert!(
+        !row.sources[0].starts_with(dir.path()),
+        "no home's path in the row: {:?}",
+        row.sources
+    );
+    assert!(row.sources[0].ends_with("index-1/kt-1.0.0/src/lib.rs"));
 }
 
 /// A workspace unit's rows in this checkout, the local one and the shared
@@ -387,6 +464,7 @@ fn a_record_keeps_no_guard_once_its_tree_moved() {
     let shared = crate::cache_key::rustc_shared_prediction_identity(&args).unwrap();
     let (portable, _) = crate::cache_key::workspace_record(&args, &dep_info, Some("tree")).unwrap();
     let record = |guard: crate::cache_key::TreeGuard| {
+        let digest = guard.digest.clone();
         let key = crate::cache_key::KeyOutputs {
             dep_info: Some(dep_info.clone()),
             tree_guard: Some(guard),
@@ -398,7 +476,9 @@ fn a_record_keeps_no_guard_once_its_tree_moved() {
         (
             tree(&local),
             tree(&shared),
-            hasher.portable_prediction(&portable).map(|row| row.tree),
+            hasher
+                .portable_prediction_under(&portable, &digest)
+                .map(|row| row.tree),
         )
     };
 
@@ -831,12 +911,12 @@ fn lookup_or_miss_turns_any_other_error_into_a_miss_without_waiting() {
 }
 
 /// The real failure: another connection holds the index's write lock while a
-/// hit refreshes its access stamp. `Store::get` fails with `SQLITE_BUSY` after
-/// the connection's busy timeout; on its own that error used to make the unit
-/// a passthrough. Through `lookup_or_miss` the lookup is tried again once the
-/// writer commits, and the entry is served.
+/// hit refreshes its access stamp. The stamp gives up after
+/// `HIT_STAMP_BUSY_WAIT` and the entry is served at once, without waiting
+/// for the writer (it used to wait out the 5 s busy timeout and then retry
+/// in `lookup_or_miss` until the writer committed).
 #[test]
-fn a_hit_behind_a_held_index_write_lock_is_served_after_the_writer_commits() {
+fn a_hit_behind_a_held_index_write_lock_is_served_without_waiting_for_the_writer() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(dir.path().join("store"));
     let store = Store::open(&cfg).unwrap();
@@ -851,23 +931,23 @@ fn a_hit_behind_a_held_index_write_lock_is_served_after_the_writer_commits() {
         .unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
 
-    // One pause means the first lookup failed as busy; the pause commits.
-    let mut writer = Some(writer);
     let mut naps = 0;
+    let started = std::time::Instant::now();
     let found = super::lookup_or_miss(
         "held",
         std::time::Duration::from_secs(30),
-        |_| {
-            naps += 1;
-            if let Some(writer) = writer.take() {
-                writer.execute_batch("COMMIT").unwrap();
-            }
-        },
+        |_| naps += 1,
         || super::lookup_local_entry(&store, &[], "held-key"),
     );
-    let (_, meta) = found.expect("served once the writer commits");
+    let waited = started.elapsed();
+    let (_, meta) = found.expect("served while the writer holds the lock");
     assert_eq!(meta.crate_name, "test-crate");
-    assert_eq!(naps, 1);
+    assert_eq!(naps, 0);
+    assert!(
+        waited < std::time::Duration::from_secs(2),
+        "waited {waited:?} for a stamp"
+    );
+    writer.execute_batch("COMMIT").unwrap();
 }
 
 /// Store a small entry so the store has a nonzero size.
@@ -909,7 +989,7 @@ fn auto_gc_wanted_fires_only_over_budget_and_respects_throttle() {
     assert!(stamp.exists(), "under budget must create the stamp");
 
     // Over budget but with a fresh stamp: check is throttled.
-    cfg.max_size = 1024; // 1 KiB budget, store holds 4 KiB (> +10% slack)
+    cfg.max_size = 1024; // 1 KiB budget, store holds 4 KiB
     assert!(
         !auto_gc_wanted(&cfg, &store),
         "fresh stamp must throttle the check even if over budget"
@@ -932,6 +1012,37 @@ fn auto_gc_wanted_fires_only_over_budget_and_respects_throttle() {
         !auto_gc_wanted(&cfg, &store),
         "the triggering check must re-claim the stamp"
     );
+}
+
+/// Wrappers that store at the same moment all find the same expired stamp;
+/// exactly one of them may ask for a sweep. Before the claim moved ahead of
+/// the size query, every one that passed the check before the first wrote
+/// the stamp asked for its own (a hint, or a detached `kache gc` each).
+#[test]
+fn concurrent_auto_gc_checks_claim_the_interval_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1024;
+    let store = Store::open(&cfg).unwrap();
+    for key in ["stampede-1", "stampede-2", "stampede-3"] {
+        put_test_entry(&store, dir.path(), key);
+    }
+    drop(store);
+    let threads = 16;
+    let start = std::sync::Barrier::new(threads);
+    let wanted = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let store = Store::open(&cfg).unwrap();
+                start.wait();
+                if auto_gc_wanted(&cfg, &store) {
+                    wanted.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    assert_eq!(wanted.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -982,7 +1093,7 @@ fn disk_pressure_hints_even_below_cache_budget_and_the_detached_worker_recovers(
 }
 
 #[test]
-fn auto_gc_wanted_respects_disable_and_slack() {
+fn auto_gc_wanted_respects_disable_and_the_trigger() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(dir.path().to_path_buf());
     let store = Store::open(&cfg).unwrap();
@@ -993,13 +1104,13 @@ fn auto_gc_wanted_respects_disable_and_slack() {
     cfg.max_size = 1;
     assert!(!auto_gc_wanted(&cfg, &store), "auto_gc=false must disable");
 
-    // Enabled but within the +10% slack band: no trigger. The store holds
-    // exactly 4096 bytes; max_size 4000 → threshold 4400 ≥ 4096.
+    // Enabled but under the trigger. The store holds exactly 4096 bytes;
+    // max_size 5000 → trigger 4500 ≥ 4096.
     cfg.auto_gc = true;
-    cfg.max_size = 4000;
+    cfg.max_size = 5000;
     assert!(
         !auto_gc_wanted(&cfg, &store),
-        "inside the slack band must not trigger"
+        "under the trigger must not start a sweep"
     );
 }
 
@@ -1218,8 +1329,9 @@ fn auto_gc_constants_are_pinned() {
     assert_eq!(AUTO_GC_SLACK_PERCENT, 10);
     assert_eq!(AUTO_GC_MAX_BACKOFF.as_secs(), 7200);
     assert_eq!(AUTO_GC_HELD_TTL.as_secs(), 21_600);
-    // Start above 110% of max_size, stop at 90%.
-    assert_eq!(auto_gc_threshold(1000), 1100);
+    // Start above 88% of max_size, stop at 78%; `kache gc` stops at 90%.
+    assert_eq!(auto_gc_threshold(1000), 880);
+    assert_eq!(kache_store::eviction::automatic_target(1000), 780);
     assert_eq!(kache_store::eviction::eviction_target(1000), 900);
 }
 
@@ -1245,47 +1357,48 @@ fn the_outcome_line_mentions_a_wait_only_when_there_is_one() {
     assert!(line.contains("next automatic sweep in 1s"), "{line}");
 }
 
-/// max 1000, so the trigger is 1100.
+/// max 1000, so the trigger is 880.
 #[test]
 fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
     let ttl = AUTO_GC_HELD_TTL.as_secs();
     // Under the trigger only once the held bytes are left out: no
     // backoff, but a record that carries them.
-    let record = next_auto_gc_backoff(None, 50, 5000, 3900, 1000).unwrap();
+    let record = next_auto_gc_backoff(None, 50, 5000, 4120, 1000).unwrap();
     assert_eq!(
         record,
         AutoGcBackoff {
             since: 50,
             interval_secs: 0,
             size_after: 5000,
-            held: 3900,
+            held: 4120,
         }
     );
     assert_eq!(
         next_auto_gc_backoff(None, 50, 5000, 0, 1000).map(|r| r.interval_secs),
         Some(600)
     );
-    assert_eq!(next_auto_gc_backoff(None, 50, 1100, 0, 1000), None);
+    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000), None);
     // Over it even so: a backoff, carrying the held bytes, doubling from
     // the check interval after a record that had none.
-    let backoff = next_auto_gc_backoff(Some(record), 60, 5000, 3899, 1000).unwrap();
-    assert_eq!((backoff.interval_secs, backoff.held), (600, 3899));
+    let backoff = next_auto_gc_backoff(Some(record), 60, 5000, 4119, 1000).unwrap();
+    assert_eq!((backoff.interval_secs, backoff.held), (600, 4119));
 
     assert_eq!(recent_held_bytes(None, 50), 0);
-    assert_eq!(recent_held_bytes(Some(record), 50 + ttl - 1), 3900);
+    assert_eq!(recent_held_bytes(Some(record), 50 + ttl - 1), 4120);
     assert_eq!(recent_held_bytes(Some(record), 50 + ttl), 0);
 
-    assert!(!auto_gc_due_at(Some(record), 60, 5000, 1000));
+    let healthy = || false;
+    assert!(!auto_gc_due_at(Some(record), 60, 5000, 1000, healthy));
     assert!(
-        auto_gc_due_at(Some(record), 60, 5001, 1000),
+        auto_gc_due_at(Some(record), 60, 5001, 1000, healthy),
         "new bytes past the trigger"
     );
     assert!(
-        auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000),
+        auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000, healthy),
         "the figure expired"
     );
-    assert!(auto_gc_due_at(None, 60, 1101, 1000));
-    assert!(!auto_gc_due_at(None, 60, 1100, 1000));
+    assert!(auto_gc_due_at(None, 60, 881, 1000, healthy));
+    assert!(!auto_gc_due_at(None, 60, 880, 1000, healthy));
 }
 
 #[test]
@@ -1293,16 +1406,69 @@ fn auto_gc_sweep_due_starts_above_the_trigger_and_honours_the_backoff() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(dir.path().to_path_buf());
     cfg.max_size = 1000;
-    assert!(!auto_gc_sweep_due(&cfg, 1099));
-    assert!(!auto_gc_sweep_due(&cfg, 1100));
-    assert!(auto_gc_sweep_due(&cfg, 1101));
+    assert!(!auto_gc_sweep_due(&cfg, 879));
+    assert!(!auto_gc_sweep_due(&cfg, 880));
+    assert!(auto_gc_sweep_due(&cfg, 881));
 
-    record_auto_gc_outcome(&cfg, 1101, 0);
-    assert!(!auto_gc_sweep_due(&cfg, 1101), "a held backoff defers");
-    assert!(!auto_gc_sweep_due(&cfg, 1201));
-    assert!(auto_gc_sweep_due(&cfg, 1202), "growth past the slack");
+    record_auto_gc_outcome(&cfg, 881, 0);
+    assert!(!auto_gc_sweep_due(&cfg, 881), "a held backoff defers");
+    assert!(!auto_gc_sweep_due(&cfg, 981));
+    assert!(auto_gc_sweep_due(&cfg, 982), "growth past the slack");
     expire_auto_gc_backoff_for_test(&cfg.cache_dir);
-    assert!(auto_gc_sweep_due(&cfg, 1101));
+    assert!(auto_gc_sweep_due(&cfg, 881));
+}
+
+/// 2026-10-31: every sweep stopped at its walk budget, so `held` was last
+/// written by a whole sweep 6 h earlier. When it expired, the trigger saw
+/// the whole store, target directories' part included, and a sweep ran at
+/// every check.
+#[test]
+fn a_sweep_cut_short_keeps_held_fresh_without_backing_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_path_buf());
+    cfg.max_size = 1000;
+    record_auto_gc_outcome(&cfg, 5000, 4120);
+    assert!(!auto_gc_sweep_due(&cfg, 5000), "held is left out");
+    age_auto_gc_record_for_test(&cfg.cache_dir, AUTO_GC_HELD_TTL.as_secs());
+    assert!(auto_gc_sweep_due(&cfg, 5000), "an expired figure counts for nothing");
+
+    record_auto_gc_cut_short(&cfg, 5000, 4120);
+    assert_eq!(recent_auto_gc_held(&cfg.cache_dir), 4120);
+    assert!(!auto_gc_sweep_due(&cfg, 5000), "fresh again");
+    assert_eq!(auto_gc_backoff_interval_for_test(&cfg.cache_dir), Some(0));
+    assert!(
+        auto_gc_sweep_due(&cfg, 5101),
+        "over the trigger without it: the next check goes on, no backoff"
+    );
+}
+
+/// 2026-10-26: a sweep ended over the trigger at 19:04Z and its 600 s
+/// backoff held while builds took free space from 15 GiB to ENOSPC.
+#[test]
+fn a_disk_running_low_starts_the_sweep_through_the_backoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().join("cache"));
+    std::fs::create_dir_all(&cfg.cache_dir).unwrap();
+    cfg.max_size = 1000;
+    cfg.auto_recover_min_free_bytes = 10;
+    let usage = |free| {
+        kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(kache_fs::VolumeUsage { total: 1000, free }),
+        )
+    };
+    record_auto_gc_outcome(&cfg, 881, 0);
+    {
+        let _healthy = usage(25);
+        assert!(!auto_gc_sweep_due(&cfg, 881), "the backoff holds");
+    }
+    {
+        let _low = usage(24);
+        assert!(auto_gc_sweep_due(&cfg, 881), "low disk ends the backoff");
+        assert!(!auto_gc_sweep_due(&cfg, 880), "but not the trigger");
+        cfg.auto_recover_min_free_bytes = 0;
+        assert!(!auto_gc_sweep_due(&cfg, 881), "no floor, no low band");
+    }
 }
 
 #[test]
@@ -1311,12 +1477,12 @@ fn auto_gc_wanted_starts_one_byte_above_the_trigger() {
     let mut cfg = test_config(dir.path().to_path_buf());
     cfg.max_size = 1000;
     let store = Store::open(&cfg).unwrap();
-    put_sized_entry(&store, dir.path(), "at-the-trigger", 1100);
-    assert_eq!(store.physical_size().unwrap(), 1100);
+    put_sized_entry(&store, dir.path(), "at-the-trigger", 880);
+    assert_eq!(store.physical_size().unwrap(), 880);
     assert!(!auto_gc_wanted(&cfg, &store));
 
     put_sized_entry(&store, dir.path(), "x", 1);
-    assert_eq!(store.physical_size().unwrap(), 1101);
+    assert_eq!(store.physical_size().unwrap(), 881);
     expire_auto_gc_stamp(&cfg);
     assert!(auto_gc_wanted(&cfg, &store));
 }
@@ -1673,15 +1839,15 @@ fn unix_now_secs_reads_the_wall_clock() {
 
 #[test]
 fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
-    // max 1000: the trigger is 1100.
-    assert_eq!(next_auto_gc_backoff(None, 50, 1100, 0, 1000), None);
-    let first = next_auto_gc_backoff(None, 50, 1101, 0, 1000).unwrap();
+    // max 1000: the trigger is 880.
+    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000), None);
+    let first = next_auto_gc_backoff(None, 50, 881, 0, 1000).unwrap();
     assert_eq!(
         first,
         AutoGcBackoff {
             since: 50,
             interval_secs: 600,
-            size_after: 1101,
+            size_after: 881,
             held: 0,
         }
     );
@@ -1705,7 +1871,7 @@ fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
             .interval_secs,
         7200
     );
-    assert_eq!(next_auto_gc_backoff(Some(second), 100, 900, 0, 1000), None);
+    assert_eq!(next_auto_gc_backoff(Some(second), 100, 880, 0, 1000), None);
 }
 
 #[test]
@@ -1743,7 +1909,7 @@ fn record_auto_gc_outcome_persists_the_backoff_until_the_store_fits() {
         1200
     );
 
-    record_auto_gc_outcome(&cfg, 900, 0);
+    record_auto_gc_outcome(&cfg, 880, 0);
     assert!(!auto_gc_backoff_path(&cfg.cache_dir).exists());
     assert!(auto_gc_sweep_due(&cfg, 5000));
 }
@@ -2083,6 +2249,7 @@ fn restore_failure_reasons_flatten_archive_text() {
         &deps.join("foo.dsym.tar"),
         ArtifactKind::DebugBundle,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -2090,6 +2257,7 @@ fn restore_failure_reasons_flatten_archive_text() {
         &*platform::current(),
         "rustc restore",
         None,
+        false,
     )
     .unwrap_err();
 
@@ -4862,6 +5030,7 @@ fn materialize_cached_artifact_reports_missing_blob_as_cache_miss() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4869,6 +5038,7 @@ fn materialize_cached_artifact_reports_missing_blob_as_cache_miss() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap_err()
     .to_string();
@@ -4906,6 +5076,7 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
         &target,
         ArtifactKind::DepInfo,
         None,
+        false,
         &anchor,
         dir.path(),
         None,
@@ -4913,6 +5084,7 @@ fn materialize_cached_artifact_expands_depinfo_blob_without_rewriting_store_blob
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -4976,6 +5148,7 @@ fn materialize_cached_artifact_restores_executable_bit_recorded_at_insert() {
         &target,
         ArtifactKind::Other("rustc:unknown"),
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -4983,6 +5156,7 @@ fn materialize_cached_artifact_restores_executable_bit_recorded_at_insert() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5018,6 +5192,7 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5025,6 +5200,7 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5040,15 +5216,7 @@ fn materialize_cached_artifact_leaves_non_executable_artifacts_unexecutable() {
 
 #[test]
 fn restore_link_strategy_shares_only_the_named_loadable_kind() {
-    use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink, WritableCopy};
-    assert_eq!(
-        restore_link_strategy(ArtifactKind::Metadata, false, None),
-        WritableCopy
-    );
-    assert_eq!(
-        restore_link_strategy(ArtifactKind::Metadata, true, None),
-        Copy
-    );
+    use link::LinkStrategy::{Copy, ExecutableHardlink, Hardlink};
     let proc_macro = Some(ArtifactKind::DynamicLibrary);
     let build_script = Some(ArtifactKind::Executable);
     assert_eq!(
@@ -5158,6 +5326,7 @@ fn materialize_shared_loadable_restores_a_loadable_file_and_leaves_the_blob() {
         &target,
         ArtifactKind::DynamicLibrary,
         Some(ArtifactKind::DynamicLibrary),
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5165,6 +5334,7 @@ fn materialize_shared_loadable_restores_a_loadable_file_and_leaves_the_blob() {
         &crate::compiler::platform::LinuxPlatform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5240,6 +5410,329 @@ fn restore_from_cache_shares_a_proc_macro_inode_but_copies_a_user_binary() {
     assert_eq!(mode & 0o777, 0o755);
 }
 
+// ── test binaries restored by private copies ──────────────────────
+
+/// A restore never re-dates a test binary that another target holds. Cargo
+/// judges a test binary by its own mtime against its dependencies' outputs,
+/// so a restore's stamp that reached another target's test binary, whose
+/// library that target rebuilt since, made the stale binary look fresh: Cargo
+/// ran the old code. Without reflink, every target restores a private,
+/// runnable copy, also of a blob that is the output it was stored from
+/// (test binaries are stored by hardlink).
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_from_cache_never_re_dates_another_targets_test_binary() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let hash = "8787878787878787878787878787878787878787878787878787878787878787";
+    create_blob(&store, hash, b"test binary");
+    let blob = store.blob_path(hash);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if crate::link::try_reflink(&blob, &dir.path().join("probe")).is_ok() {
+        eprintln!("reflink available; the no-CoW restore path is not reachable here");
+        return;
+    }
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&blob, old).unwrap();
+    let size = crate::prestage::MIN_BYTES * 2;
+    let deps = |tree: &str| dir.path().join(tree).join("target/debug/deps");
+    // Target a's own build stored its test binary: the output is the blob.
+    let stored = deps("a").join("hk-1");
+    std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+    std::fs::hard_link(&blob, &stored).unwrap();
+    let restore = |tree: &str| {
+        let root = dir.path().join(tree);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"hk\"\n").unwrap();
+        let out_dir_str = deps(tree).to_str().unwrap().to_string();
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "hk",
+            "src/lib.rs",
+            "--test",
+            "--emit",
+            "link",
+            "--out-dir",
+            &out_dir_str,
+            "-C",
+            "extra-filename=-1",
+        ]);
+        let mut cached = cached_file("hk-1", hash);
+        cached.executable = true;
+        cached.size = size;
+        let mut meta = entry_meta("hk", vec![cached], &["link"]);
+        meta.crate_types.clear(); // `--test`: no crate type
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        deps(tree).join("hk-1")
+    };
+    let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+    let mtime = |path: &Path| {
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(path).unwrap())
+    };
+
+    let b = restore("b");
+    let c = restore("c");
+    assert_eq!(
+        mtime(&stored),
+        old,
+        "b's and c's restores left a's test binary alone"
+    );
+    assert_ne!(ino(&b), ino(&blob), "b runs a private copy");
+    assert_ne!(ino(&c), ino(&blob), "c runs a private copy");
+    assert_ne!(ino(&b), ino(&c));
+    assert!(mtime(&b) > old && mtime(&c) > old, "each copy is stamped");
+    for copy in [&b, &c] {
+        assert_eq!(std::fs::metadata(copy).unwrap().mode() & 0o111, 0o111);
+        assert_eq!(std::fs::read(copy).unwrap(), b"test binary");
+    }
+    // Restoring it again where a copy already is stamps that copy alone.
+    let again = restore("b");
+    assert_eq!(ino(&again), ino(&b));
+    assert_eq!(mtime(&stored), old);
+}
+
+/// End to end on Linux without reflink: a pipelined library restored into
+/// two targets shares its rlib blob's inode in both, at the blob's own mtime,
+/// while each target gets an `.rmeta` stamped by its restore, the output
+/// Cargo reads. The second restore re-dates nothing in the first (#794).
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_from_cache_shares_an_rlib_inode_and_stamps_only_the_rmeta() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let rlib_hash = "9191919191919191919191919191919191919191919191919191919191919191";
+    let rmeta_hash = "9292929292929292929292929292929292929292929292929292929292929292";
+    create_blob(&store, rlib_hash, b"rlib bytes");
+    create_blob(&store, rmeta_hash, b"rmeta bytes");
+    let (rlib_blob, rmeta_blob) = (store.blob_path(rlib_hash), store.blob_path(rmeta_hash));
+    if crate::link::try_reflink(&rlib_blob, &dir.path().join("probe")).is_ok() {
+        eprintln!("reflink available; the no-CoW restore path is not reachable here");
+        return;
+    }
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for blob in [&rlib_blob, &rmeta_blob] {
+        std::fs::set_permissions(blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        filetime::set_file_mtime(blob, old).unwrap();
+    }
+    let restore = |tree: &str| {
+        let root = dir.path().join(tree);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"hk\"\n").unwrap();
+        let out_dir = root.join("target/debug/deps");
+        let out_dir_str = out_dir.to_str().unwrap().to_string();
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "hk",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=metadata,link",
+            "--out-dir",
+            &out_dir_str,
+            "-C",
+            "extra-filename=-1",
+        ]);
+        let files = vec![
+            cached_file("libhk-1.rlib", rlib_hash),
+            cached_file("libhk-1.rmeta", rmeta_hash),
+        ];
+        let meta = entry_meta("hk", files, &["metadata", "link"]);
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        (out_dir.join("libhk-1.rlib"), out_dir.join("libhk-1.rmeta"))
+    };
+    let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+    let mtime = |path: &Path| {
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(path).unwrap())
+    };
+
+    let (a_rlib, a_rmeta) = restore("a");
+    let a_rmeta_mtime = mtime(&a_rmeta);
+    assert_eq!(ino(&a_rlib), ino(&rlib_blob));
+    assert_eq!(
+        mtime(&a_rlib),
+        old,
+        "the shared rlib keeps the blob's mtime"
+    );
+    assert!(a_rmeta_mtime > old, "the rmeta is stamped");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let (b_rlib, b_rmeta) = restore("b");
+    assert_eq!(
+        ino(&b_rlib),
+        ino(&rlib_blob),
+        "every later target shares the rlib too"
+    );
+    assert_ne!(
+        ino(&b_rmeta),
+        ino(&rmeta_blob),
+        "an rmeta another target links is copied"
+    );
+    assert!(mtime(&b_rmeta) > a_rmeta_mtime, "and stamped");
+    assert_eq!(mtime(&a_rlib), old, "restoring b re-dates nothing a reads");
+    assert_eq!(mtime(&a_rmeta), a_rmeta_mtime);
+    assert_eq!(std::fs::read(&b_rlib).unwrap(), b"rlib bytes");
+
+    // Restoring it again where it already is keeps the shared file, unstamped.
+    let (again, _) = restore("a");
+    assert_eq!(ino(&again), ino(&rlib_blob));
+    assert_eq!(mtime(&rlib_blob), old);
+}
+
+/// Only the rlib of a unit whose `.rmeta` Cargo counts as an output, and the
+/// restore writes beside it, is shared that way.
+#[test]
+fn only_a_pipelined_rlib_restores_as_a_shared_inode() {
+    let out = "/t/debug/deps";
+    let args = |crate_type: &str, emit: &str| {
+        rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "hk",
+            "src/lib.rs",
+            "--crate-type",
+            crate_type,
+            emit,
+            "--out-dir",
+            out,
+        ])
+    };
+    let both = [
+        cached_file("libhk-1.rlib", "a"),
+        cached_file("libhk-1.rmeta", "b"),
+    ];
+    let rlib_only = [cached_file("libhk-1.rlib", "a")];
+    let other_rmeta = [
+        cached_file("libhk-1.rlib", "a"),
+        cached_file("libother-2.rmeta", "b"),
+    ];
+    let unix = cfg!(unix);
+    let pipelined = args("lib", "--emit=dep-info,metadata,link");
+    assert_eq!(
+        restores_as_shared_rlib(&pipelined, "libhk-1.rlib", &both),
+        unix
+    );
+    assert_eq!(
+        restores_as_shared_rlib(
+            &args("rlib", "--emit=dep-info,metadata,link"),
+            "libhk-1.rlib",
+            &both
+        ),
+        unix
+    );
+    assert!(
+        !restores_as_shared_rlib(&pipelined, "libhk-1.rmeta", &both),
+        "the rmeta takes the stamp"
+    );
+    assert!(!restores_as_shared_rlib(
+        &pipelined,
+        "libhk-1.rlib",
+        &rlib_only
+    ));
+    assert!(!restores_as_shared_rlib(
+        &pipelined,
+        "libhk-1.rlib",
+        &other_rmeta
+    ));
+    assert!(!restores_as_shared_rlib(
+        &args("lib", "--emit=dep-info,link"),
+        "libhk-1.rlib",
+        &both
+    ));
+    assert!(!restores_as_shared_rlib(
+        &args("lib", "--emit=dep-info,metadata"),
+        "libhk-1.rlib",
+        &both
+    ));
+    for crate_type in ["proc-macro", "dylib", "cdylib", "bin", "staticlib"] {
+        assert!(
+            !restores_as_shared_rlib(
+                &args(crate_type, "--emit=dep-info,metadata,link"),
+                "libhk-1.rlib",
+                &both
+            ),
+            "{crate_type}"
+        );
+    }
+    let to_output = rustc_args(&[
+        "rustc",
+        "--crate-name",
+        "hk",
+        "src/lib.rs",
+        "--crate-type",
+        "lib",
+        "--emit=dep-info,metadata,link",
+        "-o",
+        "/t/libhk-1.rlib",
+    ]);
+    assert!(!restores_as_shared_rlib(&to_output, "libhk-1.rlib", &both));
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Library, false, unix, None, false),
+        if unix {
+            link::LinkStrategy::SharedLibHardlink
+        } else {
+            link::LinkStrategy::Hardlink
+        }
+    );
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Library, true, true, None, false),
+        link::LinkStrategy::Copy,
+        "an executable never shares that way"
+    );
+}
+
+/// `cargo fix` compiles a path package's units again without any wrapper,
+/// and rustc refuses to replace a read-only `.rmeta` (kunobi-ninja/kache#1697):
+/// such a unit's metadata restores as a writable copy. A dependency Cargo
+/// caps, and every rlib, keep sharing the blob's inode.
+#[test]
+fn only_a_path_package_restores_its_metadata_as_a_writable_copy() {
+    let unit = |capped: bool| {
+        let mut argv = vec![
+            "rustc",
+            "--crate-name",
+            "dep",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata,link",
+            "--out-dir",
+            "/t/deps",
+        ];
+        if capped {
+            argv.extend(["--cap-lints", "allow"]);
+        }
+        rustc_args(&argv)
+    };
+    assert!(keeps_metadata_writable(&unit(false)));
+    assert!(!keeps_metadata_writable(&unit(true)));
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Metadata, false, false, None, true),
+        link::LinkStrategy::WritableCopy
+    );
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Metadata, false, false, None, false),
+        link::LinkStrategy::Hardlink
+    );
+    let unix = cfg!(unix);
+    assert_eq!(
+        restore_link_strategy_for(ArtifactKind::Library, false, unix, None, true),
+        if unix {
+            link::LinkStrategy::SharedLibHardlink
+        } else {
+            link::LinkStrategy::Hardlink
+        },
+        "a path package's rlib still shares"
+    );
+}
+
 // ── restored-blob digest reuse (kunobi-ninja/kache#540) ──────────
 
 /// A plain library restore is a verbatim blob copy, so the entry's recorded
@@ -5262,6 +5755,7 @@ fn materialize_reports_a_plain_library_restore_as_an_exact_blob_copy() {
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5269,6 +5763,7 @@ fn materialize_reports_a_plain_library_restore_as_an_exact_blob_copy() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5300,6 +5795,7 @@ fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
         &target,
         ArtifactKind::DepInfo,
         None,
+        false,
         &dir.path().join("target"),
         dir.path(),
         None,
@@ -5307,6 +5803,7 @@ fn materialize_reports_a_rewritten_depinfo_restore_as_not_exact() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5336,6 +5833,7 @@ fn materialize_reports_an_untouched_external_action_as_an_exact_blob_copy() {
         &target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5343,6 +5841,7 @@ fn materialize_reports_an_untouched_external_action_as_an_exact_blob_copy() {
         &platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5378,6 +5877,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
         &target,
         ArtifactKind::Library,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5385,6 +5885,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap() else {
         panic!("a plain library restore should be exact");
@@ -5395,7 +5896,7 @@ fn seeding_does_not_attach_the_blobs_digest_to_a_file_overwritten_since_restore(
     std::fs::remove_file(&target).unwrap();
     std::fs::write(&target, &replacement).unwrap();
 
-    record_known_file_hashes(&store, &[(fingerprint, hash.as_str())]);
+    record_known_file_hashes(&store, &[(fingerprint, hash.as_str())], &[]);
 
     assert!(
         matches!(
@@ -5457,6 +5958,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
         &target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5464,6 +5966,7 @@ fn materialize_reports_a_mutating_external_action_as_not_exact() {
         &RewritingPlatform(dir.path().join("verified")),
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5494,6 +5997,7 @@ fn restore_loadable(
         target,
         ArtifactKind::DynamicLibrary,
         None,
+        false,
         anchor,
         anchor,
         None,
@@ -5501,6 +6005,7 @@ fn restore_loadable(
         platform,
         "test restore",
         None,
+        false,
     )
     .unwrap()
 }
@@ -5817,6 +6322,7 @@ fn materialize_cached_artifact_unpacks_debug_bundle_beside_binary() {
         &target,
         ArtifactKind::DebugBundle,
         None,
+        false,
         dir.path(),
         dir.path(),
         None,
@@ -5824,6 +6330,7 @@ fn materialize_cached_artifact_unpacks_debug_bundle_beside_binary() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -5912,6 +6419,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         &target,
         ArtifactKind::DebugBundle,
         None,
+        false,
         restore_dir.path(),
         restore_dir.path(),
         None,
@@ -5919,6 +6427,7 @@ fn debug_bundle_round_trip_preserves_dwarf_uuid_on_macos() {
         &*platform,
         "test restore",
         None,
+        false,
     )
     .unwrap();
 
@@ -6677,7 +7186,13 @@ struct RemoteCheckReplyDaemon {
     recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     handle: Option<std::thread::JoinHandle<()>>,
     socket_path: PathBuf,
+    delay: std::time::Duration,
 }
+
+/// How long dropping a [`RemoteCheckReplyDaemon`] waits for its accept
+/// thread, beyond its reply delay, before it fails the test instead of
+/// hanging it.
+const FAKE_DAEMON_STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl RemoteCheckReplyDaemon {
     fn spawn(socket_path: PathBuf, found: bool) -> Self {
@@ -6756,6 +7271,7 @@ impl RemoteCheckReplyDaemon {
             recorded,
             handle: Some(handle),
             socket_path,
+            delay,
         }
     }
 
@@ -6765,12 +7281,35 @@ impl RemoteCheckReplyDaemon {
 }
 
 impl Drop for RemoteCheckReplyDaemon {
+    /// Wakes the accept thread until it ends. One wake-up connection is not
+    /// enough on Windows: a client that connects and closes before the thread
+    /// is back in `ConnectNamedPipe` leaves a dead-on-arrival instance, which
+    /// interprocess's `accept` disconnects and waits on again, so the thread
+    /// would block for good and a plain `join` with it (seen 3 times in 480
+    /// runs, 12 at once, on a loaded VM). The deadline turns any other stuck
+    /// thread into a failure rather than a hang.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = crate::transport::is_reachable(&self.socket_path);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + FAKE_DAEMON_STOP_DEADLINE + self.delay;
+        while !handle.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                // The thread is left behind; the test process ends with it.
+                if !std::thread::panicking() {
+                    panic!(
+                        "fake remote-check daemon at {} did not stop within {:?}",
+                        self.socket_path.display(),
+                        FAKE_DAEMON_STOP_DEADLINE + self.delay
+                    );
+                }
+                return;
+            }
+            let _ = crate::transport::is_reachable(&self.socket_path);
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let _ = handle.join();
     }
 }
 
@@ -11117,6 +11656,18 @@ fn refresh_session_marker_extends_own_session_but_never_clobbers_newer() {
     assert_eq!(id, "mine");
     assert!(ts > 1000, "timestamp must be refreshed");
 
+    // Touched moments ago: left alone, nothing written.
+    let fresh = now_epoch_secs() - 1;
+    std::fs::write(&marker, format!("v1 {fresh} mine")).unwrap();
+    refresh_session_marker(&config, root, "mine");
+    assert_eq!(
+        parse_session_marker(&std::fs::read_to_string(&marker).unwrap()).unwrap(),
+        (fresh, "mine".to_string())
+    );
+    assert!(!session_refresh_due(100, 100 + SESSION_REFRESH_SECS - 1));
+    assert!(session_refresh_due(100, 100 + SESSION_REFRESH_SECS));
+    assert!(session_refresh_due(200, 100));
+
     // A newer session re-minted the marker: our refresh must not
     // resurrect the old id over it.
     std::fs::write(&marker, format!("v1 {} newer", now_epoch_secs())).unwrap();
@@ -11704,9 +12255,50 @@ fn only_a_non_linking_compile_that_reports_its_dep_info_is_stopped_on_a_hit() {
     assert!(stop_on_hit_allowed(&parse("lib", true)));
     assert!(stop_on_hit_allowed(&parse("rlib", true)));
     assert!(!stop_on_hit_allowed(&parse("lib", false)));
+    // A compile that links stops only where the stop can prove its linker
+    // never runs on after it (Linux).
     for linked in ["bin", "proc-macro", "cdylib", "dylib"] {
-        assert!(!stop_on_hit_allowed(&parse(linked, true)), "{linked}");
+        assert_eq!(
+            stop_on_hit_allowed(&parse(linked, true)),
+            cfg!(target_os = "linux"),
+            "{linked}"
+        );
+        assert!(!stop_on_hit_allowed(&parse(linked, false)), "{linked}");
     }
+}
+
+/// No compile with rustc's parallel frontend starts before its key to be
+/// stopped on a hit: its frontend threads hold jobserver tokens from before
+/// the dep-info, and a stopped compile never gives them back (measured with
+/// rustc nightly-2026-09-20, `-Zthreads=8`: 7 of 16 tokens gone per stop).
+#[test]
+fn a_parallel_frontend_compile_is_never_stopped_on_a_hit() {
+    let parse = |crate_type: &str, extra: &[&str]| {
+        let mut argv = vec![
+            "rustc",
+            "--crate-name",
+            "x",
+            "src/lib.rs",
+            "--crate-type",
+            crate_type,
+            "--emit=dep-info,metadata,link",
+            "--error-format=json",
+            "--json=artifacts",
+        ];
+        argv.extend_from_slice(extra);
+        RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+    };
+    for crate_type in ["lib", "bin"] {
+        assert!(
+            !stop_on_hit_allowed(&parse(crate_type, &["-Zthreads=8"])),
+            "{crate_type}"
+        );
+        assert!(
+            !stop_on_hit_allowed(&parse(crate_type, &["-Z", "threads=0"])),
+            "{crate_type}"
+        );
+    }
+    assert!(stop_on_hit_allowed(&parse("lib", &["-Zthreads=1"])));
 }
 
 #[test]
@@ -12155,6 +12747,7 @@ fn a_read_only_store_restores_by_copy() {
             target,
             ArtifactKind::Library,
             None,
+            false,
             dir.path(),
             dir.path(),
             None,
@@ -12162,6 +12755,7 @@ fn a_read_only_store_restores_by_copy() {
             &*platform,
             "test restore",
             None,
+            false,
         )
         .unwrap();
     };
@@ -12184,74 +12778,6 @@ fn a_read_only_store_restores_by_copy() {
     assert_ne!(mode & 0o200, 0, "a private copy must be writable");
     std::fs::write(&from_readonly, b"changed target").unwrap();
     assert_eq!(std::fs::read(&blob).unwrap(), b"rlib bytes");
-}
-
-#[cfg(unix)]
-#[test]
-fn readonly_metadata_restores_honor_private_creation_permissions() {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    const CHILD: &str = "KACHE_TEST_PRIVATE_READONLY_METADATA_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "wrapper::tests::readonly_metadata_restores_honor_private_creation_permissions",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "private read-only metadata child failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    // The child runs only this test, keeping umask changes out of the suite.
-    unsafe { libc::umask(0o077) };
-    let dir = tempfile::tempdir().unwrap();
-    let config = test_config(dir.path().join("cache"));
-    let owner = Store::open(&config).unwrap();
-    let bytes = b"private metadata";
-    let hash = blake3::hash(bytes).to_hex().to_string();
-    create_blob(&owner, &hash, bytes);
-    let blob = owner.blob_path(&hash);
-    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
-    let readonly = Store::open_read_only(&config).unwrap();
-    let target_dir = dir.path().join("target");
-    std::fs::create_dir(&target_dir).unwrap();
-    std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let target = target_dir.join("libfoo.rmeta");
-    let cached = cached_file("libfoo.rmeta", &hash);
-    let platform = platform::current();
-    materialize_cached_artifact(
-        crate::config::DEFAULT_RESTORE_MAX_SIZE,
-        &readonly,
-        &cached,
-        &target,
-        ArtifactKind::Metadata,
-        None,
-        dir.path(),
-        dir.path(),
-        None,
-        &[],
-        &*platform,
-        "test private metadata restore",
-        None,
-    )
-    .unwrap();
-    let metadata = std::fs::metadata(&target).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-    assert_ne!(metadata.ino(), std::fs::metadata(&blob).unwrap().ino());
-    std::fs::write(&target, b"changed").unwrap();
-    assert_eq!(std::fs::read(&blob).unwrap(), bytes);
-    assert_eq!(
-        std::fs::metadata(&blob).unwrap().permissions().mode() & 0o777,
-        0o444
-    );
 }
 
 #[cfg(unix)]
@@ -12305,6 +12831,7 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
             &target,
             kind,
             shared_loadable,
+            false,
             dir.path(),
             dir.path(),
             None,
@@ -12312,6 +12839,7 @@ fn readonly_restore_keeps_executable_and_transformed_file_modes() {
             &*platform,
             "test restore",
             None,
+            false,
         )
         .unwrap();
         let target_meta = std::fs::metadata(&target).unwrap();
@@ -12669,6 +13197,131 @@ fn cc_failed_compile_does_not_claim_rebuilt_outputs_or_publish_handoff() {
     assert!(!object.exists());
 }
 
+/// With executables kept out of the cache (Windows' default), a Cargo build
+/// script built without debug info is cached all the same; one with debug
+/// info, a `[[bin]]` and a test harness are not.
+#[test]
+fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
+    let args = |extra: &[&str]| {
+        let mut args: Vec<String> = [
+            "rustc",
+            "--crate-name",
+            "build_script_build",
+            "--edition=2021",
+            "build.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "-C",
+            "strip=debuginfo",
+            "-C",
+            "extra-filename=-0123456789abcdef",
+            "--out-dir",
+            "/w/target/debug/build/foo-0123456789abcdef",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        RustcArgs::parse(&args).unwrap()
+    };
+    assert!(!skips_cache_as_user_facing(&args(&[]), false));
+    assert!(!skips_cache_as_user_facing(
+        &args(&["-C", "debuginfo=0"]),
+        false
+    ));
+    assert!(skips_cache_as_user_facing(
+        &args(&["-C", "debuginfo=2"]),
+        false
+    ));
+    assert!(!skips_cache_as_user_facing(
+        &args(&["-C", "debuginfo=2"]),
+        true
+    ));
+    let bin = RustcArgs::parse(
+        &[
+            "rustc",
+            "--crate-name",
+            "app",
+            "src/main.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "--out-dir",
+            "/w/target/debug/deps",
+        ]
+        .map(String::from),
+    )
+    .unwrap();
+    assert!(skips_cache_as_user_facing(&bin, false));
+    assert!(!skips_cache_as_user_facing(&bin, true));
+    let named_like_a_script = RustcArgs::parse(
+        &[
+            "rustc",
+            "--crate-name",
+            "build_script_build",
+            "src/main.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "--out-dir",
+            "/w/target/debug/deps",
+        ]
+        .map(String::from),
+    )
+    .unwrap();
+    assert!(skips_cache_as_user_facing(&named_like_a_script, false));
+}
+
+
+#[test]
+fn the_invocation_stamp_of_a_check_unit_is_found_in_both_cargo_layouts() {
+    let _lock = crate::test_support::process_state_test_lock();
+    // SAFETY: serialised by the process-state lock above. The arguments
+    // capture the invocation's environment when they are parsed.
+    unsafe { std::env::set_var("CARGO_PKG_NAME", "demo-pkg") };
+    let shared = rustc_args(&[
+        "rustc", "src/lib.rs", "--crate-name", "demo", "--emit=dep-info,metadata",
+        "-C", "extra-filename=-0123456789abcdef", "--out-dir", "/t/debug/deps",
+    ]);
+    assert_eq!(
+        cargo_invocation_stamp(&shared),
+        Some(PathBuf::from("/t/debug/.fingerprint/demo-pkg-0123456789abcdef/invoked.timestamp"))
+    );
+    unsafe { std::env::remove_var("CARGO_PKG_NAME") };
+    let per_unit = rustc_args(&[
+        "rustc", "src/lib.rs", "--crate-name", "demo", "--emit=dep-info,metadata",
+        "-C", "extra-filename=-0123456789abcdef",
+        "--out-dir", "/t/debug/build/demo-pkg/0123456789abcdef/out",
+    ]);
+    assert_eq!(
+        cargo_invocation_stamp(&per_unit),
+        Some(PathBuf::from("/t/debug/build/demo-pkg/0123456789abcdef/fingerprint/invoked.timestamp"))
+    );
+    let elsewhere = rustc_args(&[
+        "rustc", "src/lib.rs", "--crate-name", "demo", "--emit=dep-info,metadata",
+        "-C", "extra-filename=-0123456789abcdef", "--out-dir", "/t/somewhere",
+    ]);
+    assert_eq!(cargo_invocation_stamp(&elsewhere), None);
+}
+
+#[test]
+fn only_a_check_unit_is_redated() {
+    let dir = tempfile::tempdir().unwrap();
+    let unit = dir.path().join("debug/build/demo/0123456789abcdef");
+    std::fs::create_dir_all(unit.join("fingerprint")).unwrap();
+    std::fs::create_dir_all(unit.join("out")).unwrap();
+    std::fs::write(unit.join("fingerprint/invoked.timestamp"), "").unwrap();
+    let out = unit.join("out").to_string_lossy().into_owned();
+    let args = |emit: &str| {
+        rustc_args(&[
+            "rustc", "src/lib.rs", "--crate-name", "demo", emit,
+            "-C", "extra-filename=-0123456789abcdef", "--out-dir", &out,
+        ])
+    };
+    assert!(cargo_check_redate_ns(&args("--emit=dep-info,metadata")).is_some());
+    assert!(cargo_check_redate_ns(&args("--emit=dep-info,metadata,link")).is_none());
+}
+
 #[test]
 fn reused_workers_discard_unfinished_compile_and_event_state() {
     let barrier = std::sync::Barrier::new(2);
@@ -12730,6 +13383,182 @@ fn reused_workers_discard_unfinished_compile_and_event_state() {
             });
         }
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn an_output_is_kept_only_when_it_already_holds_the_entrys_bytes() {
+    let _lock = crate::test_support::process_state_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let deps = dir.path().join("t/debug/deps");
+    std::fs::create_dir_all(&deps).unwrap();
+    let bytes = vec![7u8; 100_000];
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let blob = dir.path().join("blob");
+    std::fs::write(&blob, &bytes).unwrap();
+    let cached = crate::store::CachedFile {
+        name: "libdemo-0123456789abcdef.rlib".into(),
+        size: bytes.len() as u64,
+        hash: hash.clone(),
+        executable: false,
+    };
+    let output = deps.join(&cached.name);
+    let holds = |strategy| output_already_holds(&store, &cached, &output, &blob, strategy);
+    let hardlink = link::LinkStrategy::Hardlink;
+
+    std::fs::write(&output, &bytes).unwrap();
+    assert!(holds(hardlink), "same bytes, read");
+    let mut other = bytes.clone();
+    other[50_000] = 8;
+    std::fs::write(&output, &other).unwrap();
+    assert!(!holds(hardlink), "other bytes of the same size");
+    std::fs::write(&output, &bytes[..99_999]).unwrap();
+    assert!(!holds(hardlink), "another size");
+
+    std::fs::write(&output, &bytes).unwrap();
+    let second = dir.path().join("t/elsewhere");
+    std::fs::hard_link(&output, &second).unwrap();
+    assert!(!holds(hardlink), "a name in another target shares the inode");
+    std::fs::remove_file(&second).unwrap();
+    std::fs::hard_link(&output, dir.path().join("t/debug/libdemo.rlib")).unwrap();
+    assert!(holds(hardlink), "Cargo's uplifted name is fine");
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!holds(link::LinkStrategy::Copy), "an executable that cannot run");
+
+    std::fs::remove_file(dir.path().join("t/debug/libdemo.rlib")).unwrap();
+    std::fs::remove_file(&output).unwrap();
+    std::fs::hard_link(&blob, &output).unwrap();
+    assert!(holds(hardlink), "the blob itself, linked here only");
+}
+
+/// A Cargo target directory `target_root_is_safe` accepts, under `workspace`.
+fn cargo_target_in(workspace: &Path) -> PathBuf {
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    target
+}
+
+/// A unit does not wait out the index's busy timeout to record its target
+/// root: with another connection holding the write lock it returns within a
+/// short bound, and the build's next unit records the root once the index
+/// lets it. Without the bound, a tenth of a 400-unit burst lost five seconds
+/// here.
+///
+/// The writer holds the lock until the unit returns, and lets go by itself
+/// only after `HOLD`: half the index's 5 s busy timeout, so a unit that
+/// waits for the lock (the bug) outlasts the hold, takes the lock and records
+/// the root. A unit that gives up after its 25 ms returns while the lock is
+/// still held, however slowly a loaded machine runs it. A 100 ms bound on
+/// the unit's wall time failed 18 in 360 copies run 12 at once on 4 vCPUs.
+#[test]
+fn a_busy_index_does_not_hold_a_unit_for_its_target_root() {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(2500);
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let workspace = dir.path().join("ws");
+    let target = cargo_target_in(&workspace);
+
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    let (held, wait_held) = std::sync::mpsc::channel();
+    let (returned, wait_returned) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held.send(()).unwrap();
+        let let_go_by_itself = wait_returned.recv_timeout(HOLD).is_err();
+        writer.execute_batch("COMMIT").unwrap();
+        let_go_by_itself
+    });
+    wait_held.recv().unwrap();
+    register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
+    let _ = returned.send(());
+    assert!(
+        !writer.join().unwrap(),
+        "the unit was still waiting for its target root when the writer let go after {HOLD:?}"
+    );
+    assert!(
+        store.tracked_target_roots(0).unwrap().is_empty(),
+        "the unit took the lock it should have left to the daemon"
+    );
+
+    register_target_root(&config, &store, &target, &workspace, Some("rustc 1"));
+    let roots = store.tracked_target_roots(0).unwrap();
+    assert_eq!(roots.len(), 1, "the next unit records it");
+    assert_eq!(roots[0].path, std::path::absolute(&target).unwrap());
+    assert!(!roots[0].discovered);
+}
+
+/// A unit does not wait out the index's busy timeout to record its input
+/// prediction: the rows a busy index refuses are kept for the daemon, and
+/// written later they read back as the record the unit made.
+///
+/// As in [`a_busy_index_does_not_hold_a_unit_for_its_target_root`], the
+/// writer holds the lock until both records return and lets go by itself
+/// only after `HOLD`, half the index's 5 s busy timeout: a record that waits
+/// for the lock outlasts the hold, takes the lock and writes its row, where
+/// a 100 ms bound on the records' wall time failed on a starved machine.
+#[test]
+fn a_busy_index_keeps_prediction_rows_for_the_daemon_instead_of_waiting() {
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(2500);
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let source = dir.path().join("lib.rs");
+    std::fs::write(&source, "pub fn f() {}\n").unwrap();
+    let closure = crate::cache_key::DepInfo {
+        source_files: vec![source],
+        env_deps: Vec::new(),
+    };
+    let hasher = store.file_hasher().with_input_predictions(true);
+
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    let (held, wait_held) = std::sync::mpsc::channel();
+    let (returned, wait_returned) = std::sync::mpsc::channel::<()>();
+    let writer = std::thread::spawn(move || {
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held.send(()).unwrap();
+        let let_go_by_itself = wait_returned.recv_timeout(HOLD).is_err();
+        writer.execute_batch("COMMIT").unwrap();
+        let_go_by_itself
+    });
+    wait_held.recv().unwrap();
+    hasher.record_input_prediction("unit-a", Some("a"), &closure, None);
+    hasher.record_input_prediction("unit-b", Some("b"), &closure, None);
+    let _ = returned.send(());
+    assert!(
+        !writer.join().unwrap(),
+        "the unit was still waiting for its prediction rows when the writer let go after {HOLD:?}"
+    );
+    assert!(hasher.input_prediction("unit-a").is_none());
+    let rows = hasher.take_busy_predictions();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.identity.as_str())
+            .collect::<Vec<_>>(),
+        ["unit-a", "unit-b"]
+    );
+
+    let daemon = crate::daemon::Daemon::new(config.clone());
+    let req = kache_protocol::RecordPredictionsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows,
+    };
+    assert!(daemon.handle_record_predictions(&req).ok);
+    daemon.flush_handed_rows();
+    assert_eq!(
+        hasher.input_prediction("unit-a").map(|row| row.sources),
+        Some(closure.source_files.clone())
+    );
+    assert!(hasher.input_prediction("unit-b").is_some());
 }
 
 #[cfg(unix)]
@@ -13532,6 +14361,7 @@ fn restore_paths_honor_configured_debug_bundle_budget() {
             &target,
             ArtifactKind::DebugBundle,
             None,
+            false,
             root.path(),
             root.path(),
             None,
@@ -13539,6 +14369,7 @@ fn restore_paths_honor_configured_debug_bundle_budget() {
             &*host,
             "test restore",
             None,
+            false,
         );
         if cap == 63 {
             assert!(format!("{:#}", result.unwrap_err()).contains("63-byte extraction cap"));

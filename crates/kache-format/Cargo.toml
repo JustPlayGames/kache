@@ -1,6 +1,6 @@
 [package]
 name = "kache-format"
-version = "2.0.0"
+version = "1.2.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Cache-entry metadata and validation for kache."
@@ -11,6 +11,10 @@ documentation = "https://docs.rs/kache-format"
 readme = "README.md"
 keywords = ["build-cache", "cache", "metadata", "compiler-cache"]
 categories = ["development-tools::build-utils", "caching"]
+
+[features]
+# Plays a key bump that changes no hashed byte (lane KACHE-W22 trials only).
+key-bump-trial = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

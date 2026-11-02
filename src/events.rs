@@ -209,6 +209,16 @@ pub(crate) fn log_event_for_build(event_log_path: &Path, event: &BuildEvent) -> 
     )
 }
 
+/// Append a build event the daemon logs for a compile handed to it, waiting
+/// out a busy log for a while: no build waits for it.
+pub(crate) fn log_event_from_daemon(event_log_path: &Path, event: &BuildEvent) -> Result<()> {
+    append_log_line(
+        event_log_path,
+        serde_json::to_string(event).context("serializing event")?,
+        LogLock::Daemon,
+    )
+}
+
 /// Append a heartbeat line to the event log (kunobi-ninja/kache#131).
 pub fn log_heartbeat(event_log_path: &Path, event: &HeartbeatEvent) -> Result<()> {
     append_log_line(
@@ -1235,7 +1245,7 @@ pub fn read_transfers(transfer_log_path: &Path) -> Result<Vec<TransferEvent>> {
     Ok(events)
 }
 
-fn open_log_lock(log_path: &Path) -> Result<File> {
+pub(crate) fn open_log_lock(log_path: &Path) -> Result<File> {
     OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -1581,6 +1591,7 @@ mod tests {
             dep_info_ms: 0,
             dep_info_runs: 0,
             prediction_mismatches: 0,
+            prediction: String::new(),
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,
@@ -1608,6 +1619,7 @@ mod tests {
             store_error: String::new(),
             store_handed_off: false,
             daemon_store_ms: 0,
+            daemon_store_batch: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,
@@ -1836,6 +1848,23 @@ mod tests {
         assert_eq!(legacy.flight_wait_ms, 0);
         assert_eq!(legacy.permit_wait_ms, 0);
         assert_eq!(legacy.wait_ms(), 0);
+    }
+
+    /// The prediction outcome rides in the event, and an event without one
+    /// (cc, passthrough, an older kache) neither writes nor needs the field.
+    #[test]
+    fn prediction_outcome_round_trips_and_is_omitted_when_empty() {
+        let mut event = BuildEvent::new_for_test("foo", EventResult::LocalHit);
+        let value = serde_json::to_value(&event).unwrap();
+        assert!(value.get("prediction").is_none());
+        let legacy: BuildEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.prediction, "");
+
+        event.prediction = "validated,disabled".to_string();
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["prediction"], "validated,disabled");
+        let round_trip: BuildEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(round_trip.prediction, "validated,disabled");
     }
 
     #[test]

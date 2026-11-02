@@ -354,15 +354,15 @@ fn relative_volume_routing_uses_the_client_directory() {
 /// kunobi-ninja/kache#319: executables are cached by default only where a
 /// restored binary keeps source-level debugging. Linux embeds DWARF; macOS
 /// gets a store-time `.dSYM` cached with the entry (shipped for #319);
-/// Windows `.pdb` paths still point outside the binary, so it stays off
-/// pending the equivalent work. Pinned as a test because this is a
+/// Windows names its `.pdb` by file name and stores it with the `.exe`, the
+/// pair checked at store time (`pe_pdb`). Pinned as a test because this is a
 /// deliberate platform split, not an accident of the code.
 #[test]
-fn cache_executables_defaults_on_for_linux_and_macos() {
+fn cache_executables_defaults_on_for_linux_macos_and_windows() {
     assert_eq!(
         default_cache_executables(),
-        cfg!(target_os = "linux") || cfg!(target_os = "macos"),
-        "executables default on for Linux and macOS, off for Windows (see #319)"
+        cfg!(target_os = "linux") || cfg!(target_os = "macos") || cfg!(target_os = "windows"),
+        "executables default on for Linux, macOS and Windows (see #319)"
     );
 }
 
@@ -972,7 +972,20 @@ fn unused_unit_cleanup_defaults_to_thirty_days() {
     let config_path = dir.path().join("config.toml");
     let _config = set_kache_config_for_test(&config_path);
     let _missing = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS");
+    let _hours = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS");
     assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 30);
+    assert_eq!(Config::load().unwrap().auto_clean_adaptive_idle_hours, 0);
+    std::fs::write(
+        &config_path,
+        "[cache]\nauto_clean_adaptive_idle_hours = 3\n",
+    )
+    .unwrap();
+    assert_eq!(Config::load().unwrap().auto_clean_adaptive_idle_hours, 3);
+    drop(_hours);
+    let _hours = NamedEnvGuard::set("KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS", "5");
+    assert_eq!(Config::load().unwrap().auto_clean_adaptive_idle_hours, 5);
+    drop(_hours);
+    let _hours = NamedEnvGuard::remove("KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS");
     std::fs::write(&config_path, "[cache]\nauto_clean_unused_units_days = 0\n").unwrap();
     assert_eq!(Config::load().unwrap().auto_clean_unused_units_days, 0);
     let _env = NamedEnvGuard::set("KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS", "7");
@@ -1387,16 +1400,16 @@ fn disk_share_budget_floors_caps_and_rounds() {
     // cannot change both sides of the assertion.
     assert_eq!(disk_share_budget(None), 50 << 30);
     assert_eq!(disk_share_budget(Some(0)), 50 << 30);
-    // 10GiB disk: 5% is 0.5GiB, rounds to 1GiB, then floor 5GiB.
-    assert_eq!(disk_share_budget(Some(10 * GIB)), 5 << 30);
-    // 200GiB disk: 5% is exactly 10GiB.
-    assert_eq!(disk_share_budget(Some(200 * GIB)), 10 * GIB);
-    // 256GiB disk: 5% is 12.8GiB, nearest GiB is 13GiB.
-    assert_eq!(disk_share_budget(Some(256 * GIB)), 13 * GIB);
-    // 4TiB disk: 5% is 204.8GiB, cap 100GiB.
+    // 10GiB disk: 20% is 2GiB, then floor 10GiB.
+    assert_eq!(disk_share_budget(Some(10 * GIB)), 10 << 30);
+    // 200GiB disk: 20% is exactly 40GiB.
+    assert_eq!(disk_share_budget(Some(200 * GIB)), 40 * GIB);
+    // 256GiB disk: 20% is 51.2GiB, nearest GiB is 51GiB.
+    assert_eq!(disk_share_budget(Some(256 * GIB)), 51 * GIB);
+    // 4TiB disk: 20% is 819.2GiB, cap 100GiB.
     assert_eq!(disk_share_budget(Some(4 * 1024 * GIB)), 100 << 30);
-    // Exactly at the cap: 2000GiB * 5% = 100GiB.
-    assert_eq!(disk_share_budget(Some(2000 * GIB)), 100 << 30);
+    // Exactly at the cap: 500GiB * 20% = 100GiB.
+    assert_eq!(disk_share_budget(Some(500 * GIB)), 100 << 30);
 }
 
 #[test]
@@ -1417,7 +1430,7 @@ fn describe_max_size_names_the_disk_share_when_derived() {
     let text = describe_max_size(derived, disk);
     assert_eq!(
         text,
-        "10.0 GiB (5% of 200.0 GiB, floor 5.0 GiB, cap 100.0 GiB)"
+        "40.0 GiB (20% of 200.0 GiB, floor 10.0 GiB, cap 100.0 GiB)"
     );
     assert_eq!(
         describe_max_size(2 * GIB, disk),
@@ -1430,7 +1443,7 @@ fn describe_max_size_names_the_disk_share_when_derived() {
     );
     assert!(
         describe_max_size(DISK_SHARE_FALLBACK, Some(0)).contains("disk size unknown"),
-        "a zero-byte probe is unknown, not 5% of 0: {}",
+        "a zero-byte probe is unknown, not 20% of 0: {}",
         describe_max_size(DISK_SHARE_FALLBACK, Some(0))
     );
 }
@@ -2543,7 +2556,7 @@ fn a_shard_budget_is_the_explicit_max_size_or_its_own_disk_share() {
         assert_eq!(path, shard_dir, "the shard's own filesystem is measured");
         Some(200 * GIB)
     });
-    assert_eq!(derived.max_size, 10 * GIB, "5% of the shard's 200GiB");
+    assert_eq!(derived.max_size, 40 * GIB, "20% of the shard's 200GiB");
     let unknown = main.for_volume_store(&shard, |_| None);
     assert_eq!(unknown.max_size, DISK_SHARE_FALLBACK);
     assert_eq!(main.max_size, 50 * GIB, "the main budget is untouched");
@@ -2814,6 +2827,39 @@ fn deferred_discovery_is_on_unless_switched_off() {
         );
     }
     unsafe { std::env::remove_var("KACHE_DEFERRED_DISCOVERY") };
+}
+
+#[test]
+fn rustc_daemon_publish_is_on_unless_switched_off() {
+    let _lock = config_path_lock();
+    let none: Result<FileConfig> = Err(anyhow::anyhow!("no file"));
+    let off: Result<FileConfig> =
+        Ok(toml::from_str("[cache]\ndaemon_publish_rustc = false\n").unwrap());
+    let on: Result<FileConfig> =
+        Ok(toml::from_str("[cache]\ndaemon_publish_rustc = true\n").unwrap());
+    // The C/C++ switch does not turn the rustc one off.
+    let cc_off: Result<FileConfig> =
+        Ok(toml::from_str("[cache]\ndaemon_publish = false\n").unwrap());
+    // SAFETY: the process-state lock serialises environment edits.
+    unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH_RUSTC") };
+    assert!(Config::daemon_publish_rustc_enabled(&none));
+    assert!(!Config::daemon_publish_rustc_enabled(&off));
+    assert!(Config::daemon_publish_rustc_enabled(&on));
+    assert!(Config::daemon_publish_rustc_enabled(&cc_off));
+    for (value, expected) in [("0", false), ("FALSE", false), ("1", true), ("", true)] {
+        unsafe { std::env::set_var("KACHE_DAEMON_PUBLISH_RUSTC", value) };
+        assert_eq!(
+            Config::daemon_publish_rustc_enabled(&on),
+            expected,
+            "{value:?}"
+        );
+        assert_eq!(
+            Config::daemon_publish_rustc_enabled(&off),
+            expected,
+            "{value:?} overrides the file"
+        );
+    }
+    unsafe { std::env::remove_var("KACHE_DAEMON_PUBLISH_RUSTC") };
 }
 
 #[test]
@@ -3106,6 +3152,7 @@ fn test_file_config_roundtrip() {
             out_dir_alias_root: None,
             deferred_durability: None,
             daemon_publish: None,
+            daemon_publish_rustc: None,
             trust_daemon_execution: None,
             native_runtime_warmup: None,
             daemon_execution_concurrency: None,
@@ -3120,6 +3167,7 @@ fn test_file_config_roundtrip() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            auto_clean_adaptive_idle_hours: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             gc_evict_shared: None,
@@ -3159,6 +3207,7 @@ fn test_file_config_roundtrip() {
             prefetch_deadline_secs: None,
             min_store_compile_ms: None,
             gc_max_age_hours: None,
+            gc_spare_young_hours: None,
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,
@@ -3769,6 +3818,7 @@ fn test_config_store_dir() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
         daemon_execution_concurrency: None,
@@ -3784,6 +3834,7 @@ fn test_config_store_dir() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -3825,6 +3876,7 @@ fn test_config_store_dir() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -3861,6 +3913,7 @@ fn test_config_index_db_path() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
         daemon_execution_concurrency: None,
@@ -3876,6 +3929,7 @@ fn test_config_index_db_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -3917,6 +3971,7 @@ fn test_config_index_db_path() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -3949,6 +4004,7 @@ fn test_config_event_log_path() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
         daemon_execution_concurrency: None,
@@ -3964,6 +4020,7 @@ fn test_config_event_log_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -4005,6 +4062,7 @@ fn test_config_event_log_path() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -4056,6 +4114,7 @@ fn test_config_socket_path() {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
         daemon_execution_concurrency: None,
@@ -4071,6 +4130,7 @@ fn test_config_socket_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -4112,6 +4172,7 @@ fn test_config_socket_path() {
         prefetch_deadline_secs: DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -4800,6 +4861,7 @@ fn test_save_and_load_file_config() {
             out_dir_alias_root: None,
             deferred_durability: None,
             daemon_publish: None,
+            daemon_publish_rustc: None,
             trust_daemon_execution: None,
             native_runtime_warmup: None,
             daemon_execution_concurrency: None,
@@ -4814,6 +4876,7 @@ fn test_save_and_load_file_config() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            auto_clean_adaptive_idle_hours: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             gc_evict_shared: None,
@@ -4853,6 +4916,7 @@ fn test_save_and_load_file_config() {
             prefetch_deadline_secs: None,
             min_store_compile_ms: None,
             gc_max_age_hours: None,
+            gc_spare_young_hours: None,
             daemon_idle_timeout_secs: None,
             s3_pool_idle_secs: None,
             remote_restore_timeout_secs: None,

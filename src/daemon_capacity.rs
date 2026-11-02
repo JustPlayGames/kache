@@ -20,10 +20,13 @@ impl DaemonCapacity {
     ) -> Self {
         // Pipelines spend time waiting for cache I/O and client brokers. Four
         // requests per available CPU allow overlap; the floor absorbs bursts
-        // on smaller hosts. Real compiler work still uses scheduler permits.
+        // on smaller hosts (fork: 64, not 32: on a 4-vCPU VM with eight
+        // checkouts building, 60 % of requests were declined at 16 and each
+        // started an engine process of its own). Real compiler work still
+        // uses scheduler permits.
         // Keep all derived semaphore capacities representable on 32-bit too.
         let requested = configured
-            .unwrap_or_else(|| cpus.saturating_mul(4).max(32))
+            .unwrap_or_else(|| cpus.saturating_mul(4).max(64))
             .clamp(1, usize::MAX >> 5);
         // Budget roughly 16 descriptors per pipeline for passed stdio and
         // jobserver handles, sockets, cache files and auxiliary RPCs. Leave
@@ -85,10 +88,10 @@ mod tests {
     #[test]
     fn automatic_capacity_overlaps_io_and_scales_past_32_cpus() {
         for (cpus, executions, connections, blocking_threads) in [
-            (1, 32, 128, 544),
-            (6, 32, 128, 544),
-            (8, 32, 128, 544),
-            (9, 36, 144, 548),
+            (1, 64, 256, 576),
+            (6, 64, 256, 576),
+            (16, 64, 256, 576),
+            (17, 68, 272, 580),
             (64, 256, 1024, 768),
             (256, 1024, 4096, 1536),
         ] {

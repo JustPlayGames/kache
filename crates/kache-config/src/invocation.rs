@@ -27,6 +27,64 @@ impl std::fmt::Debug for InvocationEnv {
     }
 }
 
+/// Where a test build keeps the user cache folder instead
+/// ([`user_cache_dir`]): this variable when it holds an absolute path, else
+/// `kache-test-user-cache` in the temporary directory.
+pub const TEST_USER_CACHE_DIR_ENV: &str = "KACHE_TEST_USER_CACHE_DIR";
+
+/// This user's cache folder, which holds the probe memos, the diagnostic log
+/// and the default store: the platform's (`dirs::cache_dir`). On Windows,
+/// `LOCALAPPDATA` comes first when it holds an absolute path, and the Known
+/// Folder only after it ([`windows_cache_dir`]).
+///
+/// Test builds never reach the real one. The `test-support` feature is on in
+/// every build of the workspace's tests, and so in the kache binaries they
+/// spawn, and this crate's own tests count too. Unix tests used to redirect
+/// the folder through `HOME` or `XDG_CACHE_HOME`, but Windows reads neither,
+/// and most tests set nothing: a test run wrote kache.log lines and probe
+/// memos into the developer's own cache, and into `AppData\Local\kache` on
+/// a Windows runner. There the folder is [`TEST_USER_CACHE_DIR_ENV`]'s, else
+/// one in the temporary directory.
+pub fn user_cache_dir() -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        Some(
+            std::env::var_os(TEST_USER_CACHE_DIR_ENV)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| std::env::temp_dir().join("kache-test-user-cache")),
+        )
+    }
+    #[cfg(all(windows, not(any(test, feature = "test-support"))))]
+    {
+        windows_cache_dir(std::env::var_os("LOCALAPPDATA"), dirs::cache_dir)
+    }
+    #[cfg(all(not(windows), not(any(test, feature = "test-support"))))]
+    {
+        dirs::cache_dir()
+    }
+}
+
+/// Windows' user cache folder: `LOCALAPPDATA` when it holds an absolute
+/// path, else `fallback` (this process's Known Folder, or a client
+/// snapshot's profile `AppData\Local`). A process that points the variable
+/// elsewhere means it, as `XDG_CACHE_HOME` on Linux: a launcher or a test
+/// harness keeps kache's log, probe memos and default store out of the
+/// user's own folder that way. The Known Folder API reads no variable, so
+/// taking it alone put the daemon's kache.log in the real folder under such
+/// a redirect, while a client snapshot ([`InvocationEnv::from_parts`])
+/// already followed the variable.
+#[cfg(any(windows, test))]
+fn windows_cache_dir(
+    local_app_data: Option<OsString>,
+    fallback: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    local_app_data
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(fallback)
+}
+
 impl InvocationEnv {
     pub fn capture() -> Self {
         Self::from_parts(
@@ -35,7 +93,7 @@ impl InvocationEnv {
             dirs::home_dir(),
             std::env::temp_dir(),
         )
-        .with_cache_dir(dirs::cache_dir())
+        .with_cache_dir(user_cache_dir())
     }
 
     pub fn with_cache_dir(mut self, cache: Option<PathBuf>) -> Self {
@@ -71,11 +129,9 @@ impl InvocationEnv {
         }
         #[cfg(windows)]
         {
-            invocation.cache = invocation
-                .var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
-                .or_else(|| invocation.home_dir().map(|home| home.join("AppData/Local")));
+            invocation.cache = windows_cache_dir(invocation.var_os("LOCALAPPDATA"), || {
+                invocation.home_dir().map(|home| home.join("AppData/Local"))
+            });
         }
         #[cfg(not(any(target_os = "macos", windows)))]
         {
@@ -196,6 +252,11 @@ impl InvocationEnv {
         vars.push((name.to_owned(), value));
     }
 
+    /// Drop a variable, so that nothing this invocation starts inherits it.
+    pub fn remove(&mut self, name: &str) {
+        std::sync::Arc::make_mut(&mut self.vars).retain(|(key, _)| !name_matches(key, name));
+    }
+
     /// Search the client's PATH after rooting relative entries in its cwd.
     pub fn resolve_program(&self, program: &Path) -> Option<PathBuf> {
         if program.is_absolute() || program.components().count() > 1 {
@@ -311,6 +372,28 @@ mod tests {
         assert_eq!(
             second.resolve(Path::new("src/lib.rs")),
             Some(two.join("src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn a_windows_cache_redirect_wins_over_the_known_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let redirected = root.path().join("localappdata");
+        let known = root.path().join("known-folder");
+        let known_folder = || Some(known.clone());
+        assert_eq!(
+            windows_cache_dir(Some(redirected.clone().into()), known_folder),
+            Some(redirected)
+        );
+        // Unset, empty or relative: the Known Folder.
+        assert_eq!(windows_cache_dir(None, known_folder), Some(known.clone()));
+        assert_eq!(
+            windows_cache_dir(Some("".into()), known_folder),
+            Some(known.clone())
+        );
+        assert_eq!(
+            windows_cache_dir(Some("relative".into()), known_folder),
+            Some(known.clone())
         );
     }
 

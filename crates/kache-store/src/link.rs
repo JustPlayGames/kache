@@ -13,6 +13,7 @@ struct LinkPolicy {
     storage_layout_advice: Cell<bool>,
     mapped_target: Cell<bool>,
     layout_advice_to_log: Cell<bool>,
+    bookkeeping_handed_off: Cell<bool>,
 }
 
 impl Default for LinkPolicy {
@@ -24,6 +25,7 @@ impl Default for LinkPolicy {
             storage_layout_advice: Cell::new(true),
             mapped_target: Cell::new(false),
             layout_advice_to_log: Cell::new(false),
+            bookkeeping_handed_off: Cell::new(false),
         }
     }
 }
@@ -90,6 +92,26 @@ fn cow_warn_marker() -> Option<PathBuf> {
 fn shared_hardlink_restores_enabled() -> bool {
     policy_bool(&SHARED_HARDLINK_RESTORES, |policy| {
         &policy.shared_hardlink_restores
+    })
+}
+
+/// Whether a daemon took bookkeeping rows this invocation's index was too
+/// busy for (`crate::store::note_bookkeeping_handed_off`). Per invocation
+/// scope, so a daemon running many compiler requests keeps one request's
+/// note out of the next; process-wide without a scope.
+static BOOKKEEPING_HANDED_OFF: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn note_bookkeeping_handed_off() {
+    set_policy_bool(
+        &BOOKKEEPING_HANDED_OFF,
+        |policy| &policy.bookkeeping_handed_off,
+        true,
+    );
+}
+
+pub(crate) fn bookkeeping_handed_off() -> bool {
+    policy_bool(&BOOKKEEPING_HANDED_OFF, |policy| {
+        &policy.bookkeeping_handed_off
     })
 }
 
@@ -418,7 +440,7 @@ pub(crate) fn warn_hardlink_fallback_once(
 ///   copies so their required mtime stamp cannot mutate a still-linked artifact
 ///   another process is reading (#794). This is for immutable artifacts like
 ///   `.rlib` / object files where the build won't modify the content in place.
-/// - `WritableCopy`: use a private stage with compiler-style creation permissions.
+/// - `WritableCopy`: fall back to a writable, non-executable independent copy.
 ///   Rust metadata may be rewritten by `cargo fix` without the wrapper.
 /// - `Copy`: fall back to a plain byte copy (independent file). For
 ///   executables, dylibs, and proc-macros that may be mutated post-build
@@ -429,12 +451,30 @@ pub(crate) fn warn_hardlink_fallback_once(
 ///   execute bit, because the shared inode cannot be chmod'ed. Any other blob,
 ///   and every Windows restore, is copied as `Copy` would. The caller decides
 ///   which artifacts qualify.
+/// - `SharedLibHardlink`: an `.rlib` whose unit also emits an `.rmeta` that
+///   the same restore writes and stamps beside it. Cargo judges a library
+///   unit by the newest of its outputs, or by its `.rmeta` alone where a
+///   dependent needs only the metadata, so the `.rmeta`'s stamp carries the
+///   restore's "written now" and the `.rlib` needs none. On Unix it shares
+///   the blob's inode with every target restoring it, when the blob is a
+///   read-only regular file whose mtime is not in the future, and the caller
+///   leaves the shared inode's mtime alone: nothing re-dates it, so no target
+///   sees another's restore (#794). Any other blob is copied, and a Windows
+///   restore follows `Hardlink`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LinkStrategy {
     Hardlink,
     WritableCopy,
     Copy,
     ExecutableHardlink,
+    SharedLibHardlink,
+}
+
+impl LinkStrategy {
+    /// Whether the restored file must run or load: it gets every execute bit.
+    pub fn is_executable(self) -> bool {
+        matches!(self, Self::Copy | Self::ExecutableHardlink)
+    }
 }
 
 #[cfg(not(windows))]
@@ -470,24 +510,6 @@ fn link_to_target_via(
     reflink: fn(&Path, &Path) -> Result<()>,
 ) -> Result<()> {
     let do_link = || -> Result<()> {
-        if strategy == LinkStrategy::WritableCopy {
-            // Create the private stage before cloning so the destination's
-            // umask and inherited ACLs determine its permissions.
-            let prepared = if crate::workspace::current().is_some() {
-                prepare_writable_target_from_file(store_path, target_path)?
-            } else {
-                prepare_writable_target_from_file_via(
-                    store_path,
-                    target_path,
-                    |_, _| Err(std::io::ErrorKind::Unsupported.into()),
-                    |source, target| reflink(source, target).map_err(std::io::Error::other),
-                )?
-            };
-            #[cfg(windows)]
-            clear_target(target_path)?;
-            return prepared.publish_replacing();
-        }
-
         // Remove existing file at target (link/clone calls fail if dst exists).
         clear_target(target_path)?;
 
@@ -503,11 +525,15 @@ fn link_to_target_via(
         // block-clone" from "this one file couldn't be cloned" (#508).
         let reflink_err = match reflink(store_path, target_path) {
             Ok(()) => {
-                if strategy == LinkStrategy::Hardlink {
-                    set_owner_write_permission(target_path)?;
-                } else {
+                match strategy {
+                    LinkStrategy::Hardlink | LinkStrategy::SharedLibHardlink => {
+                        set_owner_write_permission(target_path)?
+                    }
+                    LinkStrategy::WritableCopy => set_copy_permissions(target_path, false)?,
                     // Executables and loadable libraries also need execute bits.
-                    set_executable_permissions(target_path)?;
+                    LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
+                        set_copy_permissions(target_path, true)?
+                    }
                 }
                 tracing::debug!(
                     "reflinked {} -> {}",
@@ -523,37 +549,79 @@ fn link_to_target_via(
         let _ = &reflink_err;
 
         // Reflink unsupported on this filesystem — strategy-specific fallback.
-        if strategy == LinkStrategy::Hardlink {
-            // NTFS shares the read-only attribute across hardlinks. Unless the
-            // caller opted in, give its build a writable independent file.
+        match strategy {
+            // Windows has no reflink on NTFS, so the Hardlink strategy would
+            // hardlink the read-only store blob. NTFS stores FILE_ATTRIBUTE_READONLY
+            // in the shared MFT record, so EVERY hardlink to a read-only blob is
+            // itself read-only — and Windows refuses to delete or rewrite a
+            // read-only file (WinError 5). A consumer that owns its output and
+            // deletes/rewrites it — e.g. mozbuild's configure `ar_supports_response_files`
+            // conftest (#429) — then breaks. There is no way on NTFS to give a
+            // hardlink a different read-only state than its blob, so restore via an
+            // independent COPY instead: the output is writable and deletable while
+            // the store blob stays read-only (integrity preserved). This mirrors
+            // `write_restored`, already the proven-safe independent-file path, and
+            // costs only working-tree↔store block sharing (LRU is index-based, not
+            // mtime-based, so eviction is unaffected). gnu/clang restores keep
+            // hardlinking — reflink/hardlink there are writable or CoW-isolated.
             #[cfg(windows)]
-            {
+            LinkStrategy::Hardlink | LinkStrategy::SharedLibHardlink => {
                 if windows_hardlink_enabled() {
-                    return hardlink_or_copy(store_path, target_path, bytes);
+                    // Opt-in (#429 / `[cache] windows_hardlink`): the caller accepts
+                    // that this build never deletes/rewrites a restored object, so
+                    // trade the read-only-output risk for working-tree dedup.
+                    hardlink_or_copy(store_path, target_path, bytes)
+                } else {
+                    copy_file(store_path, target_path, false)?;
+                    warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, true);
+                    crate::opcounts::record_copied(bytes);
+                    Ok(())
                 }
-                copy_file(store_path, target_path, false)?;
-                warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, true);
-                crate::opcounts::record_copied(bytes);
-                return Ok(());
             }
             #[cfg(not(windows))]
-            return hardlink_or_copy(store_path, target_path, bytes);
+            LinkStrategy::Hardlink => hardlink_or_copy(store_path, target_path, bytes),
+            // An rlib whose `.rmeta` carries the stamp: every consumer may
+            // share the inode, which nobody re-dates.
+            #[cfg(unix)]
+            LinkStrategy::SharedLibHardlink
+                if lib_blob_is_shareable(
+                    fs::metadata(store_path).ok().as_ref(),
+                    std::time::SystemTime::now(),
+                ) =>
+            {
+                shared_lib_hardlink_or_copy(store_path, target_path, bytes)
+            }
+            #[cfg(unix)]
+            LinkStrategy::SharedLibHardlink => {
+                crate::opcounts::record_restore_copy_other(bytes);
+                copy_hardlink_fallback(store_path, target_path, bytes, false)
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            LinkStrategy::SharedLibHardlink => hardlink_or_copy(store_path, target_path, bytes),
+            // Share the inode only when the blob can already run as it is: a
+            // chmod on the link would change the blob too.
+            #[cfg(unix)]
+            LinkStrategy::ExecutableHardlink
+                if executable_blob_is_shareable(blob_mode(store_path)) =>
+            {
+                executable_hardlink_or_copy(store_path, target_path, bytes)
+            }
+            LinkStrategy::WritableCopy | LinkStrategy::Copy | LinkStrategy::ExecutableHardlink => {
+                // Copying here is by design (metadata and executables may be mutated
+                // after the build), so no storage-layout advice — but a large artifact that
+                // failed to block-clone on a CoW volume is still a real fault and is
+                // reported rather than swallowed.
+                copy_file(
+                    store_path,
+                    target_path,
+                    strategy != LinkStrategy::WritableCopy,
+                )?;
+                #[cfg(windows)]
+                warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, false);
+                crate::opcounts::record_copied(bytes);
+                Ok(())
+            }
         }
-        // Share the inode only when the blob can already run as it is:
-        // changing permissions on the link would change the blob too.
-        #[cfg(unix)]
-        if strategy == LinkStrategy::ExecutableHardlink
-            && executable_blob_is_shareable(blob_mode(store_path))
-        {
-            return executable_hardlink_or_copy(store_path, target_path, bytes);
-        }
-        // Executables and dylibs may change after the build. A large artifact
-        // that failed to clone on a CoW volume still needs a fault report.
-        copy_file(store_path, target_path, true)?;
-        #[cfg(windows)]
-        warn_no_cow_restore_once(store_path, target_path, bytes, &reflink_err, false);
-        crate::opcounts::record_copied(bytes);
-        Ok(())
     };
 
     let mut err = match do_link() {
@@ -610,6 +678,47 @@ fn executable_blob_is_shareable(blob_mode: Option<u32>) -> bool {
     blob_mode.is_some_and(|mode| mode & 0o111 == 0o111 && mode & 0o222 == 0)
 }
 
+/// Whether a `SharedLibHardlink` restore may share the blob's inode: a
+/// regular file nobody can write through a link, whose mtime is not later
+/// than `now`. The restore leaves that mtime alone, so it must not be newer
+/// than the stamp the `.rmeta` beside it gets, or the rlib would decide the
+/// unit's newest output instead of the `.rmeta` (a blob made on this machine
+/// is always older; a clock step or an imported file's date could say
+/// otherwise).
+#[cfg(unix)]
+fn lib_blob_is_shareable(blob: Option<&fs::Metadata>, now: std::time::SystemTime) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    blob.is_some_and(|meta| {
+        meta.is_file()
+            && meta.permissions().mode() & 0o222 == 0
+            && meta.modified().is_ok_and(|modified| modified <= now)
+    })
+}
+
+/// Hardlink fallback for `SharedLibHardlink`: link the blob whatever else
+/// links it (see [`LinkStrategy::SharedLibHardlink`]), or copy it when the
+/// link fails (another filesystem, say).
+#[cfg(unix)]
+fn shared_lib_hardlink_or_copy(store_path: &Path, target_path: &Path, bytes: u64) -> Result<()> {
+    if let Err(e) = try_hard_link(store_path, target_path) {
+        let reason = classify_hardlink_io_error(e.kind());
+        match reason {
+            HardlinkIoReason::CrossDevice => crate::opcounts::record_restore_copy_cross_device(bytes),
+            HardlinkIoReason::Permission => crate::opcounts::record_restore_copy_permission(bytes),
+            HardlinkIoReason::Other => crate::opcounts::record_restore_copy_other(bytes),
+        }
+        warn_hardlink_fallback_once(store_path, target_path, reason, &e);
+        return copy_hardlink_fallback(store_path, target_path, bytes, false);
+    }
+    tracing::debug!(
+        "hardlinked rlib {} -> {}",
+        store_path.display(),
+        target_path.display()
+    );
+    crate::opcounts::record_hardlinked(bytes);
+    Ok(())
+}
+
 /// Permission bits of a store blob, or `None` when it cannot be read.
 #[cfg(unix)]
 fn blob_mode(store_path: &Path) -> Option<u32> {
@@ -640,6 +749,19 @@ fn hardlink_or_copy_with_prelink_hook(
     match fs::metadata(store_path) {
         Ok(meta) => {
             use std::os::unix::fs::MetadataExt;
+            // Store blobs are read-only. A shared link hands the blob's inode
+            // to every tree, so a blob that has gained a write bit (a tool in
+            // some tree made its file writable to edit it in place) may no
+            // longer hold the bytes its name promises: never link it again.
+            if shared && meta.mode() & 0o222 != 0 {
+                tracing::warn!(
+                    mode = format_args!("{:o}", meta.mode() & 0o7777),
+                    "store blob is writable, restoring by copy (run `kache doctor --verify`): {}",
+                    store_path.display()
+                );
+                crate::opcounts::record_restore_copy_other(bytes);
+                return copy_instead();
+            }
             if !shared && meta.nlink() != 1 {
                 tracing::debug!(
                     links = meta.nlink(),
@@ -940,6 +1062,27 @@ fn warn_no_cow_restore_once(
     reflink_err: &anyhow::Error,
     layout_advice: bool,
 ) {
+    // Ask the cheap question first: on NTFS every copied file comes here,
+    // and once this session's advisory is out nothing below can print, so
+    // the volume queries (four GetVolumePathNameW, GetDiskFreeSpaceW and
+    // GetVolumeInformationW) would be spent for nothing. The marker is the
+    // invocation's (`InvocationLinkScope`), else the process's: a daemon
+    // runs many invocations, each with a marker of its own.
+    let marker = cow_warn_marker();
+    if marker.is_none() && NO_MARKER_WARNED.is_completed() {
+        return;
+    }
+    let layout_open = layout_bucket_open(marker.as_deref(), layout_advice);
+    let mut asked_has_cow = None;
+    if !copy_restore_may_warn(layout_open, || {
+        *asked_has_cow.insert(windows_volume_supports_block_clone(target_path))
+    }) {
+        tracing::debug!(
+            "copy-restored {} (this session's storage-layout advice is already out)",
+            target_path.display()
+        );
+        return;
+    }
     let cache_vol = windows_volume_root(store_path);
     let build_vol = windows_volume_root(target_path);
     // A file with no cluster-aligned range can't be block-cloned on ANY volume.
@@ -950,7 +1093,7 @@ fn warn_no_cow_restore_once(
     let cause = classify_copy_restore(
         cache_vol.as_deref(),
         build_vol.as_deref(),
-        windows_volume_supports_block_clone(target_path),
+        asked_has_cow.unwrap_or_else(|| windows_volume_supports_block_clone(target_path)),
         sub_cluster,
     );
 
@@ -1060,12 +1203,40 @@ fn warn_no_cow_restore_once(
         }
         // No marker configured (unit tests, non-wrapper entrypoints): fall back
         // to once-per-process rather than going silent.
-        None => {
-            use std::sync::Once;
-            static WARNED: Once = Once::new();
-            WARNED.call_once(|| sink.emit(&message));
-        }
+        None => NO_MARKER_WARNED.call_once(|| sink.emit(&message)),
     }
+}
+
+/// The once-per-process copy-restore advisory when no marker is configured.
+#[cfg_attr(not(windows), allow(dead_code))]
+static NO_MARKER_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Can the storage-layout bucket of the copy-restore advisory still print?
+/// Not when the restore's strategy or `[cache] storage_layout_advice` mutes
+/// it, nor once this session's marker (or, without one, this process) has
+/// printed it. Only reads the marker: no volume query.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn layout_bucket_open(marker: Option<&Path>, layout_advice: bool) -> bool {
+    if !layout_advice || !storage_layout_advice_enabled() {
+        return false;
+    }
+    match marker {
+        Some(base) => !crate::markers::marker_is_fresh(
+            &bucket_marker(base, "cow"),
+            crate::markers::WARN_SESSION_SECS,
+        ),
+        None => !NO_MARKER_WARNED.is_completed(),
+    }
+}
+
+/// Whether a copy-restore can still print anything, asked before the volume
+/// queries that classify it. With the layout bucket closed only a fault can
+/// print, and a fault needs a build volume that block-clones, so `has_cow`
+/// (one volume query) runs only then and the rest are skipped unless it says
+/// yes.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copy_restore_may_warn(layout_open: bool, has_cow: impl FnOnce() -> Option<bool>) -> bool {
+    layout_open || has_cow() == Some(true)
 }
 
 /// Derive a per-bucket marker path from the base marker (`…/kache-cow-warn-<hash>`
@@ -1166,16 +1337,17 @@ fn set_owner_write_permission(path: &Path) -> Result<()> {
         .with_context(|| format!("setting owner write permission on {}", path.display()))
 }
 
-/// Restore writable executable permissions on a private clone.
-/// Never call this on a hardlink.
-fn set_executable_permissions(path: &Path) -> Result<()> {
-    if let Some(result) =
-        crate::workspace::dispatch(crate::workspace::Operation::Permissions(path, 0o755))
-    {
+/// Restore writable permissions on a private clone, with execute bits only
+/// for executables and loadable libraries. Never call this on a hardlink.
+fn set_copy_permissions(path: &Path, executable: bool) -> Result<()> {
+    if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Permissions(
+        path,
+        if executable { 0o755 } else { 0o644 },
+    )) {
         return result.map_err(Into::into);
     }
-    kache_fs::set_writable_permissions(path, true)
-        .with_context(|| format!("setting executable permissions on {}", path.display()))
+    kache_fs::set_writable_permissions(path, executable)
+        .with_context(|| format!("setting copy permissions on {}", path.display()))
 }
 
 /// Clone a file using the shared filesystem implementation.
@@ -1201,7 +1373,7 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
     Ok(())
 }
 
-/// A fully-written cache artifact awaiting publication.
+/// A fully-written C/C++ cache artifact awaiting publication.
 ///
 /// The staging file is created in the target directory with the same requested
 /// mode as a compiler output (`0666`). The kernel therefore applies the current
@@ -1209,7 +1381,7 @@ fn copy_file(src: &Path, dst: &Path, executable: bool) -> Result<()> {
 /// No metadata operation is performed through the final pathname.
 ///
 /// When the filesystem can share extents, the cached bytes are cloned into that
-/// stage (or inside a private sibling directory before taking the stage's
+/// stage (or onto a new file in the same directory that then takes the stage's
 /// mode). The clone has its own inode. A hardlink of the blob is discarded and
 /// the bytes are copied instead, so a later rewrite cannot change the cache.
 pub struct PreparedWritableTarget {
@@ -1230,7 +1402,6 @@ enum WritableStage {
 /// removes that name and leaves the cache blob alone.
 struct ClonedFile {
     path: PathBuf,
-    _directory: tempfile::TempDir,
 }
 
 impl Drop for ClonedFile {
@@ -1292,9 +1463,9 @@ impl PreparedWritableTarget {
 
     /// Atomically replace an existing ordinary compiler output.
     ///
-    /// The caller owns the destination entry and must allow its replacement.
-    /// Publication replaces the entry without changing the old file's inode.
-    /// C/C++ callers leave special paths to the selected compiler instead.
+    /// The caller must first establish that the target is a private, writable
+    /// regular file. Special paths retain the no-clobber path above and are
+    /// handled by the selected compiler instead.
     pub fn publish_replacing(self) -> Result<()> {
         let PreparedWritableTarget {
             stage,
@@ -1367,7 +1538,7 @@ fn prepare_writable_target_from_file_via(
     src: &Path,
     target: &Path,
     clone_into: fn(&Path, &fs::File) -> std::io::Result<()>,
-    clone_new: impl Fn(&Path, &Path) -> std::io::Result<()>,
+    clone_new: fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<PreparedWritableTarget> {
     let bytes = fs::metadata(src)
         .with_context(|| format!("reading cached cc artifact {}", src.display()))?
@@ -1382,7 +1553,8 @@ fn prepare_writable_target_from_file_via(
             .metadata()
             .with_context(|| format!("reading restore stage mode for {}", target.display()))?
             .permissions();
-        if let Err(error) = fs::set_permissions(&cloned.path, permissions) {
+        if let Err(error) = fs::set_permissions(&cloned, permissions) {
+            let _ = fs::remove_file(&cloned);
             tracing::debug!(
                 %error,
                 "cloned cc output kept the blob mode, restoring by copy: {} -> {}",
@@ -1391,7 +1563,7 @@ fn prepare_writable_target_from_file_via(
             );
         } else {
             return Ok(PreparedWritableTarget {
-                stage: WritableStage::Cloned(cloned),
+                stage: WritableStage::Cloned(ClonedFile { path: cloned }),
                 target: target.to_path_buf(),
                 bytes,
                 source: Some(src.to_path_buf()),
@@ -1435,30 +1607,20 @@ fn prepared_reflink(
     }
 }
 
-/// Clone `src` inside a private directory beside `target`.
-/// The clone stays inaccessible until its destination permissions are applied.
+/// Clone `src` to a new file in `target`'s directory.
 ///
 /// `None` means the caller should copy. A clone that shares `src`'s inode is
 /// removed when it is an extra name, and is not returned.
 fn private_clone_file(
     src: &Path,
     target: &Path,
-    clone_new: impl Fn(&Path, &Path) -> std::io::Result<()>,
-) -> Result<Option<ClonedFile>> {
-    let Ok(directory) =
-        kache_fs::private_clone_directory(src, stage_parent(target), ".kache-cc-clone-")
-    else {
-        return Ok(None);
-    };
+    clone_new: fn(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Option<PathBuf>> {
+    let parent = stage_parent(target);
     for _ in 0..8 {
-        let dest = temp_clone_path(directory.path());
+        let dest = temp_clone_path(parent);
         match clone_new(src, &dest) {
-            Ok(()) => {
-                return Ok(accepted_private_clone(src, &dest).map(|path| ClonedFile {
-                    path,
-                    _directory: directory,
-                }));
-            }
+            Ok(()) => return Ok(accepted_private_clone(src, &dest)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => return Ok(None),
         }
@@ -1551,7 +1713,7 @@ fn link_count(meta: &fs::Metadata) -> u64 {
     }
 }
 
-/// Prepare transformed bytes with the same absent-only guarantee.
+/// Prepare transformed C/C++ bytes with the same absent-only guarantee.
 pub fn prepare_writable_target_from_bytes(
     target: &Path,
     content: &[u8],
@@ -1627,13 +1789,6 @@ fn clear_target(target_path: &Path) -> Result<()> {
 /// holds no matter which path materializes the file — including a future
 /// content transform applied to an executable artifact (issue #298).
 pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy) -> Result<()> {
-    if strategy == LinkStrategy::WritableCopy {
-        create_restore_directories(stage_parent(target_path))?;
-        let prepared = prepare_writable_target_from_bytes(target_path, content)?;
-        #[cfg(windows)]
-        clear_target(target_path)?;
-        return prepared.publish_replacing();
-    }
     if let Some(result) = crate::workspace::dispatch(crate::workspace::Operation::Write(
         target_path,
         content,
@@ -1655,10 +1810,7 @@ pub fn write_restored(target_path: &Path, content: &[u8], strategy: LinkStrategy
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = if matches!(
-                strategy,
-                LinkStrategy::Copy | LinkStrategy::ExecutableHardlink
-            ) {
+            let mode = if strategy.is_executable() {
                 0o755
             } else {
                 0o644
@@ -1801,24 +1953,30 @@ pub fn touch_mtime_write_clock(path: &Path) -> Result<()> {
             .with_context(|| format!("sampling write clock next to {}", path.display()))?;
 
         // On Windows, hardlinked files share permissions with the store
-        // blob, which is read-only. Temporarily make it writable to update
-        // the mtime, then restore the read-only flag.
+        // blob, which is read-only, and a read-only file refuses the write
+        // handle the stamp needs. Restored copies and clones are writable,
+        // so stamp first and only on a refusal from a read-only file make it
+        // writable for the stamp, then restore the read-only flag. That
+        // saves the attribute read every writable restore used to pay.
         #[cfg(windows)]
-        {
-            let meta = fs::metadata(path)?;
-            let was_readonly = meta.permissions().readonly();
-            if was_readonly {
-                let mut perms = meta.permissions();
+        match filetime::set_file_mtime(path, now) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && fs::metadata(path).is_ok_and(|meta| meta.permissions().readonly()) =>
+            {
+                let mut perms = fs::metadata(path)?.permissions();
                 perms.set_readonly(false);
                 fs::set_permissions(path, perms)?;
-            }
-            let result = filetime::set_file_mtime(path, now);
-            if was_readonly {
+                let result = filetime::set_file_mtime(path, now);
                 let mut perms = fs::metadata(path)?.permissions();
                 perms.set_readonly(true);
                 let _ = fs::set_permissions(path, perms);
+                result.with_context(|| format!("updating mtime of {}", path.display()))?;
             }
-            result.with_context(|| format!("updating mtime of {}", path.display()))?;
+            Err(error) => {
+                return Err(error).with_context(|| format!("updating mtime of {}", path.display()));
+            }
         }
 
         #[cfg(not(windows))]
@@ -2485,6 +2643,25 @@ mod tests {
 
     use super::*;
 
+    /// A daemon worker thread serves one compiler request after another:
+    /// rows one request handed to the daemon do not stop the next from
+    /// waiting for the index.
+    #[test]
+    fn bookkeeping_hand_offs_are_noted_per_invocation() {
+        std::thread::spawn(|| {
+            {
+                let _first = InvocationLinkScope::enter();
+                assert!(!bookkeeping_handed_off());
+                note_bookkeeping_handed_off();
+                assert!(bookkeeping_handed_off());
+            }
+            let _second = InvocationLinkScope::enter();
+            assert!(!bookkeeping_handed_off());
+        })
+        .join()
+        .unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_modes_preserve_permissions_and_remove_file_type_bits() {
@@ -2548,6 +2725,11 @@ mod tests {
                         let first = dir.path().join("first.rlib");
                         let second = dir.path().join("second.rlib");
                         fs::write(&blob, b"cache bytes").unwrap();
+                        // A store blob is read-only; a writable one is never
+                        // shared (see hardlink_or_copy).
+                        let mut permissions = fs::metadata(&blob).unwrap().permissions();
+                        permissions.set_readonly(true);
+                        fs::set_permissions(&blob, permissions).unwrap();
                         fs::hard_link(&blob, &first).unwrap();
                         hardlink_or_copy(&blob, &second, 11).unwrap();
                         assert_eq!(
@@ -2634,6 +2816,53 @@ mod tests {
         let emitted = crate::markers::take_emitted();
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, crate::markers::WarnSink::Log);
+    }
+
+    #[test]
+    fn a_closed_layout_bucket_asks_the_volume_only_whether_it_clones() {
+        // Open: classify as before, without the early question.
+        let asked = Cell::new(0);
+        assert!(copy_restore_may_warn(true, || {
+            asked.set(asked.get() + 1);
+            Some(false)
+        }));
+        assert_eq!(asked.get(), 0);
+        // Closed on NTFS (or unknown): nothing can print, no other query.
+        for has_cow in [Some(false), None] {
+            let asked = Cell::new(0);
+            assert!(!copy_restore_may_warn(false, || {
+                asked.set(asked.get() + 1);
+                has_cow
+            }));
+            assert_eq!(asked.get(), 1);
+        }
+        // Closed on a volume that clones: a fault may still print.
+        assert!(copy_restore_may_warn(false, || Some(true)));
+    }
+
+    #[test]
+    fn the_layout_bucket_closes_once_its_marker_is_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("cow-warn");
+        assert!(layout_bucket_open(Some(&base), true));
+        // The Copy strategy never gives layout advice.
+        assert!(!layout_bucket_open(Some(&base), false));
+        // A fault bucket's marker does not close the layout bucket.
+        crate::markers::warn_once_per_session_to(
+            &bucket_marker(&base, "cow-fault"),
+            crate::markers::WARN_SESSION_SECS,
+            "fault",
+            crate::markers::WarnSink::Log,
+        );
+        assert!(layout_bucket_open(Some(&base), true));
+        crate::markers::warn_once_per_session_to(
+            &bucket_marker(&base, "cow"),
+            crate::markers::WARN_SESSION_SECS,
+            "advice",
+            crate::markers::WarnSink::Log,
+        );
+        assert!(!layout_bucket_open(Some(&base), true));
+        let _ = crate::markers::take_emitted();
     }
 
     #[test]
@@ -3523,11 +3752,13 @@ mod tests {
     }
 
     #[test]
-    fn a_clone_is_created_in_a_private_output_directory() {
+    fn a_clone_is_created_in_the_output_directory() {
         fn write_beside(src: &Path, dest: &Path) -> std::io::Result<()> {
-            assert_eq!(dest.parent().and_then(Path::parent), src.parent());
-            #[cfg(unix)]
-            assert_eq!(mode_of(dest.parent().unwrap()), 0o700);
+            if dest.parent() != src.parent() {
+                return Err(std::io::Error::other(
+                    "clone was not created beside the output",
+                ));
+            }
             fs::write(dest, b"CLONED-BESIDE")
         }
 
@@ -3780,6 +4011,33 @@ mod tests {
     /// immediately after — that inversion is the entire #677 bug. The
     /// before-bound also proves the touch moved the mtime forward from an
     /// arbitrarily old value.
+    /// A read-only file (a hardlink to a store blob under the Windows
+    /// hardlink opt-in) is stamped and stays read-only; a writable one is
+    /// stamped directly.
+    #[cfg(windows)]
+    #[test]
+    fn touch_write_clock_stamps_readonly_and_writable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let past = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        for readonly in [false, true] {
+            let file = dir.path().join(format!("touched-{readonly}.rlib"));
+            fs::write(&file, b"content").unwrap();
+            filetime::set_file_mtime(&file, past).unwrap();
+            let mut perms = fs::metadata(&file).unwrap().permissions();
+            perms.set_readonly(readonly);
+            fs::set_permissions(&file, perms).unwrap();
+
+            touch_mtime_write_clock(&file).unwrap();
+
+            let meta = fs::metadata(&file).unwrap();
+            assert!(filetime::FileTime::from_last_modification_time(&meta) > past);
+            assert_eq!(meta.permissions().readonly(), readonly);
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&file, perms).unwrap();
+        }
+    }
+
     #[test]
     fn test_touch_write_clock_orders_with_file_writes() {
         let dir = tempfile::tempdir().unwrap();
@@ -4864,7 +5122,7 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             fs::set_permissions(&path, permissions).unwrap();
         }
 
-        set_executable_permissions(&path).unwrap();
+        set_copy_permissions(&path, true).unwrap();
 
         #[cfg(unix)]
         {
@@ -5244,6 +5502,7 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         let dir = tempfile::tempdir().unwrap();
         let blob = dir.path().join("blob.rlib");
         fs::write(&blob, b"cached rlib").unwrap();
+        read_only(&blob);
         let bytes = fs::metadata(&blob).unwrap().len();
         set_shared_hardlink_restores(true);
         let result = (|| {
@@ -5264,6 +5523,44 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
             fs::metadata(&first).unwrap().ino(),
             fs::metadata(&second).unwrap().ino()
         );
+    }
+
+    /// Store blobs are written read-only, as the store does.
+    #[cfg(unix)]
+    fn read_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    /// A blob that gained a write bit may have been edited in place through
+    /// another tree's link: shared restores copy it instead of linking it.
+    #[test]
+    #[cfg(unix)]
+    fn shared_restores_never_link_a_writable_blob() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _guard = SHARED_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob.rlib");
+        fs::write(&blob, b"cached rlib").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o644)).unwrap();
+        let bytes = fs::metadata(&blob).unwrap().len();
+        let before = crate::opcounts::restore_copy_other_bytes();
+        set_shared_hardlink_restores(true);
+        let target = dir.path().join("tree.rlib");
+        let result = hardlink_or_copy(&blob, &target, bytes);
+        set_shared_hardlink_restores(false);
+        result.unwrap();
+        assert_eq!(
+            fs::metadata(&blob).unwrap().nlink(),
+            1,
+            "the writable blob is not linked"
+        );
+        assert_ne!(
+            fs::metadata(&blob).unwrap().ino(),
+            fs::metadata(&target).unwrap().ino()
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"cached rlib");
+        assert!(crate::opcounts::restore_copy_other_bytes() >= before + bytes);
     }
 
     #[test]
@@ -5339,117 +5636,6 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
     #[cfg(unix)]
     fn running_as_root() -> bool {
         unsafe { libc::geteuid() == 0 }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn metadata_restores_honor_private_creation_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        const CHILD: &str = "KACHE_TEST_PRIVATE_METADATA_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "link::tests::metadata_restores_honor_private_creation_permissions",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "private metadata child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        // Only this test runs in the child, so changing its umask cannot race
-        // other tests or affect the parent process.
-        unsafe { libc::umask(0o077) };
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("cache");
-        let output_dir = dir.path().join("target");
-        fs::create_dir(&cache).unwrap();
-        fs::create_dir(&output_dir).unwrap();
-        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        let blob = cache.join("blob");
-        fs::write(&blob, b"private metadata").unwrap();
-        fn private_reflink(source: &Path, target: &Path) -> Result<()> {
-            assert_eq!(mode_of(target.parent().unwrap()), 0o700);
-            try_reflink(source, target)
-        }
-        for mode in [0o400, 0o444, 0o555] {
-            fs::set_permissions(&blob, fs::Permissions::from_mode(mode)).unwrap();
-            for (name, reflink) in [
-                ("copy.rmeta", no_reflink as fn(&Path, &Path) -> Result<()>),
-                ("clone.rmeta", private_reflink),
-            ] {
-                let target = output_dir.join(name);
-                link_to_target_via(&blob, &target, LinkStrategy::WritableCopy, reflink).unwrap();
-                assert_eq!(mode_of(&target), 0o600, "{name}, blob mode {mode:o}");
-                assert_ne!(ino_of(&target), ino_of(&blob));
-                assert_eq!(fs::read(&target).unwrap(), b"private metadata");
-                fs::write(&target, b"rewritten").unwrap();
-                assert_eq!(fs::read(&blob).unwrap(), b"private metadata");
-                assert_eq!(mode_of(&blob), mode);
-            }
-        }
-        let target = output_dir.join("nested/transformed.rmeta");
-        write_restored(&target, b"transformed metadata", LinkStrategy::WritableCopy).unwrap();
-        assert_eq!(mode_of(&target), 0o600);
-        assert_eq!(fs::read(&target).unwrap(), b"transformed metadata");
-    }
-
-    #[test]
-    fn metadata_restores_use_the_clients_private_staging_operations() {
-        use crate::workspace::{Operation, Outcome, Scope, Workspace};
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Default)]
-        struct Client {
-            calls: Mutex<Vec<&'static str>>,
-        }
-        impl Workspace for Client {
-            fn execute(&self, operation: Operation<'_>) -> std::io::Result<Outcome> {
-                let mut calls = self.calls.lock().unwrap();
-                match operation {
-                    Operation::PrepareFile(_, _) => calls.push("file"),
-                    Operation::PrepareBytes(_, b"metadata") => calls.push("bytes"),
-                    Operation::Publish(42, true) => {
-                        calls.push("publish");
-                        return Ok(Outcome::Done);
-                    }
-                    Operation::CreateDirectories(_) | Operation::Remove(_) => {
-                        return Ok(Outcome::Done);
-                    }
-                    _ => panic!("metadata must use the client's private staging"),
-                }
-                Ok(Outcome::Prepared {
-                    id: 42,
-                    bytes: 8,
-                    reflinked: false,
-                })
-            }
-        }
-
-        let client = Arc::new(Client::default());
-        let _scope = Scope::enter(Some(client.clone()));
-        // These paths need not exist in the engine's filesystem namespace.
-        // All access and publication must run through the original client.
-        let target = Path::new("client-only/output.rmeta");
-        link_to_target(
-            Path::new("client-only/blob"),
-            target,
-            LinkStrategy::WritableCopy,
-        )
-        .unwrap();
-        write_restored(target, b"metadata", LinkStrategy::WritableCopy).unwrap();
-        assert_eq!(
-            *client.calls.lock().unwrap(),
-            ["file", "publish", "bytes", "publish"]
-        );
     }
 
     #[cfg(unix)]
@@ -5545,6 +5731,70 @@ Unified_mm_ettings-WrongChannel0.o: Unified_mm_ettings-WrongChannel0.mm \\
         assert!(!executable_blob_is_shareable(Some(0o755)));
         assert!(!executable_blob_is_shareable(Some(0o557)));
         assert!(!executable_blob_is_shareable(None));
+    }
+
+    // ── SharedLibHardlink: pipelined rlibs ────────────────────────────────
+
+    /// Without CoW, a read-only rlib blob is linked by every target that
+    /// restores it, not only the first, and linking leaves its mtime alone:
+    /// the `.rmeta` beside it carries the restore's stamp.
+    #[cfg(unix)]
+    #[test]
+    fn a_lib_blob_is_shared_by_every_consumer_and_keeps_its_mtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("blob");
+        fs::write(&blob, b"rlib").unwrap();
+        fs::set_permissions(&blob, fs::Permissions::from_mode(0o444)).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&blob, old).unwrap();
+        let trees = [
+            dir.path().join("a/libx.rlib"),
+            dir.path().join("b/libx.rlib"),
+        ];
+        for tree in &trees {
+            fs::create_dir_all(tree.parent().unwrap()).unwrap();
+            link_to_target_via(&blob, tree, LinkStrategy::SharedLibHardlink, no_reflink).unwrap();
+        }
+        for tree in &trees {
+            assert_eq!(ino_of(tree), ino_of(&blob));
+            assert_eq!(mode_of(tree) & 0o777, 0o444, "no writer reaches the blob");
+            let mtime =
+                filetime::FileTime::from_last_modification_time(&fs::metadata(tree).unwrap());
+            assert_eq!(mtime, old, "linking re-dates nothing");
+        }
+    }
+
+    /// A blob a link could be written through, or one dated after the
+    /// restore, is copied: the copy is private, and the blob keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_lib_blob_that_cannot_be_shared_is_copied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let future = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        );
+        for (name, mode, mtime) in [("writable", 0o644, None), ("future", 0o444, Some(future))] {
+            let blob = dir.path().join(name);
+            fs::write(&blob, b"rlib").unwrap();
+            fs::set_permissions(&blob, fs::Permissions::from_mode(mode)).unwrap();
+            if let Some(mtime) = mtime {
+                filetime::set_file_mtime(&blob, mtime).unwrap();
+            }
+            let target = dir.path().join(format!("lib{name}.rlib"));
+            link_to_target_via(&blob, &target, LinkStrategy::SharedLibHardlink, no_reflink)
+                .unwrap();
+            assert_ne!(ino_of(&target), ino_of(&blob), "{name}");
+            assert_eq!(mode_of(&blob), mode, "{name}");
+            assert_eq!(fs::read(&target).unwrap(), b"rlib", "{name}");
+        }
+        let meta = fs::metadata(dir.path()).unwrap();
+        assert!(!lib_blob_is_shareable(
+            Some(&meta),
+            std::time::SystemTime::now()
+        ));
+        assert!(!lib_blob_is_shareable(None, std::time::SystemTime::now()));
     }
 
     /// Without CoW, a runnable read-only blob is shared like an rlib. The link

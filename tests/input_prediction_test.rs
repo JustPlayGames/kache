@@ -219,8 +219,10 @@ struct LastEvent {
     prediction_mismatches: u64,
 }
 
-/// `local_hits` from the report summary.
+/// `local_hits` from the report summary, once the daemon logged every
+/// compile handed to it.
 fn summary_local_hits(cache_dir: &Path) -> u64 {
+    common::wait_for_daemon_publishes(cache_dir);
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -282,6 +284,12 @@ fn compile_first_publishes_without_a_second_compiler_admission() {
 
 /// [`last_event`], with `env` set for the report as it was for the build.
 fn last_event_with(cache_dir: &Path, env: &[(&str, std::ffi::OsString)]) -> LastEvent {
+    // Under a trust domain the cache and the daemon's runtime live in the
+    // domain's folder.
+    match env.iter().find(|(name, _)| *name == "KACHE_TRUST_DOMAIN") {
+        Some((_, domain)) => common::wait_for_daemon_publishes(&cache_dir.join(domain)),
+        None => common::wait_for_daemon_publishes(cache_dir),
+    }
     let output = std::process::Command::new(kache_binary())
         .args(["report", "--format", "json", "--since", "1h"])
         .env("KACHE_CACHE_DIR", cache_dir)
@@ -427,8 +435,7 @@ fn a_stale_record_is_re_derived_from_the_running_compile() {
 
 /// The latest raw `kt` event. `kache report` leaves out skipped compiles.
 fn last_raw_event(cache_dir: &Path) -> serde_json::Value {
-    std::fs::read_to_string(cache_dir.join("events.jsonl"))
-        .expect("events.jsonl")
+    common::settled_events(cache_dir)
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -1572,12 +1579,13 @@ fn a_cargo_home_inside_the_workspace_keeps_the_record_guarded() {
     );
 }
 
-/// A file the closure does not name, anywhere in the workspace, could be one
-/// a macro reads, so B's extra file keeps A's record out.
+/// With the whole-workspace guard (`KACHE_WORKSPACE_GUARD=workspace`), a
+/// file the closure does not name, anywhere in the workspace, could be one a
+/// macro reads, so B's extra file keeps A's record out.
 #[test]
 fn a_new_file_anywhere_in_the_workspace_refuses_the_record() {
     for with_macro in [false, true] {
-        let unit = WorkspaceUnit::new(with_macro);
+        let unit = WorkspaceUnit::new(with_macro).with_env("KACHE_WORKSPACE_GUARD", "workspace");
         let warm = unit.build_a_then_b(|b| {
             std::fs::create_dir_all(b.join("docs")).unwrap();
             std::fs::write(b.join("docs/notes.md"), "not read\n").unwrap();
@@ -2112,4 +2120,706 @@ fn a_macro_on_the_shared_out_dir_predicts_in_another_target() {
 #[test]
 fn a_macro_expanding_a_macro_on_the_shared_out_dir_predicts_in_another_target() {
     predicts_on_the_shared_out_dir(true);
+}
+
+// ---------------------------------------------------------------------------
+// PROTOTYPE: the scoped workspace guard (`KACHE_WORKSPACE_GUARD=scoped`).
+// ---------------------------------------------------------------------------
+
+impl WorkspaceUnit {
+    /// Every build and report runs with the scoped guard on.
+    fn scoped(mut self) -> Self {
+        self.env.push(("KACHE_WORKSPACE_GUARD", "scoped".into()));
+        self
+    }
+
+    fn with_env(mut self, name: &'static str, value: &str) -> Self {
+        self.env.push((name, value.into()));
+        self
+    }
+}
+
+/// [`SCAN_MACRO`] over `shared/` at the workspace root, a sibling of the
+/// member's package: `CARGO_MANIFEST_DIR/../shared`.
+fn scan_macro_over(dir: &str) -> String {
+    SCAN_MACRO.replace(".join(\"assets\")", &format!(".join({dir:?})"))
+}
+
+/// [`SCAN_MACRO`] over `../shared` that, once a `add-late` file sits next to
+/// the checkout, adds `shared/late.txt` after it listed the directory: the
+/// compile saw a directory without it, which holds it by the time the
+/// wrapper records the closure.
+const LATE_ADDING_SCAN_MACRO: &str = r#"extern crate proc_macro;
+#[proc_macro]
+pub fn scan(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_dir = std::path::Path::new(&manifest_dir);
+    let shared = manifest_dir.join("../shared");
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&shared)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    files.sort();
+    let marker = manifest_dir.join("../../add-late");
+    if marker.exists() {
+        let _ = std::fs::write(shared.join("late.txt"), "late\n");
+        let _ = std::fs::remove_file(&marker);
+    }
+    let mut code = String::from("pub const ASSETS: &[&str] = &[");
+    for file in files {
+        code.push_str(&format!("include_str!({:?}),", file.display().to_string()));
+    }
+    code.push_str("];");
+    code.parse().unwrap()
+}
+"#;
+
+/// The point of the scoped guard: a file changed or added outside the
+/// member's package, where no macro of the member looks, keeps the record,
+/// in this checkout and in another one, and the predicted key is the one the
+/// pre-pass gives.
+#[test]
+fn scoped_a_change_outside_the_package_keeps_the_record() {
+    build_kache();
+    for with_macro in [false, true] {
+        let unit = WorkspaceUnit::new(with_macro)
+            .scoped()
+            .with_file("docs/old.md", "old\n");
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        std::fs::write(a.join("docs/notes.md"), "not read\n").unwrap();
+        std::fs::write(a.join("docs/old.md"), "edited\n").unwrap();
+        let warm = unit.build(&a, true, None);
+        assert_eq!(warm.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(warm.dep_info_runs, 0, "with_macro={with_macro}");
+        let off = unit.build(&a, false, None);
+        assert_eq!(off.cache_key, warm.cache_key, "with_macro={with_macro}");
+
+        // Another checkout with its own docs uses A's portable row.
+        let b = unit.checkout("b");
+        std::fs::write(b.join("docs/other.md"), "b's own\n").unwrap();
+        let other = unit.build(&b, true, None);
+        assert_eq!(other.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(other.dep_info_runs, 0, "with_macro={with_macro}");
+        assert_eq!(other.cache_key, warm.cache_key, "with_macro={with_macro}");
+    }
+}
+
+/// Inside the package, the scoped guard is the workspace guard: a file added
+/// where a re-exported macro lists is seen, and the key is the pre-pass's.
+#[test]
+fn scoped_a_file_added_inside_the_package_where_a_macro_lists_misses() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    assert_eq!(unit.build(&a, true, None).dep_info_runs, 0);
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_eq!(added.result, "miss");
+    assert_ne!(added.cache_key, cold.cache_key);
+    let off = unit.build(&a, false, None);
+    assert_eq!(off.cache_key, added.cache_key);
+}
+
+/// Outside the package, the directory of a file the closure names is part
+/// of the guard: a file added where the macro lists `../shared` is seen, in
+/// this checkout and in another checkout that has the extra file.
+#[test]
+fn scoped_a_file_added_outside_the_package_where_a_macro_lists_misses() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade_macro(&scan_macro_over("../shared"))
+        .with_file("shared/a.txt", "a\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(
+        warm.dep_info_runs, 0,
+        "an unchanged directory keeps the record"
+    );
+
+    let b = unit.checkout("b");
+    std::fs::write(b.join("shared/b.txt"), "b\n").unwrap();
+    let other = unit.build(&b, true, None);
+    assert_eq!(other.result, "miss", "B's extra file is listed");
+    assert_ne!(other.cache_key, cold.cache_key);
+    assert_eq!(unit.build(&b, false, None).cache_key, other.cache_key);
+
+    std::fs::write(a.join("shared/b.txt"), "b\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_ne!(added.cache_key, cold.cache_key, "A sees it too");
+    assert_eq!(unit.build(&a, false, None).cache_key, added.cache_key);
+}
+
+/// A file the macro adds to a listed directory after listing it, while the
+/// unit compiles, must not leave a record that lists the directory with it:
+/// the compile did not see it. The next build discovers its closure.
+#[test]
+fn scoped_a_listed_directory_changed_while_the_unit_builds_leaves_no_record() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade_macro(LATE_ADDING_SCAN_MACRO)
+        .with_file("shared/a.txt", "a\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    // A change in the package sends the next build to the pre-pass, which
+    // runs the macro, which adds `late.txt` after listing.
+    std::fs::write(unit.root.path().join("add-late"), "").unwrap();
+    std::fs::write(a.join("kt/notes.txt"), "package change\n").unwrap();
+    unit.build(&a, true, None);
+    assert!(a.join("shared/late.txt").exists(), "the macro added it");
+    let next = unit.build(&a, true, None);
+    let off = unit.build(&a, false, None);
+    assert_eq!(
+        next.cache_key, off.cache_key,
+        "keyed as the pre-pass keys it"
+    );
+}
+
+/// A dot-directory or file at the workspace root is on the way up from the
+/// package (`.sqlx`, `.env`), so a change there refuses the record, except
+/// for the paths no build reads: by default `.agents`, `.github`, `.claude`,
+/// `.config` (cargo-nextest's and other tools' settings), `AGENTS.md` and
+/// `README.md`; `KACHE_GUARD_IGNORE` replaces the list, and an empty one
+/// ignores nothing.
+#[test]
+fn scoped_a_root_change_refuses_the_record_unless_ignored() {
+    build_kache();
+    // (KACHE_GUARD_IGNORE, does a change to .agents/ refuse, to AGENTS.md, to notes.txt,
+    // to .config/nextest.toml)
+    let cases: [(Option<&str>, bool, bool, bool, bool); 3] = [
+        (None, false, false, true, false),
+        (Some(""), true, true, true, true),
+        (Some(" .agents/ ; notes.txt"), false, true, false, true),
+    ];
+    for (ignore, agents, agents_md, notes, tool_config) in cases {
+        let mut unit = WorkspaceUnit::new(false).scoped();
+        if let Some(ignore) = ignore {
+            unit = unit.with_env("KACHE_GUARD_IGNORE", ignore);
+        }
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        let changes: [(&dyn Fn(), bool, &str); 5] = [
+            (
+                &|| {
+                    std::fs::create_dir_all(a.join(".agents")).unwrap();
+                    std::fs::write(a.join(".agents/skill.md"), "skill\n").unwrap();
+                },
+                agents,
+                ".agents",
+            ),
+            (
+                &|| std::fs::write(a.join("AGENTS.md"), "rules\n").unwrap(),
+                agents_md,
+                "AGENTS.md",
+            ),
+            (
+                &|| std::fs::write(a.join("notes.txt"), "notes\n").unwrap(),
+                notes,
+                "notes.txt",
+            ),
+            (
+                &|| {
+                    std::fs::create_dir_all(a.join(".config")).unwrap();
+                    std::fs::write(a.join(".config/nextest.toml"), "[profile.default]\n").unwrap();
+                },
+                tool_config,
+                ".config",
+            ),
+            (
+                &|| {
+                    std::fs::create_dir_all(a.join(".sqlx")).unwrap();
+                    std::fs::write(a.join(".sqlx/query-1.json"), "{}\n").unwrap();
+                },
+                true,
+                ".sqlx",
+            ),
+        ];
+        for (change, refuses, what) in changes {
+            change();
+            let event = unit.build(&a, true, None);
+            assert_eq!(event.result, "local_hit", "{ignore:?} {what}");
+            assert_eq!(
+                event.dep_info_runs,
+                u64::from(refuses),
+                "KACHE_GUARD_IGNORE={ignore:?}: a change to {what}"
+            );
+        }
+    }
+}
+
+/// The workspace manifest at the root counts by what it says, less where the
+/// workspace's packages are: a comment, a new member and its path entry in
+/// `[workspace.dependencies]` (what a commit adding a crate changes) keep the
+/// record; a registry dependency or `[workspace.metadata]` refuses it, and so
+/// does any change to a manifest that does not parse.
+#[test]
+fn scoped_a_root_manifest_change_that_only_places_packages_keeps_the_record() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false).scoped();
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let manifest = a.join("Cargo.toml");
+    let changes: [(&str, bool, &str); 6] = [
+        (
+            "# The workspace.\n[workspace]\nmembers = [\"kt\"]\n",
+            false,
+            "a comment",
+        ),
+        (
+            "[workspace]\nmembers = [\"kt\", \"new\"]\nexclude = [\"old\"]\n\n\
+             [workspace.dependencies]\nnew = { path = \"new\" }\n",
+            false,
+            "a member and its path dependency",
+        ),
+        (
+            "[workspace]\nmembers = [\"kt\", \"new\"]\nexclude = [\"old\"]\n\n\
+             [workspace.dependencies]\nnew = { path = \"new\" }\nserde = \"1\"\n",
+            true,
+            "a registry dependency",
+        ),
+        (
+            "[workspace]\nmembers = [\"kt\", \"new\"]\nexclude = [\"old\"]\n\n\
+             [workspace.dependencies]\nnew = { path = \"new\" }\nserde = \"1\"\n\n\
+             [workspace.metadata.assets]\ndir = \"web\"\n",
+            true,
+            "workspace metadata",
+        ),
+        ("[workspace\n", true, "a manifest that does not parse"),
+        ("[workspace\n# still broken\n", true, "its bytes"),
+    ];
+    for (text, refuses, what) in changes {
+        std::fs::write(&manifest, text).unwrap();
+        let event = unit.build(&a, true, None);
+        assert_eq!(event.result, "local_hit", "{what}");
+        assert_eq!(event.dep_info_runs, u64::from(refuses), "a change to {what}");
+    }
+}
+
+/// THE DOCUMENTED GAP. A macro that lists a directory outside its package
+/// that holds no file of the closure (here an empty one) finds its first
+/// file with the scoped guard unchanged: the predicted key is the old one,
+/// a false hit. The workspace guard and the pre-pass both see the file.
+#[test]
+fn scoped_gap_a_macro_listing_an_empty_directory_outside_the_package() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_facade_macro(&scan_macro_over("../shared"));
+    let a = unit.checkout("a");
+    std::fs::create_dir_all(a.join("shared")).unwrap();
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    std::fs::write(a.join("shared/first.txt"), "first\n").unwrap();
+    let first = unit.build(&a, true, None);
+    let off = unit.build(&a, false, None);
+    assert_ne!(off.cache_key, cold.cache_key, "the pre-pass sees the file");
+    assert_eq!(first.cache_key, cold.cache_key, "the scoped guard does not");
+}
+
+/// Clippy names the workspace manifest in its closure. The root is on the
+/// way up from the package, so its files and dot-directories are guarded,
+/// and a new directory there (a `target` Cargo made, or any other) does not
+/// refuse the record; a new file at the root does.
+#[test]
+fn scoped_a_closure_file_at_the_root_guards_the_root_files_only() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .scoped()
+        .with_lib("pub const MANIFEST: &str = include_str!(\"../../Cargo.toml\");\n");
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::create_dir_all(a.join("target-2/debug")).unwrap();
+    std::fs::write(
+        a.join("target-2/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(a.join("notes")).unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(
+        warm.dep_info_runs, 0,
+        "new directories at the root keep the record"
+    );
+    std::fs::write(a.join("NEW.md"), "a new root file\n").unwrap();
+    assert_eq!(
+        unit.build(&a, true, None).dep_info_runs,
+        1,
+        "a new root file refuses it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The inputs guard (`KACHE_WORKSPACE_GUARD=inputs`, opt-in).
+// ---------------------------------------------------------------------------
+
+impl WorkspaceUnit {
+    /// Every build and report runs with the inputs guard on.
+    fn inputs(mut self) -> Self {
+        self.env.push(("KACHE_WORKSPACE_GUARD", "inputs".into()));
+        self
+    }
+}
+
+/// A member whose lib has a module tree: `lib.rs` -> `a.rs` -> `a/b.rs`.
+fn module_tree_unit(with_macro: bool) -> WorkspaceUnit {
+    let mut lib = String::new();
+    if with_macro {
+        lib.push_str("pm::answer!();\n");
+    }
+    lib.push_str("pub mod a;\n");
+    lib.push_str("pub const SHARED: &str = include_str!(\"../../assets/shared.txt\");\n");
+    lib.push_str("include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n");
+    WorkspaceUnit::new(with_macro)
+        .with_lib(&lib)
+        .with_file("kt/src/a.rs", "pub mod b;\n")
+        .with_file("kt/src/a/b.rs", "pub const B: u32 = 1;\n")
+        .with_file("kt/tests/t.rs", "#[test]\nfn t() {}\n")
+        .with_file("kt/benches/b.rs", "fn main() {}\n")
+        .with_file("kt/examples/e.rs", "fn main() {}\n")
+}
+
+/// The point of the inputs guard: an edit, a new file or a rename in
+/// `tests/`, `benches/` or `examples/` of the member keeps the lib's record,
+/// in this checkout and in another one, where the scoped guard sends the
+/// unit to the pre-pass. The predicted key is the pre-pass's.
+#[test]
+fn inputs_an_edit_outside_the_closure_inside_the_package_keeps_the_record() {
+    build_kache();
+    for with_macro in [false, true] {
+        let unit = module_tree_unit(with_macro).inputs();
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        std::fs::write(a.join("kt/tests/t.rs"), "#[test]\nfn t2() {}\n").unwrap();
+        std::fs::write(a.join("kt/benches/new.rs"), "fn main() {}\n").unwrap();
+        std::fs::rename(a.join("kt/examples/e.rs"), a.join("kt/examples/f.rs")).unwrap();
+        let warm = unit.build(&a, true, None);
+        assert_eq!(warm.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(warm.dep_info_runs, 0, "with_macro={with_macro}");
+        assert_eq!(
+            unit.build(&a, false, None).cache_key,
+            warm.cache_key,
+            "with_macro={with_macro}"
+        );
+
+        let b = unit.checkout("b");
+        std::fs::write(b.join("kt/tests/other.rs"), "// b's own\n").unwrap();
+        let other = unit.build(&b, true, None);
+        assert_eq!(other.result, "local_hit", "with_macro={with_macro}");
+        assert_eq!(other.dep_info_runs, 0, "with_macro={with_macro}");
+        assert_eq!(other.cache_key, warm.cache_key, "with_macro={with_macro}");
+    }
+}
+
+/// The same edit under the scoped guard (the default) refuses the record:
+/// the inputs guard is what keeps it.
+#[test]
+fn scoped_an_edit_in_tests_refuses_the_record() {
+    build_kache();
+    let unit = module_tree_unit(true).scoped();
+    let a = unit.checkout("a");
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::write(a.join("kt/tests/t.rs"), "#[test]\nfn t2() {}\n").unwrap();
+    let warm = unit.build(&a, true, None);
+    assert_eq!(warm.result, "local_hit");
+    assert_eq!(warm.dep_info_runs, 1);
+}
+
+/// A name that comes, goes or moves in a directory of the closure, or in a
+/// directory between one and the package, refuses the record: rustc looks
+/// there for module files (`a/b/mod.rs` beside `a/b.rs`, `src/c.rs`), and a
+/// macro that lists and includes looks there too.
+#[test]
+fn inputs_a_name_change_next_to_the_closure_refuses_the_record() {
+    build_kache();
+    type Change = fn(&Path);
+    let changes: [(&str, Change); 5] = [
+        ("new file beside a.rs", |a| {
+            std::fs::write(a.join("kt/src/c.rs"), "pub const C: u32 = 3;\n").unwrap()
+        }),
+        ("new file in a/", |a| {
+            std::fs::write(a.join("kt/src/a/c.rs"), "pub const C: u32 = 3;\n").unwrap()
+        }),
+        ("new directory in a/", |a| {
+            std::fs::create_dir_all(a.join("kt/src/a/c")).unwrap()
+        }),
+        ("rename of an unused file in src/", |a| {
+            std::fs::rename(a.join("kt/src/unused.rs"), a.join("kt/src/moved.rs")).unwrap()
+        }),
+        ("new top-level directory of the package", |a| {
+            std::fs::create_dir_all(a.join("kt/assets2")).unwrap()
+        }),
+    ];
+    for (what, change) in changes {
+        let unit = module_tree_unit(true)
+            .inputs()
+            .with_file("kt/src/unused.rs", "// not a module\n");
+        let a = unit.checkout("a");
+        let cold = unit.build(&a, true, None);
+        assert_eq!(cold.result, "miss", "{what}");
+        assert_eq!(unit.build(&a, true, None).dep_info_runs, 0, "{what}");
+        change(&a);
+        let changed = unit.build(&a, true, None);
+        assert_eq!(changed.dep_info_runs, 1, "{what}: the record is refused");
+        assert_eq!(changed.cache_key, cold.cache_key, "{what}: same closure");
+        assert_eq!(
+            unit.build(&a, false, None).cache_key,
+            changed.cache_key,
+            "{what}"
+        );
+    }
+}
+
+/// A file at the top of the package (`Cargo.toml`, a config a macro reads)
+/// and `OUT_DIR` stay in the inputs guard by content.
+#[test]
+fn inputs_a_top_file_or_out_dir_change_refuses_the_record() {
+    build_kache();
+    for top in [true, false] {
+        let unit = module_tree_unit(true)
+            .inputs()
+            .with_file("kt/macro.cfg", "one\n");
+        let a = unit.checkout("a");
+        assert_eq!(unit.build(&a, true, None).result, "miss");
+        if top {
+            std::fs::write(a.join("kt/macro.cfg"), "two\n").unwrap();
+        } else {
+            std::fs::write(out_dir_in(&unit.target(&a)).join("other.txt"), "x\n").unwrap();
+        }
+        let changed = unit.build(&a, true, None);
+        assert_eq!(changed.dep_info_runs, 1, "top={top}");
+    }
+}
+
+/// Inside the package, a file added where a re-exported macro lists and
+/// includes is seen by the inputs guard (the directory holds a file of the
+/// closure), and the key is the pre-pass's.
+#[test]
+fn inputs_a_file_added_inside_the_package_where_a_macro_lists_misses() {
+    build_kache();
+    let unit = WorkspaceUnit::new(false)
+        .inputs()
+        .with_facade()
+        .with_file("kt/assets/a.txt", "a\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    assert_eq!(unit.build(&a, true, None).dep_info_runs, 0);
+    std::fs::write(a.join("kt/assets/b.txt"), "b\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_eq!(added.result, "miss");
+    assert_ne!(added.cache_key, cold.cache_key);
+    assert_eq!(unit.build(&a, false, None).cache_key, added.cache_key);
+}
+
+/// Inside the package, the first file added to a directory a re-exported
+/// macro lists misses under the inputs guard when the directory was there
+/// but empty at the cold build, as it does when the directory is new. The
+/// closure names nothing in it, so the guard tells which of the package's
+/// directories next to the closure hold no file. A file added elsewhere in
+/// the package (`tests/`) still keeps the record.
+#[test]
+fn inputs_the_first_file_of_an_empty_directory_where_a_macro_lists_misses() {
+    build_kache();
+    for empty in [None, Some("kt/assets")] {
+        let unit = WorkspaceUnit::new(false)
+            .inputs()
+            .with_facade()
+            .with_file("kt/tests/t.rs", "#[test]\nfn t() {}\n");
+        let a = unit.checkout("a");
+        if let Some(empty) = empty {
+            std::fs::create_dir_all(a.join(empty)).unwrap();
+        }
+        let cold = unit.build(&a, true, None);
+        assert_eq!(cold.result, "miss", "empty={empty:?}");
+        std::fs::write(a.join("kt/tests/new.rs"), "#[test]\nfn n() {}\n").unwrap();
+        let warm = unit.build(&a, true, None);
+        assert_eq!(warm.result, "local_hit", "empty={empty:?}");
+        assert_eq!(warm.dep_info_runs, 0, "empty={empty:?}");
+
+        std::fs::create_dir_all(a.join("kt/assets")).unwrap();
+        std::fs::write(a.join("kt/assets/first.txt"), "first\n").unwrap();
+        let first = unit.build(&a, true, None);
+        assert_eq!(first.result, "miss", "empty={empty:?}");
+        assert_ne!(first.cache_key, cold.cache_key, "empty={empty:?}");
+        assert_eq!(
+            unit.build(&a, false, None).cache_key,
+            first.cache_key,
+            "empty={empty:?}"
+        );
+    }
+}
+
+/// A file a macro reads without telling rustc, declared in the member's
+/// `kache.toml`, is in the key: under the inputs guard an edit to it misses,
+/// though its directory is no directory of the closure.
+#[test]
+fn inputs_a_declared_extra_input_edit_misses() {
+    build_kache();
+    let unit = module_tree_unit(true)
+        .inputs()
+        .with_file("kt/kache.toml", "extra_inputs = [\"conf/**/*\"]\n")
+        .with_file("kt/conf/sel.txt", "one\n");
+    let a = unit.checkout("a");
+    let cold = unit.build(&a, true, None);
+    assert_ne!(cold.result, "local_hit");
+    std::fs::write(a.join("kt/conf/sel.txt"), "two\n").unwrap();
+    let edited = unit.build(&a, true, None);
+    assert_ne!(edited.result, "local_hit");
+    assert_ne!(edited.cache_key, cold.cache_key);
+    assert_eq!(unit.build(&a, false, None).cache_key, edited.cache_key);
+    std::fs::write(a.join("kt/conf/new.txt"), "new\n").unwrap();
+    let added = unit.build(&a, true, None);
+    assert_ne!(added.result, "local_hit");
+    assert_ne!(added.cache_key, edited.cache_key);
+}
+
+/// A checkout that moves between two states whose closure directories
+/// differ by a name no closure reads (`src/notes_a.txt`, then
+/// `src/notes_b.txt`, as two commits would) keeps a row for each: the inputs
+/// guard files a row under its closure directories too, so going back finds
+/// the first state's row instead of the pre-pass. The checkout's own row
+/// holds only the last state.
+#[test]
+fn inputs_a_checkout_moving_between_names_beside_the_closure_keeps_a_row_each() {
+    build_kache();
+    let unit = module_tree_unit(true).inputs();
+    let a = unit.checkout("a");
+    let notes_a = a.join("kt/src/notes_a.txt");
+    let notes_b = a.join("kt/src/notes_b.txt");
+    std::fs::write(&notes_a, "notes\n").unwrap();
+    let cold = unit.build(&a, true, None);
+    assert_eq!(cold.result, "miss");
+    std::fs::rename(&notes_a, &notes_b).unwrap();
+    let moved = unit.build(&a, true, None);
+    assert_eq!(moved.result, "local_hit");
+    assert_eq!(moved.dep_info_runs, 1, "this state was never recorded");
+    for round in 0..2 {
+        for (from, to) in [(&notes_b, &notes_a), (&notes_a, &notes_b)] {
+            std::fs::rename(from, to).unwrap();
+            let back = unit.build(&a, true, None);
+            assert_eq!(back.result, "local_hit", "round {round} {}", to.display());
+            assert_eq!(back.dep_info_runs, 0, "round {round} {}: its row stayed", to.display());
+            assert_eq!(back.cache_key, cold.cache_key);
+        }
+    }
+}
+
+/// Under the inputs guard the workspace manifest counts for a member less
+/// the `[workspace.dependencies]` entries the member does not inherit
+/// (`name.workspace = true` in any of its dependency tables, a target's
+/// too): a registry dependency that another member adds or bumps keeps the
+/// record; one the member inherits, a profile and anything else in the
+/// manifest still refuse it. A member manifest that does not parse keeps
+/// every entry.
+#[test]
+fn inputs_a_root_dependency_the_member_does_not_inherit_keeps_the_record() {
+    build_kache();
+    let member = "[package]\nname = \"kt\"\n\n[dependencies]\nserde.workspace = true\n\n\
+                  [target.'cfg(unix)'.dev-dependencies]\nrenamed = { workspace = true }\n";
+    let unit = WorkspaceUnit::new(false)
+        .with_file("kt/Cargo.toml", member)
+        .inputs();
+    let a = unit.checkout("a");
+    let manifest = a.join("Cargo.toml");
+    let head = "[workspace]\nmembers = [\"kt\"]\n\n[workspace.dependencies]\n";
+    std::fs::write(&manifest, format!("{head}serde = \"1\"\nrenamed = \"1\"\n")).unwrap();
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    let changes: [(String, bool, &str); 6] = [
+        (
+            format!("{head}serde = \"1\"\nrenamed = \"1\"\ntokio = \"1\"\n"),
+            false,
+            "a dependency another member inherits",
+        ),
+        (
+            format!(
+                "{head}serde = \"1\"\nrenamed = \"1\"\ntokio = {{ version = \"1.2\", features = [\"rt\"] }}\n"
+            ),
+            false,
+            "that dependency's version and features",
+        ),
+        (
+            format!("{head}serde = \"1.0.200\"\nrenamed = \"1\"\ntokio = \"1\"\n"),
+            true,
+            "a dependency the member inherits",
+        ),
+        (
+            format!("{head}serde = \"1.0.200\"\nrenamed = \"2\"\ntokio = \"1\"\n"),
+            true,
+            "a dependency the member inherits for one target's tests",
+        ),
+        (
+            format!("{head}serde = \"1.0.200\"\nrenamed = \"2\"\n\n[profile.dev]\nopt-level = 1\n"),
+            true,
+            "a profile",
+        ),
+        (
+            format!(
+                "{head}serde = \"1.0.200\"\nrenamed = \"2\"\nother = \"3\"\n\n[profile.dev]\nopt-level = 1\n"
+            ),
+            false,
+            "another dependency again",
+        ),
+    ];
+    for (text, refuses, what) in changes {
+        std::fs::write(&manifest, text).unwrap();
+        let event = unit.build(&a, true, None);
+        assert_eq!(event.result, "local_hit", "{what}");
+        assert_eq!(
+            event.dep_info_runs,
+            u64::from(refuses),
+            "a change to {what}"
+        );
+    }
+    // A member manifest that does not parse inherits nothing it can name:
+    // every entry counts again.
+    std::fs::write(a.join("kt/Cargo.toml"), "[package\n").unwrap();
+    assert_eq!(
+        unit.build(&a, true, None).dep_info_runs,
+        1,
+        "the member manifest changed"
+    );
+    std::fs::write(
+        &manifest,
+        format!("{head}serde = \"1.0.200\"\nrenamed = \"2\"\nother = \"4\"\n\n[profile.dev]\nopt-level = 1\n"),
+    )
+    .unwrap();
+    let event = unit.build(&a, true, None);
+    assert_eq!(event.result, "local_hit");
+    assert_eq!(
+        event.dep_info_runs, 1,
+        "any entry, with a member manifest that does not parse"
+    );
+}
+
+/// The scoped guard (the default) keeps counting every registry entry of
+/// `[workspace.dependencies]`, inherited or not.
+#[test]
+fn scoped_a_root_dependency_the_member_does_not_inherit_still_refuses_the_record() {
+    build_kache();
+    let member = "[package]\nname = \"kt\"\n\n[dependencies]\nserde.workspace = true\n";
+    let unit = WorkspaceUnit::new(false)
+        .with_file("kt/Cargo.toml", member)
+        .scoped();
+    let a = unit.checkout("a");
+    let manifest = a.join("Cargo.toml");
+    let head = "[workspace]\nmembers = [\"kt\"]\n\n[workspace.dependencies]\nserde = \"1\"\n";
+    std::fs::write(&manifest, head).unwrap();
+    assert_eq!(unit.build(&a, true, None).result, "miss");
+    std::fs::write(&manifest, format!("{head}tokio = \"1\"\n")).unwrap();
+    let event = unit.build(&a, true, None);
+    assert_eq!(event.result, "local_hit");
+    assert_eq!(
+        event.dep_info_runs, 1,
+        "the scoped guard counts every registry entry"
+    );
 }

@@ -43,6 +43,35 @@ pub enum Request {
     /// Return ready file hashes and queue cold fingerprints without reading
     /// their contents on the connection handler. Older daemons reject it.
     HashFilesWarmup(HashFilesRequest),
+    /// A wrapper's hit hands its access stamp to the daemon, which pins the
+    /// entry against its sweeps and writes the stamps in batches. Older
+    /// daemons reject the unknown variant and the wrapper stamps the index
+    /// itself.
+    StampHits(StampHitsRequest),
+    /// A wrapper hands over the file-hash memo rows its index was too busy
+    /// to take, so the restore that learned them neither waits nor loses
+    /// them. Older daemons reject the unknown variant and the wrapper drops
+    /// the rows, as it did before.
+    RecordFileHashes(RecordFileHashesRequest),
+    /// A wrapper hands over the target root its index was too busy to
+    /// record. Older daemons reject the unknown variant, and the build's
+    /// next unit records it.
+    RecordTargetRoots(RecordTargetRootsRequest),
+    /// A wrapper hands over the input prediction rows its index was too busy
+    /// to take. Older daemons reject the unknown variant, and the rows cost
+    /// the next build a pre-pass.
+    RecordPredictions(RecordPredictionsRequest),
+    /// A wrapper hands over the build events the event log was too busy to
+    /// take, so `kache stats` and the log still count those compiles. Older
+    /// daemons reject the unknown variant and the wrapper drops the events,
+    /// as it did before.
+    RecordEvents(RecordEventsRequest),
+    /// A wrapper verified an earlier key version's entry for its key (a key
+    /// bridge) and asks the daemon to register it: the daemon writes the
+    /// registrations of all builds that ask at once in one transaction.
+    /// Older daemons reject the unknown variant and the wrapper registers
+    /// the entry itself.
+    AdoptEntries(AdoptEntriesRequest),
     Prefetch(PrefetchRequest),
     BuildStarted(BuildStartedRequest),
     CompileStarted(CompileStartedRequest),
@@ -52,6 +81,11 @@ pub enum Request {
     /// of allowing an ambiguous timeout to publish and log twice.
     #[serde(rename = "publish_cc_v2")]
     PublishCc(Box<PublishCcRequest>),
+    /// A wrapper hands the daemon a finished rustc compile to store: its
+    /// outputs' snapshots and the digests read from them before the
+    /// wrapper returned. Older daemons reject the unknown variant, and the
+    /// wrapper then stores the compile itself.
+    PublishRustc(Box<PublishCcRequest>),
     /// A wrapper with no local input prediction row asks for the remote's
     /// (kunobi-ninja/kache#1011). Older daemons reject the unknown variant,
     /// which the wrapper reads as no row.
@@ -193,6 +227,12 @@ pub struct StatsResponse {
     /// its own config and labels the affected lines as client-derived.
     #[serde(default)]
     pub effective_config: Option<EffectiveConfig>,
+    /// Compiles and events the daemon has taken from wrappers (hand-offs)
+    /// and not stored and logged yet. Their wrappers, and Cargo, may have exited:
+    /// the store and the event log are complete once this reads 0. An older
+    /// daemon reports 0.
+    #[serde(default)]
+    pub publishes_pending: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,7 +299,7 @@ impl Request {
             Request::Stats(req) => req.client_version.as_deref(),
             Request::BuildStarted(req) => req.client_version.as_deref(),
             Request::CompileStarted(req) => req.client_version.as_deref(),
-            Request::PublishCc(req) => req.client_version.as_deref(),
+            Request::PublishCc(req) | Request::PublishRustc(req) => req.client_version.as_deref(),
             _ => None,
         }
     }

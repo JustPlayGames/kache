@@ -8,7 +8,7 @@ use rusqlite::{Connection, Error as SqlError, ErrorCode, OptionalExtension, para
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::config::{Config, IndexMode};
@@ -128,7 +128,10 @@ fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(blob)?;
     let mut perms = meta.permissions();
     perms.set_readonly(true);
-    fs::set_permissions(blob, perms)
+    fs::set_permissions(blob, perms)?;
+    // A store shared by several accounts: the group reads what we publish.
+    kache_fs::share_in_group_store(blob);
+    Ok(())
 }
 
 #[cfg(all(test, unix))]
@@ -312,9 +315,14 @@ fn is_blob_hash_name(name: &str) -> bool {
             .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
-/// Best-effort unlink of a blob file (clears read-only first).
+/// Best-effort unlink of a blob file (on Windows, clears read-only first).
+///
+/// Unix unlinks a read-only file as it does any other, and the mode belongs
+/// to the inode: a blob that shares one with a build output (a hardlink
+/// ingest or restore) would leave that output writable for everyone.
 fn unlink_blob(blob: &Path) {
     if blob.exists() {
+        #[cfg(windows)]
         if let Ok(meta) = fs::metadata(blob) {
             let mut perms = meta.permissions();
             perms.set_readonly(false);
@@ -330,8 +338,182 @@ fn unlink_blob(blob: &Path) {
     }
 }
 
+/// Where a put's source files come from.
+#[derive(Clone, Copy)]
+enum PutSources<'a> {
+    /// The compiler's own outputs, which may share an inode with their blobs
+    /// and are memoised once stored.
+    Outputs,
+    /// Disposable C/C++ staging files: never hardlinked, never memoised.
+    Independent,
+    /// Snapshots a wrapper handed off, each with the digest it read from it
+    /// before returning ([`ArtifactStore::put_handed_off`]).
+    Snapshots(&'a [String]),
+}
+
+/// An entry whose outputs a put has staged, hashed and published as blobs
+/// (its Phase 1), not yet registered in the index.
+///
+/// Its blobs are published but unreferenced: nothing can look the entry up
+/// until it is registered, and an entry that never is leaves only orphan
+/// blobs for the orphan sweep. [`ArtifactStore::put_with_compile_time_unless_busy`]
+/// returns one when the index's write lock is held elsewhere;
+/// [`ArtifactStore::register_staged_put`] registers it, waiting for the lock
+/// as a put does.
+#[derive(Debug)]
+pub struct StagedPut {
+    meta: EntryMeta,
+    meta_json: String,
+    crate_type_str: String,
+    num_features: i64,
+    total_size: u64,
+    content_hash: String,
+    /// Per file, the path Phase 2 re-materializes a blob from if a concurrent
+    /// removal unlinked it, and whether it may hardlink it.
+    sources: Vec<(PathBuf, bool)>,
+    result: StorePutResult,
+    /// Seed the file-hash memo for the sources once registered: they are the
+    /// compiler's own outputs.
+    seed_outputs: bool,
+    /// Cargo's `-C metadata` unit, registered with the entry; empty when
+    /// the caller records it afterwards ([`ArtifactStore::record_entry_unit`]).
+    unit: String,
+}
+
+impl StagedPut {
+    pub fn cache_key(&self) -> &str {
+        &self.meta.cache_key
+    }
+
+    /// The entry's files, each with the digest of its published blob.
+    pub fn files(&self) -> &[CachedFile] {
+        &self.meta.files
+    }
+
+    /// What Phase 1 found: how many blobs were new and how many existed.
+    pub fn result(&self) -> StorePutResult {
+        self.result
+    }
+}
+
+/// What [`ArtifactStore::put_with_compile_time_unless_busy`] did.
+#[derive(Debug)]
+pub enum PutAttempt {
+    /// The entry is registered, as after a put.
+    Stored(StorePutResult),
+    /// The index's write lock was held elsewhere past the wait: the outputs
+    /// are staged and published, and the entry is not registered yet.
+    Busy(Box<StagedPut>),
+}
+
+/// A staged entry another process handed over, checked against the links to
+/// its blobs ([`ArtifactStore::check_staged_handed_off`]) and waiting to be
+/// registered with others in one transaction
+/// ([`ArtifactStore::register_handed_off_batch`]).
+#[derive(Debug)]
+pub struct CheckedHandoff(std::result::Result<StagedPut, RefusedHandoff>);
+
+#[derive(Debug)]
+struct RefusedHandoff {
+    error: anyhow::Error,
+    /// The digest of a blob whose bytes are no longer that digest, and the
+    /// link that showed it: unlinked under the registration's write lock
+    /// when no entry references it, so no later put adopts it.
+    changed: Option<(String, PathBuf)>,
+}
+
+impl CheckedHandoff {
+    fn refused(error: anyhow::Error) -> Self {
+        Self(Err(RefusedHandoff {
+            error,
+            changed: None,
+        }))
+    }
+
+    /// Whether the entry passed its checks and can be registered.
+    pub fn is_ready(&self) -> bool {
+        self.0.is_ok()
+    }
+
+    fn with_unit(mut self, unit: &str) -> Self {
+        if let Ok(staged) = &mut self.0 {
+            staged.unit = unit.to_string();
+        }
+        self
+    }
+}
+
+/// What [`ArtifactStore::register_handed_off_batch`] did.
+#[derive(Debug)]
+pub enum BatchAttempt {
+    /// One result per entry, in the batch's order: those that passed their
+    /// checks were registered together in one transaction, and an entry
+    /// that failed (a check, its own registration) registered nothing.
+    Registered(Vec<Result<StorePutResult>>),
+    /// The index's write lock was held elsewhere past the wait: nothing was
+    /// registered, and the batch comes back to be offered again.
+    Busy(Vec<CheckedHandoff>),
+}
+
+/// How long [`ArtifactStore::register_staged`] waits for the index's write lock.
+#[derive(Debug, Clone, Copy)]
+enum RegistrationWait {
+    /// As every put: the busy timeout, asked for again up to
+    /// [`STORE_LOCK_ATTEMPTS`] times.
+    Patient,
+    /// One attempt with at most this busy timeout.
+    AtMost(Duration),
+}
+
+/// The fields of an entry's metadata a put takes from its caller.
+#[derive(Clone, Copy)]
+struct EntryFields<'a> {
+    cache_key: &'a str,
+    crate_name: &'a str,
+    crate_types: &'a [String],
+    features: &'a [String],
+    target: &'a str,
+    profile: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+    compile_time_ms: u64,
+    rustc_version: Option<&'a str>,
+}
+
+thread_local! {
+    static WRITABLE_OUTPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While held, puts on this thread store the outputs their policy calls
+/// [`ArtifactPolicy::rewritable_output`] by copy (or reflink), never by
+/// sharing the output's inode with the read-only blob: the output stays the
+/// writable file the compiler wrote. For a unit `cargo fix` may compile
+/// again without the wrapper: rustc refuses to replace a read-only output.
+pub struct WritableOutputsScope {
+    previous: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl WritableOutputsScope {
+    pub fn enter(writable: bool) -> Self {
+        Self {
+            previous: WRITABLE_OUTPUTS.with(|slot| slot.replace(writable)),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for WritableOutputsScope {
+    fn drop(&mut self) {
+        WRITABLE_OUTPUTS.with(|slot| slot.set(self.previous));
+    }
+}
+
 fn hardlink_eligible<P: ArtifactPolicy>(store_name: &str, executable: bool) -> bool {
     if executable {
+        return false;
+    }
+    if WRITABLE_OUTPUTS.with(std::cell::Cell::get) && P::rewritable_output(store_name) {
         return false;
     }
     #[cfg(windows)]
@@ -347,6 +529,33 @@ fn source_hardlink_allowed<P: ArtifactPolicy>(
     executable: bool,
 ) -> bool {
     allow_source_hardlinks && hardlink_eligible::<P>(store_name, executable)
+}
+
+/// Whether an executable output may share its inode with its blob
+/// ([`ArtifactPolicy::allow_executable_hardlink`]). Unix only: NTFS keeps the
+/// read-only attribute in the record every link shares, and Windows refuses
+/// to delete or replace a read-only file.
+fn executable_hardlink_eligible<P: ArtifactPolicy>(
+    allow_source_hardlinks: bool,
+    store_name: &str,
+    executable: bool,
+    crate_types: &[String],
+) -> bool {
+    allow_source_hardlinks
+        && executable
+        && cfg!(unix)
+        && P::allow_executable_hardlink(store_name, crate_types)
+}
+
+/// Whether a hit must make sure the blob of `file` still holds its bytes
+/// before they are restored: an executable that may have been stored by
+/// hardlink ([`executable_hardlink_eligible`]) shares its inode with a build
+/// output, which a writer that ignores the read-only bit could rewrite.
+fn blob_may_share_an_executable<P: ArtifactPolicy>(
+    file: &CachedFile,
+    crate_types: &[String],
+) -> bool {
+    executable_hardlink_eligible::<P>(true, &file.name, file.executable, crate_types)
 }
 
 /// How a new blob was staged into the store before publish. Counters are
@@ -569,6 +778,12 @@ fn materialize_blob_with_durability(
 /// does not exist yet — see the warning there.
 static STAGE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Name prefix of a snapshot staged inside a blob shard
+/// ([`Store::stage_blob_beside`]). A dot name is never a blob hash, so the
+/// orphan sweep and every hash-named lookup pass it by; the staging sweep
+/// reclaims a leftover.
+const SHARD_STAGE_PREFIX: &str = ".stage-";
+
 /// How many nonces to try before giving up on finding a free staging name.
 /// Only stale leftovers from a crashed process whose pid has since been
 /// recycled can occupy one, so a handful of attempts is already generous;
@@ -665,7 +880,45 @@ fn remove_stale_lock_file(
         .metadata()
         .is_ok_and(|meta| metadata_is_stale(&meta, now, min_age));
     // Dropping `file` on any return releases the lock.
-    locked_stale && lock_file_is_at_path(&file, path) && fs::remove_file(path).is_ok()
+    if !(locked_stale && lock_file_is_at_path(&file, path)) {
+        return false;
+    }
+    // Held here, so a storing mark beside it is one a dead holder left.
+    let _ = fs::remove_file(storing_mark_path(path));
+    fs::remove_file(path).is_ok()
+}
+
+/// Unlink up to `cap` lock files in `dir` whose names `is_lock_name`
+/// accepts and that sit stale and unheld, by the same rules as the key lock
+/// sweep ([`remove_stale_lock_file`]). For lock directories outside
+/// `store/` that grow with every distinct key, such as the scheduler's
+/// flights. A missing or unreadable directory counts as empty.
+pub fn sweep_stale_lock_files(
+    dir: &Path,
+    is_lock_name: impl Fn(&str) -> bool,
+    min_age: Duration,
+    cap: usize,
+    now: std::time::SystemTime,
+) -> KeyLockSweepStats {
+    let mut stats = KeyLockSweepStats::default();
+    let Ok(names) = fs::read_dir(dir) else {
+        return stats;
+    };
+    for name in names.flatten() {
+        let name = name.file_name();
+        if !name.to_str().is_some_and(&is_lock_name) {
+            continue;
+        }
+        stats.seen += 1;
+        // Past the cap the walk only counts, which costs no stat.
+        if stats.removed >= cap {
+            continue;
+        }
+        if remove_stale_lock_file(&dir.join(&name), min_age, now, || {}) {
+            stats.removed += 1;
+        }
+    }
+    stats
 }
 
 fn metadata_is_stale(meta: &fs::Metadata, now: std::time::SystemTime, min_age: Duration) -> bool {
@@ -715,6 +968,47 @@ enum PublishDest {
     Obstructed,
     /// Nothing readable: absent, or a Windows delete-pending name.
     Vacant,
+}
+
+/// Move a staged blob to its content address unless a file is already there.
+///
+/// A plain rename replaces a blob another put published meanwhile, and with
+/// it the inode a durability flush may already have verified and synced
+/// (that entry would then be marked durable over unflushed bytes). On Unix
+/// the staged file is linked to the address, which fails with
+/// `AlreadyExists` when a file is there, and its staging name is removed;
+/// a file system without hard links falls back to the rename. Windows'
+/// rename refuses to replace a published blob, which is read-only.
+fn publish_without_replacing(staged: &Path, blob: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        match fs::hard_link(staged, blob) {
+            Ok(()) => {
+                let _ = fs::remove_file(staged);
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(_) => fs::rename(staged, blob),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::rename(staged, blob)
+    }
+}
+
+/// Whether a failed [`publish_without_replacing`] is a race to retry.
+///
+/// Its `AlreadyExists` says a file held the blob's name when the link ran.
+/// Each attempt probes the name right after: a file there is a lost race,
+/// settled at once; a name found vacant means a remover unlinked that file
+/// between the link and the probe, so the next attempt can publish, and a
+/// budget that ends on a vacant name is deferred to the put's locked phase,
+/// as a Windows delete-pending name is. Without this the remover's unlink
+/// made the put fail with "File exists".
+fn is_transient_publish_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists || crate::atomic::is_transient_rename_error(e)
 }
 
 fn publish_dest_state(blob: &Path) -> PublishDest {
@@ -805,6 +1099,27 @@ fn paths_share_inode(a: &Path, b: &Path) -> bool {
 
 fn metadata_is_readonly_regular(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_file() && metadata.permissions().readonly()
+}
+
+/// After a hardlink snapshot that was not published, give `source` back the
+/// `permissions` it had before the snapshot made it read-only, unless it
+/// shares its inode with the published `blob` (read-only is then the shared
+/// state, as after a hardlink restore). Discarding the snapshot may have made
+/// the shared inode writable for everyone on the way out.
+fn restore_source_permissions_if_unshared(
+    source: &Path,
+    blob: Option<&Path>,
+    permissions: &fs::Permissions,
+) {
+    if blob.is_some_and(|blob| paths_share_inode(source, blob)) {
+        return;
+    }
+    if let Err(error) = fs::set_permissions(source, permissions.clone()) {
+        tracing::debug!(
+            "could not restore the mode of {} after an unpublished snapshot: {error}",
+            source.display()
+        );
+    }
 }
 
 /// After a hardlink ingest that did not publish, clear read-only on `source`
@@ -1006,6 +1321,45 @@ pub struct GcStats {
     /// as the eviction after an upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub housekeeping: Option<HousekeepingStats>,
+    /// An automatic size sweep stopped at [`SIZE_SWEEP_WALK_BUDGET`] before
+    /// it reached its target: the next automatic sweep goes on, and no
+    /// driver backs off for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut_short: bool,
+}
+
+impl GcStats {
+    /// Add the counts of `part`, another pass of the same run.
+    pub fn add(&mut self, part: &GcStats) {
+        self.entries_evicted = self.entries_evicted.saturating_add(part.entries_evicted);
+        self.bytes_freed = self.bytes_freed.saturating_add(part.bytes_freed);
+        self.blobs_removed = self.blobs_removed.saturating_add(part.blobs_removed);
+        self.duration_ms = self.duration_ms.saturating_add(part.duration_ms);
+        self.entries_pinned = self.entries_pinned.saturating_add(part.entries_pinned);
+        self.entries_unreclaimable = self
+            .entries_unreclaimable
+            .saturating_add(part.entries_unreclaimable);
+        self.disk_bytes_reclaimed = self
+            .disk_bytes_reclaimed
+            .saturating_add(part.disk_bytes_reclaimed);
+        self.entries_failed = self.entries_failed.saturating_add(part.entries_failed);
+        self.entries_locked = self.entries_locked.saturating_add(part.entries_locked);
+        self.entries_busy_snapshot = self
+            .entries_busy_snapshot
+            .saturating_add(part.entries_busy_snapshot);
+        self.entries_recent_prefiltered = self
+            .entries_recent_prefiltered
+            .saturating_add(part.entries_recent_prefiltered);
+        self.entries_import_pinned = self
+            .entries_import_pinned
+            .saturating_add(part.entries_import_pinned);
+        self.evict_write_ms = self.evict_write_ms.saturating_add(part.evict_write_ms);
+        // A measurement of the store, not work done: two sweeps probing the
+        // same held bytes must not add up to twice as many.
+        self.bytes_held = self.bytes_held.max(part.bytes_held);
+        self.skipped |= part.skipped;
+        self.cut_short |= part.cut_short;
+    }
 }
 
 /// Counts from [`Store::sweep_housekeeping`], recorded with the GC run so
@@ -1019,6 +1373,22 @@ pub struct HousekeepingStats {
     pub predictions_pruned: usize,
     /// File hash memo rows deleted as not written for a month (#1206).
     pub file_hashes_pruned: usize,
+    /// Scheduler flight files (compile and discovery flights) unlinked as
+    /// stale. Filled by the caller that sweeps the scheduler's directory.
+    #[serde(default)]
+    pub flights_removed: usize,
+    /// Flight files left after the pass: recent or held ones, and whatever
+    /// the per-sweep cap deferred.
+    #[serde(default)]
+    pub flights_remaining: usize,
+    /// Probe memos unlinked as unused for a week. Filled by the caller
+    /// that sweeps the memo directories.
+    #[serde(default)]
+    pub memos_removed: usize,
+    /// Memo files left after the pass: recently used ones, and whatever the
+    /// per-sweep cap deferred.
+    #[serde(default)]
+    pub memos_remaining: usize,
 }
 
 /// Whether `err` carries SQLite write contention (`SQLITE_BUSY` or
@@ -1032,6 +1402,43 @@ pub fn is_sqlite_contention(err: &anyhow::Error) -> bool {
                 if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
         )
     })
+}
+
+/// How many times [`Store::begin_entry_registration`] waits out the busy
+/// timeout for the write lock before the store fails: about 20 s with the
+/// 5 s timeout every store connection sets.
+const STORE_LOCK_ATTEMPTS: u32 = 4;
+
+/// How long a writable index connection waits for a lock held elsewhere
+/// ([`initialize_db`]).
+const INDEX_BUSY_WAIT: Duration = Duration::from_millis(5000);
+
+/// Whether `err` is SQLite's busy or locked answer.
+fn is_sqlite_busy(err: &SqlError) -> bool {
+    matches!(
+        err,
+        SqlError::SqliteFailure(code, _)
+            if matches!(code.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+/// A write transaction on `db` with the lock taken at once, asked for again
+/// up to [`STORE_LOCK_ATTEMPTS`] times while it stays busy past the busy
+/// timeout. `doing` names the write in the log.
+pub(crate) fn begin_write_waiting<'db>(
+    db: &'db rusqlite::Connection,
+    doing: &str,
+) -> rusqlite::Result<rusqlite::Transaction<'db>> {
+    let mut attempt = 1;
+    loop {
+        match rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate) {
+            Err(error) if attempt < STORE_LOCK_ATTEMPTS && is_sqlite_busy(&error) => {
+                tracing::debug!(attempt, doing, "index busy; asking again");
+                attempt += 1;
+            }
+            started => return started,
+        }
+    }
 }
 
 pub fn is_sqlite_busy_snapshot(err: &anyhow::Error) -> bool {
@@ -1205,9 +1612,108 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     /// Write slice and pause for eviction sweeps: [`EVICTION_WRITE_SLICE`]
     /// and [`EVICTION_WRITE_PAUSE`] outside tests.
     eviction_pacing: (Duration, Duration),
+    /// [`RANKING_FRESH_FOR`], shorter in tests.
+    ranking_fresh_for: Duration,
+    /// [`SIZE_SWEEP_WALK_BUDGET`], shorter in tests.
+    size_sweep_walk_budget: Duration,
     /// Opened by [`Self::open_read_only`]: lookups and restores only.
     read_only: bool,
+    /// Where [`Self::get`] sends a hit's access stamp instead of writing it
+    /// ([`Self::send_hit_stamps_to`]).
+    hit_stamps: Option<HitStampSink>,
+    /// Entries whose access stamp someone holds and has not written yet
+    /// ([`Self::pin_entries_with`]); eviction keeps them like freshly
+    /// stamped ones.
+    pending_pins: Option<PendingPins>,
+    /// Where memo rows go that this store's index was too busy to take
+    /// ([`Self::send_busy_memo_rows_to`]).
+    busy_memo_rows: Option<MemoRowSink>,
+    /// How long this connection waits for a lock held elsewhere: what a call
+    /// that waits with a timeout of its own gives back afterwards.
+    busy_wait: std::cell::Cell<Duration>,
 }
+
+/// A file-hash memo row: `hash` is the content of the file at exactly
+/// `fingerprint`. `redated` marks a [`FILE_HASH_RULE_REDATED`] row.
+///
+/// [`FILE_HASH_RULE_REDATED`]: crate::file_hash::FILE_HASH_RULE_REDATED
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoRow {
+    pub fingerprint: crate::file_hash::FileFingerprint,
+    pub hash: String,
+    pub redated: bool,
+}
+
+/// Takes memo rows the index was too busy to take, and returns `true` when it
+/// will write them ([`ArtifactStore::write_handed_memo_rows`]). `false` drops
+/// them, as a busy index did before there was anywhere to send them.
+pub type MemoRowSink = Box<dyn Fn(&[MemoRow]) -> bool + Send + Sync>;
+
+/// The rows worth persisting of `verified` and `redated` ones: a smaller
+/// file is hashed again faster than its row is read.
+fn memo_rows(
+    verified: &[(crate::file_hash::FileFingerprint, &str)],
+    redated: &[(crate::file_hash::FileFingerprint, &str)],
+) -> Vec<MemoRow> {
+    verified
+        .iter()
+        .map(|row| (row, false))
+        .chain(redated.iter().map(|row| (row, true)))
+        .filter(|((fingerprint, _), _)| {
+            fingerprint.size >= crate::file_hash::MIN_PERSISTED_HASH_BYTES
+        })
+        .map(|((fingerprint, hash), redated)| MemoRow {
+            fingerprint: fingerprint.clone(),
+            hash: (*hash).to_string(),
+            redated,
+        })
+        .collect()
+}
+
+/// How long a store with a [`MemoRowSink`] waits for the index's write lock
+/// before it hands its memo rows over: a restore that waited the full
+/// [`MEMO_ROW_WAIT`] stalled its hit for that long and often lost the rows
+/// all the same. When the sink does not take them (no daemon runs), the
+/// store waits the full time after all.
+const MEMO_ROW_HANDOFF_WAIT: Duration = Duration::from_millis(5);
+
+/// How long a store without a sink waits before it drops its memo rows.
+const MEMO_ROW_WAIT: Duration = Duration::from_millis(100);
+
+/// Note that a daemon took bookkeeping rows (memo rows, a target root,
+/// prediction rows) a busy index refused. It holds for the current
+/// invocation scope (`InvocationLinkScope`), else for the process.
+pub fn note_bookkeeping_handed_off() {
+    crate::link::note_bookkeeping_handed_off();
+}
+
+/// How long this invocation's next bookkeeping write waits for the index's
+/// write lock: `wait`, or none once a daemon took rows a busy index refused
+/// ([`note_bookkeeping_handed_off`]). A wrapper's memo rows, target root and
+/// prediction rows each waited for the lock in turn (165 ms a unit in a
+/// burst of misses on an index held 7 s of every 8.5 s), though the daemon
+/// takes whatever they cannot write. Once it has taken some, each later
+/// write only tries the lock and hands its rows on when another process
+/// holds it. Without a daemon nothing is ever handed off, and every write
+/// waits as before.
+pub fn bookkeeping_wait(wait: Duration) -> Duration {
+    if crate::link::bookkeeping_handed_off() {
+        Duration::ZERO
+    } else {
+        wait
+    }
+}
+
+/// Takes a hit's access stamp off the hit path: called with the entry's key
+/// when [`ArtifactStore::get`] would stamp it, and returns `true` when it has
+/// taken the stamp and will write it ([`ArtifactStore::stamp_hits`]), so the
+/// hit writes nothing. `false` makes the hit stamp the index itself.
+pub type HitStampSink = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Says whether an entry's access stamp is taken but not yet written: such an
+/// entry may be mid-restore, so eviction must keep it
+/// ([`ArtifactStore::pin_entries_with`]).
+pub type PendingPins = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// How recently an entry must have been accessed for eviction to treat it as
 /// "pinned by a live build" and skip it (kunobi-ninja/kache#326, #182).
@@ -1254,6 +1760,14 @@ impl SweepOrigin {
 /// the index's write lock.
 pub const HIT_STAMP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Longest a hit waits for the index to stamp its access time
+/// ([`Store::get`]).
+pub const HIT_STAMP_BUSY_WAIT: Duration = Duration::from_millis(100);
+
+/// How long a registered incremental directory's row counts as fresh, so the
+/// units of a build do not rewrite it ([`Store::remember_incremental_dir`]).
+pub const INCREMENTAL_DIR_REFRESH: Duration = Duration::from_secs(300);
+
 /// Write-lock time an eviction sweep may spend on removals before it pauses.
 ///
 /// SQLite's write lock is not fair. A build's `put` that finds it taken
@@ -1267,6 +1781,27 @@ pub const EVICTION_WRITE_SLICE: Duration = Duration::from_millis(50);
 /// Longer than the busy handler's 100 ms poll interval, so every waiting
 /// writer polls at least once while the lock is free.
 pub const EVICTION_WRITE_PAUSE: Duration = Duration::from_millis(150);
+
+/// How long a sweep on a low disk walks one ranking of the store before it
+/// ranks again. Entries written after the ranking are not in it, and on a
+/// disk builds fill at 3 GiB a minute those are the ones worth evicting;
+/// ranking again takes 11-73 s of a 12 GB index.
+pub const RANKING_FRESH_FOR: Duration = Duration::from_secs(300);
+
+/// How long an automatic size sweep walks its ranking, removing entries,
+/// before it stops and leaves the rest to the next automatic sweep (the
+/// wrapper's check comes every five minutes while builds run). Without it
+/// one sweep held `gc.lock` for as long as its rows took: the first sweep
+/// after an upgrade walks every row of a dead key version, which on one
+/// store was some 276k rows. The ranking before the walk is not counted.
+/// A disk short of space keeps the sweep going.
+///
+/// Long enough for one sweep to matter: each sweep also ranks the whole store
+/// (1-4 minutes on a busy machine, 2026-10-31), and a walk of 30 s removed
+/// 3-15 GB, about what builds added before the next one, so sweeps never
+/// reached the target and ran back to back. Nothing of a build's waits on
+/// `gc.lock`; removals pace their index writes either way.
+pub const SIZE_SWEEP_WALK_BUDGET: Duration = Duration::from_secs(180);
 
 /// Paces an eviction sweep's writes so build processes waiting on the index
 /// write lock get it between slices.
@@ -1342,10 +1877,188 @@ pub fn lock_poll_interval(attempt: u32) -> Duration {
 /// locked, and starts over when it does not.
 pub struct StoreLock {
     file: fs::File,
+    path: PathBuf,
+    /// The storing mark this holder wrote ([`StoreLock::mark_storing`]),
+    /// removed before the lock is released.
+    storing: Option<PathBuf>,
 }
 
 /// Lock guard for a cache key. Dropping it releases the OS lock.
 pub type KeyLock = StoreLock;
+
+/// [`ArtifactStore::try_lock`] in the store directory `store_dir`, without
+/// opening its index: the key's lock is a file of its own.
+pub fn try_lock_key_in(store_dir: &Path, cache_key: &str) -> Result<Option<KeyLock>> {
+    StoreLock::try_acquire(&store_dir.join(cache_key).with_extension("lock"))
+}
+
+/// The storing mark beside a lock file: `<key>.storing` beside
+/// `<key>.lock`, holding the process id of the holder that stores the
+/// key's entry ([`StoreLock::mark_storing`]). A file of its own because
+/// Windows refuses other processes a read of a locked file's bytes.
+fn storing_mark_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("storing")
+}
+
+/// Whether a holder of `cache_key`'s lock in `store_dir` is storing its
+/// entry right now: a wrapper registering the compile it just ran, or the
+/// daemon finishing a hand-off it accepted. Such an entry is committed
+/// within moments, so a lookup that missed it is better off waiting for the
+/// commit ([`ArtifactStore::wait_for_committed_with_timeout`]) than
+/// compiling the unit again.
+///
+/// The mark is a hint, never ownership: no mark, a mark whose process has
+/// exited, or a lock nobody holds (taken here and dropped at once, which
+/// also removes the stale mark) answers `false`, and a mark that outlives
+/// its holder otherwise (a reused process id) costs at most one bounded
+/// wait. A key with no mark answers `false` without creating a lock file.
+pub fn key_store_in_flight(store_dir: &Path, cache_key: &str) -> bool {
+    let path = store_dir.join(cache_key).with_extension("lock");
+    let Ok(content) = fs::read_to_string(storing_mark_path(&path)) else {
+        return false;
+    };
+    // A mark caught between its creation and its write names nobody yet:
+    // its holder is alive and storing.
+    if let Ok(pid) = content.trim().parse::<u32>()
+        && !process_is_alive(pid)
+    {
+        return false;
+    }
+    matches!(StoreLock::try_acquire(&path), Ok(None))
+}
+
+/// Whether process `pid` still runs, where the platform can tell; `true`
+/// when it cannot (the caller's wait is bounded).
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    // Signal 0 checks existence and permission only; EPERM means it runs
+    // under another user.
+    let signalled = unsafe { libc::kill(pid, 0) } == 0;
+    signalled || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether process `pid` still runs, where the platform can tell; `true`
+/// when it cannot (the caller's wait is bounded).
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // GetExitCodeProcess's code for a process that has not exited.
+    const STILL_ACTIVE: u32 = 259;
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // No such process; anything else (access denied) means it exists.
+        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+    }
+    let mut code = 0u32;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+    unsafe { CloseHandle(handle) };
+    !queried || code == STILL_ACTIVE
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Where the daemon notes the rustc units whose entries it is storing.
+const UNITS_IN_FLIGHT_DIR: &str = "units-in-flight";
+
+/// How old a unit's in-flight note may be and still count: a hand-off is
+/// committed or failed within its batch's patience (seconds), so an older
+/// note is one a daemon that died left behind.
+const UNIT_IN_FLIGHT_FRESH: Duration = Duration::from_secs(600);
+
+/// A note that a rustc unit's entry is being stored under `cache_key`
+/// ([`unit_in_flight_in`]). Dropping it removes the note.
+pub struct UnitInFlight {
+    path: PathBuf,
+}
+
+impl Drop for UnitInFlight {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(unit_dir) = self.path.parent() {
+            // Fails while another key of the unit is in flight, as it should.
+            let _ = fs::remove_dir(unit_dir);
+        }
+    }
+}
+
+/// A unit's directory of in-flight notes, for names Cargo gives a crate and
+/// its `-C metadata` (nothing that could leave the directory).
+fn unit_in_flight_dir(store_dir: &Path, crate_name: &str, unit: &str) -> Option<PathBuf> {
+    let plain = |name: &str| {
+        !name.is_empty()
+            && name.len() <= 128
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    };
+    (plain(crate_name) && plain(unit)).then(|| {
+        store_dir
+            .join(UNITS_IN_FLIGHT_DIR)
+            .join(format!("{crate_name}@{unit}"))
+    })
+}
+
+/// Note that the entry of `crate_name`'s unit `unit` is being stored under
+/// `cache_key` until the returned guard is dropped. The index learns a unit
+/// only when its entry is committed, so a build that asks meanwhile whether
+/// the store has ever held the unit would hear no, take its miss for
+/// certain and compile without looking for the entry
+/// ([`unit_in_flight_in`]). Best effort: `None` when the note cannot be
+/// written.
+pub fn mark_unit_in_flight_in(
+    store_dir: &Path,
+    crate_name: &str,
+    unit: &str,
+    cache_key: &str,
+) -> Option<UnitInFlight> {
+    let dir = unit_in_flight_dir(store_dir, crate_name, unit)?;
+    if !cache_key.bytes().all(|byte| byte.is_ascii_hexdigit()) || cache_key.is_empty() {
+        return None;
+    }
+    fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(cache_key);
+    fs::write(&path, b"").ok()?;
+    Some(UnitInFlight { path })
+}
+
+/// Whether an entry of `crate_name`'s unit `unit` is being stored right now
+/// ([`mark_unit_in_flight_in`]), by a note younger than
+/// [`UNIT_IN_FLIGHT_FRESH`].
+pub fn unit_in_flight_in(store_dir: &Path, crate_name: &str, unit: &str) -> bool {
+    let Some(dir) = unit_in_flight_dir(store_dir, crate_name, unit) else {
+        return false;
+    };
+    let Ok(notes) = fs::read_dir(dir) else {
+        return false;
+    };
+    notes.filter_map(Result::ok).any(|note| {
+        note.metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < UNIT_IN_FLIGHT_FRESH)
+    })
+}
+
+/// Whether the store directory `store_dir` holds a `meta.json` for
+/// `cache_key`. Without one nothing is committed under the key, whatever
+/// the index says ([`ArtifactStore::contains`]); with one, only the index
+/// can tell.
+pub fn entry_meta_exists_in(store_dir: &Path, cache_key: &str) -> bool {
+    store_dir.join(cache_key).join("meta.json").exists()
+}
 
 /// Lock guard for store-wide GC. Dropping it releases the OS lock.
 pub type GcLock = StoreLock;
@@ -1399,13 +2112,33 @@ impl StoreLock {
             .open(path)?)
     }
 
-    fn finish(mut file: fs::File) -> Result<Self> {
-        // Diagnostic only: lock ownership is determined exclusively by the OS.
+    fn finish(mut file: fs::File, path: &Path) -> Result<Self> {
         use std::io::{Seek, SeekFrom, Write};
+        // Diagnostic only: lock ownership is determined exclusively by the OS.
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         write!(file, "{}", std::process::id())?;
-        Ok(Self { file })
+        // A storing mark found while holding the lock is one a holder that
+        // died left behind ([`StoreLock::mark_storing`]).
+        let _ = fs::remove_file(storing_mark_path(path));
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            storing: None,
+        })
+    }
+
+    /// Say beside the lock file that its holder now stores the key's entry,
+    /// so a lookup that misses the entry meanwhile waits for it instead of
+    /// compiling ([`key_store_in_flight`]). The mark goes when the lock is
+    /// released, on every path out of the store, success or failure; a
+    /// holder killed meanwhile leaves one that names an exited process.
+    /// Best effort: a mark that cannot be written only costs that wait.
+    pub fn mark_storing(&mut self) {
+        let mark = storing_mark_path(&self.path);
+        if fs::write(&mark, std::process::id().to_string()).is_ok() {
+            self.storing = Some(mark);
+        }
     }
 
     /// Open, lock, then confirm the locked file is the one at `path`.
@@ -1428,7 +2161,7 @@ impl StoreLock {
                 kache_fs::handle_identity(&file),
                 kache_fs::file_identity(path),
             ) {
-                return Ok(Some(Self::finish(file)?));
+                return Ok(Some(Self::finish(file, path)?));
             }
             // Closing the handle releases the lock on the unlinked file.
         }
@@ -1490,6 +2223,10 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
+        // Before the unlock: the next holder never sees this holder's mark.
+        if let Some(mark) = self.storing.take() {
+            let _ = fs::remove_file(mark);
+        }
         let _ = self.file.unlock();
     }
 }
@@ -1683,7 +2420,7 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     db.pragma_update(None, "synchronous", mode.resolve().pragma_value())?;
     // Let concurrent writers retry for up to 5 s instead of failing immediately
     // with SQLITE_BUSY -- critical when 300+ wrapper processes hit the DB in parallel.
-    db.pragma_update(None, "busy_timeout", "5000")?;
+    db.busy_timeout(INDEX_BUSY_WAIT)?;
 
     // Every statement below is a no-op on a current index, yet each one still
     // opens a write transaction, so every wrapper process queued behind
@@ -1693,8 +2430,15 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     // added or changed below. It cannot vouch for the memo rule columns
     // ([`crate::file_hash::has_rule_columns`]), so those are checked too.
     // Both checks only read.
+    //
+    // A higher generation is a newer release's stamp. Its schema holds every
+    // statement below (they only ever add), so this release skips them as on
+    // a current index, and never stamps its own generation over the newer
+    // one: a build-script launcher keeps running the kache that installed it
+    // until the script is rebuilt, so two releases open one store for a
+    // while, and a downward stamp makes the newer one run its DDL again.
     let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if generation == INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
+    if generation >= INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
         return Ok(());
     }
 
@@ -1853,7 +2597,7 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
         .execute_batch("ALTER TABLE target_roots ADD COLUMN discovered INTEGER NOT NULL DEFAULT 0");
 
     crate::file_hash::ensure_file_hash_cache_schema(db)?;
-    db.pragma_update(None, "user_version", INDEX_SCHEMA_GENERATION)?;
+    db.pragma_update(None, "user_version", generation.max(INDEX_SCHEMA_GENERATION))?;
 
     Ok(())
 }
@@ -1885,31 +2629,147 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 /// 12: replace incompatible `record_json` prediction memos with the current
 ///    payload schema. Compiled cache entries are retained.
 /// 13: `entries.rustc_version`, for explicit compiler-version cleanup.
+///
+/// A release that finds a higher number leaves it (and skips the DDL): the
+/// stamp only ever goes up. Releases before this rule stamp their own number
+/// back, so a newer one runs its DDL once more after such an open.
 const INDEX_SCHEMA_GENERATION: i64 = 13;
 
-/// Raise the refcount of every blob `cache_key` maps to at least the
-/// references all mappings hold on it. Run before giving this key's
-/// references back.
+/// What [`ArtifactStore::adopt_legacy_entry`] did for one entry.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Adoption {
+    /// The entry's files, each re-hashed against its content address.
+    pub files: usize,
+    pub bytes: u64,
+    pub verify: Duration,
+    /// The new row, its blob references and its meta.json, or the hand-off
+    /// of them ([`Registered::Deferred`]).
+    pub register: Duration,
+    pub outcome: AdoptionOutcome,
+    /// The verified legacy entry's metadata, under the new key and version:
+    /// what to restore from, whether or not its row is written yet. `None`
+    /// when nothing was verified (another process held or had the key).
+    pub meta: Option<EntryMeta>,
+}
+
+/// How an adoption ended ([`Adoption::outcome`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionOutcome {
+    /// This process verified and registered the entry.
+    #[default]
+    Adopted,
+    /// Another process adopted or stored the key first: nothing was done.
+    ByPeer,
+    /// Another process holds the key's build lock (adopting or compiling
+    /// it): nothing was hashed, and the caller's claim waits for it.
+    Contended,
+    /// Verified, and handed to a registrar that writes the row later
+    /// ([`Registered::Deferred`]): restore from [`Adoption::meta`].
+    Deferred,
+}
+
+/// One verified adoption to register ([`ArtifactStore::register_adoptions`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionRequest {
+    pub legacy_key: String,
+    pub legacy_version: u32,
+    pub cache_key: String,
+    pub crate_name: String,
+}
+
+/// What [`ArtifactStore::register_adoptions`] did with one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registered {
+    Adopted,
+    /// The key was committed already (a peer adopted or stored it).
+    ByPeer,
+    /// The legacy row, its meta.json or a blob is gone or does not bind.
+    Refused,
+    /// Handed to a registrar (the daemon's) that writes it later and holds
+    /// the key's build lock, marked storing, until then (lane KACHE-W23):
+    /// nobody waits for the index on the build's critical path.
+    Deferred,
+}
+
+/// Idle hours added to an entry of an earlier key version when it is ranked
+/// for eviction (lane KACHE-W20 prototype), whose hit count is ranked as 0
+/// (lane KACHE-W25: the size score divides hits by idleness, so hits alone
+/// could still outrank a live entry): every policy ranks by idleness, so an
+/// entry no key bridge adopted goes before any entry of this version, and
+/// an upgrade never keeps two generations side by side over the cap. An
+/// adopted entry's legacy row shares its blobs: removing it frees the row.
+const STALE_KEY_SCHEMA_IDLE_HOURS: f64 = 1.0e6;
+
+/// SQL over an `entries` row: an earlier key version than its own
+/// component's ([`kache_format::KeyComponent`]) stored it, so no key of this
+/// release reaches it except through a key bridge. `0` (unrecorded) is not
+/// stale here: only `kache gc --stale-schema` takes those.
+fn stale_key_schema_sql() -> String {
+    format!(
+        "(key_schema > 0 AND key_schema < {})",
+        kache_format::KeyComponent::key_version_sql()
+    )
+}
+
+/// The hit path's read of a row: seconds since its last stamp, and whether
+/// it is stale ([`stale_key_schema_sql`]).
+static HIT_AGE_AND_STALE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), {} FROM entries \
+         WHERE cache_key = ?1",
+        stale_key_schema_sql()
+    )
+});
+
+/// Before `cache_key` gives back `releases` (per blob, the references its
+/// release is about to subtract), raise the refcount of each blob that
+/// release could take to zero to at least the references every other
+/// mapping holds on it plus the release's own. Returns how many it raised.
 ///
 /// A mapping can exist for references nobody counted (an older backfill
-/// mapped legacy entries before their migration). Subtracting such a mapping
-/// from a count that only covers the other owners would take one of theirs,
-/// and the blob would be reclaimed while they still need it. Flooring first
-/// can only retain too much, which the blob-index reconcile corrects.
-fn floor_blob_refs_at_mappings(
+/// mapped legacy entries before their migration). Subtracting from a count
+/// that only covers the other owners would take one of theirs, and the blob
+/// would be reclaimed while they still need it. Flooring first can only
+/// retain too much, which the blob-index reconcile corrects.
+///
+/// The floor compares against what this release subtracts, not against the
+/// mapping: a removal subtracts one per file its meta.json lists, which a
+/// drifted mapping may count differently. A count above the release stays
+/// above zero, and only a blob row at zero is deleted and unlinked, so such
+/// a blob is left as it is and summing its mappings is skipped: for a blob
+/// most entries share (the empty file: 503k mappings on one store) that sum
+/// cost about 0.2 s under the write lock on every removal. Whichever later
+/// release could take the count to zero floors it then, against the
+/// mappings left at that time.
+fn floor_blob_refs_before_release<'a>(
     conn: &rusqlite::Connection,
     cache_key: &str,
+    releases: impl IntoIterator<Item = (&'a str, i64)>,
 ) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE blobs
-         SET refcount = MAX(refcount, (
-             SELECT SUM(refs) FROM entry_blobs WHERE hash = blobs.hash
-         ))
-         WHERE hash IN (
-             SELECT hash FROM entry_blobs WHERE cache_key = ?1
-         )",
-        params![cache_key],
-    )
+    let mut raised = 0;
+    for (hash, release) in releases {
+        let refcount: Option<i64> = conn
+            .prepare_cached("SELECT refcount FROM blobs WHERE hash = ?1")?
+            .query_row(params![hash], |row| row.get(0))
+            .optional()?;
+        // No row: nothing to subtract from and nothing to unlink.
+        let Some(refcount) = refcount.filter(|&refcount| refcount <= release) else {
+            continue;
+        };
+        let others: i64 = conn
+            .prepare_cached(
+                "SELECT COALESCE(SUM(refs), 0) FROM entry_blobs \
+                 WHERE hash = ?1 AND cache_key <> ?2",
+            )?
+            .query_row(params![hash, cache_key], |row| row.get(0))?;
+        let floor = others.saturating_add(release);
+        if refcount < floor {
+            conn.prepare_cached("UPDATE blobs SET refcount = ?2 WHERE hash = ?1")?
+                .execute(params![hash, floor])?;
+            raised += 1;
+        }
+    }
+    Ok(raised)
 }
 
 /// Give back every blob reference `cache_key`'s current mapping holds, then
@@ -1926,8 +2786,41 @@ fn floor_blob_refs_at_mappings(
 /// name a blob that has no row (nothing was ever counted for it); released
 /// afterwards, that mapping would consume the reference just taken and
 /// delete the new generation's row.
+/// Unlink the blob `blob` (digest `hash`) when it is still the inode of
+/// `snapshot` and no entry references it. Its bytes are no longer `hash`,
+/// and a put of `hash` would otherwise adopt the file as it stands. `conn`
+/// holds the index's write lock, under which every blob unlink happens.
+fn discard_changed_blob(conn: &rusqlite::Connection, blob: &Path, hash: &str, snapshot: &Path) {
+    let (Ok(blob_identity), Ok(snapshot_identity)) = (
+        kache_fs::file_identity(blob),
+        kache_fs::file_identity(snapshot),
+    ) else {
+        return;
+    };
+    if blob_identity != snapshot_identity {
+        return;
+    }
+    let referenced = conn
+        .query_row("SELECT 1 FROM blobs WHERE hash = ?1", [hash], |_| Ok(()))
+        .optional();
+    if matches!(referenced, Ok(None)) {
+        unlink_blob(blob);
+    }
+}
+
 fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusqlite::Result<()> {
-    floor_blob_refs_at_mappings(conn, cache_key)?;
+    // What the subtraction below takes: this key's mapped references.
+    let releases = conn
+        .prepare_cached("SELECT hash, refs FROM entry_blobs WHERE cache_key = ?1")?
+        .query_map(params![cache_key], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    floor_blob_refs_before_release(
+        conn,
+        cache_key,
+        releases.iter().map(|(hash, refs)| (hash.as_str(), *refs)),
+    )?;
     conn.execute(
         "UPDATE blobs
          SET refcount = MAX(0, refcount - COALESCE((
@@ -1983,6 +2876,34 @@ fn record_entry_blobs(
         )?;
     }
     Ok(())
+}
+
+/// WAL pages ([`defer_wal_checkpoints`]) a compiler wrapper's connection lets
+/// the log grow to before it checkpoints it itself: 256 MiB of 4 KiB pages.
+/// The daemon checkpoints every 2 s, but readers can keep the log from being
+/// reset for a minute, and a burst of builds wrote past 64 MiB between two
+/// checkpoints on the build machine: with that threshold every commit then
+/// checkpointed and fsynced again, in wrappers (374 times in 30 minutes). A
+/// larger log costs nothing until something copies it.
+pub const DEFERRED_AUTOCHECKPOINT_PAGES: i64 = 65_536;
+
+static DEFER_WAL_CHECKPOINTS: AtomicBool = AtomicBool::new(false);
+
+/// Leave this process's routine WAL checkpoints to the daemon.
+///
+/// SQLite checkpoints the log in whichever connection's commit takes it past
+/// `wal_autocheckpoint` pages (1,000 by default), inside that commit: the
+/// committing process copies the pages into the index and fsyncs it before
+/// its statement returns. A compiler wrapper commits a hit's access stamp, its
+/// memo rows and a miss's entry, so on a shared store about every
+/// thousandth page written made some wrapper wait for the filesystem's
+/// journal, 0.3-2 s on a busy disk, while Cargo waited for that unit.
+/// Connections a process opens after this call checkpoint only once the log
+/// reaches [`DEFERRED_AUTOCHECKPOINT_PAGES`]; the daemon checkpoints it
+/// passively every few seconds ([`ArtifactStore::checkpoint_wal`]), so without
+/// a daemon the log is still bounded.
+pub fn defer_wal_checkpoints() {
+    DEFER_WAL_CHECKPOINTS.store(true, Ordering::Relaxed);
 }
 
 pub fn open_index_db(db_path: &Path) -> Result<Connection> {
@@ -2086,9 +3007,15 @@ fn try_open_index_db(db_path: &Path, mode: IndexMode) -> std::result::Result<Con
     for attempt in 1..=STORE_OPEN_MAX_ATTEMPTS {
         match Connection::open(db_path).and_then(|db| {
             initialize_db(&db, mode)?;
+            if DEFER_WAL_CHECKPOINTS.load(Ordering::Relaxed) {
+                db.pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
+            }
             Ok(db)
         }) {
-            Ok(db) => return Ok(db),
+            Ok(db) => {
+                share_index_files(db_path);
+                return Ok(db);
+            }
             Err(err)
                 if attempt < STORE_OPEN_MAX_ATTEMPTS && is_retryable_sqlite_open_error(&err) =>
             {
@@ -2110,6 +3037,20 @@ fn try_open_index_db(db_path: &Path, mode: IndexMode) -> std::result::Result<Con
     }
 
     Err(last_error.expect("try_open_index_db must record an error before returning"))
+}
+
+/// In a store several accounts share through a group, let the group write
+/// the index: SQLite creates it, its WAL and its SHM with mode 0644.
+fn share_index_files(db_path: &Path) {
+    let Some(gid) = db_path.parent().and_then(kache_fs::group_store_gid) else {
+        return;
+    };
+    kache_fs::share_with_group(db_path, gid);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        kache_fs::share_with_group(Path::new(&sidecar), gid);
+    }
 }
 
 /// Whether a SQLite error means the database file itself is unusable
@@ -2294,7 +3235,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             options,
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
+            ranking_fresh_for: RANKING_FRESH_FOR,
+            size_sweep_walk_budget: SIZE_SWEEP_WALK_BUDGET,
             read_only: false,
+            hit_stamps: None,
+            pending_pins: None,
+            busy_memo_rows: None,
+            busy_wait: std::cell::Cell::new(INDEX_BUSY_WAIT),
         };
 
         // A quarantined index comes back empty, but the blobs and every entry's
@@ -2380,7 +3327,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         let db = open_index_db_readonly(&db_path)?;
-        db.busy_timeout(Duration::from_secs(2))?;
+        let busy_wait = Duration::from_secs(2);
+        db.busy_timeout(busy_wait)?;
         // An index that cannot be read fails here, once, not as a miss per unit.
         db.query_row("SELECT 1 FROM entries LIMIT 1", [], |_| Ok(()))
             .optional()
@@ -2391,7 +3339,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             options,
             db,
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
+            ranking_fresh_for: RANKING_FRESH_FOR,
+            size_sweep_walk_budget: SIZE_SWEEP_WALK_BUDGET,
             read_only: true,
+            hit_stamps: None,
+            pending_pins: None,
+            busy_memo_rows: None,
+            busy_wait: std::cell::Cell::new(busy_wait),
         })
     }
 
@@ -2440,8 +3394,41 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             {
                 return Ok(None);
             }
+            if !verify_content
+                && blob_may_share_an_executable::<P>(cached_file, &meta.crate_types)
+                && !self.shared_blob_holds(&blob, &cached_file.hash)
+            {
+                return Ok(None);
+            }
         }
         Ok(Some(meta))
+    }
+
+    /// Whether `blob`, which may share its inode with a build output
+    /// ([`ArtifactPolicy::allow_executable_hardlink`]), still holds `hash`'s
+    /// bytes. A writer that ignores the read-only bit changes the inode's
+    /// ctime, which nothing can set back, so the file-hash memo's row for the
+    /// blob's exact fingerprint vouches for it without a read. Otherwise the
+    /// blob is read; when it matches and its fingerprint had settled and did
+    /// not move during the read, the row is written for the next hit (with a
+    /// short wait: a busy index only costs that hit the read again).
+    fn shared_blob_holds(&self, blob: &Path, hash: &str) -> bool {
+        let observed = crate::file_hash::wall_clock_ns();
+        let Ok(before) = crate::file_hash::FileFingerprint::from_path(blob) else {
+            return false;
+        };
+        if self.file_hash_at(&before).as_deref() == Some(hash) {
+            return true;
+        }
+        if !matches!(crate::file_hash::hash_file(blob), Ok(ref actual) if actual == hash) {
+            return false;
+        }
+        if crate::file_hash::stamp_is_settled(&before, observed)
+            && crate::file_hash::FileFingerprint::from_path(blob).is_ok_and(|after| after == before)
+        {
+            self.record_verified_file_hashes(&[(before, hash)]);
+        }
+        true
     }
 
     /// Persistent-cache lookup for one file's content hash — DB read only, no
@@ -2479,28 +3466,181 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// [`Self::record_verified_file_hash`] for every restored file of one
     /// hit, in one transaction with a short wait: the rows only save a later
-    /// hash, so a busy index (a miss's store transaction elsewhere) drops them
-    /// instead of stalling the hit.
+    /// hash, so a busy index (a miss's store transaction elsewhere) does not
+    /// stall the hit for them. They go to the [`MemoRowSink`] instead, or
+    /// are dropped without one.
     pub fn record_verified_file_hashes(
         &self,
         restored: &[(crate::file_hash::FileFingerprint, &str)],
     ) {
-        if self.read_only || restored.is_empty() {
+        self.record_restored_file_hashes(restored, &[]);
+    }
+
+    /// [`Self::record_verified_file_hashes`] for outputs whose mtime was just
+    /// set to the time Cargo re-dates them to after the unit
+    /// ([`crate::file_hash::FILE_HASH_RULE_REDATED`]).
+    pub fn record_redated_file_hashes(
+        &self,
+        redated: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        self.record_restored_file_hashes(&[], redated);
+    }
+
+    /// Both of the above for one hit, in one transaction: each takes the
+    /// index's write lock, which a burst of hits and stores queues on.
+    pub fn record_restored_file_hashes(
+        &self,
+        verified: &[(crate::file_hash::FileFingerprint, &str)],
+        redated: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        if self.read_only {
             return;
         }
-        let _ = self.db.busy_timeout(std::time::Duration::from_millis(100));
+        let rows = memo_rows(verified, redated);
+        if rows.is_empty() {
+            return;
+        }
+        let wait = if self.busy_memo_rows.is_some() {
+            bookkeeping_wait(MEMO_ROW_HANDOFF_WAIT)
+        } else {
+            MEMO_ROW_WAIT
+        };
+        let Err(mut error) = self.write_memo_rows(&rows, wait) else {
+            return;
+        };
+        if self.hand_busy_memo_rows(&rows) {
+            tracing::debug!(
+                rows = rows.len(),
+                "memo rows handed off (index busy): {error}"
+            );
+            return;
+        }
+        // Nowhere took them: wait as long as a store without a sink would.
+        if wait < MEMO_ROW_WAIT {
+            match self.write_memo_rows(&rows, MEMO_ROW_WAIT) {
+                Ok(()) => return,
+                Err(again) => error = again,
+            }
+        }
+        tracing::debug!(
+            rows = rows.len(),
+            "memo rows not written (index busy): {error}"
+        );
+    }
+
+    /// [`Self::record_verified_file_hashes`] for rows the caller's caller is
+    /// waiting on: handed to the [`MemoRowSink`] first, whatever the index,
+    /// and written here only when nothing takes them. A seeding memoises
+    /// what it placed while Cargo waits for its target-info probe; on a busy
+    /// journal that commit alone took 0.3-0.6 s, which the daemon's next
+    /// flush pays instead.
+    pub fn hand_off_verified_file_hashes(
+        &self,
+        verified: &[(crate::file_hash::FileFingerprint, &str)],
+    ) {
+        if self.read_only {
+            return;
+        }
+        let rows = memo_rows(verified, &[]);
+        if rows.is_empty() || self.hand_busy_memo_rows(&rows) {
+            return;
+        }
+        self.record_verified_file_hashes(verified);
+    }
+
+    /// Write rows a [`MemoRowSink`] took, in one transaction with a short
+    /// wait. A row is written only while it still describes its file: the
+    /// file's stamp is the row's, or for a re-dated row the row's but for a
+    /// ctime at most [`REDATE_CTIME_WINDOW_NS`] later, with no row for the
+    /// current stamp to overwrite. Any other row could never be served, and
+    /// could replace one that can. Returns how many were written; an error
+    /// (a busy index) writes none, and the caller may try again.
+    ///
+    /// [`REDATE_CTIME_WINDOW_NS`]: crate::file_hash::REDATE_CTIME_WINDOW_NS
+    pub fn write_handed_memo_rows(&self, rows: &[MemoRow]) -> rusqlite::Result<usize> {
+        if self.read_only {
+            return Ok(0);
+        }
+        let live: Vec<MemoRow> = rows
+            .iter()
+            .filter(|row| self.handed_memo_row_applies(row))
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            return Ok(0);
+        }
+        self.write_memo_rows(&live, MEMO_ROW_WAIT)?;
+        Ok(live.len())
+    }
+
+    fn handed_memo_row_applies(&self, row: &MemoRow) -> bool {
+        let recorded = &row.fingerprint;
+        let Ok(current) = crate::file_hash::FileFingerprint::from_path(Path::new(&recorded.path))
+        else {
+            return false;
+        };
+        if current == *recorded {
+            return true;
+        }
+        row.redated
+            && current.size == recorded.size
+            && current.mtime_ns == recorded.mtime_ns
+            && current.inode == recorded.inode
+            && current.ctime_ns >= recorded.ctime_ns
+            && current.ctime_ns - recorded.ctime_ns <= crate::file_hash::REDATE_CTIME_WINDOW_NS
+            && self.file_hash_at(&current).is_none()
+    }
+
+    /// Give the connection back its own busy timeout after a call that
+    /// waited with another.
+    fn give_back_busy_timeout(&self) {
+        let _ = self.db.busy_timeout(self.busy_wait.get());
+    }
+
+    /// One transaction for `rows`, waiting at most `wait` for the write lock.
+    fn write_memo_rows(&self, rows: &[MemoRow], wait: Duration) -> rusqlite::Result<()> {
+        let _ = self.db.busy_timeout(wait);
         let written = (|| -> rusqlite::Result<()> {
             self.db.execute_batch("BEGIN IMMEDIATE")?;
-            for (fingerprint, hash) in restored {
-                self.file_hash_cache().record_verified(fingerprint, hash);
+            let cache = self.file_hash_cache();
+            for row in rows {
+                // A row of any size holds for exactly its stamp. A restore
+                // hands over only rows above the memo's floor, but a key's
+                // rows include small workspace files, whose rows the tree
+                // guard reads.
+                if row.redated {
+                    cache.put_redated(&row.fingerprint, &row.hash)?;
+                } else {
+                    cache.put(&row.fingerprint, &row.hash)?;
+                }
             }
             self.db.execute_batch("COMMIT")
         })();
-        let _ = self.db.busy_timeout(std::time::Duration::from_millis(5000));
-        if let Err(error) = written {
+        self.give_back_busy_timeout();
+        if written.is_err() && !self.db.is_autocommit() {
             let _ = self.db.execute_batch("ROLLBACK");
-            tracing::debug!("restored file hashes not memoised (index busy): {error}");
         }
+        written
+    }
+
+    /// The memoised hash for `path` at its current stamp, read-only.
+    pub fn file_hash_at(&self, fingerprint: &crate::file_hash::FileFingerprint) -> Option<String> {
+        self.file_hash_cache().get(fingerprint).ok().flatten()
+    }
+
+    /// The memo's rows for `paths`, each with the stamp it was recorded
+    /// under ([`crate::file_hash::FileHashCache::recorded_at`]), read-only.
+    /// A failed read reads as no rows.
+    pub fn recorded_file_hashes(
+        &self,
+        paths: &[&str],
+    ) -> std::collections::HashMap<String, (crate::file_hash::FileFingerprint, String)> {
+        self.file_hash_cache()
+            .recorded_at(paths)
+            .unwrap_or_else(|error| {
+                tracing::debug!("file hash memo lookup failed: {error}");
+                std::collections::HashMap::new()
+            })
     }
 
     /// Associate a stable file with its already-known content hash, avoiding a
@@ -2634,6 +3774,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         return Ok(None);
                     }
                 }
+            } else if blob_may_share_an_executable::<P>(cached_file, &meta.crate_types)
+                && !self.shared_blob_holds(&blob, &cached_file.hash)
+            {
+                tracing::warn!(
+                    "cache entry {} file {}: its blob shares an inode with a build output \
+                     and no longer holds its bytes, evicting",
+                    cache_key.get(..16).unwrap_or(cache_key),
+                    cached_file.name,
+                );
+                let _ = self.remove_entry(cache_key);
+                return Ok(None);
             }
         }
 
@@ -2642,30 +3793,392 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // needs no write, and in a contended cell every hit's write would
         // queue behind the misses' store transactions. Hit counts therefore
         // count at most one hit per entry per [`HIT_STAMP_INTERVAL`].
-        let age_seconds: Option<i64> = self
+        //
+        // A row an earlier key version stored is stamped at once, inside the
+        // interval too: until a hit raises its `key_schema`, eviction ranks
+        // it as one no key of this release reaches (lane KACHE-W21).
+        // The version compared is the row's own component's
+        // ([`kache_format::KeyComponent`]): a C compile or build-script run
+        // whose recipe the bump left alone is not stale (lane KACHE-W22).
+        let (age_seconds, earlier_key_version): (Option<i64>, bool) = self
             .db
-            .query_row(
-                "SELECT strftime('%s', 'now') - strftime('%s', last_accessed) FROM entries \
-                 WHERE cache_key = ?1",
-                params![cache_key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64) {
-            self.db.execute(
-                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1 \
-                 WHERE cache_key = ?1",
-                params![cache_key],
-            )?;
+            .query_row(&HIT_AGE_AND_STALE_SQL, params![cache_key], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
+            .optional()?
+            .map_or((None, false), |(age, earlier)| (Some(age), earlier));
+        //
+        // The stamp waits at most [`HIT_STAMP_BUSY_WAIT`] for the index:
+        // a writer that holds it while the filesystem commits its journal
+        // under heavy writes held every hit of every build behind it for
+        // seconds (and this lookup failing busy was retried for up to 30 s).
+        // A hit that cannot stamp still restores; it only counts one hit
+        // fewer and keeps its older access time.
+        //
+        // With a sink ([`Self::send_hit_stamps_to`]) the stamp leaves the hit
+        // path altogether: the sink holds it, pins the entry against its own
+        // sweeps until it is written, and writes it in a batch.
+        if (earlier_key_version
+            || age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64))
+            && !self.hit_stamps.as_ref().is_some_and(|sink| sink(cache_key))
+        {
+            let _ = self.db.busy_timeout(HIT_STAMP_BUSY_WAIT);
+            // A hit proves the entry is one this release's keys reach: it is
+            // no longer an earlier key version's, whatever version stored it
+            // (a component whose key version did not move hits as before).
+            let stamped = self.db.execute(
+                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1, \
+                 key_schema = MAX(key_schema, ?2) WHERE cache_key = ?1",
+                params![cache_key, kache_format::CACHE_KEY_VERSION],
+            );
+            self.give_back_busy_timeout();
+            if let Err(error) = stamped {
+                tracing::debug!(
+                    "hit on {} not stamped (index busy): {error}",
+                    cache_key.get(..16).unwrap_or(cache_key)
+                );
+            }
         }
 
         Ok(Some(meta))
     }
 
+    /// Adopt the entry an earlier key version stored under `legacy_key` as
+    /// `cache_key`'s, for a release whose key bump left this invocation's
+    /// derivation alone (key bridges, lanes KACHE-W20..W22), registering it
+    /// in this store's index ([`Self::adopt_legacy_entry_with`]).
+    pub fn adopt_legacy_entry(
+        &self,
+        legacy_key: &str,
+        legacy_version: u32,
+        cache_key: &str,
+        crate_name: &str,
+    ) -> Result<Option<Adoption>> {
+        self.adopt_legacy_entry_with(
+            legacy_key,
+            legacy_version,
+            cache_key,
+            crate_name,
+            |req, _lock| Ok(self.register_adoptions(std::slice::from_ref(req))?[0]),
+        )
+    }
+
+    /// [`Self::adopt_legacy_entry`], with `register` writing the new row:
+    /// this store's [`Self::register_adoptions`], or a daemon that batches
+    /// the registrations of many builds into one transaction. `register`
+    /// gets the key's build lock, marked storing, and releases it: after its
+    /// own registration, or before a hand-off to a registrar that takes the
+    /// key's lock itself ([`Registered::Deferred`]).
+    ///
+    /// Safe only because the caller computed `legacy_key` with the earlier
+    /// version's derivation for this same invocation. The key's build lock
+    /// is taken first: a peer adopting (or compiling) the same key holds it,
+    /// and this process then leaves the key to it ([`AdoptionOutcome::Contended`]:
+    /// the caller's claim waits for that commit) instead of re-hashing the
+    /// same blobs. Under the lock the entry must be committed, say it was
+    /// stored under `legacy_key` by `legacy_version`, name `crate_name`, and
+    /// every blob must still hold the bytes its content address names
+    /// (re-hashed here, whatever `verify_restores` says). The new row then
+    /// references the same blobs (refcounts taken in one transaction, no
+    /// bytes copied); the legacy row stays for releases that still read it,
+    /// and as a stale key version it is the first an eviction takes. `None`
+    /// when there is nothing to adopt or any check fails: the caller
+    /// compiles.
+    pub fn adopt_legacy_entry_with(
+        &self,
+        legacy_key: &str,
+        legacy_version: u32,
+        cache_key: &str,
+        crate_name: &str,
+        register: impl FnOnce(&AdoptionRequest, KeyLock) -> Result<Registered>,
+    ) -> Result<Option<Adoption>> {
+        if self.read_only || legacy_key == cache_key || !self.contains(legacy_key) {
+            return Ok(None);
+        }
+        let Some(mut lock) = self.try_lock(cache_key)? else {
+            return Ok(Some(Adoption {
+                outcome: AdoptionOutcome::Contended,
+                ..Adoption::default()
+            }));
+        };
+        // Peers that missed meanwhile wait for this commit, as for a store.
+        lock.mark_storing();
+        if self.contains(cache_key) {
+            return Ok(Some(Adoption {
+                outcome: AdoptionOutcome::ByPeer,
+                ..Adoption::default()
+            }));
+        }
+        let Some(meta) = self.legacy_meta_for(legacy_key, legacy_version, crate_name) else {
+            return Ok(None);
+        };
+        let verify_started = std::time::Instant::now();
+        let mut verified_bytes = 0u64;
+        for file in &meta.files {
+            let blob = self.blob_path(&file.hash);
+            verified_bytes += file.size;
+            if validate_blob_metadata(&blob, file.size).is_err() {
+                return Ok(None);
+            }
+            match crate::file_hash::hash_file(&blob) {
+                Ok(actual) if actual == file.hash => {}
+                _ => {
+                    tracing::warn!(
+                        "key bridge: {} file {} does not hold its bytes; not adopted",
+                        &legacy_key[..16.min(legacy_key.len())],
+                        file.name
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+        let verify = verify_started.elapsed();
+        let register_started = std::time::Instant::now();
+        let request = AdoptionRequest {
+            legacy_key: legacy_key.to_string(),
+            legacy_version,
+            cache_key: cache_key.to_string(),
+            crate_name: crate_name.to_string(),
+        };
+        let outcome = match register(&request, lock)? {
+            Registered::Adopted => AdoptionOutcome::Adopted,
+            Registered::ByPeer => AdoptionOutcome::ByPeer,
+            Registered::Deferred => AdoptionOutcome::Deferred,
+            Registered::Refused => return Ok(None),
+        };
+        let mut adopted_meta = meta;
+        adopted_meta.cache_key = cache_key.to_string();
+        adopted_meta.key_schema = kache_format::CACHE_KEY_VERSION;
+        let adoption = Adoption {
+            files: adopted_meta.files.len(),
+            bytes: verified_bytes,
+            verify,
+            register: register_started.elapsed(),
+            outcome,
+            meta: Some(adopted_meta),
+        };
+        tracing::debug!(
+            "key bridge: adopted {} (v{legacy_version}) as {} for {crate_name}: {:?}, {} files, \
+             {} bytes, verified in {:?}, registered in {:?}",
+            &legacy_key[..16.min(legacy_key.len())],
+            &cache_key[..16.min(cache_key.len())],
+            adoption.outcome,
+            adoption.files,
+            adoption.bytes,
+            adoption.verify,
+            adoption.register,
+        );
+        Ok(Some(adoption))
+    }
+
+    /// `legacy_key`'s meta.json, when it binds that key, `legacy_version`
+    /// and `crate_name` and lists files.
+    fn legacy_meta_for(
+        &self,
+        legacy_key: &str,
+        legacy_version: u32,
+        crate_name: &str,
+    ) -> Option<EntryMeta> {
+        let meta = self.stored_meta(legacy_key)?;
+        if meta.cache_key != legacy_key
+            || meta.key_schema != legacy_version
+            || meta.crate_name != crate_name
+            || meta.files.is_empty()
+        {
+            tracing::info!(
+                "key bridge: refused {} for {crate_name}: meta says key {} v{} crate {}",
+                &legacy_key[..16.min(legacy_key.len())],
+                &meta.cache_key[..16.min(meta.cache_key.len())],
+                meta.key_schema,
+                meta.crate_name
+            );
+            return None;
+        }
+        Some(meta)
+    }
+
+    /// Register adoptions whose blobs [`Self::adopt_legacy_entry_with`]
+    /// verified, all in one write transaction (lane KACHE-W22: concurrent
+    /// builds queued for the index's write lock once per adopted entry).
+    /// Metadata is read and serialized before the lock is taken; each entry
+    /// commits or rolls back on its own (a savepoint), and one whose legacy
+    /// row or blobs went meanwhile is [`Registered::Refused`]. The bindings
+    /// are checked again here, the blob bytes are not: the caller re-hashed
+    /// them under the key's build lock.
+    pub fn register_adoptions(&self, requests: &[AdoptionRequest]) -> Result<Vec<Registered>> {
+        self.refuse_write("register adoptions")?;
+        let mut results = vec![Registered::Refused; requests.len()];
+        let mut prepared = Vec::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            if request.legacy_key == request.cache_key {
+                continue;
+            }
+            let Some(mut meta) = self.legacy_meta_for(
+                &request.legacy_key,
+                request.legacy_version,
+                &request.crate_name,
+            ) else {
+                continue;
+            };
+            meta.cache_key = request.cache_key.clone();
+            meta.key_schema = kache_format::CACHE_KEY_VERSION;
+            let meta_json =
+                serde_json::to_string_pretty(&meta).context("serializing adopted meta")?;
+            let entry_dir = self.entry_dir(&request.cache_key);
+            fs::create_dir_all(&entry_dir).context("creating adopted entry directory")?;
+            prepared.push((index, meta, meta_json));
+        }
+        if prepared.is_empty() {
+            return Ok(results);
+        }
+        let mut tx = self.begin_entry_registration()?;
+        for (index, meta, meta_json) in prepared {
+            let request = &requests[index];
+            let sp = tx.savepoint()?;
+            let committed: Option<bool> = sp
+                .query_row(
+                    "SELECT committed FROM entries WHERE cache_key = ?1",
+                    params![request.cache_key],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if committed == Some(true) {
+                results[index] = Registered::ByPeer;
+                continue;
+            }
+            release_entry_blob_refs(&sp, &request.cache_key)?;
+            let mut taken_all = true;
+            for file in &meta.files {
+                let taken = sp.execute(
+                    "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![file.hash],
+                )?;
+                if taken != 1 {
+                    taken_all = false;
+                    break;
+                }
+            }
+            if !taken_all {
+                // Rolled back on drop: no reference taken.
+                continue;
+            }
+            record_entry_blobs(&sp, &request.cache_key, &meta.files)?;
+            // Only once the key is known uncommitted: a committed entry's
+            // meta.json is never replaced.
+            crate::atomic::atomic_replace_deferrable(
+                &self.entry_dir(&request.cache_key).join("meta.json"),
+                meta_json.as_bytes(),
+                self.durable_writes(),
+            )
+            .context("writing adopted entry metadata")?;
+            let inserted = sp.execute(
+                "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, \
+                     num_features, size, content_hash, compile_time_ms, key_schema, committed, \
+                     durable, compile_time_backfilled, unit_id, rustc_version) \
+                 SELECT ?1, crate_name, crate_type, profile, num_features, size, content_hash, \
+                     compile_time_ms, ?2, 1, durable, compile_time_backfilled, unit_id, \
+                     rustc_version \
+                 FROM entries WHERE cache_key = ?3 AND committed = 1",
+                params![
+                    request.cache_key,
+                    kache_format::CACHE_KEY_VERSION,
+                    request.legacy_key
+                ],
+            )?;
+            if inserted != 1 {
+                continue;
+            }
+            sp.commit()?;
+            results[index] = Registered::Adopted;
+        }
+        tx.commit()?;
+        Ok(results)
+    }
+
+    /// Send the access stamps of this store's hits to `sink` instead of
+    /// writing them on the hit path ([`HitStampSink`]). The sink must write
+    /// them to this store's index ([`Self::stamp_hits`]) and pin them against
+    /// its own sweeps meanwhile ([`Self::pin_entries_with`]).
+    pub fn send_hit_stamps_to(&mut self, sink: HitStampSink) {
+        self.hit_stamps = Some(sink);
+    }
+
+    /// Whether this store hands memo rows a busy index refuses to a
+    /// [`MemoRowSink`] ([`Self::send_busy_memo_rows_to`]).
+    pub fn hands_busy_memo_rows(&self) -> bool {
+        self.busy_memo_rows.is_some()
+    }
+
+    /// Give `rows`, which this store's index was too busy to take, to its
+    /// [`MemoRowSink`]. True when the sink took them; false without one, or
+    /// when it refused them (no daemon runs, or one that will not take
+    /// them), and the caller then waits for the index or drops them.
+    pub fn hand_busy_memo_rows(&self, rows: &[MemoRow]) -> bool {
+        let handed = self.busy_memo_rows.as_ref().is_some_and(|sink| sink(rows));
+        if handed {
+            note_bookkeeping_handed_off();
+        }
+        handed
+    }
+
+    /// Hand memo rows this store's index is too busy to take to `sink`
+    /// instead of dropping them ([`MemoRowSink`]). The sink must write them
+    /// to this store's index ([`Self::write_handed_memo_rows`]).
+    pub fn send_busy_memo_rows_to(&mut self, sink: MemoRowSink) {
+        self.busy_memo_rows = Some(sink);
+    }
+
+    /// Keep the entries `pending` names, as if stamped just now, in this
+    /// store's eviction sweeps: their stamps are taken and not written yet.
+    pub fn pin_entries_with(&mut self, pending: PendingPins) {
+        self.pending_pins = Some(pending);
+    }
+
+    /// Write access stamps that hits handed off ([`HitStampSink`]): each key
+    /// gets `last_accessed = now` and its hits added to `hit_count`, in one
+    /// transaction. A key no longer in the index is skipped.
+    pub fn stamp_hits(&self, hits: &[(String, u32)]) -> Result<()> {
+        self.refuse_write("stamp hits")?;
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        {
+            let mut stamp = tx.prepare_cached(
+                "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + ?2, \
+                 key_schema = MAX(key_schema, ?3) WHERE cache_key = ?1",
+            )?;
+            for (key, count) in hits {
+                stamp.execute(params![
+                    key,
+                    i64::from(*count),
+                    kache_format::CACHE_KEY_VERSION
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Acquire a build lock for a cache key. Returns None if another process holds it.
     pub fn try_lock(&self, cache_key: &str) -> Result<Option<KeyLock>> {
         self.refuse_write("acquire a build lock")?;
-        StoreLock::try_acquire(&self.entry_dir(cache_key).with_extension("lock"))
+        try_lock_key_in(&self.config.store_dir(), cache_key)
+    }
+
+    /// [`key_store_in_flight`] in this store: another process stores
+    /// `cache_key`'s entry right now. Never for a read-only store, which
+    /// takes no key locks.
+    pub fn store_in_flight(&self, cache_key: &str) -> bool {
+        !self.is_read_only() && key_store_in_flight(&self.config.store_dir(), cache_key)
+    }
+
+    /// [`unit_in_flight_in`] in this store.
+    pub fn unit_in_flight(&self, crate_name: &str, unit: &str) -> bool {
+        unit_in_flight_in(&self.config.store_dir(), crate_name, unit)
     }
 
     /// Claim a cache miss, re-checking the store after acquiring the key lock.
@@ -2676,6 +4189,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let Some(lock) = self.try_lock(cache_key)? else {
             return Ok(BuildClaim::Contended);
         };
+        self.claim_build_locked(cache_key, lock)
+    }
+
+    /// The re-check of [`Self::claim_build`] for a key whose lock the caller
+    /// took without this store ([`try_lock_key_in`]).
+    pub fn claim_build_locked(&self, cache_key: &str, lock: KeyLock) -> Result<BuildClaim> {
+        self.refuse_write("acquire a build lock")?;
         match self.get(cache_key)? {
             Some(meta) if meta.files.is_empty() => {
                 tracing::warn!("cache entry {cache_key} has no files, evicting before build");
@@ -2809,7 +4329,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stdout,
             stderr,
             compile_time_ms,
-            true,
+            PutSources::Outputs,
             None,
         )
     }
@@ -2841,7 +4361,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stdout,
             stderr,
             compile_time_ms,
-            false,
+            PutSources::Independent,
             None,
         )
     }
@@ -2873,9 +4393,433 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stdout,
             stderr,
             compile_time_ms,
-            true,
+            PutSources::Outputs,
             rustc_version,
         )
+    }
+
+    /// Store outputs a wrapper snapshotted and handed to another process
+    /// (the daemon) to store after the compile returned.
+    ///
+    /// Each `output_files` source is a snapshot the wrapper took before it
+    /// returned to Cargo: a hardlink of the compiler's output, or a private
+    /// copy. `expected` holds, per file, the digest the wrapper read from that
+    /// snapshot then, which is the address the entry records. A snapshot that
+    /// hashes differently when it is staged here was rewritten after the
+    /// compile (a link shares the output's inode), and the put fails without
+    /// committing anything: the entry is either exactly what the compiler
+    /// wrote or absent.
+    ///
+    /// Hardlinks are allowed as for [`Self::put_with_compile_time`], so the
+    /// output ends up sharing the read-only blob as a synchronous put leaves
+    /// it. The snapshot paths are temporary, so the file-hash memo is not
+    /// seeded for them; see [`Self::record_shared_output_hash`].
+    pub fn put_handed_off(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        expected: &[String],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        rustc_version: Option<&str>,
+    ) -> Result<StorePutResult> {
+        anyhow::ensure!(
+            expected.len() == output_files.len(),
+            "a handed-off put needs one expected digest per file"
+        );
+        self.put_with_compile_time_policy(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            PutSources::Snapshots(expected),
+            rustc_version,
+        )
+    }
+
+    /// [`Self::put_with_compile_time`] that does not wait for a busy index.
+    ///
+    /// Phase 1 runs as in every put: each output is staged, hashed and
+    /// published as a blob. Phase 2 then waits at most `wait` for the index's
+    /// write lock. When it is still held elsewhere, nothing is registered and
+    /// the staged entry comes back ([`PutAttempt::Busy`]) for whoever
+    /// registers it: [`Self::register_staged_put`] here, or another process
+    /// given links to its blobs ([`Self::put_staged_handed_off`]). Until then
+    /// no lookup finds the entry, and one never registered leaves only
+    /// unreferenced blobs for the orphan sweep.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_with_compile_time_unless_busy(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        rustc_version: Option<&str>,
+        wait: Duration,
+    ) -> Result<PutAttempt> {
+        let staged = self.stage_put(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            PutSources::Outputs,
+            rustc_version,
+        )?;
+        Ok(
+            match self.register_staged(&staged, RegistrationWait::AtMost(wait))? {
+                Some(result) => PutAttempt::Stored(result),
+                None => PutAttempt::Busy(Box::new(staged)),
+            },
+        )
+    }
+
+    /// Register an entry [`Self::put_with_compile_time_unless_busy`] staged,
+    /// waiting for the index's write lock as a put does.
+    pub fn register_staged_put(&self, staged: &StagedPut) -> Result<StorePutResult> {
+        self.register_staged(staged, RegistrationWait::Patient)?
+            .context("registering a staged entry")
+    }
+
+    /// Register an entry another process staged
+    /// ([`Self::put_with_compile_time_unless_busy`]) and handed over:
+    /// [`Self::check_staged_handed_off`], then
+    /// [`Self::register_handed_off_batch`] for it alone, waiting for the
+    /// index's write lock as a put does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_staged_handed_off(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        snapshots: &[PathBuf],
+        files: &[CachedFile],
+        result: StorePutResult,
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        rustc_version: Option<&str>,
+    ) -> Result<StorePutResult> {
+        let checked = self.check_staged_handed_off(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            snapshots,
+            files,
+            result,
+            stdout,
+            stderr,
+            compile_time_ms,
+            "",
+            rustc_version,
+        );
+        match self.register_batch(vec![checked], RegistrationWait::Patient) {
+            BatchAttempt::Registered(mut results) => {
+                results.pop().context("registering a handed-off entry")?
+            }
+            BatchAttempt::Busy(_) => anyhow::bail!("the index stayed busy"),
+        }
+    }
+
+    /// Check an entry another process staged
+    /// ([`Self::put_with_compile_time_unless_busy`]) and handed over, for
+    /// [`Self::register_handed_off_batch`]: `files` is its file list, each
+    /// with the digest of the blob that process published, and `snapshots`
+    /// holds, per file, a link to that blob, which keeps its inode whatever
+    /// happens to the blob's path. `unit` is Cargo's `-C metadata` unit,
+    /// registered with the entry (empty: none).
+    ///
+    /// Nothing is staged again. Each snapshot is hashed, and one whose bytes
+    /// are no longer its digest (the blob shares an inode with a compiler
+    /// output a writer changed in place since, read-only bit or not) refuses
+    /// the entry; the registration then unlinks that blob when no entry
+    /// references it, so no later put adopts it under the digest. `result`
+    /// is what the staging put found. No lock is taken and the index is
+    /// only read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_staged_handed_off(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        snapshots: &[PathBuf],
+        files: &[CachedFile],
+        result: StorePutResult,
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        unit: &str,
+        rustc_version: Option<&str>,
+    ) -> CheckedHandoff {
+        if let Err(error) = self.refuse_write("store an entry") {
+            return CheckedHandoff::refused(error);
+        }
+        if files.is_empty() || snapshots.len() != files.len() {
+            return CheckedHandoff::refused(anyhow::anyhow!(
+                "a staged hand-off needs one snapshot per file"
+            ));
+        }
+        for (snapshot, file) in snapshots.iter().zip(files) {
+            if !kache_format::is_safe_stored_artifact_name(&file.name) {
+                return CheckedHandoff::refused(anyhow::anyhow!(
+                    "refusing to cache an artifact with an unsafe name: {}",
+                    file.name
+                ));
+            }
+            if !kache_format::is_blob_hash(&file.hash) {
+                return CheckedHandoff::refused(anyhow::anyhow!(
+                    "malformed blob hash for {}: {:?}",
+                    file.name,
+                    file.hash
+                ));
+            }
+            let read = fs::metadata(snapshot)
+                .with_context(|| format!("stating the staged blob of {}", file.name))
+                .and_then(|meta| Ok((meta.len(), crate::file_hash::hash_file(snapshot)?)));
+            let (size, hash) = match read {
+                Ok(read) => read,
+                Err(error) => return CheckedHandoff::refused(error),
+            };
+            if hash != file.hash || size != file.size {
+                return CheckedHandoff(Err(RefusedHandoff {
+                    error: anyhow::anyhow!(
+                        "{} changed after the compile returned (stored as {}, its blob now \
+                         hashes to {hash}); refusing to store it",
+                        file.name,
+                        file.hash
+                    ),
+                    changed: Some((file.hash.clone(), snapshot.clone())),
+                }));
+            }
+        }
+        let staged = self.staged_entry(
+            EntryFields {
+                cache_key,
+                crate_name,
+                crate_types,
+                features,
+                target,
+                profile,
+                stdout,
+                stderr,
+                compile_time_ms,
+                rustc_version,
+            },
+            files.to_vec(),
+            snapshots.iter().map(|path| (path.clone(), true)).collect(),
+            result,
+            false,
+        );
+        CheckedHandoff(staged.map_err(|error| RefusedHandoff {
+            error,
+            changed: None,
+        }))
+        .with_unit(unit)
+    }
+
+    /// Register checked hand-offs ([`Self::check_staged_handed_off`]) in one
+    /// transaction, waiting at most `wait` for the index's write lock.
+    ///
+    /// Under the lock, each blob a check found changed is unlinked when no
+    /// entry references it, and an entry of the batch that names one is
+    /// refused too: its check may have read the blob before the writer got
+    /// to it. Each other entry registers as a put's Phase 2 does, in a
+    /// savepoint of its own, so one that fails (a blob that cannot be
+    /// re-materialized) registers nothing and the rest commit together. A
+    /// peer sees each entry whole or not at all, and a crash commits none.
+    pub fn register_handed_off_batch(
+        &self,
+        batch: Vec<CheckedHandoff>,
+        wait: Duration,
+    ) -> BatchAttempt {
+        self.register_batch(batch, RegistrationWait::AtMost(wait))
+    }
+
+    fn register_batch(&self, batch: Vec<CheckedHandoff>, wait: RegistrationWait) -> BatchAttempt {
+        let refuse_all = |batch: Vec<CheckedHandoff>, error: &dyn std::fmt::Display| {
+            BatchAttempt::Registered(
+                batch
+                    .into_iter()
+                    .map(|checked| match checked.0 {
+                        Ok(_) => Err(anyhow::anyhow!("registering a handed-off entry: {error}")),
+                        Err(refused) => Err(refused.error),
+                    })
+                    .collect(),
+            )
+        };
+        if let Err(error) = self.refuse_write("store an entry") {
+            return refuse_all(batch, &format!("{error:#}"));
+        }
+        let changed: Vec<(String, PathBuf)> = batch
+            .iter()
+            .filter_map(|checked| checked.0.as_ref().err()?.changed.clone())
+            .collect();
+        if changed.is_empty() && !batch.iter().any(CheckedHandoff::is_ready) {
+            return refuse_all(batch, &"refused");
+        }
+        let started = match wait {
+            RegistrationWait::Patient => self.begin_entry_registration(),
+            RegistrationWait::AtMost(wait) => self.try_begin_entry_registration(wait),
+        };
+        let mut tx = match started {
+            Ok(tx) => tx,
+            Err(error) if matches!(wait, RegistrationWait::AtMost(_)) && is_sqlite_busy(&error) => {
+                return BatchAttempt::Busy(batch);
+            }
+            Err(error) => return refuse_all(batch, &error),
+        };
+        for (hash, snapshot) in &changed {
+            discard_changed_blob(&tx, &self.blob_path(hash), hash, snapshot);
+        }
+        let mut results = Vec::with_capacity(batch.len());
+        let mut registered = Vec::new();
+        for checked in batch {
+            let staged = match checked.0 {
+                Ok(staged) => staged,
+                Err(refused) => {
+                    results.push(Err(refused.error));
+                    continue;
+                }
+            };
+            if let Some(file) = staged
+                .meta
+                .files
+                .iter()
+                .find(|file| changed.iter().any(|(hash, _)| *hash == file.hash))
+            {
+                results.push(Err(anyhow::anyhow!(
+                    "{} shares its blob {} with an output changed after its compile \
+                     returned; refusing to store it",
+                    file.name,
+                    file.hash
+                )));
+                continue;
+            }
+            let outcome = tx
+                .savepoint()
+                .map_err(anyhow::Error::from)
+                .and_then(|savepoint| {
+                    self.register_in(&savepoint, &staged)?;
+                    savepoint.commit()?;
+                    Ok(())
+                });
+            match outcome {
+                Ok(()) => {
+                    results.push(Ok(staged.result));
+                    registered.push((results.len() - 1, staged));
+                }
+                Err(error) => results.push(Err(error)),
+            }
+        }
+        if let Err(error) = tx.commit() {
+            let error = format!("committing a batch of handed-off entries: {error}");
+            for result in &mut results {
+                if result.is_ok() {
+                    *result = Err(anyhow::anyhow!("{error}"));
+                }
+            }
+            return BatchAttempt::Registered(results);
+        }
+        for (index, staged) in &registered {
+            // Strict stores certify each entry's bytes before success, as a
+            // synchronous put does; a failed flush leaves it pending.
+            if let Err(error) = self.finish_strict_durability(&staged.meta.cache_key) {
+                results[*index] = Err(error);
+                continue;
+            }
+            self.seed_registered(staged);
+        }
+        BatchAttempt::Registered(results)
+    }
+
+    /// Seed the file-hash memo for a compiler output whose entry a handed-off
+    /// put ([`Self::put_handed_off`]) just stored, when the output at
+    /// `output` is still the very inode of the blob `hash` names.
+    ///
+    /// That blob was hashed by the put after it was made read-only, so its
+    /// bytes are `hash` unless a writer ignored the read-only bit, which a
+    /// synchronous put's seed equally trusts. An output that was replaced
+    /// since (a new inode), stored by copy or reflink (a different inode), or
+    /// is gone is not seeded: its bytes are not known here. The fingerprint
+    /// recorded is the one whose inode was checked, so a replacement between
+    /// the check and the write cannot be recorded under `hash`.
+    ///
+    /// `redated` records the row under the re-date rule, for a check unit's
+    /// `.rmeta` whose mtime the wrapper set as Cargo is about to.
+    pub fn record_shared_output_hash(&self, output: &Path, hash: &str, redated: bool) -> bool {
+        let Some(row) = self.shared_output_memo_row(output, hash, redated) else {
+            return false;
+        };
+        if redated {
+            self.record_redated_file_hashes(&[(row.fingerprint, hash)]);
+        } else {
+            self.file_hash_cache().record_cached(&row.fingerprint, hash);
+        }
+        true
+    }
+
+    /// The memo row [`Self::record_shared_output_hash`] would write, for a
+    /// caller that writes the rows of many outputs at once
+    /// ([`Self::write_handed_memo_rows`]). `None` when it would write none.
+    pub fn shared_output_memo_row(
+        &self,
+        output: &Path,
+        hash: &str,
+        redated: bool,
+    ) -> Option<MemoRow> {
+        if self.read_only {
+            return None;
+        }
+        let blob = kache_fs::file_identity(&self.blob_path(hash)).ok()?;
+        let current = kache_fs::file_identity(output).ok()?;
+        if current != blob {
+            return None;
+        }
+        let crate::file_hash::FileHashLookup::NeedsHash(fingerprint) =
+            self.file_hash_cache().lookup_cached(output)
+        else {
+            return None;
+        };
+        if u64::try_from(fingerprint.inode).ok() != Some(blob.ino) {
+            return None;
+        }
+        Some(MemoRow {
+            fingerprint,
+            hash: hash.to_string(),
+            redated,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2891,11 +4835,51 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stdout: &str,
         stderr: &str,
         compile_time_ms: u64,
-        allow_source_hardlinks: bool,
+        sources_kind: PutSources<'_>,
         rustc_version: Option<&str>,
     ) -> Result<StorePutResult> {
+        let staged = self.stage_put(
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            output_files,
+            stdout,
+            stderr,
+            compile_time_ms,
+            sources_kind,
+            rustc_version,
+        )?;
+        self.register_staged(&staged, RegistrationWait::Patient)?
+            .context("registering a stored entry")
+    }
+
+    /// Phase 1 of a put: stage, hash and publish every output as a blob and
+    /// build the entry's metadata, without touching the index.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_put(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_types: &[String],
+        features: &[String],
+        target: &str,
+        profile: &str,
+        output_files: &[(PathBuf, String)],
+        stdout: &str,
+        stderr: &str,
+        compile_time_ms: u64,
+        sources_kind: PutSources<'_>,
+        rustc_version: Option<&str>,
+    ) -> Result<StagedPut> {
         self.refuse_write("store an entry")?;
-        let entry_dir = self.entry_dir(cache_key);
+        let allow_source_hardlinks = !matches!(sources_kind, PutSources::Independent);
+        let expected = match sources_kind {
+            PutSources::Snapshots(expected) => Some(expected),
+            PutSources::Outputs | PutSources::Independent => None,
+        };
 
         // Phase 1: stage every output into a private snapshot and hash THE
         // SNAPSHOT — never the live build output — before any committed entry
@@ -2912,8 +4896,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let mut sources: Vec<(PathBuf, bool)> = Vec::new();
         let mut seen_output_blobs = std::collections::HashSet::new();
         let mut put_result = StorePutResult::default();
-        let mut total_size = 0u64;
-        for (source_path, store_name) in output_files {
+        for (index, (source_path, store_name)) in output_files.iter().enumerate() {
+            let expected_hash = expected.and_then(|expected| expected.get(index));
             // Every writer funnels through here, and the index checks over
             // committed metadata read these names back, so the same predicate
             // gates both: a name the verifier would call corrupt metadata must
@@ -2940,17 +4924,74 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // A failed stat is an error rather than a silent `false`, because
             // `false` is precisely the wrong value this guards against — and
             // staging opens the same path one line below regardless.
-            let executable = fs::metadata(source_path)
-                .map(|meta| crate::filesystem::is_executable(&meta))
+            let source_meta = fs::metadata(source_path)
                 .with_context(|| format!("stating compiler output for {store_name}"))?;
+            let executable = crate::filesystem::is_executable(&source_meta);
             let use_source_hardlink =
-                source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable);
+                source_hardlink_allowed::<P>(allow_source_hardlinks, store_name, executable)
+                    || executable_hardlink_eligible::<P>(
+                        allow_source_hardlinks,
+                        store_name,
+                        executable,
+                        crate_types,
+                    );
+            // A hardlinked snapshot turns the output read-only with it. When
+            // the snapshot is not what gets published, the output gets back
+            // the mode it had, not a guess at it.
+            let source_permissions = source_meta.permissions();
 
-            let (staged, ingest) = self.stage_blob_from_source(source_path, use_source_hardlink)?;
+            // The output's digest, read before any snapshot. When a blob
+            // already holds these bytes there is nothing to stage or publish:
+            // the entry references that blob, whose bytes are by its address
+            // exactly the ones just read (a snapshot would only be discarded
+            // as a lost race). Otherwise the digest names the shard the
+            // snapshot is staged in (`stage_blob_beside`), and the snapshot's
+            // own digest below is still the address. An unreadable output
+            // stages in `staging/` as before.
+            // A handed-off snapshot's digest was read by the wrapper before
+            // the compile returned: that, not whatever the file holds now,
+            // is the address.
+            let predicted = match expected_hash {
+                Some(hash) => Some(hash.clone()),
+                None => crate::file_hash::hash_file(source_path).ok(),
+            };
+            if let Some(hash) = &predicted
+                && let Ok(blob_meta) = fs::metadata(self.blob_path(hash))
+                && blob_meta.is_file()
+            {
+                let size = blob_meta.len();
+                if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
+                    anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
+                }
+                if seen_output_blobs.insert(hash.clone()) {
+                    put_result.output_blobs += 1;
+                    put_result.duplicate_blobs += 1;
+                }
+                cached_files.push(CachedFile {
+                    name: store_name.clone(),
+                    size,
+                    hash: hash.clone(),
+                    executable,
+                });
+                sources.push((source_path.clone(), use_source_hardlink));
+                continue;
+            }
+            let (staged, ingest) = match &predicted {
+                Some(predicted) => {
+                    self.stage_blob_beside(source_path, use_source_hardlink, predicted)?
+                }
+                None => self.stage_blob_from_source(source_path, use_source_hardlink)?,
+            };
+            let unshare = |blob: Option<&Path>| {
+                if matches!(ingest, StoreIngest::Hardlink) {
+                    restore_source_permissions_if_unshared(source_path, blob, &source_permissions);
+                }
+            };
             let staged_meta = match fs::metadata(&staged) {
                 Ok(meta) => meta,
                 Err(e) => {
                     Self::discard_staged_blob(&staged);
+                    unshare(None);
                     return Err(anyhow::Error::new(e)
                         .context(format!("stating staged blob for {store_name}")));
                 }
@@ -2958,11 +4999,28 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let size = staged_meta.len();
             if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
                 Self::discard_staged_blob(&staged);
+                unshare(None);
                 anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
             }
-            total_size += size;
 
-            let hash = crate::file_hash::hash_file(&staged)?;
+            let hash = match crate::file_hash::hash_file(&staged) {
+                Ok(hash) => hash,
+                Err(error) => {
+                    Self::discard_staged_blob(&staged);
+                    unshare(None);
+                    return Err(error);
+                }
+            };
+            if let Some(expected_hash) = expected_hash
+                && hash != *expected_hash
+            {
+                Self::discard_staged_blob(&staged);
+                unshare(None);
+                anyhow::bail!(
+                    "{store_name} changed after the compile returned (the compiler wrote {expected_hash}, \
+                     the snapshot now hashes to {hash}); refusing to store it"
+                );
+            }
             if seen_output_blobs.insert(hash.clone()) {
                 put_result.output_blobs += 1;
                 if self.blob_path(&hash).is_file() {
@@ -2972,7 +5030,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
 
-            self.publish_staged_blob(&staged, ingest, &hash, size)?;
+            if !self.publish_staged_blob(&staged, ingest, &hash, size)? {
+                unshare(Some(&self.blob_path(&hash)));
+            }
 
             cached_files.push(CachedFile {
                 name: store_name.clone(),
@@ -2983,6 +5043,49 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             sources.push((source_path.clone(), use_source_hardlink));
         }
 
+        self.staged_entry(
+            EntryFields {
+                cache_key,
+                crate_name,
+                crate_types,
+                features,
+                target,
+                profile,
+                stdout,
+                stderr,
+                compile_time_ms,
+                rustc_version,
+            },
+            cached_files,
+            sources,
+            put_result,
+            matches!(sources_kind, PutSources::Outputs),
+        )
+    }
+
+    /// The metadata of an entry whose blobs are published, ready for
+    /// [`Self::register_staged`].
+    fn staged_entry(
+        &self,
+        fields: EntryFields<'_>,
+        cached_files: Vec<CachedFile>,
+        sources: Vec<(PathBuf, bool)>,
+        result: StorePutResult,
+        seed_outputs: bool,
+    ) -> Result<StagedPut> {
+        let EntryFields {
+            cache_key,
+            crate_name,
+            crate_types,
+            features,
+            target,
+            profile,
+            stdout,
+            stderr,
+            compile_time_ms,
+            rustc_version,
+        } = fields;
+        let total_size = cached_files.iter().map(|file| file.size).sum();
         let content_hash = compute_content_hash(&cached_files);
 
         // Record which rustc `--emit` kinds this entry actually contains, derived
@@ -3014,8 +5117,53 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         };
         let meta_json =
             serde_json::to_string_pretty(&meta).context("serializing entry metadata")?;
-        let meta_path = entry_dir.join("meta.json");
+        Ok(StagedPut {
+            meta,
+            meta_json,
+            crate_type_str: crate_types.join(","),
+            num_features: features.len() as i64,
+            total_size,
+            content_hash,
+            sources,
+            result,
+            seed_outputs,
+            unit: String::new(),
+        })
+    }
 
+    /// Phase 2 of a put: register a staged entry and its blob references in
+    /// one transaction. With [`RegistrationWait::AtMost`], an index whose
+    /// write lock is still held elsewhere after that wait registers nothing
+    /// and returns `None`: the blobs stay published and unreferenced, and the
+    /// staged entry can be registered later, here or by another process.
+    fn register_staged(
+        &self,
+        staged: &StagedPut,
+        wait: RegistrationWait,
+    ) -> Result<Option<StorePutResult>> {
+        self.refuse_write("store an entry")?;
+        let tx = match wait {
+            RegistrationWait::Patient => self.begin_entry_registration()?,
+            RegistrationWait::AtMost(wait) => match self.try_begin_entry_registration(wait) {
+                Ok(tx) => tx,
+                Err(error) if is_sqlite_busy(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            },
+        };
+        self.register_in(&tx, staged)?;
+        tx.commit()?;
+        self.finish_strict_durability(&staged.meta.cache_key)?;
+        self.seed_registered(staged);
+        Ok(Some(staged.result))
+    }
+
+    /// Register a staged entry and its blob references on `conn`, which
+    /// holds the index's write lock in a transaction (or a savepoint of one)
+    /// that the caller commits.
+    fn register_in(&self, conn: &rusqlite::Connection, staged: &StagedPut) -> Result<()> {
+        let cache_key = staged.meta.cache_key.as_str();
+        let entry_dir = self.entry_dir(cache_key);
+        let meta_path = entry_dir.join("meta.json");
         // Phase 2: register the entry and all of its blob references in a single
         // transaction. Entries stay pending until a verified flush completes.
         // Either the whole entry (with correct refcounts) becomes
@@ -3029,9 +5177,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // row for this key yet and deletes the directory, fresh meta included
         // — stranding this put's committed row with no artifacts and leaking
         // its refcounts until doctor or an index rebuild.
-        let crate_type_str = crate_types.join(",");
-        let num_features = features.len() as i64;
-        let tx = self.db.unchecked_transaction()?;
+        //
         // A prior generation of this cache_key may still hold blob
         // references, most commonly a stranded row whose removal was
         // refused (#276) and that this put is about to overwrite via
@@ -3042,14 +5188,16 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // backfill hasn't materialized yet still slip through (there is
         // nothing to decrement by); those remain `doctor --repair` /
         // reconcile territory.
-        release_entry_blob_refs(&tx, cache_key)?;
-        for (file, (source, use_source_hardlink)) in meta.files.iter().zip(sources.iter()) {
-            let inserted = tx.execute(
+        release_entry_blob_refs(conn, cache_key)?;
+        for (file, (source, use_source_hardlink)) in
+            staged.meta.files.iter().zip(staged.sources.iter())
+        {
+            let inserted = conn.execute(
                 "INSERT OR IGNORE INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                 params![file.hash, file.size as i64],
             )?;
             if inserted == 0 {
-                tx.execute(
+                conn.execute(
                     "UPDATE blobs SET refcount = refcount + 1 WHERE hash = ?1",
                     params![file.hash],
                 )?;
@@ -3062,7 +5210,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // since the re-ingest reads the LIVE source (review finding #3).
             self.rematerialize_and_verify(source, &file.hash, &file.name, *use_source_hardlink)?;
         }
-        record_entry_blobs(&tx, cache_key, &meta.files)?;
+        record_entry_blobs(conn, cache_key, &staged.meta.files)?;
         // The write lock is held from the statements above (record_entry_blobs
         // always issues at least the DELETE). Materialize meta.json under it:
         // a concurrent removal's cleanup pass takes the same lock before it
@@ -3075,21 +5223,23 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // fsync makes the new name durable alongside the contents.
         fs::create_dir_all(&entry_dir).context("creating entry directory")?;
         let durable = self.durable_writes();
-        crate::atomic::atomic_replace_deferrable(&meta_path, meta_json.as_bytes(), durable)
+        crate::atomic::atomic_replace_deferrable(&meta_path, staged.meta_json.as_bytes(), durable)
             .context("writing entry metadata")?;
-        tx.execute(
-            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1, ?11)",
-            params![cache_key, crate_name, crate_type_str, profile, num_features, total_size as i64, content_hash, compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, false, meta.rustc_version],
+        conn.execute(
+            "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled, unit_id, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1, ?11, ?12)",
+            params![cache_key, staged.meta.crate_name, staged.crate_type_str, staged.meta.profile, staged.num_features, staged.total_size as i64, staged.content_hash, staged.meta.compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, false, staged.unit, staged.meta.rustc_version],
         )?;
-        tx.commit()?;
-        self.finish_strict_durability(cache_key)?;
+        Ok(())
+    }
 
+    /// What follows a staged entry's registration once committed.
+    fn seed_registered(&self, staged: &StagedPut) {
         // Both ingest phases may hardlink a compiler output to the immutable
         // blob and mark the shared inode read-only, changing ctime. Seed only
         // after the transaction's final rematerialization. Independent (C/C++)
         // puts use disposable staging paths and deliberately do not seed them.
-        if allow_source_hardlinks {
-            for (file, (source, _)) in meta.files.iter().zip(&sources) {
+        if staged.seed_outputs {
+            for (file, (source, _)) in staged.meta.files.iter().zip(&staged.sources) {
                 // The Rust wrapper expands dep-info back to absolute paths
                 // immediately after `put`, so it is not stable here.
                 if P::stable_after_store(&file.name) {
@@ -3097,8 +5247,38 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
+    }
 
-        Ok(put_result)
+    /// Open the write transaction that registers a stored entry, the write
+    /// lock taken at once (`BEGIN IMMEDIATE`) so no statement inside it can
+    /// find the index busy. A lock still held elsewhere after the busy
+    /// timeout is asked for again, up to [`STORE_LOCK_ATTEMPTS`] times: a
+    /// burst of stores on a disk whose journal stalls can keep the lock
+    /// queued past one timeout, and the entry is worth more than the wait
+    /// (its next build would compile it again).
+    fn begin_entry_registration(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.begin_write_waiting("registering an entry")
+    }
+
+    /// [`begin_write_waiting`] on this store's connection.
+    fn begin_write_waiting(&self, doing: &str) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        begin_write_waiting(&self.db, doing)
+    }
+
+    /// [`Self::begin_entry_registration`] in one attempt that waits at most
+    /// `wait` for the write lock, the connection's own busy timeout given
+    /// back afterwards.
+    fn try_begin_entry_registration(
+        &self,
+        wait: Duration,
+    ) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        let _ = self.db.busy_timeout(wait);
+        let started = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        );
+        self.give_back_busy_timeout();
+        started
     }
 
     /// Import a remotely downloaded entry into the database.
@@ -4022,14 +6202,45 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         source: &Path,
         allow_hardlink: bool,
     ) -> Result<(PathBuf, StoreIngest)> {
-        let dir = self.staging_dir();
-        fs::create_dir_all(&dir)
+        self.stage_blob_in(source, allow_hardlink, &self.staging_dir(), "stage-")
+    }
+
+    /// [`Self::stage_blob_from_source`] into the shard directory `hash`'s
+    /// blob goes to, under a [`SHARD_STAGE_PREFIX`] name. `hash` is the
+    /// output's digest read before the snapshot: when the snapshot hashes the
+    /// same (the output did not change in between), publishing is a rename
+    /// within one directory, which on Linux takes only that directory's lock.
+    /// A rename from `staging/` into a shard takes the filesystem-wide rename
+    /// mutex for its whole run, journal waits included, and on a busy shared
+    /// volume every put queued behind every other cross-directory rename on
+    /// it (puts sat in `do_renameat2` for up to 50 s on the build machine).
+    /// The snapshot's own digest still decides the address, so an output
+    /// that changed only costs that one cross-directory rename.
+    fn stage_blob_beside(
+        &self,
+        source: &Path,
+        allow_hardlink: bool,
+        hash: &str,
+    ) -> Result<(PathBuf, StoreIngest)> {
+        let blob = self.blob_path(hash);
+        let shard = blob.parent().context("blob path has no shard directory")?;
+        self.stage_blob_in(source, allow_hardlink, shard, SHARD_STAGE_PREFIX)
+    }
+
+    fn stage_blob_in(
+        &self,
+        source: &Path,
+        allow_hardlink: bool,
+        dir: &Path,
+        prefix: &str,
+    ) -> Result<(PathBuf, StoreIngest)> {
+        fs::create_dir_all(dir)
             .with_context(|| format!("creating staging directory {}", dir.display()))?;
 
         // Unique by construction (pid + process-wide nonce), so the path can
         // be left free for the zero-copy ingests below.
         let pid = std::process::id();
-        let tmp = free_staging_path(|nonce| dir.join(format!("stage-{pid}-{nonce}.tmp")))
+        let tmp = free_staging_path(|nonce| dir.join(format!("{prefix}{pid}-{nonce}.tmp")))
             .with_context(|| format!("reserving a staging name in {}", dir.display()))?;
 
         let stage = |tmp: &Path, allow_hardlink: bool| -> Result<(StoreIngest, bool)> {
@@ -4073,7 +6284,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                             // tree and the cache are on different mounts.
                             crate::link::warn_hardlink_fallback_once(
                                 source,
-                                &self.staging_dir(),
+                                dir,
                                 io_reason,
                                 &io_err,
                             );
@@ -4111,7 +6322,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 // source writable if the blob never got published under it, and
                 // restage as an independent copy.
                 Self::drop_tmp_restore_source(source, &tmp);
-                self.stage_blob_from_source(source, false).map_err(|_| {
+                self.stage_blob_in(source, false, dir, prefix).map_err(|_| {
                     anyhow::anyhow!("read-only guard failed on hardlinked staging temp")
                 })
             }
@@ -4167,8 +6378,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let outcome = self.publish_staged_blob_with(
             staged,
             &blob,
-            || fs::rename(staged, &blob),
-            crate::atomic::is_transient_rename_error,
+            || publish_without_replacing(staged, &blob),
+            is_transient_publish_error,
         )?;
         if outcome != PublishRename::Published {
             return Ok(false);
@@ -4190,6 +6401,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// The rename half of [`Self::publish_staged_blob`], with the rename and
     /// its transient classifier passed in so a test can stage the Windows
     /// failures. The staged file is gone afterwards unless it became the blob.
+    ///
+    /// Upstream holds SQLite's writer lock from the existence check through
+    /// the rename, so that a plain rename cannot replace a blob another entry
+    /// published (and flushed) meanwhile. This fork publishes outside the
+    /// index lock (a wrapper's put must not wait for a daemon's batch), so
+    /// production's rename never replaces a file instead:
+    /// [`publish_without_replacing`].
     fn publish_staged_blob_with(
         &self,
         staged: &Path,
@@ -4197,32 +6415,31 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         rename: impl FnMut() -> std::io::Result<()>,
         is_transient: impl Fn(&std::io::Error) -> bool,
     ) -> Result<PublishRename> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
         if blob.is_file() {
             Self::discard_staged_blob(staged);
             return Ok(PublishRename::LostRace);
         }
         fs::create_dir_all(blob.parent().unwrap()).context("creating blob shard directory")?;
-        // Keep SQLite's writer lock from this final existence check through
-        // the rename. Plain rename would otherwise overwrite a
-        // newly published inode on Unix and undo another entry's flush.
-        // `publish_rename` still handles Windows sharing/delete-pending states.
+        // Windows flushers clear a published blob's read-only bit for a
+        // moment to open a write handle, serialized under the writer lock
+        // (`open_pending_blob`). Upstream finishes publication under that
+        // lock too; this fork publishes outside it, so on Windows the blob
+        // goes out read-only already and no publisher flips the bit after the
+        // rename, inside a flusher's window. Elsewhere, or if the bit cannot
+        // be set here, the published blob is made read-only as before.
+        #[cfg(windows)]
+        let published_readonly = set_blob_readonly_checked(staged).is_ok();
+        #[cfg(not(windows))]
+        let published_readonly = false;
         let outcome = publish_rename(rename, || publish_dest_state(blob), is_transient);
         if !matches!(outcome, Ok(PublishRename::Published)) {
             tracing::debug!("{} not published by this put: {outcome:?}", blob.display());
             Self::discard_staged_blob(staged);
         }
         let outcome = outcome?;
-        if outcome == PublishRename::Published {
-            // Flushers temporarily clear this bit to open a Windows write
-            // handle. Finish publication under the same writer guard so a
-            // late read-only change cannot interrupt that opening window.
+        if outcome == PublishRename::Published && !published_readonly {
             set_blob_readonly(blob);
         }
-        tx.commit()?;
         Ok(outcome)
     }
 
@@ -4278,7 +6495,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Reclaim crash-orphaned staging files older than `min_age`. A put killed
+    /// Reclaim crash-orphaned staging files older than `min_age`, in `staging/`
+    /// and the snapshots staged beside their blob in the shards. A put killed
     /// between staging and publish leaves its snapshot here; unlike an orphaned
     /// blob it has no DB row to consult, so age is the only liveness signal —
     /// see [`STAGING_SWEEP_GRACE`] for why every caller wants the same one.
@@ -4287,12 +6505,39 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return OrphanSweepStats::default();
         }
         let mut stats = OrphanSweepStats::default();
-        let dir = self.staging_dir();
-        let Ok(entries) = fs::read_dir(&dir) else {
-            return stats;
-        };
         let now = std::time::SystemTime::now();
+        Self::sweep_stale_staging_in(&self.staging_dir(), |_| true, min_age, now, &mut stats);
+        // Snapshots staged beside their blob ([`Store::stage_blob_beside`]).
+        if let Ok(shards) = fs::read_dir(self.config.store_dir().join("blobs")) {
+            for shard in shards.flatten() {
+                Self::sweep_stale_staging_in(
+                    &shard.path(),
+                    |name| name.starts_with(SHARD_STAGE_PREFIX) && name.ends_with(".tmp"),
+                    min_age,
+                    now,
+                    &mut stats,
+                );
+            }
+        }
+        stats
+    }
+
+    /// Reclaim the files in `dir` whose name `wanted` accepts and that are
+    /// older than `min_age`.
+    fn sweep_stale_staging_in(
+        dir: &Path,
+        wanted: impl Fn(&str) -> bool,
+        min_age: Duration,
+        now: std::time::SystemTime,
+        stats: &mut OrphanSweepStats,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
+            if !entry.file_name().to_str().is_some_and(&wanted) {
+                continue;
+            }
             let Ok(meta) = entry.metadata() else { continue };
             if !meta.is_file() {
                 continue;
@@ -4311,9 +6556,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // that before unlinking. Counted only when the file is really gone,
             // so Windows sharing violations don't over-claim reclaimed bytes.
             let removed = (|| -> std::io::Result<()> {
+                // A leftover that shares its inode (a hardlink ingest of an
+                // output that is itself a restored blob) keeps its mode:
+                // clearing it would make every name on the inode writable,
+                // the blob included. Unix unlinks without it.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if meta.nlink() > 1 {
+                        return fs::remove_file(entry.path());
+                    }
+                }
                 let mut perms = meta.permissions();
                 perms.set_readonly(false);
-                fs::set_permissions(entry.path(), perms)?;
+                // Another account's temp in a shared store cannot be
+                // chmod'ed; Unix unlinks it anyway (the directory decides).
+                let chmod = fs::set_permissions(entry.path(), perms);
+                if cfg!(windows) {
+                    chmod?;
+                }
                 fs::remove_file(entry.path())
             })()
             .is_ok();
@@ -4322,7 +6583,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 stats.bytes_reclaimed += size;
             }
         }
-        stats
     }
 
     /// Unlink key lock files nobody needs: no entry row for the key, unused
@@ -4414,6 +6674,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             key_locks_remaining: locks.remaining(),
             predictions_pruned,
             file_hashes_pruned,
+            ..HousekeepingStats::default()
         }
     }
 
@@ -4467,6 +6728,35 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             [],
             |row| row.get::<_, i64>(0),
         )? as u64)
+    }
+
+    /// Leave routine checkpoints to an explicit [`Self::checkpoint_wal`] on
+    /// this connection too, as [`defer_wal_checkpoints`] does for every
+    /// connection a process opens afterwards: its commits checkpoint only
+    /// once the log reaches [`DEFERRED_AUTOCHECKPOINT_PAGES`].
+    pub fn defer_wal_checkpoints_here(&self) -> Result<()> {
+        self.db
+            .pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
+        Ok(())
+    }
+
+    /// The log size, in pages, at which this connection's own commits
+    /// checkpoint the WAL (`PRAGMA wal_autocheckpoint`).
+    pub fn wal_autocheckpoint_pages(&self) -> Result<i64> {
+        Ok(self
+            .db
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
+    }
+
+    /// Copy the WAL's committed pages into the index without waiting for
+    /// readers or writers (a passive checkpoint), so the log stays short while
+    /// compiler wrappers defer theirs ([`defer_wal_checkpoints`]). Returns the
+    /// log's frames and how many of them are now in the index.
+    pub fn checkpoint_wal(&self) -> Result<(i64, i64)> {
+        self.refuse_write("checkpoint the index")?;
+        Ok(self.db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(1)?, row.get(2)?))
+        })?)
     }
 
     /// Flush up to `limit` entries stored without an fsync: every blob and
@@ -4554,6 +6844,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 verified.push(blob);
             }
         }
+        // The metadata and its directory are flushed before the writer lock
+        // too. Each fsync waits for the filesystem's journal, which a busy
+        // disk takes seconds to commit, and every build's index write waited
+        // behind them: these two were most of the daemon's write-lock time
+        // in a build with fsyncs slowed to 150 ms. The handle stays open, so
+        // the identity check under the lock proves the file flushed is still
+        // the one published (meta.json is only ever replaced, never written
+        // in place).
+        let mut metadata_file = match open_published_file(&meta_path) {
+            Ok(file) => file,
+            Err(_) => return Ok(false),
+        };
+        let mut current_meta = Vec::new();
+        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
+        if current_meta != meta_bytes {
+            return Ok(false);
+        }
+        sync_file(&metadata_file).context("flushing entry metadata")?;
+        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         before_promotion();
         let tx = rusqlite::Transaction::new_unchecked(
             &self.db,
@@ -4568,15 +6877,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             )
             .optional()?;
         if current_hash.as_deref() != Some(content_hash.as_str()) {
-            return Ok(false);
-        }
-        let mut metadata_file = match open_published_file(&meta_path) {
-            Ok(file) => file,
-            Err(_) => return Ok(false),
-        };
-        let mut current_meta = Vec::new();
-        std::io::Read::read_to_end(&mut metadata_file, &mut current_meta)?;
-        if current_meta != meta_bytes {
             return Ok(false);
         }
         if sequential {
@@ -4597,8 +6897,6 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        sync_file(&metadata_file).context("flushing entry metadata")?;
-        crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         if kache_fs::file_identity(&meta_path).ok()
             != Some(kache_fs::handle_identity(&metadata_file)?)
         {
@@ -4741,11 +7039,43 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn remember_incremental_dir(&self, path: &Path) -> Result<()> {
         self.refuse_write("record an incremental directory")?;
         let path = path.to_string_lossy().into_owned();
+        // Every unit of a profile passes the same directory, so all but the
+        // first wrapper of a build would rewrite one row; even a write that
+        // changes nothing takes the index's write lock, and on a shared store
+        // each waited behind whichever miss was storing. A row seen within
+        // [`INCREMENTAL_DIR_REFRESH`] is left as it is: read first. A sweep
+        // that removed the row (and the directory) makes the next unit
+        // register it again.
+        let fresh: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM incremental_dirs WHERE path = ?1 \
+             AND last_seen > datetime('now', ?2))",
+            params![
+                path,
+                format!("-{} seconds", INCREMENTAL_DIR_REFRESH.as_secs())
+            ],
+            |row| row.get(0),
+        )?;
+        if fresh {
+            return Ok(());
+        }
         self.db.execute(
             "INSERT OR REPLACE INTO incremental_dirs (path, last_seen) VALUES (?1, datetime('now'))",
             params![path],
         )?;
         Ok(())
+    }
+
+    /// Run `write` inside one write transaction on this store's connection,
+    /// committed when it succeeds and rolled back when it fails. Writes that
+    /// open their own transaction only when none is open
+    /// ([`Self::remember_target_root_built_by`]) join it, so the daemon
+    /// writes the rows wrappers handed it under one take of the write lock.
+    pub fn with_write_transaction<T>(&self, write: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.refuse_write("write handed rows")?;
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let written = write(self);
+        finish_transaction(&self.db, written.is_ok())?;
+        written
     }
 
     /// Remember a Cargo target root without putting absolute paths in cache
@@ -4762,6 +7092,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         target: &Path,
         workspace_root: &Path,
         rustc: Option<&str>,
+    ) -> Result<()> {
+        self.remember_target_root_within(target, workspace_root, rustc, None)
+    }
+
+    /// [`Self::remember_target_root_built_by`], waiting at most `wait` for
+    /// the index's write lock. A build's wrapper records its target root
+    /// this way: on a new target directory every unit of the build finds no
+    /// row, and each one waiting out the full busy timeout behind a store
+    /// held a burst of misses for seconds. A refusal is SQLite contention
+    /// ([`is_sqlite_contention`]); the caller hands the row on or leaves it
+    /// to the build's next unit.
+    pub fn remember_target_root_waiting(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+        rustc: Option<&str>,
+        wait: Duration,
+    ) -> Result<()> {
+        self.remember_target_root_within(target, workspace_root, rustc, Some(wait))
+    }
+
+    fn remember_target_root_within(
+        &self,
+        target: &Path,
+        workspace_root: &Path,
+        rustc: Option<&str>,
+        wait: Option<Duration>,
     ) -> Result<()> {
         self.refuse_write("record a target root")?;
         if !crate::filesystem::target_root_is_safe(target, workspace_root) {
@@ -4800,7 +7157,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // registration cannot slip between them and lose its row to ours.
         let in_transaction = !self.db.is_autocommit();
         if !in_transaction {
-            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            if let Some(wait) = wait {
+                let _ = self.db.busy_timeout(wait);
+            }
+            let begun = self.db.execute_batch("BEGIN IMMEDIATE");
+            if wait.is_some() {
+                self.give_back_busy_timeout();
+            }
+            begun?;
         }
         let written = self.record_target_root(&target, &workspace_root, identity, rustc);
         if !in_transaction {
@@ -5169,32 +7533,42 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         &self,
         origin: SweepOrigin,
     ) -> Result<Vec<crate::eviction::EntryFeatures>> {
-        let mut stmt = self.db.prepare(
-            "SELECT cache_key, size, hit_count, content_hash, committed,
-                    (julianday('now') - julianday(last_accessed)) * 24.0,
+        #[cfg(any(test, feature = "test-support"))]
+        slow_eviction_scan_for_test(&self.config.cache_dir);
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT cache_key, size, CASE WHEN {stale} THEN 0 ELSE hit_count END,
+                    content_hash, committed,
+                    (julianday('now') - julianday(last_accessed)) * 24.0
+                      + CASE WHEN {stale} THEN ?3 ELSE 0 END,
                     compile_time_ms,
                     (SELECT COALESCE(SUM(b.size), 0)
                        FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
                       WHERE eb.cache_key = entries.cache_key
                         AND eb.refs = b.refcount),
+                    (SELECT COALESCE(SUM(b.size * eb.refs / MAX(b.refcount, 1)), 0)
+                       FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                      WHERE eb.cache_key = entries.cache_key
+                        AND eb.refs <> b.refcount),
                     EXISTS(SELECT 1 FROM entry_blobs eb2
                             WHERE eb2.cache_key = entries.cache_key),
                     last_accessed >= datetime('now', ?1),
                     COALESCE(imported_at >= unixepoch() - ?2, 0)
              FROM entries",
-        )?;
+            stale = stale_key_schema_sql(),
+        ))?;
         let rows = stmt
             .query_map(
                 params![
                     format!("-{} seconds", EVICTION_IDLE_GRACE.as_secs()),
-                    origin.import_pin_secs()
+                    origin.import_pin_secs(),
+                    STALE_KEY_SCHEMA_IDLE_HOURS
                 ],
                 |row| {
                     // Bytes this entry would actually free: blobs where it holds
                     // every remaining reference (#608). Entries not yet backfilled
                     // into entry_blobs report None and rank on logical size as
                     // before.
-                    let has_blob_rows: bool = row.get(8)?;
+                    let has_blob_rows: bool = row.get(9)?;
                     let reclaimable_bytes = if has_blob_rows {
                         Some(row.get::<_, i64>(7)?)
                     } else {
@@ -5212,8 +7586,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                         idle_hours: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
                         compile_time_ms: row.get(6)?,
                         reclaimable_bytes,
-                        recently_accessed: row.get(9)?,
-                        recently_imported: row.get(10)?,
+                        shared_share_bytes: row.get(8)?,
+                        recently_accessed: row.get(10)?,
+                        recently_imported: row.get(11)?,
                     })
                 },
             )?
@@ -5276,7 +7651,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// This is the *mechanism* half: the grace check, blob refcount decrement,
     /// and refuse-on-corrupt-meta guard all live in `remove_entry_guarded` and
     /// are deliberately not reachable from a policy. `stop_at` bounds a
-    /// size-driven sweep; `None` removes everything selected.
+    /// size-driven sweep; `None` removes everything selected. `stop` is asked
+    /// before each entry, with the time this walk has taken so far: the scan
+    /// and selection before it are not part of a removal budget.
     fn apply_eviction(
         &self,
         order: &[String],
@@ -5285,9 +7662,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         stop_at: Option<(u64, u64)>,
         shadow: Option<&ShadowSelection>,
         durable_upload_keys: &std::collections::HashSet<String>,
-        held: &std::collections::HashMap<String, u64>,
-        stop: &mut dyn FnMut() -> bool,
+        held: &mut std::collections::HashMap<String, u64>,
+        mut probe_held_per_entry: bool,
+        walk_budget: Option<Duration>,
+        stop: &mut dyn FnMut(Duration) -> bool,
+        short_of_space: &mut dyn FnMut() -> bool,
+        rank_again: &mut bool,
     ) -> GcStats {
+        let walk_started = std::time::Instant::now();
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
         let (slice, pause) = self.eviction_pacing;
@@ -5297,6 +7679,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None => (0, None),
         };
         let mut evicted = std::collections::HashSet::new();
+        // Entries a walk without the up-front probe has checked for a live
+        // file's hold.
+        let mut probed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // When free space was last read only to see whether the ranking
+        // should be made again.
+        let mut space_read: Option<std::time::Instant> = None;
         // The shadow's victims are stamped with the sweep's start, so the
         // sweep's own tombstones are never older than them.
         let swept_at: Option<String> = shadow.and_then(|_| {
@@ -5306,13 +7694,62 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         });
 
         for key in order {
-            if stop() {
+            if stop(walk_started.elapsed()) {
                 break;
             }
-            if let Some(target) = target
-                && current_size <= target
-            {
-                break;
+            if let Some(target) = target {
+                // Without the up-front probe, `current_size` still counts
+                // what target directories hold among the entries not
+                // reached yet: free space alone decides until the disk has
+                // room again, and then the probe runs on those entries.
+                let unprobed = probe_held_per_entry;
+                // On a low disk an aged ranking is made again, once this
+                // walk has removed something (so each walk makes progress).
+                // Free space is read for that alone at most once a second.
+                let aged =
+                    stats.entries_evicted > 0 && walk_started.elapsed() >= self.ranking_fresh_for;
+                // A walk past its budget stops unless the disk is short,
+                // once it has removed something, as an aged ranking does.
+                let spent = walk_budget.is_some_and(|budget| {
+                    stats.entries_evicted > 0 && walk_started.elapsed() >= budget
+                });
+                let read_for_age = (aged || spent)
+                    && space_read.is_none_or(|read| read.elapsed() >= Duration::from_secs(1));
+                if unprobed || current_size <= target || read_for_age {
+                    let short = short_of_space();
+                    space_read = Some(std::time::Instant::now());
+                    if unprobed && !short {
+                        probe_held_per_entry = false;
+                        match self.held_by_live_files(
+                            by_key.keys().copied().filter(|key| !probed.contains(key)),
+                        ) {
+                            Ok(rest) => {
+                                let rest_bytes: u64 = rest.values().sum();
+                                stats.bytes_held += rest_bytes;
+                                stats.entries_unreclaimable += rest.len();
+                                current_size = current_size.saturating_sub(rest_bytes);
+                                held.extend(rest);
+                            }
+                            Err(e) => {
+                                // The target cannot be trusted without it;
+                                // stop rather than evict for held bytes.
+                                tracing::warn!("gc: probing for held entries failed: {e:#}");
+                                break;
+                            }
+                        }
+                    }
+                    if !short && current_size <= target {
+                        break;
+                    }
+                    if short && aged {
+                        *rank_again = true;
+                        break;
+                    }
+                    if !short && spent {
+                        stats.cut_short = true;
+                        break;
+                    }
+                }
             }
             if durable_upload_keys.contains(key) {
                 stats.entries_pinned += 1;
@@ -5337,6 +7774,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             // removal would be refused.
             if held.contains_key(key) {
                 continue;
+            }
+            // The removal would refuse it too, but only after waiting for
+            // the index's write lock, which builds hold most of the time on
+            // a disk filling up; a read finds it without the lock.
+            if probe_held_per_entry {
+                probed.insert(key.as_str());
+                let held_bytes = self.held_by_live_file(key).unwrap_or(0);
+                if held_bytes > 0 {
+                    stats.entries_unreclaimable += 1;
+                    stats.bytes_held += held_bytes;
+                    current_size = current_size.saturating_sub(held_bytes);
+                    continue;
+                }
             }
             let write_started = std::time::Instant::now();
             let removal = self.remove_entry_guarded(key, Some(EVICTION_IDLE_GRACE));
@@ -5424,16 +7874,33 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         probe_held_bytes: bool,
         origin: SweepOrigin,
     ) -> Result<GcStats> {
-        self.evict_with_stop(policy, stop_at, probe_held_bytes, origin, &mut || false)
+        let held_probe = if probe_held_bytes {
+            HeldProbe::Upfront
+        } else {
+            HeldProbe::AtRemoval
+        };
+        self.evict_with_stop(
+            policy,
+            stop_at,
+            held_probe,
+            origin,
+            None,
+            &mut |_| false,
+            &mut || false,
+            &mut false,
+        )
     }
 
     fn evict_with_stop(
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
-        probe_held_bytes: bool,
+        held_probe: HeldProbe,
         origin: SweepOrigin,
-        stop: &mut dyn FnMut() -> bool,
+        walk_budget: Option<Duration>,
+        stop: &mut dyn FnMut(Duration) -> bool,
+        short_of_space: &mut dyn FnMut() -> bool,
+        rank_again: &mut bool,
     ) -> Result<GcStats> {
         let candidates = self.eviction_candidates_for(origin)?;
         let order = policy.select(&candidates);
@@ -5459,26 +7926,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         );
         // Duplicate eviction has a byte budget too, but only the size pass
         // probes the whole store for external retainers.
-        let held = if probe_held_bytes {
-            self.held_by_live_files(&candidates)?
+        let mut held = if held_probe == HeldProbe::Upfront {
+            self.held_by_live_files(candidates.iter().map(|entry| entry.key.as_str()))?
         } else {
             std::collections::HashMap::new()
         };
         let bytes_held: u64 = held.values().sum();
+        let entries_held = held.len();
         let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(bytes_held), target));
-        let shadow = stop_at.map(|(current, target)| {
-            use crate::eviction::EvictionPolicy as _;
-            let candidate = crate::eviction::ValueDensityPolicy;
-            let shadow_order = candidate.select(&candidates);
-            ShadowSelection {
-                policy: candidate.name(),
-                victims: crate::eviction::would_evict_for_budget(
-                    &candidates,
-                    &shadow_order,
-                    current.saturating_sub(target),
-                ),
+        // The shadow ranks for the byte budget, which a walk without the
+        // up-front probe does not know yet.
+        let shadow = match stop_at {
+            Some((current, target)) if held_probe == HeldProbe::Upfront => {
+                use crate::eviction::EvictionPolicy as _;
+                let candidate = crate::eviction::ValueDensityPolicy;
+                let shadow_order = candidate.select(&candidates);
+                Some(ShadowSelection {
+                    policy: candidate.name(),
+                    victims: crate::eviction::would_evict_for_budget(
+                        &candidates,
+                        &shadow_order,
+                        current.saturating_sub(target),
+                    ),
+                })
             }
-        });
+            _ => None,
+        };
         let by_key: std::collections::HashMap<&str, &crate::eviction::EntryFeatures> =
             candidates.iter().map(|e| (e.key.as_str(), e)).collect();
         let durable_upload_keys = self.durable_upload_keys()?;
@@ -5489,11 +7962,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             stop_at,
             shadow.as_ref(),
             &durable_upload_keys,
-            &held,
+            &mut held,
+            held_probe == HeldProbe::PerEntry,
+            walk_budget,
             stop,
+            short_of_space,
+            rank_again,
         );
-        stats.bytes_held = bytes_held;
-        stats.entries_unreclaimable += held.len();
+        stats.bytes_held += bytes_held;
+        stats.entries_unreclaimable += entries_held;
         Ok(stats)
     }
 
@@ -5505,22 +7982,24 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// get under a budget they keep it over (kunobi-ninja/kache#1206).
     ///
     /// Empty under `gc_evict_shared`, which evicts such entries anyway.
-    fn held_by_live_files(
+    fn held_by_live_files<'k>(
         &self,
-        candidates: &[crate::eviction::EntryFeatures],
+        keys: impl Iterator<Item = &'k str>,
     ) -> Result<std::collections::HashMap<String, u64>> {
         let mut held = std::collections::HashMap::new();
         if self.config.gc_evict_shared {
             return Ok(held);
         }
-        let keys: std::collections::HashSet<&str> =
-            candidates.iter().map(|entry| entry.key.as_str()).collect();
+        let keys: std::collections::HashSet<&str> = keys.collect();
         // Read every row first: the probes below touch the filesystem, and a
         // read statement left open across them would pin the WAL snapshot.
         let last_refs = {
             let mut stmt = self.db.prepare(
+                // The filter is holds_last_reference's: most rows fail it,
+                // and each one read costs two 64-character strings.
                 "SELECT eb.cache_key, b.hash, b.size, b.refcount, eb.refs
-                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash",
+                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                 WHERE b.refcount > 0 AND b.refcount <= eb.refs",
             )?;
             stmt.query_map([], |row| {
                 Ok((
@@ -5546,32 +8025,64 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(held)
     }
 
+    /// The bytes of the blobs `cache_key` holds the last reference to that
+    /// a live file outside the store (a hardlink or clone in a target
+    /// directory) holds as well, as [`Self::held_by_live_files`] counts
+    /// them. Not zero means evicting it frees nothing: the check
+    /// `remove_entry_guarded` makes under the write lock, read without it.
+    /// Zero under `gc_evict_shared` and for an entry with no blob rows.
+    fn held_by_live_file(&self, cache_key: &str) -> Result<u64> {
+        if self.config.gc_evict_shared {
+            return Ok(0);
+        }
+        // Read every row first, as in held_by_live_files: no read statement
+        // stays open across the filesystem probes.
+        let last_refs = {
+            let mut stmt = self.db.prepare_cached(
+                "SELECT b.hash, b.size, b.refcount, eb.refs
+                 FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
+                 WHERE eb.cache_key = ?1",
+            )?;
+            stmt.query_map(params![cache_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(last_refs
+            .into_iter()
+            .filter(|(hash, _, refcount, refs)| {
+                holds_last_reference(*refcount, *refs)
+                    && crate::filesystem::blob_has_external_retainer(&self.blob_path(hash))
+            })
+            .map(|(_, size, _, _)| size.max(0) as u64)
+            .sum())
+    }
+
     /// Weighted eviction: remove entries with lowest priority score until under the size limit.
     /// Prefers evicting old, rarely-accessed entries that actually free bytes.
     ///
     /// Fires at `max_size` and evicts down to 90% of it — a real hysteresis
     /// band, not the single 90% line that used to serve as both trigger and
-    /// target. The threshold lives here rather than at each call site so
-    /// `kache gc`, the daemon's periodic sweep, and the post-upload check all
-    /// get the same band (see [`crate::eviction::over_eviction_trigger`]).
+    /// target. An automatic sweep ([`Self::evict_for_free_space`]) fires at
+    /// 88% and evicts down to 78%, so that the cap holds while builds write
+    /// (see [`crate::eviction::automatic_trigger`]).
     pub fn evict(&self) -> Result<GcStats> {
         self.evict_for(SweepOrigin::Requested)
     }
 
     /// [`Self::evict`] for a sweep started by `origin`.
     pub fn evict_for(&self, origin: SweepOrigin) -> Result<GcStats> {
-        self.refuse_write("evict")?;
-        let target = crate::eviction::eviction_target(self.config.max_size);
         // Trigger, budget, and stop condition are all physical bytes on disk
         // (`SUM(blobs.size)`), not the logical `SUM(entries.size)`: on a
         // dedup-heavy store the logical figure over-reports by exactly the
         // dedup savings, firing GC while the disk is comfortable and
         // destroying rebuild value without reclaiming space (#608).
-        let size_before = self.physical_size()?;
-        if !crate::eviction::over_eviction_trigger(size_before, self.config.max_size) {
-            return Ok(GcStats::default());
-        }
-
+        //
         // The ranking is computed once and walked while deleting: each entry's
         // score is independent of the others, so the order stays valid as rows
         // disappear. The walk subtracts the bytes each removal actually freed
@@ -5579,29 +8090,110 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // store without re-querying. A removal that frees less than its
         // ranked `reclaimable_bytes` promised (a twin evicted earlier in the
         // same sweep) only makes the sweep continue longer — never stop early.
-        self.evict_with(
-            &crate::eviction::SizePressurePolicy,
-            Some((size_before, target)),
-            true,
-            origin,
-        )
+        self.evict_for_free_space(origin, || false)
+    }
+
+    /// [`Self::evict_for`] on a volume builds keep filling while it runs.
+    /// `short_of_space` says whether the volume is short of free space
+    /// now; the sweep asks it each time it reaches its byte target and
+    /// goes on evicting while it is. The target counts only the bytes the
+    /// sweep freed, not those builds wrote meanwhile: on 2026-10-26 a
+    /// sweep reached it while the disk fell from 91 to 15 GiB free.
+    ///
+    /// A sweep that starts short of space removes at once: it checks each
+    /// entry for a target directory's hold as it reaches it instead of
+    /// probing every candidate first, which took about three minutes
+    /// before the first removal on a 12 GB index. It asks
+    /// `short_of_space` at each entry until the space is back, then
+    /// probes the entries it has not reached and stops at the target a
+    /// sweep with the up-front probe stops at.
+    ///
+    /// While the volume is short, a sweep ranks the store again once its
+    /// ranking is [`RANKING_FRESH_FOR`] old and it has removed something:
+    /// the entries builds wrote since the ranking are not in it.
+    ///
+    /// An automatic sweep that is not short of space stops once it has
+    /// walked its ranking for [`SIZE_SWEEP_WALK_BUDGET`], and when it removed
+    /// something says so in [`GcStats::cut_short`].
+    pub fn evict_for_free_space(
+        &self,
+        origin: SweepOrigin,
+        mut short_of_space: impl FnMut() -> bool,
+    ) -> Result<GcStats> {
+        self.refuse_write("evict")?;
+        let max_size = self.config.max_size;
+        let (over, target) = match origin {
+            SweepOrigin::Automatic => (
+                crate::eviction::automatic_trigger(max_size),
+                crate::eviction::automatic_target(max_size),
+            ),
+            SweepOrigin::Requested => (max_size, crate::eviction::eviction_target(max_size)),
+        };
+        let mut size = self.physical_size()?;
+        if size <= over {
+            return Ok(GcStats::default());
+        }
+        let walk_budget = (origin == SweepOrigin::Automatic).then_some(self.size_sweep_walk_budget);
+        // An automatic sweep values young entries slow to compile more.
+        let sparing_young = crate::eviction::SizePressureSparingYoungPolicy {
+            hours: self.config.gc_spare_young_hours,
+        };
+        let policy: &dyn crate::eviction::EvictionPolicy =
+            if origin == SweepOrigin::Automatic && sparing_young.hours > 0 {
+                &sparing_young
+            } else {
+                &crate::eviction::SizePressurePolicy
+            };
+        let mut stats = GcStats::default();
+        loop {
+            let held_probe = if short_of_space() {
+                HeldProbe::PerEntry
+            } else {
+                HeldProbe::Upfront
+            };
+            let mut rank_again = false;
+            let pass = self.evict_with_stop(
+                policy,
+                Some((size, target)),
+                held_probe,
+                origin,
+                walk_budget,
+                &mut |_| false,
+                &mut short_of_space,
+                &mut rank_again,
+            )?;
+            stats.add(&pass);
+            if !rank_again {
+                return Ok(stats);
+            }
+            size = self.physical_size()?;
+        }
     }
 
     /// Reclaim eligible entries even below the cache size budget. The caller
     /// holds `gc.lock` and stops on measured free space or a work deadline.
-    /// Recent accesses, imports, upload intents and external retainers keep
-    /// the same protection as other automatic sweeps.
-    pub fn evict_for_disk_pressure(&self, mut stop: impl FnMut() -> bool) -> Result<GcStats> {
+    /// `stop` gets the time spent removing entries so far: the candidate scan
+    /// before the first removal (a minute on a large index) is not counted,
+    /// or a deadline of seconds would end the pass before it removed
+    /// anything. Recent accesses, imports, upload intents and external
+    /// retainers keep the same protection as other automatic sweeps.
+    pub fn evict_for_disk_pressure(
+        &self,
+        mut stop: impl FnMut(Duration) -> bool,
+    ) -> Result<GcStats> {
         self.refuse_write("evict")?;
-        if stop() {
+        if stop(Duration::ZERO) {
             return Ok(GcStats::default());
         }
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
             None,
-            false,
+            HeldProbe::PerEntry,
             SweepOrigin::Automatic,
+            None,
             &mut stop,
+            &mut || false,
+            &mut false,
         )
     }
 
@@ -5623,17 +8215,28 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// created before key-schema recording use `0`, and an upgrade must not
     /// discard a still-reachable cache merely because its metadata predates
     /// this field. `kache gc --stale-schema` is the user's opt-in boundary.
-    pub fn evict_stale_key_schemas(&self, current_schema: u32) -> Result<GcStats> {
+    ///
+    /// The running recipe is each row's own component's
+    /// ([`kache_format::KeyComponent`]): a C compile or build-script run a
+    /// rustc key bump left alone stays. A row of an earlier version in
+    /// `bridged` (one a key bridge of this release adopts on a miss) stays
+    /// until it has been idle for `bridge_grace`: removing it would turn the
+    /// adoption the bridge exists for into a compile (lane KACHE-W22).
+    ///
+    /// `limit` caps the rows one run removes, the longest unused first, so
+    /// a store with hundreds of thousands of them (a key bump's leftovers)
+    /// can be emptied in short runs (lane KACHE-W24).
+    pub fn evict_stale_key_schemas(
+        &self,
+        bridged: &[u32],
+        bridge_grace: Duration,
+        limit: Option<usize>,
+    ) -> Result<GcStats> {
         self.refuse_write("evict")?;
-        let keys = {
-            let mut stmt = self.db.prepare(
-                "SELECT cache_key FROM entries
-                 WHERE committed = 1 AND key_schema != ?1
-                 ORDER BY cache_key",
-            )?;
-            stmt.query_map(params![current_schema], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let mut keys = self.stale_key_schema_keys(bridged, bridge_grace)?;
+        if let Some(limit) = limit {
+            keys.truncate(limit);
+        }
         let candidates = self.eviction_candidates()?;
         let by_key = candidates
             .iter()
@@ -5647,9 +8250,56 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             None,
             None,
             &durable_upload_keys,
-            &std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+            false,
+            None,
+            &mut |_| false,
             &mut || false,
+            &mut false,
         ))
+    }
+
+    /// The rows [`Self::evict_stale_key_schemas`] removes, the longest unused
+    /// first.
+    pub fn stale_key_schema_keys(
+        &self,
+        bridged: &[u32],
+        bridge_grace: Duration,
+    ) -> Result<Vec<String>> {
+        let bridged = bridged
+            .iter()
+            .filter(|version| **version > 0 && **version < kache_format::CACHE_KEY_VERSION)
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let rustc = kache_format::CACHE_KEY_VERSION;
+        let component = kache_format::KeyComponent::key_version_sql();
+        // Kept within the grace: a rustc row (its component's version is
+        // the current one) of a bridged version.
+        let kept_by_bridge = if bridged.is_empty() {
+            "0".to_string()
+        } else {
+            format!(
+                "({component} = {rustc} AND key_schema IN ({bridged}) \
+                 AND last_accessed >= datetime('now', ?1))"
+            )
+        };
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT cache_key FROM entries
+             WHERE committed = 1
+               AND (key_schema = 0 OR key_schema > {rustc} OR key_schema < {component})
+               AND NOT {kept_by_bridge}
+             ORDER BY last_accessed, cache_key"
+        ))?;
+        let grace = format!("-{} seconds", bridge_grace.as_secs());
+        let keys = if bridged.is_empty() {
+            stmt.query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map(params![grace], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(keys)
     }
 
     /// Evict duplicate entries that share the same content_hash.
@@ -6225,10 +8875,32 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         after_meta_read: impl FnOnce(),
         before_dir_cleanup: impl FnOnce(),
     ) -> Result<GuardedRemoval> {
+        self.remove_entry_guarded_with_all_hooks(
+            cache_key,
+            skip_if_idle_lt,
+            after_meta_read,
+            || {},
+            before_dir_cleanup,
+        )
+    }
+
+    /// [`Self::remove_entry_guarded_with_hooks`] with a third seam:
+    /// `after_logical_commit` runs once the row's removal has committed and
+    /// before the cleanup pass asks for the write lock again.
+    fn remove_entry_guarded_with_all_hooks(
+        &self,
+        cache_key: &str,
+        skip_if_idle_lt: Option<Duration>,
+        after_meta_read: impl FnOnce(),
+        after_logical_commit: impl FnOnce(),
+        before_dir_cleanup: impl FnOnce(),
+    ) -> Result<GuardedRemoval> {
         self.refuse_write("remove an entry")?;
         // Boxed so the republication-retry loop below stays non-generic; the
         // production closures are zero-sized, so no allocation happens.
         let mut after_meta_read: Option<Box<dyn FnOnce() + '_>> = Some(Box::new(after_meta_read));
+        let mut after_logical_commit: Option<Box<dyn FnOnce() + '_>> =
+            Some(Box::new(after_logical_commit));
         let mut before_dir_cleanup: Option<Box<dyn FnOnce() + '_>> =
             Some(Box::new(before_dir_cleanup));
         loop {
@@ -6236,6 +8908,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 cache_key,
                 skip_if_idle_lt,
                 after_meta_read.take(),
+                after_logical_commit.take(),
                 before_dir_cleanup.take(),
             )? {
                 RemovalAttempt::Done(Some(reclaim)) => {
@@ -6259,6 +8932,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         cache_key: &str,
         skip_if_idle_lt: Option<Duration>,
         after_meta_read: Option<Box<dyn FnOnce() + '_>>,
+        after_logical_commit: Option<Box<dyn FnOnce() + '_>>,
         before_dir_cleanup: Option<Box<dyn FnOnce() + '_>>,
     ) -> Result<RemovalAttempt> {
         let entry_dir = self.entry_dir(cache_key);
@@ -6418,7 +9092,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 params![cache_key, format!("-{} seconds", grace.as_secs())],
                 |row| row.get(0),
             )?;
-            if recently_accessed != 0 {
+            // A stamp taken and not yet written pins the entry the same way.
+            if recently_accessed != 0
+                || self
+                    .pending_pins
+                    .as_ref()
+                    .is_some_and(|pending| pending(cache_key))
+            {
                 return Ok(RemovalAttempt::Done(None));
             }
         }
@@ -6471,8 +9151,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return Ok(RemovalAttempt::Done(None));
         }
         // A mapping nobody counted must not spend another entry's reference
-        // and unlink a blob that entry still serves from.
-        floor_blob_refs_at_mappings(&tx, cache_key)?;
+        // and unlink a blob that entry still serves from. The loop below
+        // subtracts one per file meta.json lists.
+        let mut releases: std::collections::BTreeMap<&str, i64> = std::collections::BTreeMap::new();
+        for hash in &hashes {
+            *releases.entry(hash.as_str()).or_insert(0) += 1;
+        }
+        floor_blob_refs_before_release(&tx, cache_key, releases)?;
         tx.execute(
             "DELETE FROM entry_blobs WHERE cache_key = ?1",
             params![cache_key],
@@ -6514,14 +9199,31 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // reclaims those), never a live row without its files.
         tx.commit()?;
 
+        if let Some(hook) = after_logical_commit {
+            hook();
+        }
+
         // Cleanup pass: a second short transaction whose only purpose is the
         // write lock. Serializing the filesystem deletions against same-key
         // writers is what closes the original #670 window — an unlocked
         // cleanup could delete a meta.json that a publisher materialized
         // (inside its own registration transaction) between our commit above
         // and this pass.
-        let cleanup_tx = self.db.unchecked_transaction()?;
-        cleanup_tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
+        //
+        // The row is gone from here on, so nothing else removes the entry's
+        // directory or the blobs it held last, and no size counts them. The
+        // pass therefore waits for the lock as a registration does instead
+        // of giving up after one busy timeout: a sweep on a busy index used
+        // to log "skipping eviction ... database is locked" here and leave
+        // both on disk.
+        let cleanup_tx = self
+            .begin_write_waiting("removing an evicted entry's files")
+            .with_context(|| {
+                format!(
+                    "entry {cache_key}: removed from the index, but its directory and \
+                     unreferenced blobs stay on disk"
+                )
+            })?;
 
         if let Some(hook) = before_dir_cleanup {
             hook();
@@ -6602,6 +9304,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         cleanup_tx.commit()?;
+
+        // The key's lock file outlives its entry: nothing but the full GC's
+        // capped sweep removed it, and evicted keys left nearly all of a
+        // shared store's lock files without an entry. Remove it here by the
+        // sweep's own rules, outside the index lock: only an idle file
+        // (unclaimed for the sweep's grace), only while holding its lock,
+        // only if it is still the file at the path. A claimant that opened
+        // it before the unlink finds the path changed and reopens.
+        if republished == 0 {
+            let lock_path = self
+                .config
+                .store_dir()
+                .join(cache_key)
+                .with_extension("lock");
+            remove_stale_lock_file(
+                &lock_path,
+                KEY_LOCK_SWEEP_GRACE,
+                std::time::SystemTime::now(),
+                || {},
+            );
+        }
         Ok(RemovalAttempt::Done(Some(reclaim)))
     }
 
@@ -6620,9 +9343,37 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .expect("test entry row insert");
     }
 
+    /// Test-only: how long this connection waits for a lock held elsewhere.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_busy_timeout_for_test(&self, wait: Duration) {
+        self.db.busy_timeout(wait).unwrap();
+        self.busy_wait.set(wait);
+    }
+
     /// Test-only: backdate an entry's `last_accessed` (via a SQLite datetime
     /// modifier like `"-1 hour"`) so eviction tests can move an entry past the
     /// active-pin grace without sleeping (kunobi-ninja/kache#326).
+    /// Test-only: make `cache_key`'s entry look stored by key version
+    /// `version` (its row and its meta.json), as a key bridge finds it.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn set_key_schema_for_test(&self, cache_key: &str, version: u32) {
+        self.db
+            .execute(
+                "UPDATE entries SET key_schema = ?2 WHERE cache_key = ?1",
+                params![cache_key, version],
+            )
+            .unwrap();
+        let mut meta = self.stored_meta(cache_key).unwrap();
+        meta.key_schema = version;
+        fs::write(
+            self.entry_dir(cache_key).join("meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn set_last_accessed_for_test(&self, cache_key: &str, sql_modifier: &str) {
@@ -6990,6 +9741,67 @@ fn finish_transaction(db: &rusqlite::Connection, succeeded: bool) -> Result<()> 
     }
     Ok(())
 }
+
+/// How an eviction walk finds entries whose removal frees nothing, because
+/// a live file outside the store holds their blobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldProbe {
+    /// Left to the removal, which refuses them under the write lock.
+    AtRemoval,
+    /// Every candidate probed before the walk, the held bytes counted apart
+    /// (the size pass).
+    Upfront,
+    /// Each entry probed as the walk reaches it, before the write lock:
+    /// disk recovery and a size pass on a low disk, which cannot wait for a
+    /// probe of the whole store.
+    PerEntry,
+}
+
+/// Stores whose eviction candidate scan a test made slow, by cache dir.
+#[cfg(any(test, feature = "test-support"))]
+static SLOW_EVICTION_SCANS: std::sync::Mutex<Vec<(PathBuf, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "test-support"))]
+fn slow_eviction_scan_for_test(cache_dir: &Path) {
+    let delay = SLOW_EVICTION_SCANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find_map(|(dir, delay)| (dir == cache_dir).then_some(*delay));
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
+    }
+}
+
+/// Test hook: while alive, the eviction candidate scan of the store in
+/// `cache_dir` takes at least `delay` longer, as the scan of a large index
+/// does.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub struct SlowEvictionScanGuard(PathBuf);
+
+#[cfg(any(test, feature = "test-support"))]
+impl SlowEvictionScanGuard {
+    pub fn new(cache_dir: &Path, delay: Duration) -> Self {
+        SLOW_EVICTION_SCANS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((cache_dir.to_path_buf(), delay));
+        Self(cache_dir.to_path_buf())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for SlowEvictionScanGuard {
+    fn drop(&mut self) {
+        SLOW_EVICTION_SCANS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(dir, _)| dir != &self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

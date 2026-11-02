@@ -41,6 +41,8 @@ C/C++ engine can also hand its private output snapshots to the daemon when
 handoff within 25 ms, the engine publishes locally. Local execution using a
 `[cache.volumes]` shard publishes from the engine.
 
+With `cache.daemon_publish_rustc` enabled (the default, Unix only), a rustc wrapper hands the daemon only the part of a miss's store that would make it wait: the index's write lock. The wrapper stages, hashes and publishes the outputs as blobs itself, as it always did, and registers the entry when the index lets it within a few milliseconds, which on a quiet index is every time. When another writer holds the lock longer (a burst of stores, a sweep), the wrapper links the staged blobs into the store's staging area and returns to Cargo; the daemon then registers the entry, holding the key's build lock from the moment it accepts, so another build that looks the key up meanwhile waits for the entry instead of finding part of it. The daemon hashes each blob again before committing and stores nothing when one changed: an output that shares its blob's inode and was rewritten in place after the compile returned costs that entry, never a wrong artifact. An output replaced by a new file leaves the blob, and so the entry, as rustc wrote it.
+
 Report JSON marks daemon-owned publication with `store_handed_off`. Queued
 publication records its background time in `daemon_store_ms`, separately from
 `store_ms`. A delegated pipeline that stores directly has no queued background
@@ -62,8 +64,9 @@ Local-only caching can fall back to the local engine when delegation is
 unavailable; this is not the normal way to disable the daemon. Compiler-driven remote reads, writes,
 and prefetch need the daemon. `kache sync` can transfer entries directly without
 it. If delegation is unavailable before Commit, the engine continues with the
-local store. After Commit, a lost daemon connection fails the invocation; see
-[Architecture](/docs/how-it-works/architecture).
+local store. After Commit, a daemon that goes away without answering leaves
+the compile to the local engine, once; see
+[Daemon lifecycle](/docs/daemon/lifecycle#stopping-during-builds).
 
 ## Endpoint placement
 

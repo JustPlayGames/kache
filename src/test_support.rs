@@ -7,7 +7,9 @@ use std::path::PathBuf;
 /// `dirs::config_dir()/kunobi/locks`. That directory follows `XDG_CONFIG_HOME`
 /// on Linux and `HOME` on macOS, and the Nix sandbox sets `HOME` to a
 /// directory the build cannot write. Hold one of these for any test that
-/// calls `TofuStore::trust` or `check_and_pin`.
+/// calls `TofuStore::trust` or `check_and_pin`. Windows reads the folder from
+/// its Known Folders, which no variable moves, so those tests are ignored
+/// there rather than write into the user's own `AppData\Roaming\kunobi`.
 pub(crate) struct KunobiConfigGuard {
     _lock: ProcessStateTestGuard,
     /// Kept so the directory outlives the tests that pin a service into it.
@@ -98,6 +100,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: true,
+        daemon_publish_rustc: true,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
         daemon_execution_concurrency: None,
@@ -113,6 +116,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -154,6 +158,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -222,6 +227,41 @@ pub(crate) fn settle_writes(paths: &[&std::path::Path]) {
     while stamp_clock_ns() <= settled_at {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+/// The runtime [`on_a_runtime_of_its_own`] builds, as `#[tokio::test]`'s
+/// `flavor` and `worker_threads` would.
+pub(crate) enum Flavor {
+    CurrentThread,
+    MultiThread(usize),
+}
+
+/// Runs `test` on a runtime of its own, as `#[tokio::test]` would, and shuts
+/// that runtime down before returning. A daemon's spawned work (its periodic
+/// flushes, durability ticks, migration, a sweep after a store, a prefetch
+/// plan) outlives the call that started it, and under `#[tokio::test]` it
+/// ran on after the test's temporary directory was removed and wrote its
+/// index, store, GC stats or transfer log there again. Create the directory
+/// before calling this, and it goes after the runtime.
+pub(crate) fn on_a_runtime_of_its_own<F: std::future::Future>(
+    flavor: Flavor,
+    test: F,
+) -> F::Output {
+    let runtime = match flavor {
+        Flavor::CurrentThread => tokio::runtime::Builder::new_current_thread(),
+        Flavor::MultiThread(workers) => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(workers);
+            builder
+        }
+    }
+    .enable_all()
+    .build()
+    .unwrap();
+    let output = runtime.block_on(test);
+    // Waits for blocking work in flight, as the end of `#[tokio::test]` did.
+    drop(runtime);
+    output
 }
 
 #[cfg(test)]

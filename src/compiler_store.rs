@@ -21,6 +21,12 @@ impl ArtifactPolicy for CompilerArtifactPolicy {
             .iter()
             .any(|kind| crate::compiler::rustc::crate_type_produces_metadata(kind))
     }
+    fn rewritable_output(name: &str) -> bool {
+        matches!(
+            crate::compiler::classify_by_filename(name),
+            crate::compiler::ArtifactKind::Metadata
+        )
+    }
     fn emit_kind(name: &str) -> Option<&'static str> {
         crate::compiler::emit_kind_for_filename(name)
     }
@@ -29,6 +35,25 @@ impl ArtifactPolicy for CompilerArtifactPolicy {
             crate::compiler::classify_by_filename(name),
             crate::compiler::ArtifactKind::DepInfo
         )
+    }
+    /// A test binary: Cargo compiles a test target with `--test` and no
+    /// `--crate-type` (a `harness = false` test with neither), so its entry
+    /// records no crate type. Cargo runs it and nothing else touches it: a
+    /// test is never uplifted out of `deps/`, and the post-build `strip` or
+    /// re-sign that keeps binaries and dylibs private copies is for what
+    /// ships. Its restore stays a private copy. A test binary is most of what
+    /// a build stores by copy: tens to hundreds of MB each, all written
+    /// again at once when a shared crate changes. Linux only, where it was
+    /// measured: macOS clones on APFS before any hardlink is tried, and may
+    /// re-sign a loadable in place.
+    fn allow_executable_hardlink(name: &str, crate_types: &[String]) -> bool {
+        use crate::compiler::{ArtifactKind, classify_by_filename};
+        cfg!(target_os = "linux")
+            && crate_types.is_empty()
+            && matches!(
+                classify_by_filename(name),
+                ArtifactKind::Executable | ArtifactKind::Other("extensionless")
+            )
     }
 }
 
@@ -42,7 +67,7 @@ pub trait StoreHashExt {
 
 impl StoreHashExt for Store {
     fn file_hasher(&self) -> crate::cache_key::FileHasher<'_> {
-        crate::cache_key::FileHasher::from_cache(self.file_hash_cache())
+        crate::cache_key::FileHasher::from_cache(self.file_hash_cache()).with_memo_handoff(self)
     }
     fn file_hasher_for(
         &self,
@@ -66,13 +91,13 @@ mod tests {
             "foo.wasm",
             "foo.d",
             "foo.pp",
-            "foo.rmeta",
             "foo",
         ] {
             assert!(!CompilerArtifactPolicy::allow_hardlink(name), "{name}");
         }
         for name in [
             "foo.rlib",
+            "foo.rmeta",
             "foo.o",
             "foo.obj",
             "foo.dwo",
@@ -80,6 +105,43 @@ mod tests {
             "foo.dsym.tar",
         ] {
             assert!(CompilerArtifactPolicy::allow_hardlink(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn compiler_policy_shares_the_inode_of_test_binaries_alone() {
+        let test: &[String] = &[];
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(
+            CompilerArtifactPolicy::allow_executable_hardlink("tests-0123456789abcdef", test),
+            linux
+        );
+        assert_eq!(
+            CompilerArtifactPolicy::allow_executable_hardlink("tests-0123456789abcdef.exe", test),
+            linux
+        );
+        for name in [
+            "libfoo.so",
+            "libfoo.dylib",
+            "foo.dll",
+            "foo.wasm",
+            "foo.d",
+            "foo.rlib",
+        ] {
+            assert!(
+                !CompilerArtifactPolicy::allow_executable_hardlink(name, test),
+                "{name}"
+            );
+        }
+        // Binaries, build scripts, dylibs and proc-macros keep their rules.
+        for kind in ["bin", "cdylib", "dylib", "proc-macro", "lib"] {
+            assert!(
+                !CompilerArtifactPolicy::allow_executable_hardlink(
+                    "app-0123456789abcdef",
+                    &[kind.into()]
+                ),
+                "{kind}"
+            );
         }
     }
 
@@ -117,6 +179,72 @@ mod tests {
         }
     }
 
+    /// Inside a `WritableOutputsScope` a put leaves the `.rmeta` the writable
+    /// file rustc wrote (stored by copy) and still shares the rlib's inode;
+    /// outside it, both are stored by hardlink as before.
+    #[cfg(unix)]
+    #[test]
+    fn writable_outputs_keep_metadata_off_the_blob_and_rlibs_on_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::write(probe.path().join("a"), b"probe").unwrap();
+        if kache_store::link::try_reflink(&probe.path().join("a"), &probe.path().join("b")).is_ok()
+        {
+            eprintln!("the test filesystem reflinks: no put shares an inode");
+            return;
+        }
+        for writable in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(kache_store::config::Config {
+                cache_dir: temp.path().join("cache"),
+                max_size: 1 << 20,
+                gc_evict_shared: false,
+                gc_spare_young_hours: 0,
+                upload_spool_max_jobs: 128,
+                deferred_durability: false,
+                index_mode: Default::default(),
+            })
+            .unwrap();
+            let files: Vec<_> = ["libfoo-1.rmeta", "libfoo-1.rlib"]
+                .into_iter()
+                .map(|name| {
+                    let path = temp.path().join(name);
+                    std::fs::write(&path, format!("{name} {writable}")).unwrap();
+                    (path, name.to_string())
+                })
+                .collect();
+            {
+                let _scope = WritableOutputsScope::enter(writable);
+                store
+                    .put(
+                        &"b".repeat(64),
+                        "foo",
+                        &["lib".into()],
+                        &[],
+                        "x86_64-unknown-linux-gnu",
+                        "dev",
+                        &files,
+                        "",
+                        "",
+                    )
+                    .unwrap();
+            }
+            let meta = store.get(&"b".repeat(64)).unwrap().unwrap();
+            for (path, name) in &files {
+                let file = meta.files.iter().find(|file| &file.name == name).unwrap();
+                let output = std::fs::metadata(path).unwrap();
+                let blob = std::fs::metadata(store.blob_path(&file.hash)).unwrap();
+                let shares = output.ino() == blob.ino() && output.dev() == blob.dev();
+                if writable && name.ends_with(".rmeta") {
+                    assert!(!shares, "{name} shares the blob inside the scope");
+                    assert_ne!(output.permissions().mode() & 0o200, 0, "{name} read-only");
+                } else {
+                    assert!(shares, "{name} (writable scope {writable}) does not share");
+                }
+            }
+        }
+    }
+
     #[test]
     fn stored_emit_metadata_uses_the_compiler_mapping() {
         let temp = tempfile::tempdir().unwrap();
@@ -124,6 +252,7 @@ mod tests {
             cache_dir: temp.path().join("cache"),
             max_size: 1 << 20,
             gc_evict_shared: false,
+            gc_spare_young_hours: 0,
             upload_spool_max_jobs: 128,
             deferred_durability: false,
             index_mode: Default::default(),

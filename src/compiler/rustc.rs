@@ -145,7 +145,22 @@ impl RustcCompiler {
                     .to_string(),
             );
         }
-        (key.map(|key| finish_key(parsed, ctx, key)), outputs)
+        // The legacy key takes the same folds, so it is the whole key the
+        // earlier release computed for this invocation.
+        outputs.legacy_key = outputs
+            .legacy_key
+            .take()
+            .map(|(version, legacy)| (version, finish_key(parsed, ctx, legacy)));
+        let key = key.map(|key| finish_key(parsed, ctx, key));
+        if let (Ok(key), Some((version, legacy))) = (key.as_ref(), outputs.legacy_key.as_ref()) {
+            crate::key_bridge::remember(
+                key,
+                *version,
+                legacy,
+                parsed.crate_name.as_deref().unwrap_or("unknown"),
+            );
+        }
+        (key, outputs)
     }
 
     /// Execute a caller-visible compile, forwarding metadata readiness to Cargo.
@@ -282,13 +297,11 @@ impl RustcCompiler {
     ) -> Result<CompileResult> {
         // The invocation and key must use the same path-normalization rules.
         let workspace_root = parsed.path_normalization_root();
-        let path_normalizer = crate::path_normalizer::PathNormalizer::from_invocation(
+        let path_normalizer = crate::path_normalizer::PathNormalizer::for_invocation(
             workspace_root,
             &self.invocation_env,
-        )
-        .with_target_dir(parsed.target_dir().as_deref())
-        .with_base_dirs(&self.base_dirs)
-        .with_rust_src_rule(
+            parsed.target_dir().as_deref(),
+            &self.base_dirs,
             crate::cache_key::get_rustc_sysroot_for(parsed, &self.invocation_env).as_deref(),
             crate::cache_key::get_rustc_commit_hash_for(&parsed.rustc, &self.invocation_env)
                 .as_deref(),
@@ -323,6 +336,7 @@ impl RustcCompiler {
             incremental_mode,
             metadata_sink,
             on_dep_info,
+            compile::StopRule::for_compile(parsed.invokes_linker()),
         )
     }
 }

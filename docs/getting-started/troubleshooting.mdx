@@ -108,7 +108,8 @@ Delete `target/<profile>/incremental.kache-auto` or run `cargo clean`.
 ## Cargo fix cannot write old metadata
 
 Older Kache versions could leave read-only `.rmeta` files linked to cache blobs.
-New restores use private writable files, but upgrading does not replace outputs
+New restores give workspace (path) packages private writable `.rmeta` files
+(this fork keeps dependencies' metadata shared with the cache), but upgrading does not replace outputs
 Cargo already considers fresh.
 
 If `cargo fix` or `cargo clippy --fix` still reports a read-only metadata file,
@@ -121,8 +122,7 @@ cargo check -p <crate>
 
 Match the affected build's target and profile when cleaning, and use its feature
 options when rebuilding. This keeps the shared artifact cache; deleting that
-cache is unnecessary. The rebuild also reapplies current creation permissions to
-metadata restored by an older Kache. Retry the fix command after the rebuild.
+cache is unnecessary. Retry the fix command after the rebuild.
 
 Managed incremental state also starts fresh on each crate's next compilation
 after the managed state format changes to version 2. Older state expires through the usual unused-unit

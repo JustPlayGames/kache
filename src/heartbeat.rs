@@ -38,8 +38,8 @@ const STUCK_CPU_FLOOR: f64 = 0.01;
 
 /// Heartbeat configuration owned by an invocation and its monitor thread.
 struct HeartbeatCtx {
-    /// Nonzero cadence in seconds; a cadence of 0 installs no context.
-    cadence_secs: u64,
+    /// Nonzero time between ticks; a cadence of 0 installs no context.
+    cadence: Duration,
     event_log: PathBuf,
     /// Daemon socket, for the fire-and-forget in-flight registry
     /// (CompileStarted/CompileFinished). The daemon may not be running;
@@ -105,9 +105,27 @@ pub fn set_heartbeat_ctx(
     root: String,
     show_lines: bool,
 ) {
-    let ctx = (cadence_secs != 0).then(|| {
+    set_heartbeat_cadence(
+        Duration::from_secs(cadence_secs),
+        event_log,
+        socket,
+        root,
+        show_lines,
+    );
+}
+
+/// [`set_heartbeat_ctx`] with any cadence: tests tick in milliseconds
+/// instead of waiting out whole seconds.
+fn set_heartbeat_cadence(
+    cadence: Duration,
+    event_log: PathBuf,
+    socket: PathBuf,
+    root: String,
+    show_lines: bool,
+) {
+    let ctx = (!cadence.is_zero()).then(|| {
         Arc::new(HeartbeatCtx {
-            cadence_secs,
+            cadence,
             event_log,
             socket,
             root,
@@ -212,7 +230,7 @@ fn run_ticks(
     wake_rx: &mpsc::Receiver<()>,
 ) {
     let started = Instant::now();
-    let cadence = Duration::from_secs(ctx.cadence_secs);
+    let cadence = ctx.cadence;
     // Lazily resolved on the first tick — see module docs.
     let mut typical_s: Option<Option<u64>> = None;
     // (sampled_at, cpu_time) anchor for the stuck window; refreshed whenever
@@ -432,28 +450,52 @@ mod tests {
 
     fn assert_test_context(cadence_secs: u64, root: &str, show_lines: bool) {
         let ctx = current_heartbeat_ctx().expect("this invocation enabled heartbeats");
-        assert_eq!(ctx.cadence_secs, cadence_secs);
+        assert_eq!(ctx.cadence, Duration::from_secs(cadence_secs));
         assert_eq!(ctx.event_log, PathBuf::from(format!("{root}/events.jsonl")));
         assert_eq!(ctx.socket, PathBuf::from(format!("{root}/daemon.sock")));
         assert_eq!(ctx.root, root);
         assert_eq!(ctx.show_lines, show_lines);
     }
 
+    /// Wait for `event_log`'s first heartbeat. The deadline only guards
+    /// against a hang: a loaded machine may delay a tick by seconds, which
+    /// says nothing about whose context the tick used.
+    fn first_heartbeat(event_log: &std::path::Path) -> Option<HeartbeatEvent> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(event_log)
+                && let Some(event) = contents
+                    .lines()
+                    .find_map(|line| serde_json::from_str::<HeartbeatEvent>(line).ok())
+            {
+                return Some(event);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Each request's monitor ticks with the context its request installed,
+    /// also after the request's scope ended, while another request runs
+    /// with another context. The cadences are milliseconds so the ticks come
+    /// at once; how soon they come is not what is tested.
     #[test]
     fn concurrent_monitors_keep_request_context_after_scope_exit() {
         let barrier = std::sync::Barrier::new(2);
         std::thread::scope(|threads| {
-            for cadence_secs in [1, 2] {
+            for cadence_ms in [10, 20] {
                 let barrier = &barrier;
                 threads.spawn(move || {
                     let scope = InvocationHeartbeatScope::enter();
                     let dir = tempfile::tempdir().unwrap();
                     let event_log = dir.path().join("events.jsonl");
                     let socket = dir.path().join("missing-daemon.sock");
-                    let root = format!("/request-{cadence_secs}");
-                    let crate_name = format!("crate_{cadence_secs}");
-                    set_heartbeat_ctx(
-                        cadence_secs,
+                    let root = format!("/request-{cadence_ms}");
+                    let crate_name = format!("crate_{cadence_ms}");
+                    set_heartbeat_cadence(
+                        Duration::from_millis(cadence_ms),
                         event_log.clone(),
                         socket.clone(),
                         root.clone(),
@@ -461,7 +503,7 @@ mod tests {
                     );
                     barrier.wait();
                     let ctx = current_heartbeat_ctx().unwrap();
-                    assert_eq!(ctx.cadence_secs, cadence_secs);
+                    assert_eq!(ctx.cadence, Duration::from_millis(cadence_ms));
                     assert_eq!(ctx.event_log, event_log);
                     assert_eq!(ctx.socket, socket);
                     assert_eq!(ctx.root, root);
@@ -469,18 +511,7 @@ mod tests {
                     let monitor = start_monitor(&crate_name, std::process::id()).unwrap();
                     drop(scope);
                     drop(ctx);
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    let event = loop {
-                        if let Ok(contents) = std::fs::read_to_string(&event_log)
-                            && let Some(event) = contents
-                                .lines()
-                                .find_map(|line| serde_json::from_str::<HeartbeatEvent>(line).ok())
-                        {
-                            break event;
-                        }
-                        assert!(Instant::now() < deadline, "request monitor did not tick");
-                        std::thread::sleep(Duration::from_millis(20));
-                    };
+                    let event = first_heartbeat(&event_log).expect("request monitor did not tick");
                     drop(monitor);
                     assert_eq!(event.root, root);
                     assert_eq!(event.crate_name, crate_name);
@@ -580,7 +611,8 @@ mod tests {
 
         let monitor = start_monitor("slow_crate", std::process::id())
             .expect("a configured heartbeat context must start a monitor");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // A hang guard only (see `first_heartbeat`).
+        let deadline = Instant::now() + Duration::from_secs(120);
         let heartbeat = loop {
             if let Ok(contents) = std::fs::read_to_string(&event_log)
                 && let Some(line) = contents

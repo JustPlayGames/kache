@@ -34,10 +34,40 @@ pub const EVICT_TARGET_PERCENT: u64 = 90;
 /// Compute through `u128` so arbitrary byte-sized limits get an exact floor
 /// without overflowing near `u64::MAX`.
 pub fn eviction_target(max_size: u64) -> u64 {
-    ((max_size as u128 * EVICT_TARGET_PERCENT as u128) / 100) as u64
+    percent_of(max_size, EVICT_TARGET_PERCENT)
 }
 
-/// The high edge of GC's hysteresis band: the size a sweep *fires* at.
+/// Percentage of `max_size` an automatic sweep starts at.
+///
+/// Below the cap, because the store goes on growing before the first removal.
+/// On the build machine (2026-10-31, 483 GB cap, 150-250 GB of writes an hour)
+/// the size check came up to 5 minutes late (up to 21 GB), ranking took up to 4
+/// (17 GB), and target directories let go of up to 20 GB between the sweeps that
+/// measure what they hold. A trigger at 110 % saw the store's own part reach
+/// 533 GB. From 88 % those 58 GB stay under the cap.
+pub const AUTO_TRIGGER_PERCENT: u64 = 88;
+
+/// Percentage of `max_size` an automatic sweep evicts down to, far enough
+/// under [`AUTO_TRIGGER_PERCENT`] that a sweep's ranking, minutes on a large
+/// store, does not run back to back.
+pub const AUTO_TARGET_PERCENT: u64 = 78;
+
+fn percent_of(max_size: u64, percent: u64) -> u64 {
+    ((max_size as u128 * percent as u128) / 100) as u64
+}
+
+/// The size an automatic sweep starts above; see [`AUTO_TRIGGER_PERCENT`].
+pub fn automatic_trigger(max_size: u64) -> u64 {
+    percent_of(max_size, AUTO_TRIGGER_PERCENT)
+}
+
+/// The size an automatic sweep evicts down to; see [`AUTO_TARGET_PERCENT`].
+pub fn automatic_target(max_size: u64) -> u64 {
+    percent_of(max_size, AUTO_TARGET_PERCENT)
+}
+
+/// The high edge of GC's hysteresis band: the size a requested sweep *fires*
+/// at. Automatic sweeps have a band of their own ([`automatic_trigger`]).
 ///
 /// Trigger and target were both [`eviction_target`], so "evict to 90% — avoids
 /// boundary thrashing" described a band that did not exist: a store parked on
@@ -77,6 +107,11 @@ pub struct EntryFeatures {
     /// `None` means unknown (entry not yet backfilled into `entry_blobs`);
     /// policies fall back to the logical `size`.
     pub reclaimable_bytes: Option<i64>,
+    /// This entry's fair share of the blobs other entries reference too: each
+    /// such blob's size times the part of its references this entry holds.
+    /// Evicting the entry alone frees none of it; evicting every entry sharing
+    /// a blob frees all of it, so a cold set of twins is worth this much each.
+    pub shared_share_bytes: i64,
     /// Recent at candidate selection time. GC skips their metadata read and
     /// transaction setup; removal checks the grace again for other entries.
     pub recently_accessed: bool,
@@ -96,25 +131,54 @@ pub trait EvictionPolicy {
     fn select(&self, candidates: &[EntryFeatures]) -> Vec<String>;
 }
 
+/// How much more an automatic sweep values a young entry slow to compile than
+/// its [`size_pressure_score`] says: it ranks with ten times the score.
+///
+/// Replaying the build machine's sweeps of 2026-11-01/02 (60 sweeps, 27 h):
+/// young entries whose eviction came back as a miss cost about 80 s of compile
+/// each, while the entries a sweep took in their place cost about 2 s. Sparing
+/// every entry idle under 12 h made re-misses 38 % worse (2.35 to 3.24
+/// compile-hours: entries idle 12-24 h are yesterday's work coming back).
+/// Ranking those idle under 12 h that took 30 s or more at ten times their
+/// score cut them 77 % (2.35 to 0.54), as much as putting them last, and
+/// unlike that it degrades: with every entry over 10 s counted young, putting
+/// them last made it 55 compile-hours (sweeps ate hot entries), ten times
+/// their score still 1.39.
+pub const YOUNG_SCORE_FACTOR: f64 = 10.0;
+
+/// The compile time from which a recently used entry counts as young for
+/// [`SizePressureSparingYoungPolicy`], in milliseconds. Unknown compile times
+/// (`0`) never do.
+pub const YOUNG_MIN_COMPILE_MS: i64 = 30_000;
+
 /// Priority score for size-pressure eviction; **lower is evicted first**.
 ///
-/// `(hit_count + 1) / (idle_hours * reclaimable_mb)` — prefers evicting stale,
-/// rarely-hit entries whose removal actually frees bytes, degrading to LRU
-/// with a size tiebreaker when ages are similar. The size term is the entry's
-/// *marginal reclaimable* bytes (blobs it holds the last references to), not
-/// its logical size: a 500 MB entry whose blobs are all shared frees nothing,
-/// while a 200 MB entry with unique blobs frees 200 MB, and a size-pressure
-/// sweep exists to free bytes (kunobi-ninja/kache#608). Entries not yet
-/// backfilled into `entry_blobs` (`None`) rank on logical size as before.
-/// The clamps reproduce the `MAX(..., 0.01)` / `MAX(..., 0.001)` of the SQL
-/// this replaced, which exist to keep a just-accessed or free-nothing entry
-/// from dividing by zero — a fully-shared entry thus ranks as if it were
-/// tiny, i.e. last among equally stale candidates.
+/// `(hit_count + 1) / (idle_hours * bytes_mb)` — prefers evicting stale,
+/// rarely-hit entries, degrading to LRU with a size tiebreaker when ages are
+/// similar. `bytes` is what the entry stands for on disk: the blobs it holds
+/// the last references to (kunobi-ninja/kache#608: a 200 MB entry with unique
+/// blobs frees 200 MB) plus its fair share of the blobs it shares.
+///
+/// Not the marginal reclaimable bytes alone. Those are zero for every entry of
+/// a shared blob, so such entries ranked last whatever their age, none of them
+/// was ever evicted and the blob never freed: on the build machine (2026-11-01)
+/// 292 GB of a 650 GB store were blobs whose entries had all been idle for two
+/// days or more, while sweeps evicted entries idle for half an hour. Evicting
+/// one cold twin frees nothing and loses little; the sweep budgets on the bytes
+/// removals actually free, so it goes on to the other twins.
+///
+/// Entries not yet backfilled into `entry_blobs` (`None`) rank on logical size
+/// as before. The clamps reproduce the `MAX(..., 0.01)` / `MAX(..., 0.001)` of
+/// the SQL this replaced, which exist to keep a just-accessed or empty entry
+/// from dividing by zero.
 ///
 /// Note this score has no notion of what an entry costs to *rebuild*; see #594.
 pub fn size_pressure_score(e: &EntryFeatures) -> f64 {
     let idle = e.idle_hours.max(0.01);
-    let bytes = e.reclaimable_bytes.unwrap_or(e.size);
+    let bytes = match e.reclaimable_bytes {
+        Some(reclaimable) => reclaimable.saturating_add(e.shared_share_bytes),
+        None => e.size,
+    };
     let size_mb = (bytes as f64 / 1_048_576.0).max(0.001);
     (e.hit_count as f64 + 1.0) / (idle * size_mb)
 }
@@ -137,6 +201,44 @@ impl EvictionPolicy for SizePressurePolicy {
                 .unwrap_or(Ordering::Equal)
         });
         ranked.into_iter().map(|e| e.key.clone()).collect()
+    }
+}
+
+/// Size-pressure eviction that ranks young entries slow to compile (used
+/// within `hours`, at least [`YOUNG_MIN_COMPILE_MS`] to compile) with
+/// [`YOUNG_SCORE_FACTOR`] times their [`size_pressure_score`]: an automatic
+/// sweep takes colder entries first, and hotter ones still after them.
+///
+/// Held bytes swing with worktrees (59-275 GB a day on the build machine,
+/// 2026-11-02), and a removed worktree turns what it held into the store's own
+/// bytes at once. The sweeps that followed evicted 25-60 % of their entries
+/// idle under 12 h, and a new worktree asked for the third-party crates among
+/// them again 3-7 h later.
+pub struct SizePressureSparingYoungPolicy {
+    pub hours: u64,
+}
+
+impl SizePressureSparingYoungPolicy {
+    fn score(&self, e: &EntryFeatures) -> f64 {
+        let score = size_pressure_score(e);
+        if e.idle_hours < self.hours as f64 && e.compile_time_ms >= YOUNG_MIN_COMPILE_MS {
+            score * YOUNG_SCORE_FACTOR
+        } else {
+            score
+        }
+    }
+}
+
+impl EvictionPolicy for SizePressureSparingYoungPolicy {
+    fn name(&self) -> &'static str {
+        "size-pressure-young"
+    }
+
+    fn select(&self, candidates: &[EntryFeatures]) -> Vec<String> {
+        let mut ranked: Vec<(f64, &EntryFeatures)> =
+            candidates.iter().map(|e| (self.score(e), e)).collect();
+        ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        ranked.into_iter().map(|(_, e)| e.key.clone()).collect()
     }
 }
 
@@ -348,6 +450,7 @@ mod tests {
             committed: true,
             compile_time_ms: 0,
             reclaimable_bytes: None,
+            shared_share_bytes: 0,
             recently_accessed: false,
             recently_imported: false,
         }
@@ -393,6 +496,21 @@ mod tests {
         assert!(size_pressure_score(&unique_small) < size_pressure_score(&shared_big));
         let order = SizePressurePolicy.select(&[shared_big, unique_small]);
         assert_eq!(order, vec!["unique_small", "shared_big"]);
+    }
+
+    /// Twins of a blob nobody has used for days go before an entry a build used
+    /// an hour ago, though evicting either twin alone frees nothing: marginal
+    /// bytes alone ranked them last for ever, and their blob was never freed.
+    #[test]
+    fn size_pressure_ranks_cold_twins_before_warm_entries() {
+        let mut twin = feat("twin", 40 * 1024 * 1024, 0, 100.0);
+        twin.reclaimable_bytes = Some(0);
+        twin.shared_share_bytes = 20 * 1024 * 1024;
+        let mut warm = feat("warm", 5 * 1024 * 1024, 0, 1.0);
+        warm.reclaimable_bytes = Some(5 * 1024 * 1024);
+
+        let order = SizePressurePolicy.select(&[warm, twin]);
+        assert_eq!(order, vec!["twin", "warm"]);
     }
 
     /// An entry not yet backfilled into `entry_blobs` (None) ranks on its
@@ -605,6 +723,7 @@ mod tests {
                             committed,
                             compile_time_ms: 0,
                             reclaimable_bytes: [None, Some(0), Some(size)][reclaim as usize],
+                            shared_share_bytes: 0,
                             recently_accessed: false,
                             recently_imported: false,
                         },

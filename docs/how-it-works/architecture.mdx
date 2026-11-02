@@ -140,12 +140,12 @@ performs brokered restores under its own process restrictions:
 
 - concurrent cache pipelines for delegated compiler invocations
 - exact remote checks and downloads
-- storing finished C/C++ compiles that wrappers hand over (`cache.daemon_publish`)
+- storing finished C/C++ compiles that wrappers hand over, and registering rustc stores the index was too busy for (`cache.daemon_publish`, `cache.daemon_publish_rustc`)
 - background uploads and durable upload replay
 - background MSVC runtime hashing, with one worker and a bounded queue
 - speculative prefetch, and fetching and publishing input records on the remote
 - seeding a new checkout's target directory with registry units another checkout built (`cache.seed_new_targets`)
-- copying large executables beside their destinations while the rest of a build runs
+- copying large executables beside their destinations while the rest of a build runs, for clients that restore on their own (a brokered restore takes no such copy, and its build asks for none)
 - flushing entries stored without an fsync, every two seconds
 - scheduled garbage collection
 - index upkeep, target-directory cleanup and target-file sharing when the machine is quiet
@@ -160,7 +160,7 @@ See [Daemon overview](/docs/daemon/overview) and [Lifecycle](/docs/daemon/lifecy
 
 ## Interception boundary
 
-As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations, and caches the Clippy ones among them. On Unix, after rustc builds a build script, Kache puts a launcher in its place, so Cargo runs the script through Kache too; see [Build scripts](/docs/how-it-works/build-scripts). Rust link work driven by rustc can be cached when the artifact policy allows it (`cache.cache_executables`, on by default on Linux and macOS); an independently invoked linker is outside this path.
+As `RUSTC_WRAPPER`, Kache sees rustc and workspace-wrapper invocations, and caches the Clippy ones among them. On Unix, after rustc builds a build script, Kache puts a launcher in its place, so Cargo runs the script through Kache too; see [Build scripts](/docs/how-it-works/build-scripts). Rust link work driven by rustc can be cached when the artifact policy allows it (`cache.cache_executables`, on by default on Linux, macOS and Windows); an independently invoked linker is outside this path.
 
 On Unix, `kache init` also adds a shim directory to the front of `PATH` and sets `kache test-runner` as Cargo's runner for the host, both through your shell startup files. The `cargo` shim runs the real Cargo and marks its target directories in use while it runs, so cleanup leaves them alone. It can seed compatible dependency units before Cargo checks a new target. On main it can also route explicitly opted-in local builds through [Blaze](/docs/getting-started/blaze). Compiler artifact caching still happens at the wrapper boundary. The `rustdoc` shim, which init sets as `build.rustdoc` when that is unset, caches the modes described in [Rust documentation](/docs/getting-started/rustdoc). The test runner makes test binaries wait for the compile scheduler's slots.
 

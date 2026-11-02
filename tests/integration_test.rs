@@ -308,6 +308,7 @@ fn rustc_corrupt_entry_recompiles_with_the_normal_path_remap() {
 }
 
 fn kache_report(cache_dir: &Path) -> serde_json::Value {
+    common::wait_for_daemon_publishes(cache_dir);
     let output = hermetic_command(
         kache_binary(),
         cache_dir,
@@ -3257,6 +3258,7 @@ native_runtime_warmup = false
     println!("STDERR:\n{}", String::from_utf8_lossy(&output.stderr));
 
     // Connect to SQLite to check initial size and age the entries
+    common::wait_for_daemon_publishes(cache_dir.path());
     let db_path = cache_dir.path().join("index.db");
     assert!(db_path.exists(), "index.db should exist");
 
@@ -3351,12 +3353,11 @@ native_runtime_warmup = false
         String::from_utf8_lossy(&output.stderr)
     );
 
+    // The store that triggers auto-GC is the wrapper's, or the daemon's when
+    // the wrapper handed it over (a busy index): then the trigger is logged
+    // by the daemon, not on this build's stderr. The eviction is the proof.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("auto-gc: spawned background `kache gc`")
-            || stderr.contains("auto-gc: handed the sweep to the daemon"),
-        "second build should trigger background auto-GC.\nstderr: {stderr}"
-    );
+    common::wait_for_daemon_publishes(cache_dir.path());
 
     // Poll fresh SQLite connections until the aged first entry is evicted.
     let mut size_after = total_store_size();
@@ -3382,7 +3383,8 @@ native_runtime_warmup = false
     }
     assert!(
         size_after <= gc_budget as i64,
-        "auto-GC failed to evict store below budget {gc_budget}, current size: {size_after}"
+        "auto-GC failed to evict store below budget {gc_budget}, current size: {size_after}\n\
+         second build's stderr: {stderr}"
     );
 }
 

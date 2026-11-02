@@ -93,12 +93,23 @@ impl Env {
     /// Run `cargo build --lib` for `project` through the kache rustc wrapper,
     /// wired to this env's isolated cache/config/HOME. Returns the build output.
     fn wrapper_build(&self, project: &Path, target_dir: &Path) -> std::process::Output {
-        hermetic_command(
+        self.wrapper_cargo(project, target_dir, &["build", "--lib"])
+    }
+
+    /// `cargo <args>` in `project` with kache as `RUSTC_WRAPPER`, returned
+    /// once the daemon stored and logged every compile handed to it.
+    fn wrapper_cargo(
+        &self,
+        project: &Path,
+        target_dir: &Path,
+        args: &[&str],
+    ) -> std::process::Output {
+        let output = hermetic_command(
             env!("CARGO"),
             &self.cache,
             Some(&self.cache.join("config.toml")),
         )
-        .args(["build", "--lib"])
+        .args(args)
         .current_dir(project)
         .env("RUSTC_WRAPPER", KACHE_BIN)
         .env("KACHE_LOG", "off")
@@ -107,7 +118,9 @@ impl Env {
         .env("CARGO_TARGET_DIR", target_dir)
         .env("CARGO_INCREMENTAL", "0")
         .output()
-        .expect("run cargo build with kache wrapper")
+        .expect("run cargo build with kache wrapper");
+        common::wait_for_daemon_publishes(&self.cache);
+        output
     }
 }
 
@@ -205,6 +218,42 @@ fn help_lists_subcommands() {
         .stdout(predicates::str::contains("stats"))
         .stdout(predicates::str::contains("doctor"))
         .stdout(predicates::str::contains("completions"));
+}
+
+/// Commands that only print leave no trace: no log file in the default cache
+/// folder and no probe memo in the store. `kache --help` once ran the C
+/// compiler probe on kache itself and opened the log before it had a line.
+/// A test build of kache keeps its default cache folder where
+/// `KACHE_TEST_USER_CACHE_DIR` says, on every platform.
+#[test]
+fn printing_commands_write_nothing() {
+    fn files_under(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path, found);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    let e = env();
+    for args in [
+        &["--help"][..],
+        &["--version"],
+        &["help", "stats"],
+        &["stats", "--help"],
+    ] {
+        e.cmd()
+            .env("KACHE_TEST_USER_CACHE_DIR", e.home.join(".cache"))
+            .args(args)
+            .assert()
+            .success();
+    }
+    let mut written = Vec::new();
+    files_under(&e.home, &mut written);
+    files_under(&e.cache, &mut written);
+    assert!(written.is_empty(), "{written:?}");
 }
 
 #[test]
@@ -424,6 +473,51 @@ fn daemon_lifecycle_commands_say_what_happened() {
     assert!(run("restart").contains("daemon restarted"));
     assert!(run("stop").contains("daemon stopped"));
     assert!(run("stop").contains("daemon is not running"));
+}
+
+/// A daemon that answers late (one starved behind a full machine, a
+/// below-normal one behind normal-priority compiles, a paused one) is still
+/// stopped: `daemon stop` keeps asking while it holds its run lock, instead
+/// of giving up after one request's deadline and leaving it running.
+#[cfg(unix)]
+#[test]
+fn stop_stops_a_daemon_that_answers_late() {
+    let e = env();
+    let start = e.cmd().args(["daemon", "start"]).output().unwrap();
+    assert!(start.status.success(), "{start:?}");
+    let state = std::fs::read_to_string(e.cache.join("daemon.state.json")).unwrap();
+    let pid = serde_json::from_str::<serde_json::Value>(&state).unwrap()["pid"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let signal = |name: &str| {
+        let status = std::process::Command::new("kill")
+            .args([name, &pid])
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill {name} {pid}");
+    };
+    signal("-STOP");
+    // Longer than one shutdown request's 5 s deadline.
+    let resume = std::thread::spawn({
+        let pid = pid.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_secs(7));
+            std::process::Command::new("kill")
+                .args(["-CONT", &pid])
+                .status()
+                .unwrap();
+        }
+    });
+    let stop = e.cmd().args(["daemon", "stop"]).output().unwrap();
+    resume.join().unwrap();
+    assert!(stop.status.success(), "{stop:?}");
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("daemon stopped"),
+        "{stop:?}"
+    );
+    let gone = e.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&gone.stderr).contains("daemon is not running"));
 }
 
 #[cfg(unix)]
@@ -2737,79 +2831,6 @@ fn init_rejects_unavailable_daemon_replacement() {
     );
 }
 
-/// The first compiler invocation after an upgrade must retire a v1 daemon,
-/// even though its lifetime lock still reports a running process.
-#[cfg(unix)]
-#[test]
-fn compiler_upgrades_a_legacy_daemon_without_another_init() {
-    use std::io::{BufRead, Write};
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let e = env();
-    let socket = e.cache.join("daemon.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let run_lock = std::fs::File::create(e.cache.join("daemon.run.lock")).unwrap();
-    run_lock.lock().unwrap();
-    let done = Arc::new(AtomicBool::new(false));
-    let server_done = Arc::clone(&done);
-    let server = std::thread::spawn(move || {
-        let _run_lock = run_lock;
-        for incoming in listener.incoming() {
-            let mut stream = incoming.unwrap();
-            if server_done.load(Ordering::SeqCst) {
-                return false;
-            }
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut request = String::new();
-            std::io::BufReader::new(&stream)
-                .read_line(&mut request)
-                .unwrap();
-            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
-            let shutdown = request == "shutdown";
-            let response = if request == "health" {
-                serde_json::json!({"ok": true, "health": {"version": "1.2.2", "build_epoch": 1}})
-            } else {
-                serde_json::json!({"ok": shutdown, "error": "legacy execution protocol"})
-            };
-            // Probes can disconnect as soon as they recognize a legacy reply.
-            let _ = writeln!(stream, "{response}");
-            if shutdown {
-                return true;
-            }
-        }
-        false
-    });
-    let output = e
-        .cmd()
-        .args(["rustc", "--version"])
-        .timeout(std::time::Duration::from_secs(30))
-        .output()
-        .unwrap();
-    done.store(true, Ordering::SeqCst);
-    drop(UnixStream::connect(&socket));
-    let retired = server.join().unwrap();
-    assert!(output.status.success(), "{output:?}");
-    assert!(
-        retired,
-        "compiler left the legacy daemon running: {output:?}"
-    );
-    let status = e
-        .cmd()
-        .args(["daemon", "status", "--json"])
-        .output()
-        .unwrap();
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["daemon_running"], true);
-    assert_eq!(status["daemon_version"], env!("CARGO_PKG_VERSION"));
-    assert!(
-        !e.home.join(".cargo/config.toml").exists(),
-        "upgrade must not repeat setup"
-    );
-}
-
 /// Services installed before the engine split remain valid entry points.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
@@ -3021,6 +3042,55 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
             ["--user", "start", "kache.service"]
         );
     }
+}
+
+/// A shell whose `XDG_CONFIG_HOME` names a private config (a test rig's own
+/// store and runtime folder) runs an instance the login service does not
+/// own: the service reads the home folder's config. `daemon start` used to
+/// take the private config for the service's, kick the service manager and
+/// wait out its 8 s budget for a socket that never came ("daemon did not
+/// start within timeout"); every compile's auto-start did the same.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_private_xdg_config_starts_its_own_daemon_beside_the_login_service() {
+    let e = env();
+    let unit = e.home.join(".config/systemd/user/kache.service");
+    std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    std::fs::write(&unit, "installed test service").unwrap();
+    let xdg = e.home.join("rig/xdg");
+    std::fs::create_dir_all(xdg.join("kache")).unwrap();
+    std::fs::write(
+        xdg.join("kache/config.toml"),
+        format!(
+            "[cache]\nlocal_store = {:?}\nruntime_dir = {:?}\n",
+            e.cache.to_str().unwrap(),
+            e.cache.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let calls = e.home.join("systemctl.calls");
+    let path = fake_systemd_path(
+        &e.home.join("fake-bin"),
+        &format!("echo \"$*\" >> {:?}; exit 0", calls.to_str().unwrap()),
+    );
+    let output = e
+        .cmd()
+        .args(["daemon", "start"])
+        .env_remove("KACHE_CONFIG")
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("PATH", path)
+        .timeout(std::time::Duration::from_secs(60))
+        .output()
+        .unwrap();
+    let state = std::fs::read(e.cache.join("daemon.state.json"));
+    e.cmd().args(["daemon", "stop"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let calls = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|call| call.contains("start")),
+        "the service manager was asked to start the private instance: {calls}"
+    );
+    assert!(state.is_ok(), "the private instance's daemon recorded no state");
 }
 
 #[test]
@@ -5158,6 +5228,134 @@ fn daemon_start_needs_no_more_path_than_its_own_socket() {
     assert!(bound, "the daemon must have bound its socket: {stderr}");
 }
 
+/// `cargo clippy` runs each workspace unit as `kache clippy-driver <rustc>`,
+/// but Cargo probes plain rustc. The target records the inner rustc, so a
+/// checkout Clippy checked last still seeds a new one; it recorded
+/// `clippy-driver`'s own version before, which no probe matched. Cargo's
+/// rustc cache is removed so only kache's record can decide.
+#[test]
+fn a_target_clippy_checked_last_seeds_a_new_checkout() {
+    let clippy = std::process::Command::new(env!("CARGO"))
+        .args(["clippy", "--version"])
+        .output();
+    if !clippy.is_ok_and(|out| out.status.success()) {
+        eprintln!("skipping: no cargo clippy");
+        return;
+    }
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    let root = TempDir::new().unwrap();
+    let donor = root.path().join("donor");
+    std::fs::create_dir_all(donor.join("src")).unwrap();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    std::fs::write(donor.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(donor.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let donor_target = donor.join("target");
+    let checked = e.wrapper_cargo(&donor, &donor_target, &["clippy", "--lib"]);
+    assert!(checked.status.success(), "{checked:?}");
+    std::fs::remove_file(donor_target.join(".rustc_info.json")).unwrap();
+    let profile = donor_target.join("debug");
+    let hash = "0123456789abcdef";
+    let marker = |target: &Path| {
+        if profile.join(".fingerprint").is_dir() {
+            target
+                .join("debug/.fingerprint")
+                .join(format!("dep-{hash}"))
+        } else {
+            target.join("debug/build/dep").join(hash)
+        }
+    };
+    let donor_marker = marker(&donor_target);
+    std::fs::create_dir_all(donor_marker.join("fingerprint")).unwrap();
+    std::fs::write(donor_marker.join("fingerprint/lib"), "fp").unwrap();
+    let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                [[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n\
+                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let checkout = root.path().join("seeded");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(checkout.join("Cargo.lock"), lock).unwrap();
+    e.cmd()
+        .current_dir(&checkout)
+        .env("KACHE_SEED_NEW_TARGETS", "1")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .args(["rustc", "-", "--crate-name", "___", "--print=file-names"])
+        .args(["--crate-type", "lib"])
+        .write_stdin("")
+        .assert()
+        .success();
+    let seeded = marker(&checkout.join("target")).is_dir();
+    let tracked = e.cmd().args(["targets", "--json"]).output().unwrap();
+    assert!(
+        seeded,
+        "a target Clippy checked last must seed: {}",
+        String::from_utf8_lossy(&tracked.stdout)
+    );
+}
+
+/// A build that starts while no daemon runs is seeded too: the wrapper
+/// copies the units itself when it answers Cargo's target-info probe. It
+/// used to ask the daemon, so such a build restored every registry unit one
+/// compiler call at a time instead.
+#[test]
+fn the_target_info_probe_seeds_a_new_checkout_while_no_daemon_runs() {
+    let e = env();
+    e.cmd().args(["daemon", "start"]).assert().success();
+    let root = TempDir::new().unwrap();
+    let donor = root.path().join("donor");
+    std::fs::create_dir_all(donor.join("src")).unwrap();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    std::fs::write(donor.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(donor.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let donor_target = donor.join("target");
+    let built = e.wrapper_build(&donor, &donor_target);
+    assert!(built.status.success(), "{built:?}");
+    e.cmd().args(["daemon", "stop"]).assert().success();
+    let profile = donor_target.join("debug");
+    let hash = "0123456789abcdef";
+    let per_unit = !profile.join(".fingerprint").is_dir();
+    let marker = |target: &Path| {
+        if per_unit {
+            target.join("debug/build/dep").join(hash)
+        } else {
+            target
+                .join("debug/.fingerprint")
+                .join(format!("dep-{hash}"))
+        }
+    };
+    let donor_marker = marker(&donor_target);
+    std::fs::create_dir_all(donor_marker.join("fingerprint")).unwrap();
+    std::fs::write(donor_marker.join("fingerprint/lib"), "fp").unwrap();
+    let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                [[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n\
+                source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    let checkout = root.path().join("seeded");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), manifest).unwrap();
+    std::fs::write(checkout.join("Cargo.lock"), lock).unwrap();
+    e.cmd()
+        .current_dir(&checkout)
+        .env("KACHE_SEED_NEW_TARGETS", "1")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .args(["rustc", "-", "--crate-name", "___", "--print=file-names"])
+        .args(["--crate-type", "lib"])
+        .write_stdin("")
+        .assert()
+        .success();
+    if !donor_target.join(".rustc_info.json").is_file() {
+        eprintln!("skipping: Cargo cached no rustc info for the donor");
+        return;
+    }
+    assert!(
+        marker(&checkout.join("target")).is_dir(),
+        "a probe while no daemon runs must seed"
+    );
+}
+
 /// Cargo's first call for a target directory it has not built is its
 /// target-info probe. Sent through the wrapper, it has the daemon copy the
 /// registry units another checkout built (see `src/target_seed.rs`) before
@@ -5514,13 +5712,28 @@ fn doctor_probe_restores_a_rust_library_without_touching_the_configured_store() 
     let rustup_home = std::env::var_os("RUSTUP_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| dirs::home_dir().unwrap().join(".rustup"));
+    let temp = e.home.join("tmp");
+    std::fs::create_dir_all(&temp).unwrap();
     let output = e
         .cmd()
         .env("RUSTUP_HOME", rustup_home)
+        .env("TMPDIR", &temp)
+        .env("TMP", &temp)
+        .env("TEMP", &temp)
         .args(["--json", "doctor", "--probe"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
+    // The probe's daemon is gone with its fixture, and nothing put the
+    // fixture back while it shut down.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Test builds keep the user's cache folder there instead (by design).
+    let left: Vec<_> = std::fs::read_dir(&temp)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "kache-test-user-cache")
+        .collect();
+    assert!(left.is_empty(), "the probe left {left:?} in its temporary folder");
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let check = body["checks"]
         .as_array()

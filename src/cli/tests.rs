@@ -721,39 +721,66 @@ fn the_volume_row_says_what_is_free_and_whether_recovery_is_on() {
 }
 
 #[test]
-fn cloned_targets_summary_only_appears_for_retained_blocks() {
+fn storage_splits_exclusive_and_shared_bytes_only_when_blocks_are_shared() {
     let dir = tempfile::tempdir().unwrap();
     let mut disk = crate::machine::disk_view(dir.path(), 0, 1024);
-    assert!(cloned_targets_row(&disk).map(row_text).is_none());
+    let text = |disk: &crate::machine::DiskView| {
+        cloned_targets_rows(disk)
+            .into_iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+    };
+    assert!(text(&disk).is_empty());
 
     disk.disk_private_bytes = 3;
     disk.cloned_into_targets_bytes = 7;
-    let line = cloned_targets_row(&disk)
-        .map(row_text)
-        .expect("cloned blocks need a summary");
-    assert!(line.contains("3 B"), "{line}");
-    assert!(
-        line.contains("7 B cloned into target/, which the limit leaves out"),
-        "{line}"
+    let rows = text(&disk);
+    assert_eq!(
+        rows,
+        [
+            "Exclusive | 3 B | the store's own blocks, which eviction frees",
+            "Shared | 7 B | hardlinked or cloned into target/, which the limit leaves out",
+        ]
     );
-    assert!(!line.contains("snapshots"), "{line}");
+
+    // A store over its cap says how much of the excess targets hold.
+    disk.store_bytes = 100;
+    disk.store_limit_bytes = 95;
+    let shared = text(&disk).pop().unwrap();
+    assert!(
+        shared.contains(": it is why Cache reads 5 B over Limit, and only cleaning those targets"),
+        "{shared}"
+    );
+    disk.store_limit_bytes = 90;
+    let shared = text(&disk).pop().unwrap();
+    assert!(
+        shared.contains("; Cache reads 10 B over Limit, 7 B of it held there"),
+        "{shared}"
+    );
+    // Past what targets hold, the store's own excess is due for a sweep.
+    disk.store_limit_bytes = 1000;
+    disk.cloned_into_targets_bytes = 70;
+    disk.store_bytes = 1200;
+    let shared = text(&disk).pop().unwrap();
+    assert!(
+        shared.contains("the other 130 B past the sweep's start"),
+        "{shared}"
+    );
+    disk.cloned_into_targets_bytes = 7;
+    disk.store_bytes = 0;
 
     disk.snapshot_retained_bytes = 5;
-    let line = cloned_targets_row(&disk)
-        .map(row_text)
-        .expect("both retainers are named");
-    assert!(line.contains("7 B cloned"), "{line}");
+    let rows = text(&disk);
     assert!(
-        line.contains("5 B held only by filesystem snapshots"),
-        "{line}"
+        rows[0].ends_with("and 5 B held only by filesystem snapshots"),
+        "{rows:?}"
     );
+    assert!(rows[1].starts_with("Shared | 7 B"), "{rows:?}");
 
     disk.cloned_into_targets_bytes = 0;
-    let line = cloned_targets_row(&disk)
-        .map(row_text)
-        .expect("snapshot blocks need a summary");
-    assert!(!line.contains("cloned"), "{line}");
-    assert!(line.contains("5 B held only"), "{line}");
+    let rows = text(&disk);
+    assert_eq!(rows.len(), 1, "snapshot blocks alone: no Shared row");
+    assert!(rows[0].contains("5 B held only"), "{rows:?}");
 }
 
 #[test]
@@ -847,6 +874,7 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
         entries_import_pinned: 12,
         evict_write_ms: 11,
         bytes_held: 13,
+        cut_short: false,
         // Set once by the driver, never summed over policies.
         housekeeping: None,
     };
@@ -866,6 +894,7 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
         entries_import_pinned: 120,
         evict_write_ms: 110,
         bytes_held: 7,
+        cut_short: true,
         // Set once by the driver, never summed over policies.
         housekeeping: None,
     };
@@ -883,6 +912,7 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
     assert_eq!(accumulated.evict_write_ms, 121);
     assert_eq!(accumulated.entries_import_pinned, 132);
     assert!(accumulated.skipped);
+    assert!(accumulated.cut_short);
 }
 
 /// The auto-GC worker used to throw its outcome away, so a machine where
@@ -993,6 +1023,7 @@ fn local_gc_runs_store_housekeeping_and_records_it() {
             key_locks_remaining: 1,
             predictions_pruned: 0,
             file_hashes_pruned: 0,
+            ..Default::default()
         })
     );
     assert!(!lock_path(1).exists());
@@ -1010,7 +1041,7 @@ fn stale_schema_gc_records_its_run() {
     let dir = tempfile::tempdir().unwrap();
     let config = save_manifest_config(dir.path().to_path_buf(), None);
 
-    gc(&config, None, true, true).unwrap();
+    gc(&config, None, true, None, true).unwrap();
 
     let stats = crate::report::read_gc_stats(&config.cache_dir).expect("stale-schema run recorded");
     assert_eq!(stats.source, "manual");
@@ -3836,6 +3867,7 @@ fn save_manifest_config(
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         trust_daemon_execution: false,
         native_runtime_warmup: true,
         daemon_execution_concurrency: None,
@@ -3851,6 +3883,7 @@ fn save_manifest_config(
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
@@ -3890,6 +3923,7 @@ fn save_manifest_config(
         prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -4412,6 +4446,23 @@ fn explain_crate_cascade_notes_uncached_compiles_and_unresolved_endpoints() {
             "  unresolved: leaf, nothing earlier to compare it against",
             "  note: no endpoint could be resolved; the recorded history does not explain this \
              miss",
+        ]
+    );
+    let unreproducible = MissDiagnosis::new(
+        &miss,
+        false,
+        0,
+        false,
+        Some(chain(RootKind::Unreproducible, Vec::new())),
+        true,
+    );
+    assert_eq!(
+        extern_chain_lines(&unreproducible),
+        [
+            "  this miss is downstream of a dependency that changed (leaf)",
+            "  root: leaf, same cache key as before but its artifact differs: its compile is \
+             not reproducible (e.g. rustc's -Zthreads above 1), so the crates above it miss \
+             whenever it is compiled again",
         ]
     );
 }
@@ -5586,20 +5637,20 @@ fn render_stats_offline_and_not_configured() {
 fn cache_limit_note_names_the_disk_share_budget() {
     const GIB: u64 = 1 << 30;
     let share = format!(
-        " (5% of {}, floor 5.0 GiB, cap 100.0 GiB)",
+        " (20% of {}, floor 10.0 GiB, cap 100.0 GiB)",
         ByteSize(200 * GIB)
     );
-    // 5% of 200 GiB is 10 GiB, inside the floor and the cap.
-    assert_eq!(cache_limit_note(0, 10 * GIB, Some(200 * GIB)), share);
-    assert_eq!(cache_limit_note(1, 10 * GIB, Some(200 * GIB)), share);
-    assert_eq!(cache_limit_note(2, 10 * GIB, Some(200 * GIB)), "");
+    // 20% of 200 GiB is 40 GiB, inside the floor and the cap.
+    assert_eq!(cache_limit_note(0, 40 * GIB, Some(200 * GIB)), share);
+    assert_eq!(cache_limit_note(1, 40 * GIB, Some(200 * GIB)), share);
+    assert_eq!(cache_limit_note(2, 40 * GIB, Some(200 * GIB)), "");
     assert_eq!(cache_limit_note(0, 7 * GIB, Some(200 * GIB)), "");
-    // 5% of 1 GiB rounds to 0, then the floor raises the budget to 5 GiB.
-    let floor = cache_limit_note(0, 5 * GIB, Some(GIB));
+    // 20% of 1 GiB rounds to 0, then the floor raises the budget to 10 GiB.
+    let floor = cache_limit_note(0, 10 * GIB, Some(GIB));
     assert!(floor.contains("floor"), "{floor}");
-    assert!(floor.contains("floor 5.0 GiB"), "{floor}");
+    assert!(floor.contains("floor 10.0 GiB"), "{floor}");
     assert!(floor.contains(&ByteSize(GIB).to_string()), "{floor}");
-    // 5% of 4000 GiB is 200 GiB, then the cap lowers the budget to 100 GiB.
+    // 20% of 4000 GiB is 800 GiB, then the cap lowers the budget to 100 GiB.
     let cap = cache_limit_note(0, 100 * GIB, Some(4000 * GIB));
     assert!(cap.contains("cap"), "{cap}");
     assert!(cap.contains("cap 100.0 GiB"), "{cap}");
@@ -6172,6 +6223,7 @@ fn build_event(
         dep_info_ms: 0,
         dep_info_runs: 0,
         prediction_mismatches: 0,
+        prediction: String::new(),
         flight_wait_ms: 0,
         permit_wait_ms: 0,
         store_output_blobs: 0,
@@ -6200,6 +6252,7 @@ fn build_event(
         store_error: String::new(),
         store_handed_off: false,
         daemon_store_ms: 0,
+        daemon_store_batch: 0,
         lookup_rejection: String::new(),
         verify_compare: String::new(),
         fallback: false,
@@ -9119,7 +9172,33 @@ fn test_cache_line() -> CacheLine {
         bytes: 3 << 20,
         limit: 5 << 30,
         entries: 1_234,
+        held: 0,
     }
+}
+
+#[test]
+fn a_cache_over_its_limit_by_bytes_targets_hold_says_so() {
+    let under = test_cache_line();
+    assert_eq!(
+        under.text(),
+        "Cache    3.0 MiB of 5.0 GiB · 1,234 entries · kept under its limit automatically; `kache clean --cache` empties it"
+    );
+    let over = CacheLine {
+        bytes: 588 << 30,
+        limit: 450 << 30,
+        entries: 1_234,
+        held: 145 << 30,
+    };
+    assert_eq!(
+        over.text(),
+        "Cache    588.0 GiB of 450.0 GiB · 1,234 entries · 145.0 GiB of it still linked from target/, which the limit leaves out (cleaning those targets frees it); the rest is kept under its limit automatically; `kache clean --cache` empties it"
+    );
+    let held_under = CacheLine {
+        bytes: 400 << 30,
+        ..over
+    };
+    assert!(held_under.text().contains("kept under its limit automatically;"));
+    assert!(!held_under.text().contains("still linked"));
 }
 
 #[test]

@@ -11,6 +11,23 @@
 
 static FRONTEND_IMAGE: std::sync::OnceLock<kache_shims::FrontendImage> = std::sync::OnceLock::new();
 
+/// Whether this account owns `path`, so that maintenance leaves another
+/// account's files alone on a store they share. Always on a platform without
+/// such owners; a path that cannot be read is not ours.
+pub(crate) fn owned_by_us(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let us = unsafe { libc::geteuid() };
+        std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.uid() == us)
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
+}
+
 pub(crate) fn process_context() -> kache_protocol::ProcessContext {
     kache_protocol::ProcessContext {
         pid: std::process::id(),
@@ -285,6 +302,93 @@ pub fn raise_open_file_limit() -> std::io::Result<Option<(libc::rlim_t, libc::rl
     Ok(Some((before, target)))
 }
 
+/// How many malloc arenas the daemon lets glibc keep.
+///
+/// glibc gives each thread an arena of its own on its first allocation, up
+/// to eight per core (1,536 on a 192-thread machine), and keeps what a
+/// thread frees for that arena. The daemon runs hundreds of threads, and a
+/// sweep's ranking or a housekeeping pass leaves its peak in whichever
+/// arena its thread had: the build machine's service grew from 5.3 to
+/// 10.9 GB (RSS and swap) in 2.5 hours, in about 1,100 arena heaps. A
+/// private daemon serving 30 rounds of builds grew to 3.2 GB holding 43 MB,
+/// still growing; with eight arenas it stayed at 0.63 GB from round 20 on.
+/// Each thread keeps a cache in front of the arenas (tcache), so a few
+/// arenas cost little contention.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub const DAEMON_MALLOC_ARENAS: libc::c_int = 8;
+
+/// Cap glibc's malloc arenas at [`DAEMON_MALLOC_ARENAS`], unless the
+/// environment sets `MALLOC_ARENA_MAX` (glibc then applies that itself).
+/// Returns the cap set. Arenas already made stay.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn limit_malloc_arenas() -> Option<libc::c_int> {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return None;
+    }
+    cap_malloc_arenas(DAEMON_MALLOC_ARENAS).then_some(DAEMON_MALLOC_ARENAS)
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cap_malloc_arenas(arenas: libc::c_int) -> bool {
+    // SAFETY: mallopt only changes glibc's allocator tuning.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, arenas) == 1 }
+}
+
+/// Give the heap's free pages back to the system. glibc returns only the
+/// top of each arena on its own; after a sweep freed hundreds of megabytes
+/// in the middle of one, those pages stayed resident until reused.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn release_free_heap() {
+    // SAFETY: malloc_trim takes the arenas' own locks; 0 keeps no padding.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn release_free_heap() {}
+
+/// This process's resident memory in bytes, from `/proc/self/statm`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf only reads a system constant.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page).ok().map(|page| pages * page)
+}
+
+/// When the daemon gives its free heap back between sweeps: once its
+/// resident memory has grown [`HeapTrimGate::GROWTH`] past the lowest it
+/// has been since the last trim. Builds' requests leave freed memory in
+/// glibc's arenas, which only a trim returns, and sweeps (which trim) can be
+/// hours apart: the build machine's daemon went from 0.5 to 1.4 GB in the
+/// 15 minutes after one, and a trim took it from 2.2 GB to 0.5 GB. Memory
+/// that is in use stays, and the next trim waits for as much growth again,
+/// so a daemon that really holds more trims no more often.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Debug, Default)]
+pub struct HeapTrimGate {
+    floor: Option<u64>,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl HeapTrimGate {
+    pub const GROWTH: u64 = 256 << 20;
+
+    /// Whether to trim at `resident` bytes.
+    pub fn due(&mut self, resident: u64) -> bool {
+        let floor = self.floor.map_or(resident, |floor| floor.min(resident));
+        self.floor = Some(floor);
+        resident >= floor.saturating_add(Self::GROWTH)
+    }
+
+    /// A trim left `resident` bytes.
+    pub fn trimmed(&mut self, resident: u64) {
+        self.floor = Some(resident);
+    }
+}
+
 /// The soft limit to ask for: the hard limit, capped by what the kernel lets
 /// one process open. `None` when that is no higher than `soft`.
 #[cfg(unix)]
@@ -317,6 +421,254 @@ fn macos_max_files_per_proc() -> libc::rlim_t {
         value as libc::rlim_t
     } else {
         10_240
+    }
+}
+
+/// Windows: the daemon's priorities. It runs at normal priority, its
+/// background work below normal ([`run_below_normal`]), and its part of each
+/// compile at the priority of the build it compiles for
+/// ([`run_at_client_priority`]).
+///
+/// tasty.42 ran the whole daemon below normal. The frontends hand each
+/// compile to the daemon with a few seconds' deadline before they give up
+/// and run a kache-engine of their own, and when rustc filled every core at
+/// normal priority the below-normal daemon lost that race: its threads,
+/// the accept loop's among them, ran only when Windows' starvation boost
+/// picked them, every few seconds. Every compile of the build then ran its
+/// own engine, the very load the low priority was meant to spare the
+/// person at the computer.
+///
+/// A daemon `kache` starts itself inherits a normal-priority build's class.
+/// One started below normal (`kache daemon install`'s scheduled task, or a
+/// build started below normal) is raised to normal; a process at idle
+/// priority, or above normal, is left alone. Returns whether the class
+/// changed.
+#[cfg(windows)]
+pub fn set_daemon_priority() -> std::io::Result<bool> {
+    use windows_sys::Win32::System::Threading::{
+        BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass, NORMAL_PRIORITY_CLASS,
+        SetPriorityClass,
+    };
+    // SAFETY: the pseudo-handle of this process needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    let class = unsafe { GetPriorityClass(process) };
+    if class == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if class != BELOW_NORMAL_PRIORITY_CLASS {
+        return Ok(false);
+    }
+    if unsafe { SetPriorityClass(process, NORMAL_PRIORITY_CLASS) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+/// Windows: the base priority of a process priority class, the level its
+/// threads run at before any thread-relative adjustment or boost.
+#[cfg(windows)]
+fn class_base_priority(class: u32) -> i32 {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+        IDLE_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+    };
+    match class {
+        IDLE_PRIORITY_CLASS => 4,
+        BELOW_NORMAL_PRIORITY_CLASS => 6,
+        ABOVE_NORMAL_PRIORITY_CLASS => 10,
+        HIGH_PRIORITY_CLASS => 13,
+        REALTIME_PRIORITY_CLASS => 24,
+        _ => 8,
+    }
+}
+
+/// Windows: the thread-relative priority (-2..=2) that brings a thread of a
+/// process in `own` class as close as it can get to `level`.
+#[cfg(windows)]
+fn relative_priority(own: u32, level: i32) -> i32 {
+    (level - class_base_priority(own)).clamp(-2, 2)
+}
+
+/// Windows: the daemon's own class, read once the daemon set it
+/// ([`set_daemon_priority`] runs before any thread asks).
+#[cfg(windows)]
+fn own_priority_class() -> u32 {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetPriorityClass, NORMAL_PRIORITY_CLASS,
+    };
+    static CLASS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: the pseudo-handle of this process needs no closing.
+    *CLASS.get_or_init(|| match unsafe { GetPriorityClass(GetCurrentProcess()) } {
+        0 => NORMAL_PRIORITY_CLASS,
+        class => class,
+    })
+}
+
+/// Windows: put the calling thread at `relative`, logging a refusal.
+#[cfg(windows)]
+fn set_thread_priority(relative: i32) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    // SAFETY: the pseudo-handle of this thread needs no closing.
+    if unsafe { SetThreadPriority(GetCurrentThread(), relative) } == 0 {
+        tracing::debug!(
+            "could not set a daemon thread's priority: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Windows: a daemon thread back at the priority it had when the guard drops
+/// ([`run_at_client_priority`], [`run_below_normal`]).
+#[cfg(windows)]
+#[must_use]
+pub struct ThreadPriority {
+    restore: Option<i32>,
+}
+
+#[cfg(windows)]
+impl Drop for ThreadPriority {
+    fn drop(&mut self) {
+        if let Some(previous) = self.restore {
+            set_thread_priority(previous);
+        }
+    }
+}
+
+/// Windows: run the calling thread as close to `level` as the daemon's class
+/// allows until the guard drops.
+#[cfg(windows)]
+fn run_at_level(level: i32) -> ThreadPriority {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+    // MAXLONG: GetThreadPriority's failure value (not in windows-sys).
+    const THREAD_PRIORITY_ERROR_RETURN: i32 = i32::MAX;
+    let wanted = relative_priority(own_priority_class(), level);
+    // SAFETY: the pseudo-handle of this thread needs no closing.
+    let previous = unsafe { GetThreadPriority(GetCurrentThread()) };
+    if previous == THREAD_PRIORITY_ERROR_RETURN || previous == wanted {
+        return ThreadPriority { restore: None };
+    }
+    set_thread_priority(wanted);
+    ThreadPriority {
+        restore: Some(previous),
+    }
+}
+
+/// Windows: run the calling daemon thread below normal until the guard drops:
+/// for its background work (GC sweeps, store walks), which no compile waits
+/// for and which yields to what the person at the computer is doing.
+#[cfg(windows)]
+pub fn run_below_normal() -> ThreadPriority {
+    use windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS;
+    run_at_level(class_base_priority(BELOW_NORMAL_PRIORITY_CLASS))
+}
+
+/// Windows: run the calling daemon thread at the priority of the frontend
+/// whose compile it runs (`client_class`, that process's priority class),
+/// until the guard drops.
+///
+/// The frontend starts rustc at its own priority, the build's. The daemon's
+/// part of the same compile (keys, lookup, store) runs in the daemon, and
+/// below the build's priority it waits behind every other unit's rustc while
+/// cargo waits for it. At the build's priority it competes as the compile
+/// itself does, and a build started below normal keeps its pipeline below
+/// normal too. Never above normal.
+#[cfg(windows)]
+pub fn run_at_client_priority(client_class: u32) -> ThreadPriority {
+    use windows_sys::Win32::System::Threading::NORMAL_PRIORITY_CLASS;
+    run_at_level(
+        class_base_priority(client_class).min(class_base_priority(NORMAL_PRIORITY_CLASS)),
+    )
+}
+
+/// Linux: the nice value the daemon's background work runs at, at least:
+/// the build machine's service and `cargo xtask`'s builds already run at
+/// 10, so there it changes nothing; on a PC whose build started the daemon
+/// at 0 it puts sweeps and maintenance behind the builds and the desktop.
+#[cfg(target_os = "linux")]
+pub(crate) const BACKGROUND_NICE: i32 = 10;
+
+/// The daemon's background work (GC sweeps, disk recovery, store walks,
+/// maintenance), which no compile waits for: run `job` below normal
+/// priority and return what it returns.
+///
+/// Windows runs it on this thread below normal ([`run_below_normal`]).
+/// Linux runs it on a thread of its own at [`BACKGROUND_NICE`] or the
+/// daemon's own nice when that is lower already, because an unprivileged
+/// thread cannot raise its priority back, and the blocking pool reuses
+/// threads for compiles. Elsewhere it runs as it is.
+pub fn below_normal<R: Send>(job: impl FnOnce() -> R + Send) -> R {
+    #[cfg(windows)]
+    {
+        let _low = run_below_normal();
+        job()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        at_nice_at_least(BACKGROUND_NICE, job)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        job()
+    }
+}
+
+/// Linux: run `job` on a scoped thread whose nice is at least `floor`,
+/// inside this thread's tokio runtime when it has one. A refused nice
+/// leaves the job at the inherited one; a refused thread runs it here.
+#[cfg(target_os = "linux")]
+fn at_nice_at_least<R: Send>(floor: i32, job: impl FnOnce() -> R + Send) -> R {
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    let job = std::sync::Mutex::new(Some(job));
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("kache-background".into())
+            .spawn_scoped(scope, || {
+                let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
+                let nice = thread_nice();
+                if nice < floor {
+                    // SAFETY: plain syscalls on this thread's own id.
+                    let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
+                    if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, floor) } != 0 {
+                        tracing::debug!(
+                            "could not lower a background thread's priority: {}",
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                }
+                let job = job.lock().ok().and_then(|mut job| job.take());
+                job.map(|job| job())
+            });
+        match spawned.map(std::thread::ScopedJoinHandle::join) {
+            Ok(Ok(Some(result))) => result,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            // The thread was refused (or never took the job): run it here.
+            Ok(Ok(None)) | Err(_) => {
+                let job = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("a background job that did not run is still here");
+                job()
+            }
+        }
+    })
+}
+
+/// Linux: the calling thread's nice value.
+#[cfg(target_os = "linux")]
+fn thread_nice() -> i32 {
+    // SAFETY: plain syscalls on this thread's own id. getpriority's -1 is
+    // a valid answer too; errno tells a failure apart, and a failure reads
+    // as 0, the default.
+    unsafe {
+        let tid = libc::syscall(libc::SYS_gettid) as libc::id_t;
+        *libc::__errno_location() = 0;
+        let nice = libc::getpriority(libc::PRIO_PROCESS, tid);
+        if nice == -1 && *libc::__errno_location() != 0 {
+            0
+        } else {
+            nice
+        }
     }
 }
 
@@ -416,6 +768,137 @@ pub fn is_self_spawn(argv: &[String], self_spawn: Option<&std::ffi::OsStr>) -> b
 
 #[cfg(test)]
 mod tests {
+    /// The arenas glibc has, read from malloc_info's XML.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn malloc_arena_count() -> usize {
+        let mut buffer: *mut libc::c_char = std::ptr::null_mut();
+        let mut size: libc::size_t = 0;
+        // SAFETY: open_memstream owns `buffer` until fclose, which leaves it
+        // NUL-terminated for us to read and free.
+        let xml = unsafe {
+            let stream = libc::open_memstream(&mut buffer, &mut size);
+            assert!(!stream.is_null());
+            assert_eq!(libc::malloc_info(0, stream), 0);
+            libc::fclose(stream);
+            let xml = std::ffi::CStr::from_ptr(buffer)
+                .to_string_lossy()
+                .into_owned();
+            libc::free(buffer.cast());
+            xml
+        };
+        xml.matches("<heap nr=").count()
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn the_heap_is_trimmed_after_growth_past_its_lowest_point() {
+        const MIB: u64 = 1 << 20;
+        let mut gate = super::HeapTrimGate::default();
+        assert!(
+            !gate.due(500 * MIB),
+            "the first reading only sets the floor"
+        );
+        assert!(!gate.due(700 * MIB));
+        // A sweep's own trim lowered it: growth counts from there.
+        assert!(!gate.due(300 * MIB));
+        assert!(!gate.due(555 * MIB));
+        assert!(gate.due(556 * MIB));
+        // Memory in use stays: the next trim waits for as much growth again.
+        gate.trimmed(550 * MIB);
+        assert!(!gate.due(805 * MIB));
+        assert!(gate.due(806 * MIB));
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn resident_bytes_reads_this_process() {
+        let resident = super::resident_bytes().unwrap();
+        assert!(resident > 1 << 20, "{resident}");
+    }
+
+    /// glibc fixes its arena limit the first time a thread finds more than
+    /// eight arenas, and ignores `M_ARENA_MAX` after that: in a test process
+    /// whose other tests' threads got there first, the cap cannot work, as it
+    /// cannot in a daemon that sets it late. So the check runs in a process
+    /// of its own, as the daemon sets the cap, before its threads start.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn capped_malloc_arenas_stop_many_threads_making_one_each() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::tests::capped_malloc_arenas_fixture",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "run in a process of its own by capped_malloc_arenas_stop_many_threads_making_one_each"]
+    fn capped_malloc_arenas_fixture() {
+        use std::sync::{Arc, Barrier};
+        assert!(super::cap_malloc_arenas(super::DAEMON_MALLOC_ARENAS));
+        let before = malloc_arena_count();
+        // A thread takes an arena of its own on its first allocation while
+        // the count is under the cap: 32 threads alive at once would make 32.
+        let barrier = Arc::new(Barrier::new(33));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let block = std::hint::black_box(vec![1u8; 4096]);
+                    barrier.wait();
+                    barrier.wait();
+                    drop(block);
+                })
+            })
+            .collect();
+        barrier.wait();
+        let during = malloc_arena_count();
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let cap = super::DAEMON_MALLOC_ARENAS as usize;
+        assert!(
+            during <= before.max(cap),
+            "{before} arenas became {during} with the cap at {cap}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_work_runs_at_the_floor_and_leaves_the_caller_alone() {
+        let before = super::thread_nice();
+        // 19, the lowest priority, is above whatever nice the suite runs at.
+        let (inside, value) = super::at_nice_at_least(19, || (super::thread_nice(), 7));
+        assert_eq!((inside, value), (19, 7));
+        assert_eq!(super::thread_nice(), before, "the caller's thread keeps its nice");
+        // A floor under the thread's nice changes nothing.
+        let inside = super::at_nice_at_least(-20, super::thread_nice);
+        assert_eq!(inside, before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn background_work_keeps_the_runtime_and_its_panics() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let _entered = runtime.enter();
+        assert!(super::below_normal(|| tokio::runtime::Handle::try_current().is_ok()));
+        let panic = std::panic::catch_unwind(|| super::below_normal(|| panic!("swept")));
+        assert!(panic.is_err(), "a panic in the job reaches the caller");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn host_utilities_capture_bytes_without_request_cancellation() {
@@ -483,6 +966,27 @@ mod tests {
     fn ps_available() -> bool {
         std::env::var_os("PATH")
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("ps").is_file()))
+    }
+
+    /// The daemon raises a below-normal process to normal and leaves every
+    /// other class alone. Each nextest test is a process of its own, so this
+    /// changes no other test's priority.
+    #[cfg(windows)]
+    #[test]
+    fn daemon_priority_rises_from_below_normal_only() {
+        use windows_sys::Win32::System::Threading::{
+            BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess, GetPriorityClass,
+            IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, SetPriorityClass,
+        };
+        let process = unsafe { GetCurrentProcess() };
+        let class = || unsafe { GetPriorityClass(process) };
+        assert_ne!(unsafe { SetPriorityClass(process, IDLE_PRIORITY_CLASS) }, 0);
+        assert!(!super::set_daemon_priority().unwrap());
+        assert_eq!(class(), IDLE_PRIORITY_CLASS);
+        assert_ne!(unsafe { SetPriorityClass(process, BELOW_NORMAL_PRIORITY_CLASS) }, 0);
+        assert!(super::set_daemon_priority().unwrap());
+        assert_eq!(class(), NORMAL_PRIORITY_CLASS);
+        assert!(!super::set_daemon_priority().unwrap());
     }
 
     #[cfg(unix)]

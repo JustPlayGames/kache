@@ -190,6 +190,7 @@ impl Compiler for RustdocCompiler {
         Ok(super::CompileResult {
             exit_code: exit_code(&output.status),
             signaled: output.status.code().is_none(),
+            stopped: false,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             pending_stderr: None,
@@ -3562,12 +3563,9 @@ mod tests {
 
     #[test]
     fn archive_round_trip_restores_into_the_current_directories() {
-        let stored_source = std::env::temp_dir()
-            .join("kache-rustdoc-old")
-            .join("lib.rs");
-        let current_source = std::env::temp_dir()
-            .join("kache-rustdoc-new")
-            .join("lib.rs");
+        let sources = tempfile::tempdir().unwrap();
+        let stored_source = sources.path().join("kache-rustdoc-old").join("lib.rs");
+        let current_source = sources.path().join("kache-rustdoc-new").join("lib.rs");
         std::fs::create_dir_all(current_source.parent().unwrap()).unwrap();
         std::fs::write(&current_source, b"pub fn demo() {}\n").unwrap();
         let bundle = Bundle {

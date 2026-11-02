@@ -3,6 +3,13 @@ use super::*;
 use std::fs;
 use std::sync::mpsc;
 
+use crate::test_support::{Flavor, on_a_runtime_of_its_own};
+
+/// How long a wait the tests below end themselves may last before it fails
+/// the test: it only turns a hang into a failure, never decides a result. A
+/// loaded machine (the suite beside other builds) stretches a step that takes
+/// milliseconds alone past several seconds.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 #[cfg(any(unix, windows))]
 #[test]
 fn compiler_request_capacity_handles_bursts_and_recovers_after_drop() {
@@ -89,6 +96,28 @@ fn automatic_identity_publish_reports_when_work_was_attempted() {
 
     assert!(!daemon.maybe_publish_identity_manifest(None, "session"));
     assert!(daemon.maybe_publish_identity_manifest(Some("id/test"), "session"));
+}
+
+/// A daemon a build started stops after an hour without work unless an idle
+/// timeout is configured (0 included); a service's or a person's
+/// `kache daemon run` keeps the configured one, 0 by default.
+#[test]
+fn only_an_unconfigured_auto_started_daemon_stops_after_an_idle_hour() {
+    // (configured value, explicitly configured, auto-started) -> seconds
+    for (configured, explicit, auto, expected) in [
+        (0, false, true, AUTO_STARTED_IDLE_TIMEOUT_SECS),
+        (0, true, true, 0),
+        (600, true, true, 600),
+        (0, false, false, 0),
+        (600, true, false, 600),
+    ] {
+        assert_eq!(
+            effective_idle_timeout_secs(configured, explicit, auto),
+            expected,
+            "configured {configured}, explicit {explicit}, auto-started {auto}"
+        );
+    }
+    assert_eq!(AUTO_STARTED_IDLE_TIMEOUT_SECS, 3600);
 }
 
 /// kunobi-ninja/kache#706: an auto-spawned daemon must not inherit the
@@ -205,7 +234,8 @@ fn detached_daemon_survives_sigint_to_the_callers_group() {
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut caller = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut caller = std::process::Command::new(std::env::current_exe().unwrap());
+    caller
         .args([
             "--exact",
             "daemon::tests::detached_daemon_caller_fixture",
@@ -213,9 +243,20 @@ fn detached_daemon_survives_sigint_to_the_callers_group() {
             "--nocapture",
         ])
         .env(DETACH_FIXTURE_DIR, root)
-        .process_group(0)
-        .spawn()
-        .unwrap();
+        .process_group(0);
+    // A shell that runs the tests in the background (`cargo test &`, nohup)
+    // leaves SIGINT ignored, and the caller and its daemon would inherit
+    // that: the caller would never stop, and a daemon in the caller's group
+    // would survive for the wrong reason. A terminal's foreground group has
+    // the default action.
+    // SAFETY: signal() is async-signal-safe and the closure allocates nothing.
+    unsafe {
+        caller.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let mut caller = caller.spawn().unwrap();
     // The caller is a second copy of this debug test binary; on a loaded
     // machine its start alone can take seconds.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -263,6 +304,11 @@ fn detached_daemon_survives_sigint_to_the_callers_group() {
             "{name} leaked into the daemon's environment"
         );
     }
+    let auto_started = format!("{AUTO_STARTED_ENV}=1");
+    assert!(
+        env.lines().any(|line| line == auto_started),
+        "the daemon must know a build started it, for its idle timeout: {env}"
+    );
     let log = std::fs::read_to_string(root.join("daemon.log")).unwrap();
     assert_eq!(log, "daemon-stderr\n", "stderr must go to the daemon log");
 }
@@ -1077,6 +1123,7 @@ fn compile_started_wire_tags_and_stats_default() {
             restore_max_size: None,
             auto_recover_targets: None,
         }),
+        publishes_pending: 0,
     })
     .unwrap();
     {
@@ -1458,6 +1505,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         out_dir_alias_root: None,
         deferred_durability: false,
         daemon_publish: false,
+        daemon_publish_rustc: false,
         trust_daemon_execution: false,
         daemon_execution_concurrency: None,
         project_rules: crate::config::ProjectRules::default(),
@@ -1472,6 +1520,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         gc_evict_shared: false,
@@ -1514,6 +1563,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
@@ -1735,6 +1785,7 @@ fn requests_accept_legacy_epochs_and_report_optional_release_versions() {
         publishes_to_remote: false,
         event: crate::events::BuildEvent::new_for_test("a.c", crate::events::EventResult::Miss),
         memo: None,
+        rustc: None,
     }));
     assert_eq!(publish.client_version(), None);
     assert_eq!(Request::Health.client_version(), None);
@@ -1912,96 +1963,198 @@ fn foreground_startup_rejects_a_file_in_place_of_the_runtime_directory() {
     assert!(run_server(&config, &provenance, None).is_err());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn server_main_binds_socket_and_handles_shutdown() {
+#[test]
+fn server_main_binds_socket_and_handles_shutdown() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.daemon_idle_timeout_secs = 0;
-    config.prefetch_enabled = false;
-    config.remote = Some(crate::config::RemoteConfig {
-        restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
-        prefix: "artifacts".into(),
-        backend: crate::config::RemoteBackendConfig::Filesystem(
-            crate::config::FilesystemRemoteConfig {
-                root: dir.path().join("remote"),
-                atomic_write_dir: dir.path().join("remote-staging"),
-            },
-        ),
-    });
-    let socket_path = config.socket_path();
-    let coord = DaemonCoordFile::for_socket(&socket_path);
-    let server_config = config.clone();
-    let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
-    let server = tokio::spawn(async move {
-        server_main(
-            &server_config,
-            &provenance,
-            coord,
-            None,
-            PathBuf::from("Cargo.lock"),
-            DaemonCapacity::discover(server_config.daemon_execution_concurrency),
-        )
-        .await
-    });
+    on_a_runtime_of_its_own(Flavor::MultiThread(2), async {
+        let mut config = test_config(dir.path());
+        config.daemon_idle_timeout_secs = 0;
+        config.prefetch_enabled = false;
+        config.remote = Some(crate::config::RemoteConfig {
+            restore_max_size: kache_config::config::DEFAULT_RESTORE_MAX_SIZE,
+            prefix: "artifacts".into(),
+            backend: crate::config::RemoteBackendConfig::Filesystem(
+                crate::config::FilesystemRemoteConfig {
+                    root: dir.path().join("remote"),
+                    atomic_write_dir: dir.path().join("remote-staging"),
+                },
+            ),
+        });
+        let socket_path = config.socket_path();
+        let coord = DaemonCoordFile::for_socket(&socket_path);
+        let server_config = config.clone();
+        let provenance = crate::config::config_file_provenance_at(dir.path().join("config.toml"));
+        let server = tokio::spawn(async move {
+            server_main(
+                &server_config,
+                &provenance,
+                coord,
+                None,
+                PathBuf::from("Cargo.lock"),
+                DaemonCapacity::discover(server_config.daemon_execution_concurrency),
+            )
+            .await
+        });
 
-    let ready_socket = socket_path.clone();
-    let ready = tokio::task::spawn_blocking(move || {
-        kunobi_daemon::readiness::wait_until(Instant::now() + Duration::from_secs(5), |deadline| {
-            lifecycle_client::current_socket(&ready_socket, deadline)
+        let ready_socket = socket_path.clone();
+        let ready = tokio::task::spawn_blocking(move || {
+            kunobi_daemon::readiness::wait_until(
+                Instant::now() + Duration::from_secs(5),
+                |deadline| lifecycle_client::current_socket(&ready_socket, deadline),
+            )
+            .map(|proof| proof.is_some())
         })
-        .map(|proof| proof.is_some())
-    })
-    .await
-    .unwrap()
-    .unwrap();
-    assert!(ready, "server_main must bind its configured socket");
-
-    assert_eq!(
-        read_daemon_state(&socket_path).unwrap().control_version,
-        Some(kunobi_daemon::wire::VERSION),
-        "stop must use the advertised binary DRAIN endpoint"
-    );
-    let response = client_roundtrip(
-        &socket_path,
-        &Request::BuildStarted(BuildStartedRequest {
-            intent: kache_core::BuildIntent::default(),
-            client_epoch: 0,
-            client_version: None,
-            session_id: "binary-drain-session".into(),
-        }),
-    )
-    .await;
-    assert!(response.ok, "build session must be accepted: {response:?}");
-    assert!(!config.summary_log_path().exists());
-
-    let shutdown_config = config.clone();
-    tokio::task::spawn_blocking(move || send_shutdown_request(&shutdown_config))
         .await
         .unwrap()
         .unwrap();
+        assert!(ready, "server_main must bind its configured socket");
 
-    let result = tokio::time::timeout(Duration::from_secs(10), server)
-        .await
-        .expect("server_main should stop after a shutdown request")
-        .expect("server_main task should not panic");
-    assert!(
-        result.is_ok(),
-        "server_main should exit cleanly: {result:?}"
-    );
-    let summaries = events::read_summaries(&config.summary_log_path()).unwrap();
-    assert_eq!(
-        summaries.len(),
-        1,
-        "shutdown must finalize the session once"
-    );
-    assert_eq!(summaries[0].session_id, "binary-drain-session");
-    assert_eq!(summaries[0].closure_reason, "shutdown");
-    assert!(!summaries[0].incomplete);
-    assert!(!summaries[0].cancelled);
-    assert!(
-        !socket_path.exists(),
-        "server_main should remove its socket during shutdown"
-    );
+        assert_eq!(
+            read_daemon_state(&socket_path).unwrap().control_version,
+            Some(kunobi_daemon::wire::VERSION),
+            "stop must use the advertised binary DRAIN endpoint"
+        );
+        let response = client_roundtrip(
+            &socket_path,
+            &Request::BuildStarted(BuildStartedRequest {
+                intent: kache_core::BuildIntent::default(),
+                client_epoch: 0,
+                client_version: None,
+                session_id: "binary-drain-session".into(),
+            }),
+        )
+        .await;
+        assert!(response.ok, "build session must be accepted: {response:?}");
+        assert!(!config.summary_log_path().exists());
+
+        let shutdown_config = config.clone();
+        tokio::task::spawn_blocking(move || send_shutdown_request(&shutdown_config))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("server_main should stop after a shutdown request")
+            .expect("server_main task should not panic");
+        assert!(
+            result.is_ok(),
+            "server_main should exit cleanly: {result:?}"
+        );
+        let summaries = events::read_summaries(&config.summary_log_path()).unwrap();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "shutdown must finalize the session once"
+        );
+        assert_eq!(summaries[0].session_id, "binary-drain-session");
+        assert_eq!(summaries[0].closure_reason, "shutdown");
+        assert!(!summaries[0].incomplete);
+        assert!(!summaries[0].cancelled);
+        assert!(
+            !socket_path.exists(),
+            "server_main should remove its socket during shutdown"
+        );
+    });
+}
+
+/// A daemon nobody can reach any more stops instead of running for good: the
+/// suite's leaked daemons were ones whose test removed the temporary runtime
+/// directory without stopping them.
+#[cfg(unix)]
+#[test]
+fn a_daemon_whose_socket_is_removed_or_replaced_shuts_down() {
+    for replace in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        on_a_runtime_of_its_own(Flavor::MultiThread(2), async {
+            let mut config = test_config(dir.path());
+            config.daemon_idle_timeout_secs = 0;
+            config.prefetch_enabled = false;
+            let socket_path = config.socket_path();
+            let coord = DaemonCoordFile::for_socket(&socket_path);
+            let server_config = config.clone();
+            let provenance =
+                crate::config::config_file_provenance_at(dir.path().join("config.toml"));
+            let server = tokio::spawn(async move {
+                server_main(
+                    &server_config,
+                    &provenance,
+                    coord,
+                    None,
+                    PathBuf::from("Cargo.lock"),
+                    DaemonCapacity::discover(server_config.daemon_execution_concurrency),
+                )
+                .await
+            });
+            let ready_socket = socket_path.clone();
+            let ready = tokio::task::spawn_blocking(move || {
+                kunobi_daemon::readiness::wait_until(Instant::now() + HANG_GUARD, |deadline| {
+                    lifecycle_client::current_socket(&ready_socket, deadline)
+                })
+                .map(|proof| proof.is_some())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(ready, "server_main must bind its configured socket");
+
+            fs::remove_file(&socket_path).unwrap();
+            let _successor =
+                replace.then(|| std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
+
+            let result = tokio::time::timeout(HANG_GUARD, server)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("a daemon whose socket was removed (replaced: {replace}) kept running")
+                })
+                .expect("server_main task should not panic");
+            assert!(
+                result.is_ok(),
+                "server_main should exit cleanly: {result:?}"
+            );
+            assert_eq!(
+                socket_path.exists(),
+                replace,
+                "the exiting daemon leaves a successor's socket alone"
+            );
+        });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_bound_socket_is_lost_only_when_its_path_leads_elsewhere() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    let path = runtime.join("daemon.sock");
+    let _listener = UnixListener::bind(&path).unwrap();
+    let bound = BoundSocket::capture(&path).unwrap();
+    assert!(!bound.is_lost(), "its own socket");
+
+    // A lookup that fails without an answer keeps the daemon (unless root,
+    // whom permissions do not stop).
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = fs::symlink_metadata(&path).is_err();
+    let lost_when_unreadable = bound.is_lost();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    if unreadable {
+        assert!(!lost_when_unreadable, "a permission error proves nothing");
+    }
+
+    fs::remove_file(&path).unwrap();
+    assert!(bound.is_lost(), "removed");
+    fs::write(&path, b"").unwrap();
+    assert!(bound.is_lost(), "a file in its place");
+    fs::remove_file(&path).unwrap();
+    let _successor = UnixListener::bind(&path).unwrap();
+    assert!(bound.is_lost(), "another socket in its place");
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir(&runtime).unwrap();
+    fs::write(&runtime, b"").unwrap();
+    assert!(bound.is_lost(), "its directory replaced by a file");
 }
 
 // ── Protocol serde round-trips ───────────────────────────────
@@ -2047,6 +2200,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: VERSION.into(),
                     build_epoch: build_epoch(),
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -2058,6 +2212,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: "0.0.1".into(),
                     build_epoch: 1,
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -2069,6 +2224,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: String::new(),
                     build_epoch: 1,
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -2080,6 +2236,7 @@ async fn readiness_requires_a_successful_compatible_health_response() {
                     version: "999.0.0".into(),
                     build_epoch: 1,
                     remote_readonly: None,
+                    compiles_in_flight: None,
                 }),
                 ..Response::ok()
             },
@@ -2156,15 +2313,29 @@ fn accept_backoff_pauses_only_on_descriptor_exhaustion() {
     use std::io::{Error, ErrorKind};
     for errno in [libc::EMFILE, libc::ENFILE] {
         assert_eq!(
-            accept_backoff(&Error::from_raw_os_error(errno)),
+            accept_backoff(&Error::from_raw_os_error(errno), 1),
             Some(ACCEPT_EXHAUSTED_BACKOFF)
         );
     }
     assert_eq!(
-        accept_backoff(&Error::from_raw_os_error(libc::ECONNABORTED)),
+        accept_backoff(&Error::from_raw_os_error(libc::ECONNABORTED), 1),
         None
     );
-    assert_eq!(accept_backoff(&Error::from(ErrorKind::Other)), None);
+    assert_eq!(accept_backoff(&Error::from(ErrorKind::Other), 1), None);
+}
+
+/// On Windows a listener whose accept keeps failing (pipe instance creation
+/// refused under memory pressure) backs off instead of spinning, and logs
+/// only the first error and each power of two.
+#[cfg(windows)]
+#[test]
+fn a_failing_pipe_listener_backs_off_instead_of_spinning() {
+    let error = std::io::Error::from_raw_os_error(1450); // ERROR_NO_SYSTEM_RESOURCES
+    assert_eq!(accept_backoff(&error, 1), Some(Duration::from_millis(10)));
+    assert_eq!(accept_backoff(&error, 2), Some(Duration::from_millis(20)));
+    assert_eq!(accept_backoff(&error, 50), Some(ACCEPT_FAILING_BACKOFF_MAX));
+    let logged: Vec<u32> = (1..=20).filter(|n| accept_error_logged(*n)).collect();
+    assert_eq!(logged, [1, 2, 4, 8, 16]);
 }
 
 #[test]
@@ -3185,6 +3356,7 @@ fn automatic_gc_runs_store_housekeeping_and_records_it() {
             key_locks_remaining: 1,
             predictions_pruned: 0,
             file_hashes_pruned: 0,
+            ..Default::default()
         })
     );
     assert!(!lock_path(1).exists());
@@ -3491,6 +3663,45 @@ fn disk_pressure_reaches_main_and_shards_below_budget_and_respects_locks_and_bac
     );
 }
 
+/// No build stores, so no wrapper asks: the daemon's own timer sees the
+/// volume run low and sweeps through the backoff a sweep left.
+#[test]
+#[cfg(unix)]
+fn the_daemon_sweeps_on_its_own_when_the_disk_runs_low() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(&dir.path().join("main"));
+    config.max_size = 100;
+    config.auto_recover_min_free_bytes = 10;
+    let store = Store::open(&config).unwrap();
+    put_upload_evict_entry(&store, dir.path(), "old", 200, false);
+    crate::wrapper::record_auto_gc_outcome(&config, 200, 0);
+    let volume = |free| {
+        kache_fs::testutil::VolumeUsageGuard::new(
+            dir.path(),
+            Some(kache_fs::VolumeUsage { total: 1000, free }),
+        )
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _enter = runtime.enter();
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let watch = spawn_free_space_watch(daemon, Duration::from_millis(5));
+    let healthy = volume(25);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(store.contains("old"), "the backoff holds while space lasts");
+    drop(healthy);
+    let _low = volume(24);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.contains("old") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    watch.abort();
+    assert!(!store.contains("old"), "the daemon swept on its own");
+}
+
 /// Hardlink `key`'s blob into a stand-in target directory, which then
 /// holds its blocks.
 fn hold_in_target_dir(store: &Store, dir: &std::path::Path, key: &str) {
@@ -3566,17 +3777,17 @@ fn upload_triggered_eviction_waits_out_the_auto_gc_backoff() {
     );
 }
 
-/// The post-upload check used to start at 100% of `max_size` while the
-/// wrapper waited for 110%, so the two alternated on a store in between.
+/// The post-upload check used to start at another size than the wrapper's,
+/// so the two alternated on a store in between.
 #[test]
 fn upload_triggered_eviction_starts_one_byte_above_the_shared_trigger() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = test_config(dir.path());
     config.max_size = 1000;
     let store = Store::open(&config).unwrap();
-    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
-    assert_eq!(store.physical_size().unwrap(), 1100);
-    assert!(!crate::wrapper::auto_gc_sweep_due(&config, 1100));
+    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 880, false);
+    assert_eq!(store.physical_size().unwrap(), 880);
+    assert!(!crate::wrapper::auto_gc_sweep_due(&config, 880));
 
     let daemon = Daemon::new(config.clone());
     daemon.sweep_under_size_pressure().unwrap();
@@ -3584,8 +3795,8 @@ fn upload_triggered_eviction_starts_one_byte_above_the_shared_trigger() {
     assert!(crate::report::read_gc_stats(dir.path()).is_none());
 
     put_upload_evict_entry(&store, dir.path(), "x", 1, false);
-    assert_eq!(store.physical_size().unwrap(), 1101);
-    assert!(crate::wrapper::auto_gc_sweep_due(&config, 1101));
+    assert_eq!(store.physical_size().unwrap(), 881);
+    assert!(crate::wrapper::auto_gc_sweep_due(&config, 881));
     daemon.sweep_under_size_pressure().unwrap();
     assert!(!store.contains("at_the_trigger"));
     assert!(crate::report::read_gc_stats(dir.path()).is_some());
@@ -3867,13 +4078,13 @@ fn a_gc_hint_does_nothing_at_the_trigger_and_clears_the_backoff_once_the_store_f
     let mut config = test_config(dir.path());
     config.max_size = 1000;
     let store = Store::open(&config).unwrap();
-    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
+    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 880, false);
     let daemon = Daemon::new(config.clone());
     assert!(daemon.handle_request_sync(&Request::GcHint).ok);
     assert!(store.contains("at_the_trigger"));
 
     put_upload_evict_entry(&store, dir.path(), "x", 1, false);
-    crate::wrapper::record_auto_gc_outcome(&config, 1101, 0);
+    crate::wrapper::record_auto_gc_outcome(&config, 881, 0);
     crate::wrapper::expire_auto_gc_backoff_for_test(dir.path());
     assert!(daemon.handle_request_sync(&Request::GcHint).ok);
     assert!(!store.contains("at_the_trigger"));
@@ -3925,7 +4136,7 @@ async fn send_gc_hint_is_acknowledged_and_the_daemon_sweeps() {
     put_upload_evict_entry(&store, dir.path(), "evictable", 1200, false);
 
     let listener = bind_listener(&socket_path);
-    let daemon = Arc::new(Daemon::new(config.clone()));
+    let daemon = Arc::new(Daemon::new(config.clone()).settled());
     let server = tokio::spawn(async move {
         let stream = listener.accept().await.expect("accept");
         handle_connection(stream, &daemon, &Arc::new(Lifecycle::default()))
@@ -4041,7 +4252,7 @@ fn periodic_gc_size_pass_starts_one_byte_above_the_shared_trigger() {
     let mut config = test_config(dir.path());
     config.max_size = 1000;
     let store = Store::open(&config).unwrap();
-    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 1100, false);
+    put_upload_evict_entry(&store, dir.path(), "at_the_trigger", 880, false);
 
     let daemon = Daemon::new(config);
     let policy = GcPolicy::Automatic { max_age_hours: 0 };
@@ -4408,34 +4619,54 @@ fn test_run_gc_cleans_registered_incremental_dirs_once() {
     assert!(incremental_dir.exists());
 }
 
-#[test]
-fn clean_tool_version_caches_removes_only_old_tool_version_txt() {
-    // Branch: old rustc/linker version-cache file cleanup.
-    let dir = tempfile::tempdir().unwrap();
-    let old_rustc = dir.path().join("rustc-ver-old.txt");
-    let old_linker = dir.path().join("linker-ver-old.txt");
-    let fresh_rustc = dir.path().join("rustc-ver-fresh.txt");
-    let old_other = dir.path().join("other-ver-old.txt");
-    for path in [&old_rustc, &old_linker, &fresh_rustc, &old_other] {
-        std::fs::write(path, b"version").unwrap();
-    }
-
-    let old = filetime::FileTime::from_system_time(
-        std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600),
-    );
-    for path in [&old_rustc, &old_linker, &old_other] {
-        filetime::set_file_mtime(path, old).unwrap();
-    }
-
-    Daemon::clean_tool_version_caches(dir.path());
-
-    assert!(!old_rustc.exists());
-    assert!(!old_linker.exists());
-    assert!(fresh_rustc.exists());
-    assert!(old_other.exists());
-}
-
 // ── Socket integration tests ─────────────────────────────────
+
+/// Events a wrapper's busy log could not take are logged by the daemon,
+/// which counts them pending until they are in the log; another event log's
+/// are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handed_over_events_are_pending_until_logged() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket_path = config.socket_path();
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let request = |log: &Path| {
+        Request::RecordEvents(RecordEventsRequest {
+            event_log: log.to_string_lossy().into_owned(),
+            events: vec![events::BuildEvent::new_for_test(
+                "handed",
+                events::EventResult::LocalHit,
+            )],
+        })
+    };
+    let foreign = one_shot_request(&daemon, &socket_path, &request(&dir.path().join("x"))).await;
+    assert!(!foreign.ok);
+
+    // A reader holds the log: the event waits, pending.
+    let log = config.event_log_path();
+    let reader = crate::events::open_log_lock(&log).unwrap();
+    reader.lock_shared().unwrap();
+    assert!(
+        one_shot_request(&daemon, &socket_path, &request(&log))
+            .await
+            .ok
+    );
+    let pending = || daemon.events_pending.load(Ordering::Acquire);
+    assert_eq!(pending(), 1);
+    reader.unlock().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pending() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the handed event was never logged"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let logged = crate::events::read_events(&log).unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].crate_name, "handed");
+}
 
 #[tokio::test]
 async fn test_socket_gc_roundtrip() {
@@ -4637,6 +4868,7 @@ fn test_stats_response_serde() {
         prefetch: PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
         effective_config: None,
+        publishes_pending: 0,
     };
     let resp = Response::ok_stats(stats.clone());
     let json = serde_json::to_string(&resp).unwrap();
@@ -4722,6 +4954,7 @@ fn test_stats_response_with_entries() {
         prefetch: PrefetchStatsSnapshot::default(),
         in_flight: Vec::new(),
         effective_config: None,
+        publishes_pending: 0,
     };
     let resp = Response::ok_stats(stats);
     let json = serde_json::to_string(&resp).unwrap();
@@ -4917,6 +5150,28 @@ fn test_daemon_reuses_store_handle() {
     assert_eq!(first, second);
 }
 
+/// The daemon commits under its store mutex (file-hash records, published
+/// entries). A commit that takes the WAL past the threshold checkpoints it
+/// inside that commit, fsync included, and every request needing the mutex
+/// (a wrapper's file-hash prefetch, 3 s timeout) waits behind it. The
+/// daemon's connections defer like a wrapper's; its durability tick
+/// checkpoints on a connection of its own.
+#[test]
+fn test_daemon_store_connections_defer_wal_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config);
+
+    let pages = daemon
+        .with_store(|store| store.wal_autocheckpoint_pages())
+        .unwrap();
+    assert_eq!(pages, kache_store::DEFERRED_AUTOCHECKPOINT_PAGES);
+
+    let shard = daemon.shard_store_lock(dir.path()).unwrap();
+    let shard_pages = shard.lock().unwrap().wal_autocheckpoint_pages().unwrap();
+    assert_eq!(shard_pages, kache_store::DEFERRED_AUTOCHECKPOINT_PAGES);
+}
+
 /// A request for `file` as it is on disk, and the clock at which its stamp
 /// settles: [`crate::cache_key::HASH_SETTLE_NS`] after its last change.
 fn hash_files_request(file: &Path) -> (HashFilesRequest, i64) {
@@ -5010,6 +5265,72 @@ fn test_handle_hash_files_uses_memory_cache() {
     assert_eq!(second_result.bytes_hashed, 0);
 }
 
+/// A HashFiles request is on a wrapper's key path with a 3 s timeout. It
+/// must not queue behind the daemon's store mutex, which a publish or any
+/// other commit holds while it waits for the index's write lock: its memo
+/// reads and writes go through a connection of their own, and the rows it
+/// learns are written in one batch afterwards
+/// ([`Daemon::flush_file_hash_records`]).
+#[test]
+fn hash_files_do_not_wait_for_the_store_mutex() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = std::sync::Arc::new(Daemon::new(config.clone()));
+    let file = dir.path().join("held.rlib");
+    std::fs::write(&file, vec![9u8; 90 * 1024]).unwrap();
+    let (req, settles_at) = hash_files_request(&file);
+    let expected = crate::cache_key::hash_file(&file).unwrap();
+
+    let (held_tx, held_rx) = mpsc::channel();
+    let holder = {
+        let daemon = std::sync::Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            let _guard = daemon.store_lock().unwrap().lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+        })
+    };
+    held_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    let resp = daemon.handle_hash_files_at(&req, || settles_at);
+    let waited = started.elapsed();
+    holder.join().unwrap();
+
+    assert!(resp.ok);
+    let result = &resp.hash_results.as_ref().unwrap()[0];
+    assert_eq!(result.hash.as_deref(), Some(expected.as_str()));
+    assert!(
+        waited < std::time::Duration::from_millis(1000),
+        "the request waited {waited:?} for the store mutex"
+    );
+
+    daemon.flush_file_hash_records();
+    assert!(matches!(
+        crate::store::Store::open(&config).unwrap().file_hash_lookup(&file),
+        crate::cache_key::FileHashLookup::Hit(hash) if hash == expected
+    ));
+}
+
+/// The daemon's checkpoint loop copies what deferring connections left in
+/// the WAL into the index.
+#[test]
+fn checkpoint_index_copies_the_log_a_deferring_writer_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let writer = crate::store::Store::open(&config).unwrap();
+    writer.defer_wal_checkpoints_here().unwrap();
+    let file = dir.path().join("rows.rlib");
+    std::fs::write(&file, vec![1u8; 70 * 1024]).unwrap();
+    let (req, settles_at) = hash_files_request(&file);
+    daemon.handle_hash_files_at(&req, || settles_at);
+    daemon.flush_file_hash_records();
+
+    let (frames, copied) = daemon.checkpoint_index().unwrap();
+    assert!(frames > 0, "the deferring writer left the rows in the log");
+    assert_eq!(frames, copied, "the passive checkpoint copied all of it");
+}
+
 /// A stamp still inside the settle window when the daemon observes it gets
 /// its hash back, but neither cache keeps it: a second write in the same
 /// timestamp tick would leave the stamp as it is. From the moment the
@@ -5036,6 +5357,7 @@ fn handle_hash_files_remembers_a_hash_only_if_its_stamp_had_settled() {
         assert!(!result.cache_hit, "{attempt}: neither cache kept it");
         assert!(result.bytes_hashed > 0, "{attempt}");
     }
+    daemon.flush_file_hash_records();
     assert!(matches!(
         memoised(),
         crate::cache_key::FileHashLookup::NeedsHash(_)
@@ -5044,14 +5366,75 @@ fn handle_hash_files_remembers_a_hash_only_if_its_stamp_had_settled() {
     daemon.handle_hash_files_at(&req, || settles_at);
     let resp = daemon.handle_hash_files_at(&req, || settles_at);
     assert!(resp.hash_results.as_ref().unwrap()[0].cache_hit);
+    daemon.flush_file_hash_records();
     assert!(matches!(
         memoised(),
         crate::cache_key::FileHashLookup::Hit(hash) if hash == expected
     ));
 }
 
-/// #281: the lock-narrowed HashFiles path (cache lookup under the store
-/// lock, blake3 outside it, record under the lock) must preserve the
+/// Cargo's re-date of a check output kache restored moves only its ctime,
+/// so the stamp the next units ask about has not settled. The bytes read
+/// for the first of them match the re-dated row, which lets the daemon
+/// remember the hash for that stamp: the others asking at once are served
+/// from memory instead of each reading the file before the row lands.
+/// Other bytes under the same stamp are not remembered.
+#[cfg(unix)]
+#[test]
+fn handle_hash_files_remembers_a_redated_output_it_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let redate = |file: &Path| {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(file).unwrap());
+        filetime::set_file_mtime(file, mtime).unwrap();
+    };
+    let ask_twice = |file: &Path| {
+        let (req, settles_at) = hash_files_request(file);
+        let results: Vec<_> = (0..2)
+            .map(|_| {
+                let resp = daemon.handle_hash_files_at(&req, || settles_at - 1);
+                resp.hash_results.unwrap().remove(0)
+            })
+            .collect();
+        (results[0].clone(), results[1].clone())
+    };
+
+    let file = dir.path().join("libdep.rmeta");
+    std::fs::write(&file, vec![3u8; 70 * 1024]).unwrap();
+    let recorded = crate::cache_key::FileFingerprint::from_path(&file).unwrap();
+    let hash = crate::cache_key::hash_file(&file).unwrap();
+    crate::store::Store::open(&config)
+        .unwrap()
+        .record_redated_file_hashes(&[(recorded, hash.as_str())]);
+    redate(&file);
+    let (first, second) = ask_twice(&file);
+    assert_eq!(first.hash.as_deref(), Some(hash.as_str()));
+    assert!(!first.cache_hit && first.bytes_hashed > 0);
+    assert!(second.cache_hit, "the re-dated stamp is remembered");
+    assert_eq!(second.bytes_hashed, 0);
+
+    // Same size and mtime, other bytes: the row does not vouch for them.
+    let other = dir.path().join("libother.rmeta");
+    std::fs::write(&other, vec![4u8; 70 * 1024]).unwrap();
+    let recorded = crate::cache_key::FileFingerprint::from_path(&other).unwrap();
+    crate::store::Store::open(&config)
+        .unwrap()
+        .record_redated_file_hashes(&[(recorded, hash.as_str())]);
+    redate(&other);
+    let (first, second) = ask_twice(&other);
+    assert_ne!(first.hash.as_deref(), Some(hash.as_str()));
+    assert!(
+        !second.cache_hit,
+        "bytes the row does not describe are not kept"
+    );
+    assert!(second.bytes_hashed > 0);
+}
+
+/// #281: the lock-narrowed HashFiles path (cache lookup on the hash store,
+/// blake3 outside its lock, the row written by the flush) must preserve the
 /// PERSISTENT cache. A second daemon with a fresh in-memory cache but the
 /// same `index.db` gets a hit without re-hashing, and every hash matches
 /// the canonical `hash_file`.
@@ -5072,6 +5455,8 @@ fn handle_hash_files_persistent_cache_hit_across_daemons() {
     assert_eq!(ra.hash.as_deref(), Some(expected.as_str()));
     assert!(!ra.cache_hit, "first hash is a persistent-cache miss");
     assert!(ra.bytes_hashed > 0);
+    // Its rows are written by the flush tick, off the request's path.
+    a.flush_file_hash_records();
 
     // Daemon B: fresh in-memory cache, same store — must hit the PERSISTENT
     // cache via the lock-narrowed lookup rather than re-hashing.
@@ -5211,6 +5596,7 @@ fn readiness_reply_requires_success_but_allows_missing_release_metadata() {
             version: "v1".into(),
             build_epoch: 7,
             remote_readonly: None,
+            compiles_in_flight: None,
         }
     );
     for response in [
@@ -6086,7 +6472,8 @@ fn daemon_on(
     config: Config,
     backend: &Arc<dyn crate::remote_backend::RemoteBackend>,
 ) -> Arc<Daemon> {
-    let daemon = Arc::new(Daemon::new(config));
+    // Settled: an upload's size sweep starts at once, as these tests expect.
+    let daemon = Arc::new(Daemon::new(config).settled());
     daemon.set_remote_backend_for_test(Arc::clone(backend));
     daemon
 }
@@ -6813,7 +7200,7 @@ impl crate::remote_backend::RemoteBackend for BlockingV3Backend {
 }
 
 async fn wait_for_download_waiter(daemon: &Daemon, key: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(HANG_GUARD, async {
         loop {
             let attached = {
                 let downloading = daemon.downloading.read().await;
@@ -6965,51 +7352,53 @@ async fn test_do_upload_skips_when_entry_already_in_remote() {
     );
 }
 
-#[tokio::test]
-async fn test_do_upload_uploads_when_not_in_remote_records_v3_transfer_timestamps() {
+#[test]
+fn test_do_upload_uploads_when_not_in_remote_records_v3_transfer_timestamps() {
     // Injected mock 404s the HEAD then 200s the pack + manifest PUTs, so
     // do_upload packs the local entry and uploads it end-to-end. Covers the
     // full upload path: exists_entry(miss) -> upload_entry(pack+manifest) ->
     // transfer-event + key-cache update -> ok.
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.remote = Some(test_remote_config());
-    config.prefetch_enabled = false;
-    let key = test_cache_key("new-upload");
-    seed_store_entry(&config, &key, "serde", dir.path());
-    let entry_dir = config.store_dir().join(&key);
+    on_a_runtime_of_its_own(Flavor::CurrentThread, async {
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        config.prefetch_enabled = false;
+        let key = test_cache_key("new-upload");
+        seed_store_entry(&config, &key, "serde", dir.path());
+        let entry_dir = config.store_dir().join(&key);
 
-    let client = test_remote_backend();
-    let daemon = Arc::new(Daemon::new(config));
-    assert!(
-        daemon.remote_backend.set(client.clone()).is_ok(),
-        "inject mock backend"
-    );
+        let client = test_remote_backend();
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(
+            daemon.remote_backend.set(client.clone()).is_ok(),
+            "inject mock backend"
+        );
 
-    let resp = daemon
-        .do_upload(&UploadJob {
-            key: key.clone(),
-            entry_dir: entry_dir.to_string_lossy().into_owned(),
-            crate_name: "serde".into(),
-            client_epoch: 0,
-            client_version: None,
-        })
-        .await;
+        let resp = daemon
+            .do_upload(&UploadJob {
+                key: key.clone(),
+                entry_dir: entry_dir.to_string_lossy().into_owned(),
+                crate_name: "serde".into(),
+                client_epoch: 0,
+                client_version: None,
+            })
+            .await;
 
-    assert!(resp.ok, "upload of a new entry should succeed: {resp:?}");
-    assert!(
-        client
-            .head(&test_pack_object_key(&key, "serde"))
-            .await
-            .unwrap()
-    );
-    assert!(
-        client
-            .head(&test_manifest_object_key(&key, "serde"))
-            .await
-            .unwrap()
-    );
-    assert_v3_transfer_timestamps(&latest_transfer(&daemon));
+        assert!(resp.ok, "upload of a new entry should succeed: {resp:?}");
+        assert!(
+            client
+                .head(&test_pack_object_key(&key, "serde"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            client
+                .head(&test_manifest_object_key(&key, "serde"))
+                .await
+                .unwrap()
+        );
+        assert_v3_transfer_timestamps(&latest_transfer(&daemon));
+    });
 }
 
 #[tokio::test]
@@ -8418,72 +8807,75 @@ async fn packed_prefetch_drains_bodies_with_room_for_only_one_object() {
     );
 }
 
-#[tokio::test]
-async fn packed_prefetch_response_returns_before_blocked_pack_get() {
+#[test]
+fn packed_prefetch_response_returns_before_blocked_pack_get() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    // Catalog discovery is a LIST.
-    config.remote_key_listing = true;
-    config.remote = Some(test_remote_config());
-    let inner = test_remote_backend();
-    let context = PackPrefetchContext::from_deps(
-        crate::identity::host_target_triple(),
-        "linux/toolchain/release",
-        &[("serde".to_string(), "1.0.0".to_string())],
-    )
-    .unwrap();
-    let key = test_cache_key("nonblocking-prefetch-pack");
-    let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
-    seed_packed_catalog(
-        &inner,
-        &context,
-        vec![crate::remote_pack::PackInputEntry {
-            cache_key: key.clone(),
-            crate_name: "serde".into(),
-            meta_digest,
-            payload,
-        }],
-        None,
-    )
-    .await;
+    on_a_runtime_of_its_own(Flavor::CurrentThread, async {
+        let mut config = test_config(dir.path());
+        // Catalog discovery is a LIST.
+        config.remote_key_listing = true;
+        config.remote = Some(test_remote_config());
+        let inner = test_remote_backend();
+        let context = PackPrefetchContext::from_deps(
+            crate::identity::host_target_triple(),
+            "linux/toolchain/release",
+            &[("serde".to_string(), "1.0.0".to_string())],
+        )
+        .unwrap();
+        let key = test_cache_key("nonblocking-prefetch-pack");
+        let (payload, meta_digest) = build_entry_pack_with_meta(&key, "serde");
+        seed_packed_catalog(
+            &inner,
+            &context,
+            vec![crate::remote_pack::PackInputEntry {
+                cache_key: key.clone(),
+                crate_name: "serde".into(),
+                meta_digest,
+                payload,
+            }],
+            None,
+        )
+        .await;
 
-    let pack_started = Arc::new(Notify::new());
-    let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
-    let backend: Arc<dyn crate::remote_backend::RemoteBackend> = Arc::new(BlockingPackBackend {
-        inner,
-        pack_started: pack_started.clone(),
-        release_pack: release_pack.clone(),
-        v3_get_started: None,
-    });
-    let daemon = Arc::new(Daemon::new(config));
-    assert!(daemon.remote_backend.set(backend).is_ok());
+        let pack_started = Arc::new(Notify::new());
+        let release_pack = Arc::new(tokio::sync::Semaphore::new(0));
+        let backend: Arc<dyn crate::remote_backend::RemoteBackend> =
+            Arc::new(BlockingPackBackend {
+                inner,
+                pack_started: pack_started.clone(),
+                release_pack: release_pack.clone(),
+                v3_get_started: None,
+            });
+        let daemon = Arc::new(Daemon::new(config));
+        assert!(daemon.remote_backend.set(backend).is_ok());
 
-    let started = pack_started.notified();
-    tokio::pin!(started);
-    started.as_mut().enable();
-    let response = tokio::time::timeout(
-        Duration::from_secs(10),
-        daemon.handle_prefetch_with_context(
-            &PrefetchRequest {
-                keys: vec![(key.clone(), "serde".into())],
-                warm_all: false,
-                origin: None,
-                candidate_sources: HashMap::new(),
-            },
-            Some(context),
-            Instant::now(),
-        ),
-    )
-    .await
-    .expect("prefetch acknowledgement must not await the pack GET");
-    assert!(response.ok);
-    tokio::time::timeout(Duration::from_secs(10), started)
+        let started = pack_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            daemon.handle_prefetch_with_context(
+                &PrefetchRequest {
+                    keys: vec![(key.clone(), "serde".into())],
+                    warm_all: false,
+                    origin: None,
+                    candidate_sources: HashMap::new(),
+                },
+                Some(context),
+                Instant::now(),
+            ),
+        )
         .await
-        .expect("background coordinator should start the pack GET");
-    assert!(!daemon.entry_dir_for(&key).exists());
+        .expect("prefetch acknowledgement must not await the pack GET");
+        assert!(response.ok);
+        tokio::time::timeout(Duration::from_secs(10), started)
+            .await
+            .expect("background coordinator should start the pack GET");
+        assert!(!daemon.entry_dir_for(&key).exists());
 
-    release_pack.add_permits(1);
-    wait_for_store_entry(&daemon, &key).await;
+        release_pack.add_permits(1);
+        wait_for_store_entry(&daemon, &key).await;
+    });
 }
 
 #[tokio::test]
@@ -9400,17 +9792,22 @@ async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
         deadline_ms: None,
         shard_dir: None,
     };
+    // Neither request may run out of its deadline on a loaded machine: a
+    // waiter past it gives up as a miss without the retry this test is about.
     let leader = {
         let daemon = daemon.clone();
         let request = request.clone();
         tokio::spawn(async move {
             daemon
-                .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                .handle_remote_check_leader(
+                    &request,
+                    RemoteDeadline::from_secs(HANG_GUARD.as_secs()),
+                )
                 .await
         })
     };
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+        tokio::time::timeout(HANG_GUARD, v3_started_rx.recv())
             .await
             .expect("leader must reach its gated v3 GET"),
         Some(1)
@@ -9420,7 +9817,10 @@ async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
         let daemon = daemon.clone();
         tokio::spawn(async move {
             daemon
-                .handle_remote_check_leader(&request, RemoteDeadline::from_secs(10))
+                .handle_remote_check_leader(
+                    &request,
+                    RemoteDeadline::from_secs(HANG_GUARD.as_secs()),
+                )
                 .await
         })
     };
@@ -9431,19 +9831,19 @@ async fn concurrent_remote_check_waiter_retries_after_leader_import_failure() {
     // start a second GET; returning a hit from stale meta would skip it.
     release_v3_get.add_permits(1);
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), v3_started_rx.recv())
+        tokio::time::timeout(HANG_GUARD, v3_started_rx.recv())
             .await
             .expect("waiter must retry rather than report the failed leader as a hit"),
         Some(2)
     );
-    let leader_response = tokio::time::timeout(Duration::from_secs(5), leader)
+    let leader_response = tokio::time::timeout(HANG_GUARD, leader)
         .await
         .expect("leader must finish after its GET is released")
         .expect("leader task must not panic");
     assert_eq!(leader_response.found, Some(false));
 
     release_v3_get.add_permits(1);
-    let waiter_response = tokio::time::timeout(Duration::from_secs(5), waiter)
+    let waiter_response = tokio::time::timeout(HANG_GUARD, waiter)
         .await
         .expect("waiter must finish after its retry is released")
         .expect("waiter task must not panic");
@@ -12882,55 +13282,57 @@ fn test_prefetch_byte_budget_exhausted() {
 
 /// `prefetch_deadline_secs = 0` disables the deadline rather than dropping
 /// the plan immediately (#616).
-#[tokio::test]
-async fn test_prefetch_deadline_stops_the_plan() {
+#[test]
+fn test_prefetch_deadline_stops_the_plan() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.remote = Some(test_remote_config());
-    // The coordinator checks the deadline before starting each candidate,
-    // so a zero-length budget drops the whole plan on the first iteration.
-    config.prefetch_deadline_secs = 0;
+    on_a_runtime_of_its_own(Flavor::CurrentThread, async {
+        let mut config = test_config(dir.path());
+        config.remote = Some(test_remote_config());
+        // The coordinator checks the deadline before starting each candidate,
+        // so a zero-length budget drops the whole plan on the first iteration.
+        config.prefetch_deadline_secs = 0;
 
-    let key = "4444444444444444".repeat(4);
-    let client = test_remote_backend();
-    put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
-    put_test_object(
-        &client,
-        &test_pack_object_key(&key, "serde"),
-        &build_entry_pack(&key, "serde"),
-    )
-    .await;
-
-    let daemon = Arc::new(Daemon::new(config.clone()));
-    assert!(
-        daemon.remote_backend.set(client).is_ok(),
-        "inject mock backend"
-    );
-
-    let resp = daemon
-        .handle_prefetch(&PrefetchRequest {
-            keys: vec![(key.clone(), "serde".to_string())],
-            warm_all: false,
-            origin: None,
-            candidate_sources: HashMap::new(),
-        })
+        let key = "4444444444444444".repeat(4);
+        let client = test_remote_backend();
+        put_test_object(&client, &test_manifest_object_key(&key, "serde"), b"{}").await;
+        put_test_object(
+            &client,
+            &test_pack_object_key(&key, "serde"),
+            &build_entry_pack(&key, "serde"),
+        )
         .await;
-    assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
 
-    // `0` means "no deadline", so the plan must still run.
-    let entry_meta = config.store_dir().join(&key).join("meta.json");
-    let mut imported = false;
-    for _ in 0..100 {
-        if entry_meta.exists() {
-            imported = true;
-            break;
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        assert!(
+            daemon.remote_backend.set(client).is_ok(),
+            "inject mock backend"
+        );
+
+        let resp = daemon
+            .handle_prefetch(&PrefetchRequest {
+                keys: vec![(key.clone(), "serde".to_string())],
+                warm_all: false,
+                origin: None,
+                candidate_sources: HashMap::new(),
+            })
+            .await;
+        assert!(resp.ok, "prefetch dispatch should be ok: {resp:?}");
+
+        // `0` means "no deadline", so the plan must still run.
+        let entry_meta = config.store_dir().join(&key).join("meta.json");
+        let mut imported = false;
+        for _ in 0..100 {
+            if entry_meta.exists() {
+                imported = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        imported,
-        "prefetch_deadline_secs = 0 disables the deadline rather than dropping the plan"
-    );
+        assert!(
+            imported,
+            "prefetch_deadline_secs = 0 disables the deadline rather than dropping the plan"
+        );
+    });
 }
 
 /// An empty candidate list must mean "nothing to prefetch", never
@@ -16122,6 +16524,11 @@ async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
     config.remote = Some(remote.clone());
     config.remote_readonly = true;
     config.prefetch_enabled = false;
+    // The remote check has three seconds, and a busy disk took them with
+    // fsyncs: six to create the consumer's index, six more to store the
+    // download under strict durability. A consumer that has built before
+    // has its index, and downloads are stored without an fsync by default.
+    config.deferred_durability = true;
     let key = test_cache_key("readonly-cold-restore");
     let donor_config = test_config(donor.path());
     seed_store_entry(&donor_config, &key, "serde", donor.path());
@@ -16156,6 +16563,7 @@ async fn assert_read_only_consumer_can_restore(daemon_readonly: bool) {
         inner: backend,
         writes: AtomicU64::new(0),
     });
+    drop(Store::open(&config).unwrap());
     let mut daemon_config = config.clone();
     daemon_config.remote_readonly = daemon_readonly;
     let daemon = Arc::new(Daemon::new(daemon_config));
@@ -16388,13 +16796,14 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     let starter_calls = calls.clone();
     let (server_tx, server_rx) = std::sync::mpsc::channel();
     let outcome = tokio::task::spawn_blocking(move || {
-        send_gc_request_with_timeout(&config, Some(17), Duration::from_secs(2), || {
+        send_gc_request_with_timeout(&config, Some(17), HANG_GUARD, || {
             starter_calls.fetch_add(1, Ordering::SeqCst);
-            closed_rx.recv_timeout(Duration::from_secs(2))?;
+            // Restart once the first daemon is gone, however long that takes.
+            closed_rx.recv_timeout(HANG_GUARD)?;
             // Windows may still hold the old named-pipe instance while its
             // asynchronous close finishes. The old handler has exited above.
             #[cfg(windows)]
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + HANG_GUARD;
             #[cfg(windows)]
             let listener = loop {
                 match ListenerOptions::new()
@@ -16434,13 +16843,533 @@ async fn gc_retries_when_the_probed_daemon_disappears_before_send() {
     assert!(!outcome.skipped);
     assert_eq!(outcome.breakdown.unwrap().mode, GcRequestMode::ExplicitAge);
     first_server.await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        server_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+    tokio::time::timeout(HANG_GUARD, server_rx.recv_timeout(HANG_GUARD).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+fn put_aged_entry(config: &Config, dir: &Path, key: &str) {
+    let src_file = dir.join(format!("{key}.rlib"));
+    std::fs::write(&src_file, vec![0u8; 200]).unwrap();
+    let store = Store::open(config).unwrap();
+    store
+        .put(
+            key,
+            "testcrate",
+            &["lib".into()],
+            &[],
+            "host",
+            "dev",
+            &[(src_file.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src_file);
+    store.set_last_accessed_for_test(key, "-1 hour");
+}
+
+fn access_of(config: &Config, key: &str) -> (i64, i64) {
+    rusqlite::Connection::open(config.index_db_path())
+        .unwrap()
+        .query_row(
+            "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), hit_count \
+             FROM entries WHERE cache_key = ?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+}
+
+fn stamp_request(config: &Config, keys: &[&str]) -> StampHitsRequest {
+    StampHitsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        keys: keys.iter().map(|k| k.to_string()).collect(),
+    }
+}
+
+/// N3: a stamp the daemon took pins its entry until it is written, and a
+/// sweep writes the stamps taken so far before it ranks entries, so an
+/// hour-old entry a build just hit survives a sweep that wants its space.
+#[test]
+fn hit_stamps_pin_their_entries_until_written_and_sweeps_write_them_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    put_aged_entry(&config, dir.path(), "hit-key");
+    config.max_size = 100;
+    let daemon = Daemon::new(config.clone());
+
+    let resp = daemon.handle_stamp_hits(&stamp_request(&config, &["hit-key", "hit-key"]));
+    assert!(resp.ok, "{:?}", resp.error);
+    assert!(daemon.pending_pins()("hit-key"));
+    assert!(!daemon.pending_pins()("other-key"));
+    assert!(access_of(&config, "hit-key").0 >= 3500, "not written yet");
+
+    let stats = daemon
+        .run_gc(
+            GcPolicy::Automatic {
+                max_age_hours: daemon.config.gc_max_age_hours,
+            },
+            GcDriver::Requested,
+        )
+        .unwrap();
+    assert_eq!(stats.total.entries_evicted, 0, "the hit's entry stays");
+    let (age, hits) = access_of(&config, "hit-key");
+    assert!(age < 60, "the sweep wrote the stamp first (age {age} s)");
+    assert_eq!(hits, 2);
+    assert!(!daemon.pending_pins()("hit-key"), "written, so no longer pending");
+}
+
+/// Stamps written by the tick leave the pending set; a batch the index
+/// refuses stays pending (and pinned) for the next tick.
+#[test]
+fn hit_stamps_stay_pending_while_the_index_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    put_aged_entry(&config, dir.path(), "busy-key");
+    let daemon = Daemon::new(config.clone());
+    assert!(daemon.handle_stamp_hits(&stamp_request(&config, &["busy-key"])).ok);
+
+    // Open the stamp connection first, then hold the write lock longer
+    // than its busy timeout would allow a test to wait: use a short one.
+    daemon.flush_hit_stamps();
+    assert!(!daemon.pending_pins()("busy-key"));
+    assert!(daemon.handle_stamp_hits(&stamp_request(&config, &["busy-key"])).ok);
+    {
+        let store = daemon.stamp_store.get().unwrap().lock().unwrap();
+        store.set_busy_timeout_for_test(std::time::Duration::from_millis(20));
+    }
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    daemon.flush_hit_stamps();
+    assert!(daemon.pending_pins()("busy-key"), "refused, still pending");
+    writer.execute_batch("COMMIT").unwrap();
+    daemon.flush_hit_stamps();
+    assert!(!daemon.pending_pins()("busy-key"));
+    assert_eq!(access_of(&config, "busy-key").1, 2);
+}
+
+#[test]
+fn hit_stamps_for_another_store_or_past_the_queue_bound_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+
+    let mut other = stamp_request(&config, &["k"]);
+    other.cache_dir = dir.path().join("elsewhere").to_string_lossy().into_owned();
+    assert!(!daemon.handle_stamp_hits(&other).ok);
+    assert!(!daemon.pending_pins()("k"));
+
+    let keys: Vec<String> = (0..MAX_PENDING_HIT_STAMPS).map(|n| format!("k{n}")).collect();
+    let full = StampHitsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        keys,
+    };
+    assert!(daemon.handle_stamp_hits(&full).ok);
+    assert!(
+        !daemon.handle_stamp_hits(&stamp_request(&config, &["one-more"])).ok,
+        "a full queue sends the hit back to stamping the index itself"
+    );
+}
+
+fn memo_row_request(config: &Config, path: &Path) -> (RecordFileHashesRequest, String) {
+    let fingerprint = crate::cache_key::FileFingerprint::from_path(path).unwrap();
+    let hash = crate::cache_key::hash_file(path).unwrap();
+    let row = kache_protocol::FileHashRow {
+        path: fingerprint.path,
+        size: fingerprint.size,
+        mtime_ns: fingerprint.mtime_ns,
+        ctime_ns: fingerprint.ctime_ns,
+        inode: fingerprint.inode,
+        hash: hash.clone(),
+        redated: false,
+    };
+    let req = RecordFileHashesRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows: vec![row],
+    };
+    (req, hash)
+}
+
+/// Memo rows a wrapper handed over stay queued while the index refuses
+/// them, and land once it lets them.
+#[test]
+fn handed_memo_rows_stay_queued_while_the_index_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    daemon.with_hash_store(|_| Ok(())).unwrap();
+    let file = dir.path().join("libdep.rmeta");
+    std::fs::write(&file, vec![b'm'; 128 * 1024]).unwrap();
+    let (req, hash) = memo_row_request(&config, &file);
+    let fingerprint = crate::cache_key::FileFingerprint::from_path(&file).unwrap();
+
+    assert!(daemon.handle_record_file_hashes(&req).ok);
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    daemon.flush_file_hash_records();
+    assert_eq!(
+        daemon.pending_memo_rows.lock().unwrap().len(),
+        1,
+        "refused, still queued"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+
+    daemon.flush_file_hash_records();
+    assert!(daemon.pending_memo_rows.lock().unwrap().is_empty());
+    let store = Store::open(&config).unwrap();
+    assert_eq!(store.file_hash_at(&fingerprint), Some(hash));
+}
+
+#[test]
+fn handed_memo_rows_for_another_store_or_past_the_queue_bound_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let file = dir.path().join("libdep.rmeta");
+    std::fs::write(&file, vec![b'm'; 128 * 1024]).unwrap();
+    let (mut req, _) = memo_row_request(&config, &file);
+
+    let mut other = req.clone();
+    other.cache_dir = dir.path().join("elsewhere").to_string_lossy().into_owned();
+    assert!(!daemon.handle_record_file_hashes(&other).ok);
+
+    let row = req.rows[0].clone();
+    req.rows = vec![row; MAX_PENDING_MEMO_ROWS];
+    assert!(daemon.handle_record_file_hashes(&req).ok);
+    req.rows.truncate(1);
+    assert!(
+        !daemon.handle_record_file_hashes(&req).ok,
+        "a full queue sends the rows back to the wrapper, which drops them"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn memo_rows_are_not_handed_off_without_a_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let row = crate::store::MemoRow {
+        fingerprint: crate::cache_key::FileFingerprint {
+            path: "/x".into(),
+            size: 1 << 20,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            inode: 1,
+        },
+        hash: "h".into(),
+        redated: false,
+    };
+    assert!(!send_memo_rows(
+        &dir.path().join("none.sock"),
+        &dir.path().join("cache"),
+        &[row]
+    ));
+}
+
+/// The wrapper's side: a stamp counts as handed off only when a daemon took
+/// it (or may have: no answer in time). No daemon, or one that refuses it
+/// (an older release answers an unknown request with an error), leaves the
+/// stamp to the hit.
+#[cfg(unix)]
+#[test]
+fn a_hit_stamp_is_handed_off_only_to_a_daemon_that_takes_it() {
+    use std::io::{BufRead, Write};
+    use interprocess::local_socket::traits::ListenerExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    assert!(!send_hit_stamp(&dir.path().join("none.sock"), &cache_dir, "k"));
+
+    let answer = |reply: Option<&'static str>| {
+        let socket = fresh_endpoint(&dir.path().join("daemon.sock"));
+        let listener = bind_sync_listener(&socket);
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.incoming().next().unwrap().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            assert!(line.contains("stamp_hits"), "{line}");
+            match reply {
+                Some(reply) => stream.write_all(reply.as_bytes()).unwrap(),
+                None => std::thread::sleep(std::time::Duration::from_millis(300)),
+            }
+        });
+        let started = std::time::Instant::now();
+        let taken = send_hit_stamp(&socket, &cache_dir, "k");
+        let waited = started.elapsed();
+        server.join().unwrap();
+        (taken, waited)
+    };
+    let refused = serde_json::to_string(&Response::err("invalid request: unknown variant")).unwrap() + "\n";
+    let ok = serde_json::to_string(&Response::ok()).unwrap() + "\n";
+    assert!(!answer(Some(Box::leak(refused.into_boxed_str()))).0, "an older daemon refuses");
+    assert!(answer(Some(Box::leak(ok.into_boxed_str()))).0, "a daemon that takes it");
+    let (taken, waited) = answer(None);
+    assert!(taken, "no answer in time: the daemon may hold it");
+    assert!(
+        waited < std::time::Duration::from_millis(250),
+        "the hit waited {waited:?}"
+    );
+}
+
+/// Memo rows go to the daemon without waiting for its answer: a restore that
+/// found the index busy is done once the request is in the daemon's socket,
+/// however slowly the daemon answers, and whatever it answers.
+#[cfg(unix)]
+#[test]
+fn memo_rows_are_handed_off_without_waiting_for_the_answer() {
+    use interprocess::local_socket::traits::ListenerExt as _;
+    use std::io::{BufRead, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let row = crate::store::MemoRow {
+        fingerprint: crate::cache_key::FileFingerprint {
+            path: "/x".into(),
+            size: 1 << 20,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            inode: 1,
+        },
+        hash: "h".into(),
+        redated: false,
+    };
+    let socket = fresh_endpoint(&dir.path().join("daemon.sock"));
+    let listener = bind_sync_listener(&socket);
+    let (received, got) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .unwrap();
+        received.send(line).unwrap();
+        // A daemon busy elsewhere, then refusing them.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let refused = serde_json::to_string(&Response::err("memo row queue full")).unwrap();
+        let _ = stream.write_all(format!("{refused}\n").as_bytes());
+    });
+    let started = std::time::Instant::now();
+    assert!(send_memo_rows(&socket, &dir.path().join("cache"), &[row]));
+    let waited = started.elapsed();
+    assert!(
+        got.recv().unwrap().contains("record_file_hashes"),
+        "the daemon got the rows"
+    );
+    server.join().unwrap();
+    assert!(
+        waited < std::time::Duration::from_millis(250),
+        "the restore waited {waited:?}"
+    );
+}
+
+/// Target roots a wrapper handed over stay queued while the index refuses
+/// them, and are recorded once it lets them, as a build's own unit would.
+#[test]
+fn handed_target_roots_stay_queued_while_the_index_refuses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let workspace = dir.path().join("ws");
+    let target = workspace.join("target");
+    fs::create_dir_all(target.join("debug")).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
     )
-    .await
-    .unwrap()
     .unwrap();
+    let req = RecordTargetRootsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        roots: vec![kache_protocol::TargetRootRow {
+            target: target.to_string_lossy().into_owned(),
+            workspace_root: workspace.to_string_lossy().into_owned(),
+            rustc: Some("rustc 1".into()),
+        }],
+    };
+    assert!(daemon.handle_record_target_roots(&req).ok);
+    let mut other = req.clone();
+    other.cache_dir = dir.path().join("elsewhere").to_string_lossy().into_owned();
+    assert!(!daemon.handle_record_target_roots(&other).ok);
+
+    daemon
+        .with_stamp_store(|store| {
+            store.set_busy_timeout_for_test(Duration::from_millis(0));
+            Ok(())
+        })
+        .unwrap();
+    let writer = rusqlite::Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    daemon.flush_handed_rows();
+    assert_eq!(
+        daemon.pending_target_roots.lock().unwrap().len(),
+        1,
+        "refused, still queued"
+    );
+    writer.execute_batch("COMMIT").unwrap();
+
+    daemon.flush_handed_rows();
+    assert!(daemon.pending_target_roots.lock().unwrap().is_empty());
+    let store = Store::open(&config).unwrap();
+    let roots = store.tracked_target_roots(0).unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].path, std::path::absolute(&target).unwrap());
+    assert!(!roots[0].discovered);
+}
+
+/// A handed target root whose directory is gone by the time the daemon
+/// writes it is not recorded: the registry never names a directory that
+/// is not there.
+#[test]
+fn a_handed_target_root_gone_before_the_flush_is_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let workspace = dir.path().join("ws");
+    let target = workspace.join("target");
+    fs::create_dir_all(target.join("debug")).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55",
+    )
+    .unwrap();
+    let req = RecordTargetRootsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        roots: vec![kache_protocol::TargetRootRow {
+            target: target.to_string_lossy().into_owned(),
+            workspace_root: workspace.to_string_lossy().into_owned(),
+            rustc: None,
+        }],
+    };
+    assert!(daemon.handle_record_target_roots(&req).ok);
+    fs::remove_dir_all(&target).unwrap();
+    daemon.flush_handed_rows();
+    assert!(daemon.pending_target_roots.lock().unwrap().is_empty());
+    let store = Store::open(&config).unwrap();
+    assert!(store.tracked_target_roots(0).unwrap().is_empty());
+}
+
+/// Handed prediction rows: the latest row of an identity wins, a row of a
+/// unit's tree trims the unit's other trees as the wrapper's own write does,
+/// and a full queue refuses more.
+#[test]
+fn handed_prediction_rows_keep_the_latest_and_trim_like_the_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config.clone());
+    let row = |identity: &str, json: &str, keep: Option<u32>| kache_protocol::PredictionRow {
+        identity: identity.into(),
+        schema: 7,
+        crate_name: Some("c".into()),
+        json: json.into(),
+        keep_under: keep.map(|keep| ("unit/".to_string(), keep)),
+    };
+    let request = |rows| RecordPredictionsRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        rows,
+    };
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![
+                row("plain", "old", None),
+                row("unit/a", "a", Some(1)),
+            ]))
+            .ok
+    );
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![row("plain", "new", None)]))
+            .ok
+    );
+    daemon.flush_handed_rows();
+    assert!(
+        daemon
+            .handle_record_predictions(&request(vec![row("unit/b", "b", Some(1))]))
+            .ok
+    );
+    daemon.flush_handed_rows();
+    let store = Store::open(&config).unwrap();
+    let cache = store.file_hash_cache();
+    assert_eq!(
+        cache.get_input_prediction("plain").unwrap(),
+        Some((7, "new".to_string()))
+    );
+    assert_eq!(
+        cache.get_input_prediction("unit/b").unwrap(),
+        Some((7, "b".to_string()))
+    );
+    assert_eq!(
+        cache.get_input_prediction("unit/a").unwrap(),
+        None,
+        "kept one row of the unit"
+    );
+
+    let full = vec![row("plain", "x", None); MAX_PENDING_HANDED_ROWS + 1];
+    assert!(!daemon.handle_record_predictions(&request(full)).ok);
+}
+
+/// Target roots and prediction rows go to the daemon without waiting for
+/// its answer, however slowly it answers.
+#[cfg(unix)]
+#[test]
+fn handed_rows_are_sent_without_waiting_for_the_answer() {
+    use interprocess::local_socket::traits::ListenerExt as _;
+    use std::io::{BufRead, Write};
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    assert!(!send_target_root(
+        &dir.path().join("none.sock"),
+        &cache_dir,
+        kache_protocol::TargetRootRow {
+            target: "/t".into(),
+            workspace_root: "/".into(),
+            rustc: None,
+        }
+    ));
+    let serve = |expect: &'static str| {
+        let socket = fresh_endpoint(&dir.path().join("daemon.sock"));
+        let listener = bind_sync_listener(&socket);
+        let (received, got) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.incoming().next().unwrap().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .unwrap();
+            received.send(line).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = stream.write_all(b"{\"ok\":false}\n");
+        });
+        (socket, move || {
+            let line = got.recv().unwrap();
+            assert!(line.contains(expect), "{line}");
+            server.join().unwrap();
+        })
+    };
+    let (socket, check) = serve("record_target_roots");
+    let started = std::time::Instant::now();
+    assert!(send_target_root(
+        &socket,
+        &cache_dir,
+        kache_protocol::TargetRootRow {
+            target: "/t".into(),
+            workspace_root: "/".into(),
+            rustc: None,
+        }
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    check();
+    let (socket, check) = serve("record_predictions");
+    let started = std::time::Instant::now();
+    assert!(send_prediction_rows(
+        &socket,
+        &cache_dir,
+        vec![kache_protocol::PredictionRow {
+            identity: "i".into(),
+            schema: 1,
+            crate_name: None,
+            json: "{}".into(),
+            keep_under: None,
+        }]
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    check();
 }
 
 #[test]
@@ -17550,4 +18479,257 @@ mod hash_warmup_tests {
         );
         stop(&daemon);
     }
+}
+
+#[test]
+fn a_started_daemon_sweeps_when_the_last_sweep_is_due_and_never_at_once() {
+    let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    let ago = |seconds| Some(now - Duration::from_secs(seconds));
+    // A restart in the middle of builds does not sweep while they store.
+    assert_eq!(first_periodic_gc_delay(None, now), STARTUP_GC_DELAY);
+    assert_eq!(first_periodic_gc_delay(ago(7 * 3600), now), STARTUP_GC_DELAY);
+    // A sweep an hour ago: the next is due five hours on, as without the restart.
+    assert_eq!(first_periodic_gc_delay(ago(3600), now), Duration::from_secs(5 * 3600));
+    assert_eq!(
+        first_periodic_gc_delay(ago(6 * 3600 - 60), now),
+        STARTUP_GC_DELAY,
+        "due in a minute still waits for the start delay"
+    );
+    // A record from the future (a clock step) is not trusted to postpone it.
+    assert_eq!(
+        first_periodic_gc_delay(Some(now + Duration::from_secs(3600)), now),
+        STARTUP_GC_DELAY
+    );
+}
+
+/// Cargo waits for the target-info probe until a seeding has memoised what
+/// it placed. On a busy journal the index's commit took 0.3-0.6 s of that
+/// wait, so a store that can hand rows to the daemon hands them over at
+/// once, and the daemon writes them in its next flush.
+#[test]
+fn a_seeding_hands_its_memo_rows_over_rather_than_waiting_for_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let mut store = Store::open(&config).unwrap();
+    let donor = dir.path().join("donor/libdep.rlib");
+    let placed = dir.path().join("new/libdep.rlib");
+    fs::create_dir_all(donor.parent().unwrap()).unwrap();
+    fs::create_dir_all(placed.parent().unwrap()).unwrap();
+    fs::write(&donor, vec![b'r'; 128 * 1024]).unwrap();
+    let before = crate::cache_key::FileFingerprint::from_path(&donor).unwrap();
+    let hash = kache_store::file_hash::hash_file(&donor).unwrap();
+    store.record_verified_file_hashes(&[(before.clone(), hash.as_str())]);
+    let since_ns = kache_store::file_hash::stamp_clock_ns();
+    fs::copy(&donor, &placed).unwrap();
+    filetime::set_file_mtime(
+        &placed,
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&donor).unwrap()),
+    )
+    .unwrap();
+    let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&handed);
+    store.send_busy_memo_rows_to(Box::new(move |rows| {
+        sink.lock().unwrap().extend_from_slice(rows);
+        true
+    }));
+    let file = crate::target_seed::PlacedFile {
+        from: donor.clone(),
+        before,
+        at: placed.clone(),
+    };
+
+    memoise_seeded_files(&store, std::slice::from_ref(&file), since_ns);
+
+    let at = crate::cache_key::FileFingerprint::from_path(&placed).unwrap();
+    let handed = handed.lock().unwrap().clone();
+    assert_eq!(
+        handed,
+        vec![crate::store::MemoRow {
+            fingerprint: at.clone(),
+            hash: hash.clone(),
+            redated: false,
+        }]
+    );
+    assert_eq!(store.file_hash_at(&at), None, "written by the daemon later");
+    assert_eq!(store.write_handed_memo_rows(&handed).unwrap(), 1);
+    assert_eq!(store.file_hash_at(&at), Some(hash.clone()));
+
+    // With no daemon to take them, the seeding writes them itself.
+    let mut alone = Store::open(&config).unwrap();
+    alone.send_busy_memo_rows_to(Box::new(|_| false));
+    fs::remove_file(&placed).unwrap();
+    fs::copy(&donor, &placed).unwrap();
+    filetime::set_file_mtime(
+        &placed,
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&donor).unwrap()),
+    )
+    .unwrap();
+    memoise_seeded_files(&alone, std::slice::from_ref(&file), since_ns);
+    let again = crate::cache_key::FileFingerprint::from_path(&placed).unwrap();
+    assert_eq!(alone.file_hash_at(&again), Some(hash));
+}
+
+/// A daemon that has just started defers a hinted size sweep to the end of
+/// STARTUP_GC_DELAY, as its periodic one, and then sweeps; one that has run
+/// that long sweeps on the hint (lane KACHE-W21: tasty.56 swept 670 GB seven
+/// seconds after its start, while the builds it restarted under stored).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_daemon_defers_a_hinted_sweep_to_the_end_of_its_startup_delay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100;
+    let store = Store::open(&config).unwrap();
+    let swept = |daemon: Daemon, key: &'static str| {
+        put_upload_evict_entry(&store, dir.path(), key, 200, false);
+        let daemon = Arc::new(daemon);
+        daemon.handle_gc_hint();
+        let store = &store;
+        async move {
+            let start = Instant::now();
+            while store.contains(key) && start.elapsed() < Duration::from_secs(10) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            (!store.contains(key), start.elapsed())
+        }
+    };
+
+    let mut fresh = Daemon::new(config.clone());
+    fresh.started = Instant::now();
+    let (gone, _) = tokio::time::timeout(Duration::from_secs(1), swept(fresh, "fresh"))
+        .await
+        .unwrap_or((false, Duration::ZERO));
+    assert!(!gone, "no sweep in the first second of a daemon");
+
+    let mut ending = Daemon::new(config.clone());
+    ending.started = Instant::now() - STARTUP_GC_DELAY + Duration::from_millis(1500);
+    let (gone, after) = swept(ending, "ending").await;
+    assert!(gone, "the deferred sweep runs once the delay is over");
+    assert!(
+        after >= Duration::from_millis(1000),
+        "not before: {after:?}"
+    );
+
+    let mut settled = Daemon::new(config);
+    settled.started = Instant::now() - STARTUP_GC_DELAY;
+    let (gone, after) = swept(settled, "settled").await;
+    assert!(gone && after < Duration::from_secs(5), "{after:?}");
+}
+
+/// KACHE-W22/W23: the daemon takes the adoptions concurrent builds hand
+/// over and answers at once; each key stays locked (marked storing) and
+/// pinned against the daemon's sweeps until its registrar wrote the batch:
+/// an adopted key then has the entry, one with nothing to adopt does not,
+/// and a key another process holds is left to it.
+#[test]
+fn handed_adoptions_are_answered_at_once_and_registered_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let old = crate::cache_key::CACHE_KEY_VERSION - 1;
+    let key = |i: usize| format!("{i:064x}");
+    let store = Store::open(&config).unwrap();
+    for i in 0..8 {
+        put_aged_entry(&config, dir.path(), &key(i));
+        store.set_key_schema_for_test(&key(i), old);
+    }
+    let held = store.try_lock(&key(300)).unwrap().expect("free");
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let request = |i: usize, legacy: String| AdoptEntriesRequest {
+        cache_dir: config.cache_dir.to_string_lossy().into_owned(),
+        entries: vec![
+            kache_protocol::AdoptEntry {
+                legacy_key: legacy,
+                legacy_version: old,
+                cache_key: key(100 + i),
+                crate_name: "testcrate".into(),
+            },
+            kache_protocol::AdoptEntry {
+                legacy_key: key(50 + i),
+                legacy_version: old,
+                cache_key: key(200 + i),
+                crate_name: "testcrate".into(),
+            },
+            kache_protocol::AdoptEntry {
+                legacy_key: key(i),
+                legacy_version: old,
+                cache_key: key(300),
+                crate_name: "testcrate".into(),
+            },
+        ],
+    };
+    let answers: Vec<Response> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let daemon = Arc::clone(&daemon);
+                let request = request(i, key(i));
+                scope.spawn(move || daemon.handle_adopt_entries(&request))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (i, answer) in answers.iter().enumerate() {
+        assert!(answer.ok, "{:?}", answer.error);
+        let taken: Vec<_> = answer
+            .batch_results
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|one| (one.found, one.skipped))
+            .collect();
+        assert_eq!(
+            taken,
+            [(Some(true), false), (Some(true), false), (Some(true), true)],
+            "request {i}"
+        );
+    }
+    let start = Instant::now();
+    while !daemon.pending_adoptions.lock().unwrap().is_empty()
+        && start.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(daemon.pending_adoptions.lock().unwrap().is_empty());
+    for i in 0..8 {
+        assert!(store.contains(&key(100 + i)));
+        assert!(!store.contains(&key(200 + i)));
+        assert!(
+            store.try_lock(&key(100 + i)).unwrap().is_some(),
+            "lock let go"
+        );
+    }
+    assert!(
+        !store.contains(&key(300)),
+        "left to the process that holds it"
+    );
+    drop(held);
+    let foreign = AdoptEntriesRequest {
+        cache_dir: "/elsewhere".into(),
+        ..request(0, key(0))
+    };
+    assert!(!daemon.handle_adopt_entries(&foreign).ok);
+}
+
+/// Until its registration is written, a taken adoption's keys are pinned
+/// against the daemon's own sweeps: the wrapper restores from the legacy
+/// entry's blobs meanwhile (KACHE-W23).
+#[test]
+fn a_taken_adoption_pins_both_keys_until_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let daemon = Daemon::new(config);
+    let pins = daemon.pending_pins();
+    daemon
+        .pending_adoptions
+        .lock()
+        .unwrap()
+        .extend(["legacy".to_string(), "current".to_string()]);
+    assert!(pins("legacy") && pins("current"));
+    assert!(!pins("other"));
+    let request = crate::store::AdoptionRequest {
+        legacy_key: "legacy".into(),
+        legacy_version: 1,
+        cache_key: "current".into(),
+        crate_name: "c".into(),
+    };
+    unpin_adoption(&daemon.pending_adoptions, &request);
+    assert!(!pins("legacy") && !pins("current"));
 }

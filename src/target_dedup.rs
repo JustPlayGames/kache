@@ -1038,6 +1038,7 @@ impl PipelineDb {
         fs::create_dir_all(cache_dir)?;
         let conn = Connection::open(cache_dir.join(DB_FILE))
             .with_context(|| format!("opening {}", cache_dir.join(DB_FILE).display()))?;
+        kache_fs::share_in_group_store(&cache_dir.join(DB_FILE));
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS reject (
                 path TEXT NOT NULL,

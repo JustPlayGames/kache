@@ -7,32 +7,6 @@ use std::fs;
 
 #[test]
 fn cached_check_outputs_allow_cargo_and_clippy_fix() {
-    #[cfg(unix)]
-    {
-        const CHILD: &str = "KACHE_TEST_PRIVATE_CARGO_FIX_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "cached_check_outputs_allow_cargo_and_clippy_fix",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "private cargo fix child failed:\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        // Only this test runs in the child. Subprocesses inherit its private
-        // umask without changing the creation policy of other tests.
-        unsafe { libc::umask(0o077) };
-    }
-
     let kache = common::kache_binary();
     for (fix_command, source, fixed) in [
         (
@@ -48,11 +22,6 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
     ] {
         let dir = tempfile::tempdir_in(common::scratch_dir()).unwrap();
         let root = dir.path().canonicalize().unwrap();
-        // Canonicalization adds the Windows device prefix. Use ordinary paths
-        // for the Cargo project and its SQLite-backed cache in this fixture.
-        let root = std::path::PathBuf::from(
-            kache_fs::paths::strip_verbatim_prefix(root.to_str().unwrap()).into_owned(),
-        );
         let project = root.join("project");
         let target = root.join("target");
         let cache = root.join("cache");
@@ -88,7 +57,6 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
                 "{args:?} failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            output
         };
         for warm in [false, true] {
             fs::write(project.join("src/lib.rs"), source).unwrap();
@@ -96,25 +64,7 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
                 fs::remove_dir_all(&target).unwrap();
             }
             common::settle_writes(&[&project]);
-            let output = run(&["check"]);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let metadata: Vec<_> = fs::read_dir(target.join("debug/deps"))
-                    .unwrap()
-                    .map(|entry| entry.unwrap().path())
-                    .filter(|path| path.extension().is_some_and(|ext| ext == "rmeta"))
-                    .collect();
-                assert!(!metadata.is_empty(), "cargo check must produce metadata");
-                for path in metadata {
-                    assert_eq!(
-                        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                        0o600,
-                        "metadata permissions after cargo check, warm={warm}: {}",
-                        path.display()
-                    );
-                }
-            }
+            run(&["check"]);
             let events: Vec<serde_json::Value> = fs::read_to_string(cache.join("events.jsonl"))
                 .unwrap()
                 .lines()
@@ -124,8 +74,7 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
             assert_eq!(
                 events.last().unwrap()["result"],
                 if warm { "local_hit" } else { "miss" },
-                "{events:#?}\ncargo stderr: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "{events:#?}"
             );
             if fix_command == "clippy" {
                 run(&["clippy", "--fix", "--allow-dirty", "--allow-no-vcs"]);

@@ -7,13 +7,23 @@ const RECENT_BYTES: u64 = 262_144;
 pub(super) enum LogLock {
     Wait,
     Build,
+    /// The daemon's writes, which no build waits for: they wait out a busy
+    /// log up to [`DAEMON_LOCK_BUDGET`] instead of being dropped.
+    Daemon,
 }
+
+/// How long the daemon's event writes wait for the log. The daemon logs a
+/// handed-off compile's miss after Cargo may have exited, in bursts of a
+/// batch, while every wrapper of the machine's builds takes the same lock;
+/// at the build budget, under load, it dropped events of compiles that ran.
+const DAEMON_LOCK_BUDGET: Duration = Duration::from_secs(2);
 
 impl LogLock {
     pub(super) fn exclusive(self, file: &File) -> Result<()> {
         match self {
             Self::Wait => Ok(file.lock()?),
             Self::Build => lock_for_build(|| file.try_lock()),
+            Self::Daemon => lock_while(|elapsed| elapsed < DAEMON_LOCK_BUDGET, || file.try_lock()),
         }
     }
 }
@@ -23,13 +33,20 @@ fn within_lock_budget(elapsed: Duration) -> bool {
 }
 
 pub(crate) fn lock_for_build(
+    attempt: impl FnMut() -> std::result::Result<(), TryLockError>,
+) -> Result<()> {
+    lock_while(within_lock_budget, attempt)
+}
+
+fn lock_while(
+    within_budget: impl Fn(Duration) -> bool,
     mut attempt: impl FnMut() -> std::result::Result<(), TryLockError>,
 ) -> Result<()> {
     let started = Instant::now();
     loop {
         match attempt() {
             Ok(()) => return Ok(()),
-            Err(TryLockError::WouldBlock) if within_lock_budget(started.elapsed()) => {
+            Err(TryLockError::WouldBlock) if within_budget(started.elapsed()) => {
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(TryLockError::WouldBlock) => {
@@ -196,9 +213,15 @@ mod tests {
         assert!(rotate_events_if_needed(&path, 1, 1, dir.path()).is_err());
         assert!(rotate_transfers_if_needed(&path, 1, 1).is_err());
         assert_eq!(fs::read(&path).unwrap(), line("original"));
-        drop(release_tx);
+        // The daemon's write waits for the reader instead.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(release_tx);
+        });
+        log_event_from_daemon(&path, &event).unwrap();
+        release.join().unwrap();
         holder.join().unwrap();
         log_event_for_build(&path, &event).unwrap();
-        assert_eq!(read_events(&path).unwrap().len(), 2);
+        assert_eq!(read_events(&path).unwrap().len(), 3);
     }
 }

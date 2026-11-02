@@ -133,8 +133,7 @@ fn run_app(target: &Path) -> String {
 }
 
 fn crate_events(cache: &Path, crate_name: &str) -> Vec<Value> {
-    std::fs::read_to_string(cache.join("events.jsonl"))
-        .unwrap_or_default()
+    common::settled_events(cache)
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["crate_name"] == crate_name)

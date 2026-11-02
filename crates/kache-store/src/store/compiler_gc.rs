@@ -69,7 +69,7 @@ impl<P: crate::ArtifactPolicy> ArtifactStore<P> {
         let by_key = candidates
             .iter()
             .map(|entry| (entry.key.as_str(), entry))
-            .collect();
+            .collect::<std::collections::HashMap<_, _>>();
         let durable_upload_keys = self.durable_upload_keys()?;
         Ok(self.apply_eviction(
             &keys,
@@ -78,8 +78,12 @@ impl<P: crate::ArtifactPolicy> ArtifactStore<P> {
             None,
             None,
             &durable_upload_keys,
-            &std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+            false,
+            None,
+            &mut |_| false,
             &mut || false,
+            &mut false,
         ))
     }
 }

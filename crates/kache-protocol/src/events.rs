@@ -165,6 +165,14 @@ pub struct BuildEvent {
     /// comparison. Always zero with verification off, which is the default.
     #[serde(default)]
     pub prediction_mismatches: u32,
+    /// How the input closure was decided, in order, comma-separated:
+    /// `validated` (prediction used), `emitted`, `deferred-new-crate`, or why
+    /// the dep-info pre-pass ran instead (`no-record`, `tree-changed`,
+    /// `env-changed`, `disabled`, ...). `validated,disabled` is a predicted
+    /// key that missed and was derived again. Empty when no rustc key was
+    /// derived. `serde(default)`, no schema bump.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prediction: String,
     /// Time blocked joining a machine-wide flight another process already
     /// owned for the same compile (ms). Zero on a hit served at first
     /// lookup; a hit taken on the recheck after the owner finished carries
@@ -286,6 +294,11 @@ pub struct BuildEvent {
     /// Background publication time; excluded from wrapper phase totals.
     #[serde(default)]
     pub daemon_store_ms: u64,
+    /// How many handed-off entries the daemon registered in the one
+    /// transaction that registered this one; 0 when it was registered alone
+    /// or not at all. `serde(default)`, no schema bump.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub daemon_store_batch: u32,
     /// Why an existing entry for this exact key was rejected before the
     /// compiler ran (kunobi-ninja/kache#655).
     ///
@@ -440,6 +453,10 @@ impl BuildEvent {
     }
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -586,6 +603,7 @@ impl BuildEvent {
             dep_info_ms: 0,
             dep_info_runs: 0,
             prediction_mismatches: 0,
+            prediction: String::new(),
             flight_wait_ms: 0,
             permit_wait_ms: 0,
             store_output_blobs: 0,
@@ -613,6 +631,7 @@ impl BuildEvent {
             store_error: String::new(),
             store_handed_off: false,
             daemon_store_ms: 0,
+            daemon_store_batch: 0,
             lookup_rejection: String::new(),
             verify_compare: String::new(),
             fallback: false,

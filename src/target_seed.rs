@@ -6,9 +6,12 @@
 //! before it takes the build lock and before it checks any unit's freshness.
 //! Cargo caches the answer in `<target>/.rustc_info.json`, so a target
 //! directory without that file is one Cargo has not built yet. The wrapper
-//! asks the daemon to seed it and waits up to [`SEED_DEADLINE`]; the daemon
+//! seeds it before it answers the probe, for up to [`SEED_DEADLINE`]: it
 //! copies the units another checkout already built for the same registry and
-//! git packages, and Cargo then finds them fresh and skips them.
+//! git packages, and Cargo then finds them fresh and skips them. The wrapper
+//! does this itself rather than through the daemon, so a build that starts
+//! while no daemon runs, or while the daemon is starting or busy, is seeded
+//! all the same.
 //!
 //! A unit's directory name carries Cargo's hash of everything that decides it
 //! (package, version, features, profile, dependencies, compiler). A registry
@@ -21,7 +24,9 @@
 //!   from a checkout with different sources could pass as fresh.
 //! - Modification times are kept: Cargo rebuilds a unit whose dependencies'
 //!   outputs are newer than its own.
-//! - Files are cloned where the filesystem can, else copied. Each unit's
+//! - Files are cloned where the filesystem can. Otherwise a file nobody may
+//!   write (a store blob the donor's restore linked) is hard-linked, and any
+//!   other file is copied (see [`shares_inode`]). Each unit's
 //!   fingerprint is put in place last, so an interrupted copy leaves a unit
 //!   Cargo rebuilds rather than one it trusts.
 //! - Compiler dep-info paths and paired build-script stdout/root-output are
@@ -66,15 +71,14 @@ use crate::build_script::HeldRun;
 #[cfg(not(unix))]
 type HeldRun = std::convert::Infallible;
 
-/// How long the daemon copies for. Copying stops at this deadline, between
+/// How long seeding copies for. Copying stops at this deadline, between
 /// files, and Cargo builds whatever was not copied.
-pub(crate) const SEED_DEADLINE: Duration = Duration::from_secs(3);
-
-/// How long the probe waits for the daemon's answer: the deadline and time
-/// for the file copy in progress when it passed.
-pub(crate) fn seed_wait() -> Duration {
-    SEED_DEADLINE + Duration::from_secs(2)
-}
+///
+/// A unit left out costs far more later than copying it now: the wrapper
+/// restores it from the store in a compiler call of its own (about 50 ms of
+/// CPU each in a 1,300-unit workspace, against about 1 ms to copy). On a
+/// loaded machine 3 s cut seedings of 1,400-1,500 units to 78-166.
+pub(crate) const SEED_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Units copied at once. A copy is mostly metadata calls, which overlap: on
 /// btrfs, 1159 units took 2.9 s on one thread, 0.6 s on four and 0.5 s on
@@ -232,8 +236,38 @@ struct Unit {
     hash: String,
 }
 
-/// The donor's units of `packages`.
+/// The donor's units of `packages`, in the order the donor built them
+/// ([`built_at`]), so a seeding the deadline cuts short has copied units
+/// whose dependencies it copied too: Cargo rebuilds a unit whose dependency
+/// it rebuilds, so a unit copied without its dependencies is copied in vain.
 fn units(profile: &Path, layout: Layout, packages: &BTreeSet<String>) -> Vec<Unit> {
+    let mut units = units_by_name(profile, layout, packages);
+    // Stable: units built at the same time keep their names' order, and a
+    // unit without a time goes last.
+    units.sort_by_cached_key(|unit| {
+        let built = built_at(profile, layout, unit);
+        (built.is_none(), built)
+    });
+    units
+}
+
+/// When the donor built `unit`: when Cargo last added a file to the unit's
+/// fingerprint directory, which it fills once the unit is built. A
+/// dependency is built, and its fingerprint written, before the units that
+/// use it start. Not the unit's own directory in the per-unit layout,
+/// which also changes when Cargo makes the unit's other directories.
+fn built_at(profile: &Path, layout: Layout, unit: &Unit) -> Option<std::time::SystemTime> {
+    let fingerprint = match layout {
+        Layout::PerUnit => marker(profile, layout, unit).join("fingerprint"),
+        Layout::Shared => marker(profile, layout, unit),
+    };
+    std::fs::symlink_metadata(fingerprint)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+/// The donor's units of `packages`, by package and hash.
+fn units_by_name(profile: &Path, layout: Layout, packages: &BTreeSet<String>) -> Vec<Unit> {
     let mut units = Vec::new();
     match layout {
         Layout::PerUnit => {
@@ -522,39 +556,149 @@ fn unit_hashes(name: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// The store's memo rows for a donor's artifacts, by path, each with the
+/// stamp it was recorded under
+/// ([`kache_store::file_hash::FileHashCache::recorded_at`]).
+pub(crate) type RecordedHashes = HashMap<String, (kache_store::file_hash::FileFingerprint, String)>;
+
+/// Reads the memo rows for the paths it is given; [`no_recorded_hashes`]
+/// when there is no store to ask.
+pub(crate) type RecordedLookup<'a> = &'a dyn Fn(&[&str]) -> RecordedHashes;
+
+/// A [`RecordedLookup`] that knows no hashes: every artifact is read.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn no_recorded_hashes(_: &[&str]) -> RecordedHashes {
+    RecordedHashes::new()
+}
+
+/// Whether `file` is an artifact a dependent's `--extern` reads.
+fn is_artifact(file: &Path) -> bool {
+    file.extension().is_some_and(|ext| {
+        ["rlib", "rmeta", "dylib", "so", "dll"].contains(&&*ext.to_string_lossy())
+    })
+}
+
+/// The unit's artifacts ([`is_artifact`]), or `None` once `deadline` passes.
+fn unit_artifacts(
+    from: &Path,
+    layout: Layout,
+    unit: &Unit,
+    deps: &HashMap<String, Vec<PathBuf>>,
+    deadline: Instant,
+) -> Option<Vec<PathBuf>> {
+    let mut files = match layout {
+        Layout::PerUnit => vec![from.join("build").join(&unit.package).join(&unit.hash)],
+        Layout::Shared => deps.get(&unit.hash).cloned().unwrap_or_default(),
+    };
+    let mut artifacts = Vec::new();
+    while let Some(file) = files.pop() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
+            files.extend(entries(&file));
+        } else if is_artifact(&file) {
+            artifacts.push(file);
+        }
+    }
+    Some(artifacts)
+}
+
+/// The memo rows for every artifact of `units`, read in one lookup before
+/// the copy threads start.
+fn recorded_for_units(
+    from: &Path,
+    layout: Layout,
+    units: &[Unit],
+    deps: &HashMap<String, Vec<PathBuf>>,
+    recorded: RecordedLookup,
+    deadline: Instant,
+) -> RecordedHashes {
+    let paths: Vec<String> = units
+        .iter()
+        .filter_map(|unit| unit_artifacts(from, layout, unit, deps, deadline))
+        .flatten()
+        .map(|file| {
+            kache_store::file_hash::absolute_path(&file)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    if paths.is_empty() || Instant::now() >= deadline {
+        return RecordedHashes::new();
+    }
+    recorded(&paths.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// Whether the donor file `file` is byte for byte a blob in `store`, read
+/// only when the store cannot vouch for it. The memo's row for its path
+/// vouches when the file's whole stamp (size, modification and change times,
+/// inode) is the one the row was recorded under, as a dependent's key takes
+/// it for the same file. Or the file is the blob the row names: the same
+/// inode, which nobody may write ([`is_blob_inode`]). Links come and go on
+/// such an inode with every target that restores or seeds it, and each one
+/// moves its change time, so only this second check lasts on a busy store.
+fn is_stored_blob(file: &Path, recorded: &RecordedHashes, store: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(file) else {
+        return false;
+    };
+    let now = kache_store::file_hash::FileFingerprint::from_metadata(file, &metadata);
+    if let Some((stamp, hash)) = recorded.get(&now.path) {
+        let blob = kache_store::blob_path_in_store_dir(store, hash);
+        if *stamp == now {
+            return blob.is_file();
+        }
+        if is_blob_inode(&metadata, &blob) {
+            return true;
+        }
+    }
+    kache_store::file_hash::hash_file(file)
+        .is_ok_and(|hash| kache_store::blob_path_in_store_dir(store, &hash).is_file())
+}
+
+/// Whether `metadata` is of the inode at `blob`, and nobody may write it.
+/// The store names a blob by the hash of its bytes and keeps it without
+/// write permission, so a link to it holds those bytes, as every restore
+/// and every seeded link ([`shares_inode`]) already relies on.
+#[cfg(unix)]
+fn is_blob_inode(metadata: &std::fs::Metadata, blob: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    metadata.is_file()
+        && metadata.permissions().mode() & 0o222 == 0
+        && std::fs::metadata(blob).is_ok_and(|blob| {
+            blob.is_file() && blob.dev() == metadata.dev() && blob.ino() == metadata.ino()
+        })
+}
+
+/// Without inode numbers, a blob's link is known only by its stamp.
+#[cfg(not(unix))]
+fn is_blob_inode(_: &std::fs::Metadata, _: &Path) -> bool {
+    false
+}
+
 /// Whether every artifact of the unit, what a dependent's `--extern` reads,
 /// is byte for byte a blob in this cache. A dependent's key hashes those
 /// bytes, and another kache or a build without kache writes different ones
 /// for the same Cargo unit; such a unit is left for Cargo to build through
-/// the cache.
+/// the cache. A file the store vouches for ([`is_stored_blob`]) is not read
+/// again: under load, reading every donor rlib back (0.7-1.2 GB a seeding)
+/// left hundreds of units past the deadline.
 fn artifacts_stored(
     from: &Path,
     layout: Layout,
     unit: &Unit,
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
+    recorded: &RecordedHashes,
     deadline: Instant,
 ) -> bool {
-    let mut files = match layout {
-        Layout::PerUnit => vec![from.join("build").join(&unit.package).join(&unit.hash)],
-        Layout::Shared => deps.get(&unit.hash).cloned().unwrap_or_default(),
+    let Some(files) = unit_artifacts(from, layout, unit, deps, deadline) else {
+        return false;
     };
     let store = cache_dir.join("store");
-    while let Some(file) = files.pop() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        if std::fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_dir()) {
-            files.extend(entries(&file));
-        } else if file.extension().is_some_and(|ext| {
-            ["rlib", "rmeta", "dylib", "so", "dll"].contains(&&*ext.to_string_lossy())
-        }) && !kache_store::file_hash::hash_file(&file)
-            .is_ok_and(|hash| kache_store::blob_path_in_store_dir(&store, &hash).is_file())
-        {
-            return false;
-        }
-    }
-    true
+    files
+        .iter()
+        .all(|file| Instant::now() < deadline && is_stored_blob(file, recorded, &store))
 }
 
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
@@ -567,6 +711,7 @@ fn copy_unit(
     unit: &Unit,
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
+    counts: &FileCounts,
     deadline: Instant,
 ) -> std::io::Result<()> {
     let relocation = relocation::Relocation::for_unit(from, to, layout, unit, deadline)?;
@@ -587,6 +732,7 @@ fn copy_unit(
                 &from.join("build").join(&unit.package).join(&unit.hash),
                 &package.join(&unit.hash),
                 cache_dir,
+                counts,
                 deadline,
                 Some(&relocation),
             )
@@ -602,6 +748,7 @@ fn copy_unit(
                         file,
                         &to_deps.join(&name),
                         cache_dir,
+                        counts,
                         deadline,
                         Some(&relocation),
                     )?;
@@ -614,6 +761,7 @@ fn copy_unit(
                     &build,
                     &to.join("build").join(&named),
                     cache_dir,
+                    counts,
                     deadline,
                     Some(&relocation),
                 )?;
@@ -623,6 +771,7 @@ fn copy_unit(
                 &from.join(".fingerprint").join(&named),
                 &to.join(".fingerprint").join(&named),
                 cache_dir,
+                counts,
                 deadline,
                 Some(&relocation),
             )
@@ -635,14 +784,22 @@ fn place_tree(
     from: &Path,
     to: &Path,
     cache_dir: &Path,
+    counts: &FileCounts,
     deadline: Instant,
     relocation: Option<&relocation::Relocation>,
 ) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if link_in_place(from, to, counts, relocation, deadline)? {
+        return Ok(());
+    }
     let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
+    let placed = std::sync::Mutex::new(Vec::new());
     let tree = Placing {
         from,
         to,
         cache_dir,
+        counts,
+        placed: &placed,
         relocation,
     };
     // Held past the rename, so a sweep keeps each run the tree links to until
@@ -650,11 +807,83 @@ fn place_tree(
     let mut runs = Vec::new();
     let copied = copy_tree(from, &staging, tree, &mut runs, deadline)
         .and_then(|()| std::fs::rename(&staging, to));
+    if copied.is_ok() {
+        let placed = placed.into_inner().unwrap_or_default();
+        let mut all = counts.placed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        all.extend(placed.into_iter().map(|mut file: PlacedFile| {
+            file.at = match file.at.strip_prefix(&staging) {
+                Ok(below) if below.as_os_str().is_empty() => to.to_path_buf(),
+                Ok(below) => to.join(below),
+                Err(_) => file.at,
+            };
+            file
+        }));
+    }
     if copied.is_err() {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_file(&staging);
     }
     copied
+}
+
+/// Link the donor file `from` straight to its final name `to`, once this
+/// seeding knows clones fail ([`FileCounts::no_clones`]) and when
+/// [`shares_inode`] allows a link: a link makes the name whole at once, as
+/// the rename of a staged copy does, and spares the journal that rename.
+/// False when `from` is not such a file or the link cannot be made: the
+/// caller stages it as before.
+#[cfg(unix)]
+fn link_in_place(
+    from: &Path,
+    to: &Path,
+    counts: &FileCounts,
+    relocation: Option<&relocation::Relocation>,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    if !counts.no_clones.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let metadata = std::fs::symlink_metadata(from)?;
+    if !metadata.is_file() || !shares_inode(Path::new(""), &metadata) {
+        return Ok(false);
+    }
+    if Instant::now() >= deadline {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    // Dep-info and a build script's records are written anew, never linked.
+    if let Some(relocation) = relocation
+        && relocation.contents(from, deadline)?.is_some()
+    {
+        return Ok(false);
+    }
+    if !link_read_only(from, to) {
+        return Ok(false);
+    }
+    counts.linked.fetch_add(1, Ordering::Relaxed);
+    if let Some(placed) = placed_file(from, &metadata, to) {
+        counts
+            .placed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(placed);
+    }
+    Ok(true)
+}
+
+/// The [`PlacedFile`] for the donor file `from`, with `metadata` read before
+/// it was placed at `at`, when it is large enough for the hash memo.
+fn placed_file(from: &Path, metadata: &std::fs::Metadata, at: &Path) -> Option<PlacedFile> {
+    (metadata.len() >= crate::target_dedup::MIN_BYTES).then(|| PlacedFile {
+        from: from.to_path_buf(),
+        before: kache_store::file_hash::FileFingerprint {
+            path: from.to_string_lossy().into_owned(),
+            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+            mtime_ns: kache_store::file_hash::metadata_mtime_ns(metadata),
+            ctime_ns: kache_store::file_hash::metadata_ctime_ns(metadata),
+            inode: kache_store::file_hash::metadata_inode(metadata),
+        },
+        at: at.to_path_buf(),
+    })
 }
 
 /// A tree [`place_tree`] copies: where it comes from, where it is placed,
@@ -665,7 +894,70 @@ struct Placing<'a> {
     from: &'a Path,
     to: &'a Path,
     cache_dir: &'a Path,
+    counts: &'a FileCounts,
+    /// Files placed under the staging path, before the tree's rename.
+    placed: &'a std::sync::Mutex<Vec<PlacedFile>>,
+    /// Target-local metadata rewritten for the new target.
     relocation: Option<&'a relocation::Relocation>,
+}
+
+/// A donor file a seeding placed, large enough for the hash memo: the donor
+/// path and its stamp before it was linked or copied, and where it went. The
+/// donor's memo row for that stamp is the placed file's hash too, so the
+/// seeding can memoise it ([`PlacedFile::memo_rows`]) and the first build in
+/// the new target does not read it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlacedFile {
+    pub(crate) from: PathBuf,
+    pub(crate) before: kache_store::file_hash::FileFingerprint,
+    pub(crate) at: PathBuf,
+}
+
+impl PlacedFile {
+    /// The memo rows this placement earns, given `hash`, the donor's memo
+    /// row for its stamp before the seeding, and `since_ns`, read from
+    /// [`kache_store::file_hash::stamp_clock_ns`] before the seeding began.
+    ///
+    /// A link shares the donor's inode, which nobody may write
+    /// ([`shares_inode`]): the link itself changes the ctime, and nothing
+    /// else did when the size, mtime and inode are the donor's and the ctime
+    /// moved only during the seeding. That stamp then holds for the donor
+    /// path too. A copy is a new inode with the donor's mtime; its bytes are
+    /// the donor's when the donor's whole stamp did not move while it was
+    /// copied.
+    pub(crate) fn memo_rows(
+        &self,
+        since_ns: i64,
+    ) -> Vec<kache_store::file_hash::FileFingerprint> {
+        use kache_store::file_hash::FileFingerprint;
+        let (Ok(from), Ok(at)) = (
+            FileFingerprint::from_path(&self.from),
+            FileFingerprint::from_path(&self.at),
+        ) else {
+            return Vec::new();
+        };
+        let before = &self.before;
+        let content_kept = |now: &FileFingerprint| {
+            now.size == before.size && now.mtime_ns == before.mtime_ns
+        };
+        if before.inode != 0 && at.inode == before.inode {
+            let linked_now = |now: &FileFingerprint| {
+                now.inode == before.inode
+                    && content_kept(now)
+                    && now.ctime_ns >= before.ctime_ns
+                    && (now.ctime_ns == before.ctime_ns
+                        || kache_store::file_hash::stamp_written_since(now, since_ns))
+            };
+            if linked_now(&at) && linked_now(&from) {
+                return vec![at, from];
+            }
+            return Vec::new();
+        }
+        if from == *before && content_kept(&at) {
+            return vec![at];
+        }
+        Vec::new()
+    }
 }
 
 /// Copy `from`, a file or directory in `tree`, to `to`, keeping every file's
@@ -717,28 +1009,34 @@ fn copy_tree(
             from.display()
         )));
     }
+    let below = from.strip_prefix(tree.from).unwrap_or(Path::new(""));
+    // Dep-info and a build script's records name the donor's paths: they
+    // are written anew for this target, never linked, and never memoised
+    // as the donor's bytes.
     let contents = tree
         .relocation
         .map(|relocation| relocation.contents(from, deadline))
         .transpose()?
         .flatten();
-    copy_file(from, to, &metadata, contents.as_deref())
+    if let Some(contents) = contents {
+        write_stamped(to, &mut &contents[..], &metadata)?;
+        tree.counts.copied.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    place_file(from, below, to, &metadata, tree.counts)?;
+    if let Some(placed) = placed_file(from, &metadata, to) {
+        tree.placed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(placed);
+    }
+    Ok(())
 }
 
-/// Copy the file `from` to `to`, giving it `metadata`'s permissions and
-/// modification time. A Linux reflink creates `to` with the default mode, so
+/// Give a cloned or copied file `metadata`'s modification time and
+/// permissions. A Linux reflink creates `to` with the default mode, so
 /// without the permissions a seeded build script is one Cargo cannot execute.
-fn copy_file(
-    from: &Path,
-    to: &Path,
-    metadata: &std::fs::Metadata,
-    contents: Option<&[u8]>,
-) -> std::io::Result<()> {
-    if let Some(contents) = contents {
-        std::fs::write(to, contents)?;
-    } else if kache_store::link::try_reflink(from, to).is_err() {
-        std::fs::copy(from, to)?;
-    }
+fn stamp(to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
     filetime::set_file_mtime(
         to,
         filetime::FileTime::from_last_modification_time(metadata),
@@ -746,11 +1044,171 @@ fn copy_file(
     std::fs::set_permissions(to, metadata.permissions())
 }
 
+/// Write `contents` to a new file `to` with `metadata`'s modification time
+/// and permissions, set through the open file. On a busy journal each
+/// metadata call waits its turn: `std::fs::copy` and [`stamp`] made five of
+/// them (create, mode, write, time by path, mode again by path), this makes
+/// three, and a fourth only when the umask took bits from the mode.
+#[cfg(unix)]
+fn write_stamped(
+    to: &Path,
+    contents: &mut impl std::io::Read,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mode = metadata.permissions().mode() & 0o7777;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(to)?;
+    std::io::copy(contents, &mut file)?;
+    // After the write, which clears set-id bits.
+    if file.metadata()?.permissions().mode() & 0o7777 != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    filetime::set_file_handle_times(
+        &file,
+        None,
+        Some(filetime::FileTime::from_last_modification_time(metadata)),
+    )
+}
+
+/// Without a mode to create a file with, written and then stamped.
+#[cfg(not(unix))]
+fn write_stamped(
+    to: &Path,
+    contents: &mut impl std::io::Read,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    std::io::copy(contents, &mut std::fs::File::create(to)?)?;
+    stamp(to, metadata)
+}
+
+/// Whether a clone failed because this filesystem, or this pair of
+/// directories, cannot clone at all, as ext4 and tmpfs refuse every one.
+fn cannot_clone(error: &anyhow::Error) -> bool {
+    let Some(error) = error.downcast_ref::<std::io::Error>() else {
+        return false;
+    };
+    #[cfg(unix)]
+    if let Some(code) = error.raw_os_error() {
+        return [
+            libc::EOPNOTSUPP,
+            libc::ENOTSUP,
+            libc::EXDEV,
+            libc::ENOTTY,
+            libc::ENOSYS,
+        ]
+        .contains(&code);
+    }
+    error.kind() == std::io::ErrorKind::Unsupported
+}
+
+/// Files a seeding gave by hard link and by copy or clone.
+#[derive(Debug, Default)]
+struct FileCounts {
+    linked: AtomicUsize,
+    copied: AtomicUsize,
+    /// Set once a clone fails because the filesystem cannot make one
+    /// ([`cannot_clone`]). Each failed clone created and removed a file in
+    /// the target, two waits on a busy journal, so the seeding stops
+    /// asking.
+    no_clones: std::sync::atomic::AtomicBool,
+    /// Files placed for good, at their final paths.
+    placed: std::sync::Mutex<Vec<PlacedFile>>,
+}
+
+/// Give `to` the donor file `from` (`below` is its path inside the unit's
+/// tree): a clone where the filesystem can make one, else a hard link when
+/// [`shares_inode`] allows it, else a copy. A link is the donor's own inode,
+/// so its modification time and mode are already the donor's.
+fn place_file(
+    from: &Path,
+    below: &Path,
+    to: &Path,
+    metadata: &std::fs::Metadata,
+    counts: &FileCounts,
+) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = below;
+    if !counts.no_clones.load(Ordering::Relaxed) {
+        match kache_store::link::try_reflink(from, to) {
+            Ok(()) => {
+                counts.copied.fetch_add(1, Ordering::Relaxed);
+                return stamp(to, metadata);
+            }
+            Err(error) if cannot_clone(&error) => {
+                counts.no_clones.store(true, Ordering::Relaxed);
+            }
+            Err(_) => {}
+        }
+    }
+    #[cfg(unix)]
+    if shares_inode(below, metadata) && link_read_only(from, to) {
+        counts.linked.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    write_stamped(to, &mut std::fs::File::open(from)?, metadata)?;
+    counts.copied.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Whether a donor file may be given to the new target as a hard link rather
+/// than a copy: a regular file that nobody may write, outside a build script's
+/// `out/`, while kache does not run as root (root writes any file).
+///
+/// kache's store keeps its blobs without write permission (`0444`, `0440`
+/// when a group shares the store), and a donor's restored outputs are links
+/// to them, so these are most of a donor's bytes. Nothing in a build rewrites
+/// such a file in place: rustc and the linkers write a new file and rename it
+/// over the old one, which leaves every other link alone, and a tool that
+/// opens one for writing fails in the new target exactly as it would in the
+/// donor, where the file has the same mode. So the shared inode is never
+/// written through, neither into the donor nor into the store. A build
+/// script's `out/` holds whatever the script wrote; a rerun could make a
+/// file writable and rewrite it, so those files stay copies.
+#[cfg(unix)]
+fn shares_inode(below: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.is_file()
+        && metadata.permissions().mode() & 0o222 == 0
+        && !below
+            .components()
+            .any(|component| component.as_os_str() == "out")
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        && unsafe { libc::geteuid() } != 0
+}
+
+/// Hard-link `from` to `to`. False when the link cannot be made (another
+/// filesystem, the link limit, the kernel's protected hard links for a file
+/// another user owns), or when the inode it shares turns out writable after
+/// all, in which case the link is removed again and the caller copies.
+#[cfg(unix)]
+fn link_read_only(from: &Path, to: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::hard_link(from, to).is_err() {
+        return false;
+    }
+    match std::fs::symlink_metadata(to) {
+        Ok(linked) if linked.is_file() && linked.permissions().mode() & 0o222 == 0 => true,
+        _ => {
+            let _ = std::fs::remove_file(to);
+            false
+        }
+    }
+}
+
 /// What a seeding did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seeded {
     pub(crate) units: usize,
     pub(crate) donor: Option<PathBuf>,
+    /// Files given as hard links rather than copies ([`shares_inode`]).
+    pub(crate) linked: usize,
+    /// Files large enough for the hash memo, for [`PlacedFile::memo_rows`].
+    pub(crate) placed: Vec<PlacedFile>,
 }
 
 /// Editor and check targets reuse only the same lane in another checkout.
@@ -766,12 +1224,37 @@ fn seed_lane(directory: &Path) -> &str {
 /// first, built by the `rustc -vV` in `rustc_version` that has any. A link
 /// to a hermetic run is linked again only into `cache_dir`. Stops at
 /// `deadline`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn seed(
     target: &NewTarget,
     rustc_version: &str,
     donors: &[Donor],
     cache_dir: &Path,
     deadline: Instant,
+) -> Seeded {
+    seed_for_lane(
+        target,
+        rustc_version,
+        donors,
+        cache_dir,
+        &no_recorded_hashes,
+        deadline,
+        false,
+    )
+}
+
+/// [`seed`], and for a build that only checks (`check_lane`), only the units
+/// a check of the donor's workspace used ([`check_demand`]). Without such a
+/// record in the donor, every unit, as [`seed`]. `recorded` reads the
+/// store's memo rows for the donor's artifacts ([`artifacts_stored`]).
+pub(crate) fn seed_for_lane(
+    target: &NewTarget,
+    rustc_version: &str,
+    donors: &[Donor],
+    cache_dir: &Path,
+    recorded: RecordedLookup,
+    deadline: Instant,
+    check_lane: bool,
 ) -> Seeded {
     let Ok(lockfile) = std::fs::read_to_string(target.workspace_root.join("Cargo.lock")) else {
         return Seeded::default();
@@ -795,36 +1278,40 @@ pub(crate) fn seed(
     if built(&target.target_dir) {
         return Seeded::default();
     }
-    for donor in donors {
+    for (donor, layout) in ranked_donors(target, rustc_version, donors, &packages, check_lane) {
         if Instant::now() >= deadline {
             break;
         }
-        if donor.target_dir == target.target_dir
-            || seed_lane(&donor.target_dir) != seed_lane(&target.target_dir)
-            || !donor_built_by(donor, rustc_version)
-        {
-            continue;
-        }
         let from = donor.target_dir.join(PROFILE);
-        let Some(layout) = layout(&from) else {
-            continue;
-        };
-        let Some(_theirs) = try_lock(&from.join(".cargo-lock")) else {
+        let Some(_theirs) = try_lock_shared(&from.join(".cargo-lock")) else {
             continue;
         };
         let deps = match layout {
             Layout::Shared => deps_by_hash(&from.join("deps")),
             Layout::PerUnit => HashMap::new(),
         };
-        let units = units(&from, layout, &packages);
+        let mut units = units(&from, layout, &packages);
+        if check_lane
+            && layout == Layout::Shared
+            && let Some(demand) = check_demand(&from, &packages, &deps)
+        {
+            let all = units.len();
+            units.retain(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)));
+            tracing::info!(
+                "check build: seeding {} of {all} registry units the donor's check used",
+                units.len()
+            );
+        }
+        let recorded = recorded_for_units(&from, layout, &units, &deps, recorded, deadline);
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
+        let files = FileCounts::default();
         let cancellation = crate::invocation::process::current();
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
                 let cancellation = cancellation.clone();
-                let (units, next, copied, from, to, deps) =
-                    (&units, &next, &copied, &from, &to, &deps);
+                let (units, next, copied, from, to, deps, files, recorded) =
+                    (&units, &next, &copied, &from, &to, &deps, &files, &recorded);
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
@@ -837,11 +1324,13 @@ pub(crate) fn seed(
                         if marker(to, layout, unit).exists()
                             || names_the_donor(from, layout, unit, donor)
                             || out_dir_names_the_donor(from, layout, unit, donor, deadline)
-                            || !artifacts_stored(from, layout, unit, deps, cache_dir, deadline)
+                            || !artifacts_stored(
+                                from, layout, unit, deps, cache_dir, recorded, deadline,
+                            )
                         {
                             continue;
                         }
-                        match copy_unit(from, to, layout, unit, deps, cache_dir, deadline) {
+                        match copy_unit(from, to, layout, unit, deps, cache_dir, files, deadline) {
                             Ok(()) => {
                                 copied.fetch_add(1, Ordering::Relaxed);
                             }
@@ -862,6 +1351,8 @@ pub(crate) fn seed(
             return Seeded {
                 units: copied,
                 donor: Some(donor.workspace_root.clone()),
+                linked: files.linked.into_inner(),
+                placed: files.placed.into_inner().unwrap_or_default(),
             };
         }
     }
@@ -916,6 +1407,105 @@ fn pin_launcher(from: &Path, to: &Path, record: &Path, deadline: Instant) -> std
     std::fs::rename(staged, pinned)
 }
 
+/// How many of the most recently used donors are ranked by what they hold.
+const RANKED_DONORS: usize = 8;
+
+/// The donors that can give `target` units, in the order seeding tries them:
+/// of the [`RANKED_DONORS`] most recently used, the one that can give the
+/// most first (the more recent of two that give as many), then every other
+/// in order of use. A build gets every unit of `packages` a donor holds; a
+/// check (`check_lane`) only those [`check_units`] counts.
+///
+/// The checkout used last may have built a small part of the workspace: a
+/// `cargo xtask` command builds the dependencies of one crate, 361 units of
+/// a 1,900-unit workspace. Seeding stops at the first donor it copies from,
+/// so taking the most recent one alone left a new checkout with those 361.
+fn ranked_donors<'a>(
+    target: &'a NewTarget,
+    rustc_version: &'a str,
+    donors: &'a [Donor],
+    packages: &BTreeSet<String>,
+    check_lane: bool,
+) -> impl Iterator<Item = (&'a Donor, Layout)> + 'a {
+    let mut usable = donors.iter().filter_map(move |donor| {
+        if donor.target_dir == target.target_dir
+            || seed_lane(&donor.target_dir) != seed_lane(&target.target_dir)
+            || !donor_built_by(donor, rustc_version)
+        {
+            return None;
+        }
+        layout(&donor.target_dir.join(PROFILE)).map(|layout| (donor, layout))
+    });
+    let candidates: Vec<_> = usable.by_ref().take(RANKED_DONORS).collect();
+    // Each donor's fingerprints are read in a thread of its own: a check
+    // reads every unit's, tens of milliseconds a donor.
+    let mut ranked: Vec<_> = std::thread::scope(|scope| {
+        let counts: Vec<_> = candidates
+            .iter()
+            .map(|&(donor, layout)| {
+                scope.spawn(move || {
+                    let profile = donor.target_dir.join(PROFILE);
+                    if check_lane && layout == Layout::Shared {
+                        check_units(&profile, packages)
+                    } else {
+                        units_by_name(&profile, layout, packages).len()
+                    }
+                })
+            })
+            .collect();
+        candidates
+            .iter()
+            .zip(counts)
+            .map(|(&(donor, layout), count)| (donor, layout, count.join().unwrap_or(0)))
+            .collect()
+    });
+    // Stable: equals keep their order of use.
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+    ranked
+        .into_iter()
+        .map(|(donor, layout, _)| (donor, layout))
+        .chain(usable)
+}
+
+/// The units of `packages` in a donor's shared-layout `profile` a check
+/// build is given ([`seed_for_lane`]): those a check of the donor's
+/// workspace used ([`check_demand`]). A donor without a checked workspace
+/// unit gives every unit, but a check uses only those it compiled itself,
+/// which are metadata alone; only they count.
+///
+/// Ranked by every unit they hold, a workspace clippy in a new target was
+/// seeded from a checkout's test-build target, whose checks had used 808 to
+/// 1,000 registry units, while another checkout's workspace check, which
+/// used 1,285, held fewer units in all.
+fn check_units(profile: &Path, packages: &BTreeSet<String>) -> usize {
+    let deps = deps_by_hash(&profile.join("deps"));
+    let held = units_by_name(profile, Layout::Shared, packages);
+    match check_demand(profile, packages, &deps) {
+        Some(demand) => held
+            .iter()
+            .filter(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)))
+            .count(),
+        None => held
+            .iter()
+            .filter(|unit| metadata_only(&deps, &unit.hash))
+            .count(),
+    }
+}
+
+/// Are the unit's `deps/` outputs metadata alone (`.rmeta`, `.d`), as a
+/// check writes them?
+fn metadata_only(deps: &HashMap<String, Vec<PathBuf>>, hash: &str) -> bool {
+    deps.get(hash).is_some_and(|files| {
+        !files.is_empty()
+            && files.iter().all(|file| {
+                matches!(
+                    file.extension().and_then(OsStr::to_str),
+                    Some("rmeta" | "d")
+                )
+            })
+    })
+}
+
 /// What Cargo writes to `CACHEDIR.TAG` in a target directory it creates.
 const CARGO_CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55
 # This file is a cache directory tag created by cargo.
@@ -939,9 +1529,17 @@ fn tag_as_cargo_target(target_dir: &Path) {
 /// does not always write (it cannot fingerprint every rustc).
 fn donor_built_by(donor: &Donor, version: &str) -> bool {
     match &donor.rustc {
-        Some(recorded) => recorded.trim() == version.trim(),
-        None => built_by(&donor.target_dir, version),
+        Some(recorded) if is_rustc_version(recorded) => recorded.trim() == version.trim(),
+        // Not a `rustc -vV`: before 1.2.1-tasty.4 a unit Clippy checked
+        // recorded `clippy-driver`'s version (`clippy 0.1.99 (...)`), which
+        // no probe ever matches. Cargo's own cache decides instead.
+        _ => built_by(&donor.target_dir, version),
     }
+}
+
+/// Is `recorded` the output of `rustc -vV`, as a probe reports it?
+fn is_rustc_version(recorded: &str) -> bool {
+    recorded.trim_start().starts_with("rustc ")
 }
 
 fn built_by(target_dir: &Path, version: &str) -> bool {
@@ -974,14 +1572,29 @@ impl Drop for Held {
 /// Lock `path` exclusively without waiting, creating it if needed. `None`
 /// when another process holds it or it cannot be opened.
 fn try_lock(path: &Path) -> Option<Held> {
-    let file = std::fs::OpenOptions::new()
+    let file = open_lock(path)?;
+    file.try_lock().ok()?;
+    Some(Held(file))
+}
+
+/// Lock a donor's `path` for reading without waiting: Cargo building there
+/// holds it exclusively and keeps seeding out, while other seedings, which
+/// only read the donor, share it. An exclusive lock let one new checkout
+/// at a time read a donor: of three started together from one donor, two
+/// went unseeded and restored every unit one compiler call at a time.
+fn try_lock_shared(path: &Path) -> Option<Held> {
+    let file = open_lock(path)?;
+    file.try_lock_shared().ok()?;
+    Some(Held(file))
+}
+
+fn open_lock(path: &Path) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(path)
-        .ok()?;
-    file.try_lock().ok()?;
-    Some(Held(file))
+        .ok()
 }
 
 fn entries(dir: &Path) -> Vec<PathBuf> {
@@ -1005,6 +1618,111 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The unit directories (`<package>-<hash>`) a check build of the donor's
+/// workspace reads, from Cargo's own fingerprints in the `profile` directory
+/// of the shared layout: every unit reachable from a workspace unit Cargo
+/// checked (one whose outputs are metadata only) through the `deps` of each
+/// unit's fingerprint. A dependency is named there by its fingerprint hash,
+/// the one the dependency's own hash file holds.
+///
+/// `None` when the donor holds no checked workspace unit or a fingerprint
+/// cannot be read: then nothing says what a check needs. Only ever a filter
+/// on what is copied: a unit left out is restored by the wrapper when Cargo
+/// asks for it, as without seeding.
+fn check_demand(
+    profile: &Path,
+    registry: &BTreeSet<String>,
+    deps: &HashMap<String, Vec<PathBuf>>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut by_fingerprint: HashMap<String, String> = HashMap::new();
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    let mut roots = Vec::new();
+    for unit in subdirectories(&profile.join(".fingerprint")) {
+        let name = file_name(&unit);
+        let Some((package, hash)) = name.rsplit_once('-') else {
+            continue;
+        };
+        let mut wants = Vec::new();
+        for file in entries(&unit) {
+            let file_name = file_name(&file);
+            if file_name.ends_with(".json") {
+                let text = std::fs::read_to_string(&file).ok()?;
+                let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+                for dep in json.get("deps")?.as_array()? {
+                    let fingerprint = dep.as_array()?.get(3)?.as_u64()?;
+                    wants.push(hex_le(fingerprint));
+                }
+            } else if file_name != "invoked.timestamp"
+                && !file_name.starts_with("dep-")
+                && !file_name.contains('.')
+            {
+                let fingerprint = std::fs::read_to_string(&file).ok()?;
+                by_fingerprint.insert(fingerprint.trim().to_owned(), name.clone());
+            }
+        }
+        if !registry.contains(package) && metadata_only(deps, hash) {
+            roots.push(name.clone());
+        }
+        edges.insert(name, wants);
+    }
+    if roots.is_empty() {
+        return None;
+    }
+    let mut reached = std::collections::HashSet::new();
+    while let Some(unit) = roots.pop() {
+        if !reached.insert(unit.clone()) {
+            continue;
+        }
+        for fingerprint in edges.get(&unit).into_iter().flatten() {
+            if let Some(dep) = by_fingerprint.get(fingerprint) {
+                roots.push(dep.clone());
+            }
+        }
+    }
+    Some(reached)
+}
+
+/// A fingerprint as Cargo's hash files spell it: the little-endian bytes of
+/// the `u64` in hex.
+fn hex_le(fingerprint: u64) -> String {
+    fingerprint
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Does the Cargo that sent this probe only check? `cargo clippy` runs
+/// `cargo check` with `CLIPPY_ARGS` set; a `cargo check` is the subcommand of
+/// the parent process. Only narrows what is seeded, so a wrong answer costs
+/// time, never a wrong build.
+fn probe_is_check_lane(env: &crate::invocation::InvocationEnv) -> bool {
+    if env.var_os("CLIPPY_ARGS").is_some() {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ppid) = crate::invocation::cargo_pid()
+        && let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline"))
+    {
+        let args: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        return matches!(cargo_subcommand(&args), Some("check" | "clippy"));
+    }
+    false
+}
+
+/// The subcommand of a Cargo command line: the first argument after the
+/// program that is neither an option nor a `+toolchain`.
+#[cfg(any(target_os = "linux", test))]
+fn cargo_subcommand(args: &[String]) -> Option<&str> {
+    args.iter()
+        .skip(1)
+        .map(String::as_str)
+        .find(|arg| !arg.starts_with('-') && !arg.starts_with('+'))
+}
+
 /// Pass Cargo's explicit target selection to its compiler wrappers.
 pub(crate) fn configure_cargo_seed(
     command: &mut std::process::Command,
@@ -1020,6 +1738,44 @@ fn asks_for_seed(enabled: bool, args: &[String]) -> bool {
     enabled && is_target_info_probe(args)
 }
 
+/// Does `args` name a target platform (`--target <triple>` or
+/// `--target=<triple>`)?
+fn names_a_target(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--target" || arg.starts_with("--target="))
+}
+
+/// Does the build this probe is for name a target platform? Cargo then
+/// builds that platform's units under `<target>/<triple>/` and only the
+/// units for the host (build scripts, proc macros) under `debug/`, which is
+/// all seeding fills. A cross check of a web or Windows build used none of
+/// the thousands of host units seeding copied from a donor (687 of 687
+/// units restored with and without them, 2026-10-18), and the copy took the
+/// whole [`SEED_DEADLINE`] before Cargo started. Read from the probe's own
+/// arguments (Cargo probes each platform), `CARGO_BUILD_TARGET` and, on
+/// Linux, the Cargo command line that sent the probe. Only skips a seeding,
+/// so a wrong answer costs time, never a wrong build.
+fn build_names_a_target(args: &[String], env: &crate::invocation::InvocationEnv) -> bool {
+    if names_a_target(args)
+        || env
+            .var_os("CARGO_BUILD_TARGET")
+            .is_some_and(|target| !target.is_empty())
+    {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ppid) = crate::invocation::cargo_pid()
+        && let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline"))
+    {
+        let args: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        return names_a_target(&args);
+    }
+    false
+}
+
 /// The wrapper's side: when `args` is the probe for a target directory Cargo
 /// has not built, ask the daemon to seed it and wait for the answer.
 ///
@@ -1029,7 +1785,7 @@ pub(crate) fn before_probe_for(
     args: &[String],
     env: &crate::invocation::InvocationEnv,
 ) {
-    if !asks_for_seed(config.seed_new_targets, args) {
+    if !asks_for_seed(config.seed_new_targets, args) || build_names_a_target(args, env) {
         return;
     }
     let Some(cwd) = env.cwd() else {
@@ -1066,7 +1822,41 @@ pub(crate) fn before_probe_for(
     let Some(version) = rustc_version_for(args.first().map(String::as_str), env) else {
         return;
     };
-    crate::daemon::send_seed_target(config, &target, &version);
+    let note = env.var_os("KACHE_LOG_FILE").is_none();
+    if let Err(error) =
+        crate::daemon::seed_new_target(config, &target, &version, probe_is_check_lane(env), note)
+    {
+        tracing::debug!("not seeding {}: {error:#}", target.target_dir.display());
+    }
+}
+
+/// Append `line` to kache's diagnostic log as its file layer writes an info
+/// event. A wrapper has no file layer unless `KACHE_LOG_FILE` asks for one
+/// (Cargo runs hundreds of wrappers a build), but a seeding happens once per
+/// new target directory and leaves no other trace of what it copied.
+pub(crate) fn note_in_log(line: &str) {
+    note_in_log_for(&crate::invocation::InvocationEnv::capture(), line);
+}
+
+/// [`note_in_log`] into the file the log's file layer would write for `env`:
+/// `KACHE_LOG_FILE_PATH` when set, not the default log beside the default
+/// cache folder.
+fn note_in_log_for(env: &crate::invocation::InvocationEnv, line: &str) {
+    use std::io::Write;
+    let Some(path) = crate::log_file_path_for(env) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let _ = writeln!(file, "{now}  INFO kache::target_seed: {line}");
+    }
 }
 
 /// `rustc -vV` from the compiler Cargo is probing.
@@ -1095,6 +1885,56 @@ fn rustc_version_for(
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn a_placed_file_earns_memo_rows_only_while_it_holds_the_donors_bytes() {
+        use kache_store::file_hash::{FileFingerprint, stamp_clock_ns};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let donor = dir.path().join("donor.rlib");
+        std::fs::write(&donor, vec![3u8; 70_000]).unwrap();
+        std::fs::set_permissions(&donor, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let placed = |at: &std::path::Path| PlacedFile {
+            from: donor.clone(),
+            before: FileFingerprint::from_path(&donor).unwrap(),
+            at: at.to_path_buf(),
+        };
+        let since = stamp_clock_ns();
+
+        let linked = dir.path().join("linked.rlib");
+        let file = placed(&linked);
+        std::fs::hard_link(&donor, &linked).unwrap();
+        let rows = file.memo_rows(since);
+        assert_eq!(rows.len(), 2, "the link and the donor: {rows:?}");
+        assert!(rows.iter().all(|row| row.ctime_ns >= file.before.ctime_ns));
+
+        let copy = |to: &std::path::Path, mtime_ns: i64| {
+            std::fs::copy(&donor, to).unwrap();
+            filetime::set_file_mtime(
+                to,
+                filetime::FileTime::from_unix_time(
+                    mtime_ns.div_euclid(1_000_000_000),
+                    mtime_ns.rem_euclid(1_000_000_000) as u32,
+                ),
+            )
+            .unwrap();
+        };
+        let copied = dir.path().join("copied.rlib");
+        let file = placed(&copied);
+        copy(&copied, file.before.mtime_ns);
+        assert_eq!(file.memo_rows(since).len(), 1, "the copy only");
+
+        let late = dir.path().join("late.rlib");
+        let file = placed(&late);
+        copy(&late, file.before.mtime_ns);
+        std::fs::set_permissions(&donor, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&donor, vec![4u8; 70_000]).unwrap();
+        assert!(
+            file.memo_rows(since).is_empty(),
+            "the donor changed while it was copied"
+        );
+    }
     use super::*;
 
     const HASH: &str = "0123456789abcdef";
@@ -1240,12 +2080,62 @@ source = "git+https://example.com/gitdep#abc"
         );
     }
 
+    /// A target whose last unit Clippy checked recorded the driver's version
+    /// before 1.2.1-tasty.4. That is no `rustc -vV`, so Cargo's cache decides:
+    /// the target still seeds a checkout built by the same rustc.
+    #[test]
+    fn a_donor_recorded_by_clippy_falls_back_to_cargos_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut clippy = donor(dir.path(), "clippy", Layout::Shared);
+        clippy.rustc = Some("clippy 0.1.99 (58cf8f9c35 2026-10-13)".into());
+        assert!(donor_built_by(&clippy, VERSION), "Cargo's cache decides");
+        assert!(!donor_built_by(&clippy, "rustc 2.0.0\n"));
+        std::fs::remove_file(clippy.target_dir.join(".rustc_info.json")).unwrap();
+        assert!(!donor_built_by(&clippy, VERSION), "no cache, no seed");
+
+        let target = checkout(dir.path(), "new");
+        let seeded = seed(
+            &target,
+            VERSION,
+            &[donor(dir.path(), "built", Layout::Shared)],
+            no_runs().path(),
+            later(),
+        );
+        assert!(seeded.donor.is_some(), "the fixture seeds");
+        let mut by_clippy = donor(dir.path(), "checked", Layout::Shared);
+        by_clippy.rustc = Some("clippy 0.1.99 (58cf8f9c35 2026-10-13)".into());
+        let target = checkout(dir.path(), "after-clippy");
+        let seeded = seed(&target, VERSION, &[by_clippy], no_runs().path(), later());
+        assert!(seeded.donor.is_some(), "a donor Clippy checked last seeds");
+    }
+
     #[test]
     fn only_the_target_info_probe_asks_for_a_seed_and_only_when_enabled() {
         let probe = args("rustc - --crate-name ___ --print=file-names --crate-type bin");
         assert!(asks_for_seed(true, &probe));
         assert!(!asks_for_seed(false, &probe));
         assert!(!asks_for_seed(true, &args("rustc -vV")));
+    }
+
+    /// A build for a named platform is not seeded: its units are not the
+    /// host units seeding copies.
+    #[test]
+    fn a_probe_naming_a_target_is_a_cross_build() {
+        assert!(names_a_target(&args(
+            "rustc - --crate-name ___ --print=file-names --target wasm32-unknown-unknown"
+        )));
+        assert!(names_a_target(&args(
+            "cargo +nightly check -p web --target=wasm32-unknown-unknown"
+        )));
+        assert!(!names_a_target(&args(
+            "rustc - --crate-name ___ --print=file-names --crate-type bin"
+        )));
+        assert!(!names_a_target(&args(
+            "cargo clippy --workspace --all-targets"
+        )));
+        assert!(!names_a_target(&args(
+            "cargo build --target-dir target/other"
+        )));
     }
 
     #[test]
@@ -1262,6 +2152,57 @@ source = "git+https://example.com/gitdep#abc"
             .map(|unit| (unit.package, unit.hash))
             .collect();
         assert_eq!(found, [("dep".to_string(), HASH.to_string())]);
+    }
+
+    /// A seeding cut short by its deadline copies a prefix of the units.
+    /// A unit whose dependency was left out is rebuilt anyway, so units go
+    /// in the order the donor built them, dependencies first: Cargo writes
+    /// a unit's fingerprint only once the unit is built. In the donor of a
+    /// 1,075-unit workspace, a cut after 458 units in name order left 242
+    /// of them waiting on a dependency that was not copied; in build order,
+    /// none.
+    #[test]
+    fn units_come_in_the_order_the_donor_built_them() {
+        for layout in [Layout::Shared, Layout::PerUnit] {
+            let dir = tempfile::tempdir().unwrap();
+            let profile = dir.path().join(PROFILE);
+            let fingerprint = |package: &str, hash: &str| match layout {
+                Layout::Shared => profile
+                    .join(".fingerprint")
+                    .join(format!("{package}-{hash}")),
+                Layout::PerUnit => profile
+                    .join("build")
+                    .join(package)
+                    .join(hash)
+                    .join("fingerprint"),
+            };
+            // Built in the order zeta, alpha, mid: neither the names' order
+            // nor the hashes'.
+            let built = [
+                ("zeta", OTHER, 100),
+                ("alpha", HASH, 200),
+                ("mid", OTHER, 300),
+            ];
+            for (package, hash, _) in built {
+                write(&fingerprint(package, hash).join("lib"), "fp");
+            }
+            for (package, hash, offset) in built {
+                let at = filetime::FileTime::from_unix_time(1_700_000_000 + offset, 0);
+                filetime::set_file_mtime(fingerprint(package, hash), at).unwrap();
+                if layout == Layout::PerUnit {
+                    // The unit's own directory changes at other times.
+                    let early = filetime::FileTime::from_unix_time(1_600_000_000 - offset, 0);
+                    filetime::set_file_mtime(marker(&profile, layout, &unit(package, hash)), early)
+                        .unwrap();
+                }
+            }
+            let packages: BTreeSet<String> = ["alpha", "mid", "zeta"].map(str::to_string).into();
+            let found: Vec<String> = units(&profile, layout, &packages)
+                .into_iter()
+                .map(|unit| unit.package)
+                .collect();
+            assert_eq!(found, ["zeta", "alpha", "mid"], "{layout:?}");
+        }
     }
 
     #[test]
@@ -1341,6 +2282,38 @@ source = "git+https://example.com/gitdep#abc"
         assert!(registry_packages("not toml [").is_empty());
         assert!(registry_packages("version = 3\n").is_empty());
         assert!(registry_packages("[[package]]\nsource = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn a_recent_donor_holding_more_units_is_used_before_the_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let more = donor(dir.path(), "more", Layout::Shared);
+        let named = format!("gitdep-{OTHER}");
+        let profile = more.target_dir.join(PROFILE);
+        write(&profile.join(".fingerprint").join(&named).join("lib"), "fp");
+        write(
+            &profile.join("deps").join(format!("libgitdep-{OTHER}.rlib")),
+            "rlib",
+        );
+        let last = donor(dir.path(), "last", Layout::Shared);
+        let new = checkout(dir.path(), "b");
+        // Most recently used first, as the store lists them.
+        let donors = [last.clone(), more.clone()];
+        assert_eq!(
+            seed(&new, VERSION, &donors, no_runs().path(), later()),
+            Seeded {
+                units: 2,
+                donor: Some(more.workspace_root.clone()),
+                ..Seeded::default()
+            }
+        );
+        // Holding as many, the one used last goes first.
+        let other = checkout(dir.path(), "c");
+        let even = [last.clone(), donor(dir.path(), "even", Layout::Shared)];
+        assert_eq!(
+            seed(&other, VERSION, &even, no_runs().path(), later()).donor,
+            Some(last.workspace_root.clone())
+        );
     }
 
     #[test]
@@ -1701,7 +2674,8 @@ source = "git+https://example.com/gitdep#abc"
                 seeded,
                 Seeded {
                     units: 1,
-                    donor: Some(donor.workspace_root.clone())
+                    donor: Some(donor.workspace_root.clone()),
+                    ..Seeded::default()
                 },
                 "{layout:?}"
             );
@@ -1815,6 +2789,80 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    /// A donor artifact whose memo row holds for its whole current stamp, or
+    /// that is a read-only link to the blob its row names, is taken as that
+    /// blob without being read; anything else reads it. The donor's bytes
+    /// here differ from the stored blob the row names, so only an artifact
+    /// that was not read passes.
+    #[test]
+    fn the_store_vouches_for_a_donor_artifact_by_its_stamp_or_its_blobs_inode() {
+        use kache_store::file_hash::FileFingerprint;
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let profile = donor.target_dir.join(PROFILE);
+            let rlib = match layout {
+                Layout::PerUnit => profile.join("build/dep").join(HASH).join("out/lib.rlib"),
+                Layout::Shared => profile.join("deps").join(format!("libdep-{HASH}.rlib")),
+            };
+            write(&rlib, "RLIB");
+            let deps = deps_by_hash(&profile.join("deps"));
+            let cache = cache_storing(&dir.path().join("cache"), &["rlib"]);
+            let stored = blake3::hash(b"rlib").to_hex().to_string();
+            let stamp = FileFingerprint::from_path(&rlib).unwrap();
+            let stored_at = |stamp: FileFingerprint, hash: &str| {
+                let recorded = RecordedHashes::from([(stamp.path.clone(), (stamp, hash.into()))]);
+                artifacts_stored(
+                    &profile,
+                    layout,
+                    &unit("dep", HASH),
+                    &deps,
+                    &cache,
+                    &recorded,
+                    later(),
+                )
+            };
+            assert!(stored_at(stamp.clone(), &stored), "{layout:?}");
+            let unstored = blake3::hash(b"other").to_hex().to_string();
+            assert!(!stored_at(stamp.clone(), &unstored), "{layout:?}");
+            type Change = fn(&mut FileFingerprint);
+            let changes: [(&str, Change); 4] = [
+                ("size", |stamp| stamp.size += 1),
+                ("mtime", |stamp| stamp.mtime_ns -= 1),
+                ("ctime", |stamp| stamp.ctime_ns -= 1),
+                ("inode", |stamp| stamp.inode += 1),
+            ];
+            for (field, change) in changes {
+                let mut stale = stamp.clone();
+                change(&mut stale);
+                assert!(!stored_at(stale, &stored), "{layout:?} {field}");
+            }
+            // A link to the blob the row names is that blob at any stamp,
+            // while nobody may write the inode. The blob's bytes here are not
+            // the ones its name says, so again only an unread link passes.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let blob = kache_store::blob_path_in_store_dir(&cache.join("store"), &stored);
+                std::fs::write(&blob, "RLIB").unwrap();
+                std::fs::remove_file(&rlib).unwrap();
+                std::fs::hard_link(&blob, &rlib).unwrap();
+                let mode = |mode| {
+                    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(mode)).unwrap()
+                };
+                mode(0o444);
+                let mut stale = FileFingerprint::from_path(&rlib).unwrap();
+                stale.ctime_ns -= 1;
+                assert!(stored_at(stale.clone(), &stored), "{layout:?} link");
+                cache_storing(&dir.path().join("cache"), &["other"]);
+                let other = blake3::hash(b"other").to_hex().to_string();
+                assert!(!stored_at(stale.clone(), &other), "{layout:?} another blob");
+                mode(0o644);
+                assert!(!stored_at(stale, &stored), "{layout:?} writable link");
+            }
+        }
+    }
+
     #[test]
     fn stored_artifact_validation_stops_at_the_seed_deadline() {
         for layout in [Layout::PerUnit, Layout::Shared] {
@@ -1830,6 +2878,7 @@ source = "git+https://example.com/gitdep#abc"
                 &unit,
                 &deps,
                 &cache,
+                &RecordedHashes::new(),
                 later()
             ));
             assert!(!artifacts_stored(
@@ -1838,6 +2887,7 @@ source = "git+https://example.com/gitdep#abc"
                 &unit,
                 &deps,
                 &cache,
+                &RecordedHashes::new(),
                 Instant::now(),
             ));
         }
@@ -1918,6 +2968,18 @@ source = "git+https://example.com/gitdep#abc"
         );
         assert_eq!(seeded.donor, Some(free.workspace_root.clone()));
         drop(held);
+        // Another seeding reading the donor does not keep this one out.
+        let reading = try_lock_shared(&busy.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
+        let beside = checkout(dir.path(), "beside");
+        let seeded = seed(
+            &beside,
+            VERSION,
+            std::slice::from_ref(&busy),
+            no_runs().path(),
+            later(),
+        );
+        assert_eq!(seeded.donor, Some(busy.workspace_root.clone()));
+        drop(reading);
         // The target itself, and a donor with no units, give nothing.
         let other = checkout(dir.path(), "c");
         let own = Donor {
@@ -2573,6 +3635,7 @@ source = "git+https://example.com/gitdep#abc"
                 Seeded {
                     units: 1,
                     donor: Some(donor.workspace_root.clone()),
+                    ..Seeded::default()
                 },
                 "{layout:?}"
             );
@@ -3015,7 +4078,15 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join("out/include/rdkafka.h"), "h");
         std::os::unix::fs::symlink("../include", from.join("out/src/include")).unwrap();
         let to = dir.path().join("copy");
-        place_tree(&from, &to, no_runs().path(), later(), None).unwrap();
+        place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &FileCounts::default(),
+            later(),
+            None,
+        )
+        .unwrap();
         let link = to.join("out/src/librdkafka.so");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
@@ -3033,6 +4104,7 @@ source = "git+https://example.com/gitdep#abc"
                 &from,
                 &dir.path().join("escaped"),
                 no_runs().path(),
+                &FileCounts::default(),
                 later(),
                 None
             )
@@ -3047,6 +4119,7 @@ source = "git+https://example.com/gitdep#abc"
                 &linked_unit,
                 &dir.path().join("whole"),
                 no_runs().path(),
+                &FileCounts::default(),
                 later(),
                 None
             )
@@ -3061,10 +4134,10 @@ source = "git+https://example.com/gitdep#abc"
     #[cfg(unix)]
     #[test]
     fn a_link_to_a_sealed_hermetic_run_is_linked_again_and_recorded() {
-        use crate::build_script::hermetic_test_support::{linked_to, sealed_run};
+        use crate::build_script::hermetic_test_support::{linked_to, sealed_run, tempdir};
         const RUN: &str = "1111222233334444";
         for layout in [Layout::PerUnit, Layout::Shared] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = tempdir();
             let donor = donor(dir.path(), "a", layout);
             let from = donor.target_dir.join(PROFILE);
             let run = match layout {
@@ -3182,11 +4255,47 @@ source = "git+https://example.com/gitdep#abc"
         let from = dir.path().join("unit");
         write(&from.join("a/file"), "x");
         let to = dir.path().join("copy");
-        let error = place_tree(&from, &to, no_runs().path(), Instant::now(), None).unwrap_err();
+        let error = place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &FileCounts::default(),
+            Instant::now(),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(entries(dir.path()), vec![from.clone()]);
-        place_tree(&from, &to, no_runs().path(), later(), None).unwrap();
+        place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &FileCounts::default(),
+            later(),
+            None,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(to.join("a/file")).unwrap(), "x");
+    }
+
+    /// A seeding's note goes where the log's file layer writes:
+    /// `KACHE_LOG_FILE_PATH`, never the default log beside the default cache
+    /// folder (found on Windows, where that is `%LOCALAPPDATA%\\kache`).
+    #[test]
+    fn a_seeding_note_honours_the_log_file_path() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("os-cache");
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("KACHE_LOG_FILE_PATH", "logs/seed.log")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        )
+        .with_cache_dir(Some(cache.clone()));
+        note_in_log_for(&env, "seeded target");
+        let logged = std::fs::read_to_string(root.path().join("logs/seed.log")).unwrap();
+        assert!(logged.contains("INFO kache::target_seed: seeded target"), "{logged}");
+        assert!(!cache.exists(), "nothing is written beside the default cache folder");
     }
 
     /// A target directory seeding creates carries Cargo's tag, so kache
@@ -3229,12 +4338,243 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o644)).unwrap();
         let recorded = dir.path().join("recorded");
         write(&recorded, "");
-        std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o757)).unwrap();
         let to = dir.path().join("copy");
-        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap(), None).unwrap();
+        place_file(
+            &from,
+            Path::new(""),
+            &to,
+            &std::fs::metadata(&recorded).unwrap(),
+            &FileCounts::default(),
+        )
+        .unwrap();
         let mode = std::fs::metadata(&to).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o751);
+        assert_eq!(mode & 0o777, 0o757);
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
+    }
+
+    /// Whether this process writes files whatever their mode (root).
+    #[cfg(unix)]
+    fn writes_anything() -> bool {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_is_linked_and_a_writable_one_copied() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("unit");
+        let blob = from.join("libdep-0123456789abcdef.rlib");
+        write(&blob, "rlib");
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o440)).unwrap();
+        let dep_info = from.join("dep-0123456789abcdef.d");
+        write(&dep_info, "d");
+        let to = dir.path().join("placed");
+        let counts = FileCounts::default();
+        place_tree(&from, &to, no_runs().path(), &counts, later(), None).unwrap();
+        let linked = to.join("libdep-0123456789abcdef.rlib");
+        let copied = to.join("dep-0123456789abcdef.d");
+        assert_eq!(std::fs::read_to_string(&linked).unwrap(), "rlib");
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), "d");
+        let same_inode = |a: &Path, b: &Path| {
+            std::fs::metadata(a).unwrap().ino() == std::fs::metadata(b).unwrap().ino()
+        };
+        if writes_anything() {
+            assert!(!same_inode(&blob, &linked), "root must copy");
+            return;
+        }
+        if kache_store::link::try_reflink(&dep_info, &dir.path().join("probe")).is_ok() {
+            // A clone is preferred where the filesystem makes one.
+            assert!(!same_inode(&blob, &linked));
+            return;
+        }
+        assert!(same_inode(&blob, &linked));
+        assert!(!same_inode(&dep_info, &copied));
+        assert_eq!(counts.linked.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.copied.load(Ordering::Relaxed), 1);
+        // The shared inode cannot be written through the new name.
+        let opened = std::fs::OpenOptions::new().write(true).open(&linked);
+        assert_eq!(
+            opened.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(std::fs::read_to_string(&blob).unwrap(), "rlib");
+    }
+
+    /// The events inotify reports for the entries of one directory.
+    #[cfg(target_os = "linux")]
+    struct Watch(std::os::fd::OwnedFd);
+
+    #[cfg(target_os = "linux")]
+    impl Watch {
+        fn new(dir: &Path) -> Self {
+            use std::os::fd::FromRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            // SAFETY: inotify_init1 has no preconditions; a valid descriptor
+            // is owned from here on.
+            let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+            assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+            // SAFETY: fd was just returned by inotify_init1 and is open.
+            let watch = Self(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+            let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            let mask = libc::IN_CREATE
+                | libc::IN_DELETE
+                | libc::IN_MOVED_TO
+                | libc::IN_MODIFY
+                | libc::IN_CLOSE_WRITE;
+            // SAFETY: fd is an inotify descriptor and path a C string.
+            assert!(unsafe { libc::inotify_add_watch(fd, path.as_ptr(), mask) } >= 0);
+            watch
+        }
+
+        /// Each event so far: its mask and the entry's name.
+        fn events(&self) -> Vec<(u32, String)> {
+            use std::io::Read;
+            use std::os::fd::AsFd;
+            let mut file = std::fs::File::from(self.0.as_fd().try_clone_to_owned().unwrap());
+            let mut bytes = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = file.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            let mut events = Vec::new();
+            let mut at = 0;
+            let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+            while at + 16 <= bytes.len() {
+                let (mask, len) = (word(at + 4), word(at + 12) as usize);
+                let name = &bytes[at + 16..at + 16 + len];
+                let name = name.split(|&byte| byte == 0).next().unwrap_or_default();
+                events.push((mask, String::from_utf8_lossy(name).into_owned()));
+                at += 16 + len;
+            }
+            events
+        }
+    }
+
+    /// Under a busy journal, every metadata call of a copy waits its turn.
+    /// A filesystem that cannot clone (ext4) refuses the first clone of a
+    /// seeding, and each later attempt only created and removed a file in
+    /// the target. And a final name never holds a file being written: each
+    /// one appears whole, by link or by rename, so a seeding cut short
+    /// leaves no partial artifact.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seeding_asks_for_a_clone_once_and_never_writes_a_final_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("probe"), "probe");
+        if kache_store::link::try_reflink(&dir.path().join("probe"), &dir.path().join("clone"))
+            .is_ok()
+        {
+            eprintln!("skipping: this filesystem clones");
+            return;
+        }
+        let from = dir.path().join("donor");
+        let blobs = ["a", "b", "c", "d"].map(|name| from.join(format!("lib{name}-0123.rlib")));
+        for (blob, text) in blobs.iter().zip(["a", "b", "c", "d"]) {
+            write(blob, text);
+            std::fs::set_permissions(blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let dep_info = from.join("dep-0123.d");
+        write(&dep_info, "d");
+        let deps = dir.path().join("deps");
+        std::fs::create_dir(&deps).unwrap();
+        let watch = Watch::new(&deps);
+        let counts = FileCounts::default();
+        for file in blobs.iter().chain([&dep_info]) {
+            let to = deps.join(file_name(file));
+            place_tree(file, &to, no_runs().path(), &counts, later(), None).unwrap();
+            assert_eq!(
+                std::fs::read(&to).unwrap(),
+                std::fs::read(file).unwrap(),
+                "{}",
+                to.display()
+            );
+        }
+        let events = watch.events();
+        let removed = events
+            .iter()
+            .filter(|(mask, _)| mask & libc::IN_DELETE != 0)
+            .count();
+        assert!(removed <= 1, "a clone is asked for once: {events:?}");
+        for (mask, name) in &events {
+            if !name.starts_with(STAGING) {
+                assert_eq!(
+                    mask & (libc::IN_MODIFY | libc::IN_CLOSE_WRITE),
+                    0,
+                    "{name} was written in place: {events:?}"
+                );
+            }
+        }
+        if !writes_anything() {
+            // Once the filesystem has refused a clone, a file nobody may
+            // write is linked straight to its name.
+            let renamed = events
+                .iter()
+                .filter(|(mask, name)| mask & libc::IN_MOVED_TO != 0 && name.ends_with(".rlib"))
+                .count();
+            assert!(renamed <= 1, "{events:?}");
+            assert_eq!(counts.linked.load(Ordering::Relaxed), 4);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_under_a_build_scripts_out_dir_is_copied() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("dep-0123456789abcdef");
+        let generated = from.join("out/bindings.rs");
+        write(&generated, "generated");
+        std::fs::set_permissions(&generated, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let to = dir.path().join("placed");
+        let counts = FileCounts::default();
+        place_tree(&from, &to, no_runs().path(), &counts, later(), None).unwrap();
+        let placed = to.join("out/bindings.rs");
+        assert_ne!(
+            std::fs::metadata(&generated).unwrap().ino(),
+            std::fs::metadata(&placed).unwrap().ino()
+        );
+        assert_eq!(counts.linked.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_file_on_another_filesystem_is_copied() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(other) = tempfile::tempdir_in("/dev/shm") else {
+            eprintln!("skipping: no /dev/shm");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        if std::fs::metadata(other.path()).unwrap().dev()
+            == std::fs::metadata(dir.path()).unwrap().dev()
+        {
+            eprintln!("skipping: /dev/shm is on the same filesystem");
+            return;
+        }
+        let blob = other.path().join("libdep-0123456789abcdef.rmeta");
+        write(&blob, "rmeta");
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let metadata = std::fs::metadata(&blob).unwrap();
+        let to = dir.path().join("libdep-0123456789abcdef.rmeta");
+        let counts = FileCounts::default();
+        place_file(&blob, Path::new(""), &to, &metadata, &counts).unwrap();
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "rmeta");
+        assert_eq!(counts.linked.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.copied.load(Ordering::Relaxed), 1);
+        let placed = std::fs::metadata(&to).unwrap();
+        assert_eq!(placed.permissions().mode() & 0o777, 0o444);
+        assert_eq!(placed.mtime(), metadata.mtime());
     }
 
     #[cfg(windows)]
@@ -3249,7 +4589,14 @@ source = "git+https://example.com/gitdep#abc"
         permissions.set_readonly(true);
         std::fs::set_permissions(&recorded, permissions).unwrap();
         let to = dir.path().join("copy");
-        copy_file(&from, &to, &std::fs::metadata(&recorded).unwrap(), None).unwrap();
+        place_file(
+            &from,
+            Path::new(""),
+            &to,
+            &std::fs::metadata(&recorded).unwrap(),
+            &FileCounts::default(),
+        )
+        .unwrap();
         assert!(std::fs::metadata(&to).unwrap().permissions().readonly());
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
     }
@@ -3304,6 +4651,29 @@ source = "git+https://example.com/gitdep#abc"
     }
 
     #[test]
+    fn donor_locks_are_shared_with_readers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".cargo-lock");
+        let first = try_lock_shared(&path).unwrap();
+        let second = try_lock_shared(&path).unwrap();
+        assert!(
+            try_lock(&path).is_none(),
+            "a build got in while seedings read"
+        );
+        drop((first, second));
+        let building = try_lock(&path).unwrap();
+        assert!(
+            try_lock_shared(&path).is_none(),
+            "a seeding read a donor being built"
+        );
+        drop(building);
+        assert!(
+            try_lock_shared(&path).is_some(),
+            "the lock was not released"
+        );
+    }
+
+    #[test]
     fn asks_the_probed_compiler_for_its_version() {
         let version = rustc_version(Some("rustc")).expect("rustc on the test PATH");
         assert!(version.starts_with("rustc "), "{version}");
@@ -3312,7 +4682,220 @@ source = "git+https://example.com/gitdep#abc"
         assert_eq!(rustc_version(Some("/nonexistent/rustc")), None);
         #[cfg(unix)]
         assert_eq!(rustc_version(Some("false")), None);
-        assert_eq!(SEED_DEADLINE, Duration::from_secs(3));
-        assert_eq!(seed_wait(), Duration::from_secs(5));
+        assert_eq!(SEED_DEADLINE, Duration::from_secs(10));
+    }
+
+    /// One Cargo unit in a shared-layout profile: its fingerprint directory
+    /// with a hash file and JSON naming its dependencies by fingerprint, and
+    /// its `deps/` outputs.
+    fn fingerprinted_unit(
+        profile: &Path,
+        package: &str,
+        hash: &str,
+        fingerprint: u64,
+        needs: &[u64],
+        outputs: &[&str],
+    ) {
+        let dir = profile
+            .join(".fingerprint")
+            .join(format!("{package}-{hash}"));
+        write(&dir.join(format!("lib-{package}")), &hex_le(fingerprint));
+        let deps: Vec<_> = needs
+            .iter()
+            .map(|need| serde_json::json!([1, "d", false, need]))
+            .collect();
+        write(
+            &dir.join(format!("lib-{package}.json")),
+            &serde_json::json!({"deps": deps}).to_string(),
+        );
+        write(&dir.join("invoked.timestamp"), "");
+        for ext in outputs {
+            write(
+                &profile
+                    .join("deps")
+                    .join(format!("lib{package}-{hash}.{ext}")),
+                "x",
+            );
+        }
+    }
+
+    /// A check build needs what the donor's checked workspace units reach,
+    /// through checked and built dependencies alike, and not what only a
+    /// built (test) workspace unit reaches.
+    #[test]
+    fn a_check_needs_what_the_checked_workspace_units_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let h = |n: u8| format!("{n:016x}");
+        // Registry: `dep` checked, `dep` built (for the test), `mac` a proc
+        // macro the check uses, `mac_dep` built for it, `only_test` built for
+        // the test alone.
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "mac_dep", &h(3), 13, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "mac", &h(4), 14, &[13], &["so"]);
+        fingerprinted_unit(&profile, "only_test", &h(5), 15, &[12], &["rlib", "rmeta"]);
+        // Workspace: `app` checked, and built as a test.
+        fingerprinted_unit(&profile, "app", &h(6), 16, &[11, 14], &["rmeta"]);
+        fingerprinted_unit(
+            &profile,
+            "app",
+            &h(7),
+            17,
+            &[12, 14, 15],
+            &["rlib", "rmeta"],
+        );
+        let registry: BTreeSet<String> = ["dep", "mac", "mac_dep", "only_test"]
+            .map(String::from)
+            .into();
+        let deps = deps_by_hash(&profile.join("deps"));
+        let demand = check_demand(&profile, &registry, &deps).unwrap();
+        for wanted in [
+            format!("dep-{}", h(1)),
+            format!("mac-{}", h(4)),
+            format!("mac_dep-{}", h(3)),
+        ] {
+            assert!(demand.contains(&wanted), "{wanted}");
+        }
+        for unwanted in [format!("dep-{}", h(2)), format!("only_test-{}", h(5))] {
+            assert!(!demand.contains(&unwanted), "{unwanted}");
+        }
+    }
+
+    /// A checkout at `root/name` with `LOCK`, whose target `VERSION` built:
+    /// no units yet ([`fingerprinted_unit`] adds them).
+    fn empty_donor(root: &Path, name: &str) -> Donor {
+        let workspace_root = root.join(name);
+        write(
+            &workspace_root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        );
+        write(&workspace_root.join("Cargo.lock"), LOCK);
+        let target_dir = workspace_root.join("target");
+        let info = serde_json::json!({"outputs": {"1": {"stdout": VERSION}}});
+        write(&target_dir.join(".rustc_info.json"), &info.to_string());
+        Donor {
+            target_dir,
+            workspace_root,
+            rustc: None,
+        }
+    }
+
+    /// A check build goes to the donor whose check gives it the most units,
+    /// not the one holding the most: a target that also built tests holds
+    /// more units, most of which a check never reads.
+    #[test]
+    fn a_check_build_takes_the_donor_whose_check_gives_the_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        // Used last: `dep` and `gitdep` built for a test, `dep` checked, and
+        // the workspace's check read only the checked `dep`.
+        let tests = empty_donor(dir.path(), "tests");
+        let profile = tests.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "gitdep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(3), 13, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(4), 14, &[13], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(5), 15, &[11, 12], &["rlib", "rmeta"]);
+        // Used before: a check of the whole workspace, `dep` and `gitdep`.
+        let checks = empty_donor(dir.path(), "checks");
+        let profile = checks.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(3), 13, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "gitdep", &h(6), 16, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(7), 17, &[13, 16], &["rmeta"]);
+        let donors = [tests.clone(), checks.clone()];
+        let stored = cache_storing(&dir.path().join("cache"), &["x"]);
+        let check = checkout(dir.path(), "check");
+        assert_eq!(
+            seed_for_lane(
+                &check,
+                VERSION,
+                &donors,
+                &stored,
+                &no_recorded_hashes,
+                later(),
+                true
+            ),
+            Seeded {
+                units: 2,
+                donor: Some(checks.workspace_root.clone()),
+                ..Seeded::default()
+            }
+        );
+        // A build still takes the donor holding the most.
+        let build = checkout(dir.path(), "build");
+        assert_eq!(
+            seed_for_lane(
+                &build,
+                VERSION,
+                &donors,
+                &stored,
+                &no_recorded_hashes,
+                later(),
+                false
+            ),
+            Seeded {
+                units: 3,
+                donor: Some(tests.workspace_root.clone()),
+                ..Seeded::default()
+            }
+        );
+    }
+
+    /// A check donor with no checked workspace unit gives every unit, but
+    /// counts only those a check compiled: its metadata-only ones.
+    #[test]
+    fn a_donor_without_a_workspace_check_counts_its_checked_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        let profile = dir.path().join("debug");
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(2), 12, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(3), 13, &[11], &["rlib", "rmeta"]);
+        let registry: BTreeSet<String> = ["dep"].map(String::from).into();
+        assert_eq!(check_units(&profile, &registry), 1);
+        fingerprinted_unit(&profile, "app", &h(4), 14, &[11, 12], &["rmeta"]);
+        assert_eq!(check_units(&profile, &registry), 2);
+    }
+
+    /// Without a checked workspace unit, nothing says what a check needs.
+    #[test]
+    fn no_checked_workspace_unit_gives_no_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        fingerprinted_unit(
+            &profile,
+            "dep",
+            &format!("{:016x}", 2),
+            12,
+            &[],
+            &["rlib", "rmeta"],
+        );
+        fingerprinted_unit(
+            &profile,
+            "app",
+            &format!("{:016x}", 7),
+            17,
+            &[12],
+            &["rlib", "rmeta"],
+        );
+        let registry: BTreeSet<String> = ["dep"].map(String::from).into();
+        let deps = deps_by_hash(&profile.join("deps"));
+        assert!(check_demand(&profile, &registry, &deps).is_none());
+    }
+
+    #[test]
+    fn the_subcommand_skips_options_and_toolchains() {
+        let line = |text: &str| args(text);
+        assert_eq!(
+            cargo_subcommand(&line("cargo +nightly -q check --workspace")),
+            Some("check")
+        );
+        assert_eq!(
+            cargo_subcommand(&line("/usr/bin/cargo clippy")),
+            Some("clippy")
+        );
+        assert_eq!(cargo_subcommand(&line("cargo test --no-run")), Some("test"));
+        assert_eq!(cargo_subcommand(&line("cargo")), None);
     }
 }

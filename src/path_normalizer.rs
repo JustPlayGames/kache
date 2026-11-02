@@ -230,6 +230,8 @@ impl PathNormalizer {
         workspace_root: Option<&Path>,
         env: &crate::invocation::InvocationEnv,
     ) -> Self {
+        #[cfg(test)]
+        FROM_ENV_BUILDS.with(|builds| builds.set(builds.get() + 1));
         let resolve = |path: &Path| env.resolve(path).filter(|path| path.is_absolute());
         let mut rules = Vec::new();
         let mut source_restore_roots = Vec::new();
@@ -290,11 +292,27 @@ impl PathNormalizer {
             .map(PathBuf::from)
             .or_else(|| env.home_dir().map(|home| home.join(".cargo")))
             .and_then(|path| resolve(&path));
+        // A Cargo home whose `registry` and `git` link into another one (a
+        // worktree pool member's own home, sharing `~/.cargo`'s downloads):
+        // rustc runs a dependency in its package directory, `getcwd` spells
+        // that through the link, and the other home's path is not under this
+        // one. It fell to the `<WORKSPACE>` cwd rule (`/proc/self/cwd` in the
+        // debug info), so a registry proc macro compiled there differed from
+        // the one stored from the shared home under the same key, and every
+        // crate that names it as an extern keyed apart (30 misses on a pool
+        // member's first build, 2026-10-23). The other home is this one.
+        let linked_homes = cargo_home
+            .as_deref()
+            .map(linked_cargo_home_roots)
+            .unwrap_or_default();
         push_rule_with_variants(
             &mut rules,
             cargo_home.and_then(|p| canonical_string(&p)),
             "<CARGO_HOME>",
         );
+        for root in linked_homes {
+            push_rule_with_variants(&mut rules, Some(root), "<CARGO_HOME>");
+        }
 
         // Same default-fallback story for RUSTUP_HOME. rustup paths
         // appear in -L flags and toolchain refs — without this rule,
@@ -707,6 +725,71 @@ impl PathNormalizer {
         let mut seen = std::collections::HashSet::new();
         self.rules.retain(|r| seen.insert(r.prefix.clone()));
         self
+    }
+
+    /// `from_invocation(workspace_root, env).with_target_dir(target_dir)
+    /// .with_base_dirs(base_dirs)`, then `.with_rust_src_rule(sysroot,
+    /// commit_hash)` when both are given, built once per compiler invocation
+    /// for the same inputs and cloned after that (see
+    /// [`InvocationNormalizerScope`]); outside an invocation scope it is
+    /// built afresh on every call.
+    ///
+    /// A rustc miss builds this normalizer three or four times (the key, the
+    /// compile's remap flags, the dep-info roots, build-script inputs), each
+    /// canonicalizing about ten paths (and on Windows asking about twenty
+    /// short names). The result depends only on the arguments and on the
+    /// invocation's working, home and temporary directories and the
+    /// environment variables `from_invocation` reads, all part of the memo's
+    /// key, so a changed input builds a new one. The memo lives no longer
+    /// than the invocation: a daemon runs many invocations, from other
+    /// workspaces, environments and toolchains, one after another on the same
+    /// threads, and a normalizer canonicalizes paths whose targets can change
+    /// between them (a directory created, a junction moved).
+    pub(crate) fn for_invocation(
+        workspace_root: Option<&Path>,
+        env: &crate::invocation::InvocationEnv,
+        target_dir: Option<&Path>,
+        base_dirs: &[String],
+        sysroot: Option<&Path>,
+        commit_hash: Option<&str>,
+    ) -> Self {
+        let key = InvocationKey {
+            cwd: env.cwd().map(Path::to_path_buf),
+            home: env.home_dir().map(Path::to_path_buf),
+            temp: env.temp_dir().to_path_buf(),
+            env: FROM_ENV_VARS.iter().map(|name| env.var_os(name)).collect(),
+            workspace_root: workspace_root.map(Path::to_path_buf),
+            target_dir: target_dir.map(Path::to_path_buf),
+            base_dirs: base_dirs.to_vec(),
+            rust_src: sysroot
+                .zip(commit_hash)
+                .map(|(sysroot, hash)| (sysroot.to_path_buf(), hash.to_owned())),
+        };
+        if let Some(normalizer) = remembered(&key) {
+            return normalizer;
+        }
+        // The rust-src rule goes on top of the same base the callers without
+        // one use, so a miss builds the base once for both.
+        let base_key = InvocationKey {
+            rust_src: None,
+            ..key.clone()
+        };
+        let base = match remembered(&base_key) {
+            Some(base) => base,
+            None => {
+                let base = Self::from_invocation(workspace_root, env)
+                    .with_target_dir(target_dir)
+                    .with_base_dirs(base_dirs);
+                remember(base_key, &base);
+                base
+            }
+        };
+        if key.rust_src.is_none() {
+            return base;
+        }
+        let normalizer = base.with_rust_src_rule(sysroot, commit_hash);
+        remember(key, &normalizer);
+        normalizer
     }
 
     /// A normalizer with no rules — leaves every input unchanged.
@@ -1292,6 +1375,32 @@ pub(crate) fn canonical_form(canon: &Path) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Where a Cargo home's `registry` and `git` resolve when they link into
+/// another directory of that name: that directory's parent, canonical, once.
+/// Empty when they are the home's own.
+fn linked_cargo_home_roots(home: &Path) -> Vec<String> {
+    let own = home.canonicalize().ok();
+    let mut roots = Vec::new();
+    for sub in ["registry", "git"] {
+        let Ok(target) = home.join(sub).canonicalize() else {
+            continue;
+        };
+        if target.file_name() != Some(std::ffi::OsStr::new(sub)) {
+            continue;
+        }
+        let Some(parent) = target.parent().filter(|parent| Some(*parent) != own.as_deref()) else {
+            continue;
+        };
+        if let Some(root) = canonical_form(parent)
+            && !is_filesystem_root_prefix(&root)
+            && !roots.contains(&root)
+        {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
 /// Drop the Windows extended-length (`\\?\`) verbatim prefix that
 /// [`Path::canonicalize`] returns on Windows.
 ///
@@ -1617,11 +1726,226 @@ fn lowercase_drive_letter(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// The environment variables [`PathNormalizer::from_invocation`] reads
+/// (its home and temporary directories come from the invocation itself):
+/// part of the key of [`PathNormalizer::for_invocation`].
+const FROM_ENV_VARS: &[&str] = &[
+    "KACHE_BASE_DIR",
+    "CARGO_TARGET_DIR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+];
+
+/// What a [`PathNormalizer::for_invocation`] result depends on.
+#[derive(Clone, PartialEq)]
+struct InvocationKey {
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp: PathBuf,
+    env: Vec<Option<std::ffi::OsString>>,
+    workspace_root: Option<PathBuf>,
+    target_dir: Option<PathBuf>,
+    base_dirs: Vec<String>,
+    rust_src: Option<(PathBuf, String)>,
+}
+
+/// How many normalizers one invocation remembers: a rustc unit asks for two
+/// (with and without the rust-src rule).
+const MAX_BUILT: usize = 8;
+
+thread_local! {
+    /// The normalizers the current invocation on this thread built, `None`
+    /// outside an [`InvocationNormalizerScope`].
+    static INVOCATION_NORMALIZERS: std::cell::RefCell<Option<Vec<(InvocationKey, PathNormalizer)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Remember [`PathNormalizer::for_invocation`]'s normalizers for one
+/// synchronous compiler invocation on this thread, which starts with none.
+/// Nested scopes restore their parent on drop. A wrapper was a process per
+/// compile; since the daemon runs compiles on reused worker threads, the
+/// memo must end with the compile, as a process did.
+pub(crate) struct InvocationNormalizerScope {
+    previous: Option<Vec<(InvocationKey, PathNormalizer)>>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl InvocationNormalizerScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: INVOCATION_NORMALIZERS.with(|slot| slot.replace(Some(Vec::new()))),
+            _thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for InvocationNormalizerScope {
+    fn drop(&mut self) {
+        let discarded = INVOCATION_NORMALIZERS.with(|slot| slot.replace(self.previous.take()));
+        drop(discarded);
+    }
+}
+
+fn remembered(key: &InvocationKey) -> Option<PathNormalizer> {
+    INVOCATION_NORMALIZERS.with(|slot| {
+        slot.borrow().as_ref().and_then(|built| {
+            built
+                .iter()
+                .find(|(known, _)| known == key)
+                .map(|(_, normalizer)| normalizer.clone())
+        })
+    })
+}
+
+fn remember(key: InvocationKey, normalizer: &PathNormalizer) {
+    INVOCATION_NORMALIZERS.with(|slot| {
+        if let Some(built) = slot.borrow_mut().as_mut() {
+            if built.len() >= MAX_BUILT {
+                built.remove(0);
+            }
+            built.push((key, normalizer.clone()));
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread ran [`PathNormalizer::from_invocation`].
+    static FROM_ENV_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_invocation_builds_its_normalizer_once() {
+        let _scope = InvocationNormalizerScope::enter();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("ws");
+        let target = workspace.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let base_dirs = vec![workspace.display().to_string()];
+        let env = crate::invocation::InvocationEnv::capture();
+        let build = |target: &Path| {
+            PathNormalizer::for_invocation(
+                Some(&workspace),
+                &env,
+                Some(target),
+                &base_dirs,
+                None,
+                None,
+            )
+        };
+        let before = FROM_ENV_BUILDS.with(std::cell::Cell::get);
+        let first = build(&target);
+        let second = build(&target);
+        assert_eq!(FROM_ENV_BUILDS.with(std::cell::Cell::get) - before, 1);
+        // The same rules the chain it stands for builds.
+        let chain = PathNormalizer::from_env(Some(&workspace))
+            .with_target_dir(Some(&target))
+            .with_base_dirs(&base_dirs);
+        assert_eq!(format!("{first:?}"), format!("{chain:?}"));
+        assert_eq!(format!("{second:?}"), format!("{chain:?}"));
+        // The rust-src rule goes on the same base without building it again.
+        let sysroot = dir.path().join("sysroot");
+        let rust_src = sysroot.join("lib/rustlib/src/rust");
+        std::fs::create_dir_all(&rust_src).unwrap();
+        let before = FROM_ENV_BUILDS.with(std::cell::Cell::get);
+        let with_src = PathNormalizer::for_invocation(
+            Some(&workspace),
+            &env,
+            Some(&target),
+            &base_dirs,
+            Some(&sysroot),
+            Some("abc"),
+        );
+        assert_eq!(FROM_ENV_BUILDS.with(std::cell::Cell::get) - before, 0);
+        let chain_with_src = chain.with_rust_src_rule(Some(&sysroot), Some("abc"));
+        assert_eq!(format!("{with_src:?}"), format!("{chain_with_src:?}"));
+        // Another input builds again.
+        let other = dir.path().join("other-target");
+        std::fs::create_dir_all(&other).unwrap();
+        let before = FROM_ENV_BUILDS.with(std::cell::Cell::get);
+        let _ = build(&other);
+        assert_eq!(FROM_ENV_BUILDS.with(std::cell::Cell::get) - before, 1);
+    }
+
+    /// A daemon worker thread runs one invocation after another: the next
+    /// one builds its own normalizer, and outside a scope nothing is kept.
+    #[test]
+    fn a_normalizer_is_remembered_only_within_its_invocation() {
+        std::thread::spawn(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let workspace = dir.path().join("ws");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let env = crate::invocation::InvocationEnv::capture();
+            let build = || {
+                let _ = PathNormalizer::for_invocation(
+                    Some(&workspace),
+                    &env,
+                    None,
+                    &[],
+                    None,
+                    None,
+                );
+            };
+            let builds = || FROM_ENV_BUILDS.with(std::cell::Cell::get);
+            let before = builds();
+            build();
+            build();
+            assert_eq!(builds() - before, 2, "no scope, no memo");
+            {
+                let _first = InvocationNormalizerScope::enter();
+                let before = builds();
+                build();
+                build();
+                assert_eq!(builds() - before, 1);
+            }
+            let _second = InvocationNormalizerScope::enter();
+            let before = builds();
+            build();
+            assert_eq!(builds() - before, 1, "a new invocation starts empty");
+        })
+        .join()
+        .unwrap();
+    }
     use std::fs;
     use tempfile::TempDir;
+
+    /// A pool member's own Cargo home links `registry` and `git` into the
+    /// shared one; rustc's cwd in a dependency spells the shared path.
+    #[cfg(unix)]
+    #[test]
+    fn a_cargo_home_linking_its_registry_into_another_maps_both_to_cargo_home() {
+        let dir = TempDir::new().unwrap();
+        let root = PathBuf::from(canonical_string(dir.path()).unwrap());
+        let shared = root.join("shared-cargo");
+        let own = root.join("member.cargo");
+        let project = root.join("project");
+        for path in [shared.join("registry/src/idx/dep-1.0.0"), shared.join("git"), own.clone(), project.clone()] {
+            fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink(shared.join("registry"), own.join("registry")).unwrap();
+        std::os::unix::fs::symlink(shared.join("git"), own.join("git")).unwrap();
+        let env = crate::invocation::InvocationEnv::from_parts(
+            [("CARGO_HOME", own.as_os_str().to_owned())],
+            Some(project),
+            Some(root.join("home")),
+            root.join("tmp"),
+        );
+        let normalizer = PathNormalizer::from_invocation(None, &env);
+        let through_link = own.join("registry/src/idx/dep-1.0.0");
+        let resolved = shared.join("registry/src/idx/dep-1.0.0");
+        let expected = "<CARGO_HOME>/registry/src/idx/dep-1.0.0";
+        assert_eq!(normalizer.normalize(through_link.to_str().unwrap()), expected);
+        assert_eq!(normalizer.normalize(resolved.to_str().unwrap()), expected);
+        assert_eq!(linked_cargo_home_roots(&own), vec![shared.to_str().unwrap().to_string()]);
+        assert!(linked_cargo_home_roots(&shared).is_empty());
+    }
 
     #[test]
     fn concurrent_invocation_normalizers_use_each_clients_paths() {

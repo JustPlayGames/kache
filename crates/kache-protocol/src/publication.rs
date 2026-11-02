@@ -35,6 +35,77 @@ pub struct PublishCcRequest {
     /// build script would otherwise wait for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memo: Option<CcMemoHandoff>,
+    /// What only a rustc compile carries. Present exactly on a
+    /// `PublishRustc` hand-off: a daemon that does not know that request
+    /// refuses it, so a wrapper never has a rustc compile stored as a C/C++
+    /// object without its digest checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc: Option<RustcPublish>,
+}
+
+/// The rest of a rustc compile's store: what `Store::put_handed_off` and
+/// the bookkeeping after a synchronous rustc put need.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RustcPublish {
+    pub crate_types: Vec<String>,
+    pub features: Vec<String>,
+    pub profile: String,
+    /// One per [`PublishCcRequest::files`] entry, in the same order.
+    pub outputs: Vec<RustcOutput>,
+    /// Cargo's `-C metadata` unit, recorded with the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// The compiler's identity (`1.99.0 (abc 2026-01-01)`), recorded with the
+    /// entry for compiler-version cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc_version: Option<String>,
+    /// Large executables to record for prestaging once stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prestage: Vec<PrestageHint>,
+    /// The wrapper staged and published the entry's blobs itself and only
+    /// the index was too busy to register it: the files are links to those
+    /// blobs, registered in a batch (`Store::register_handed_off_batch`)
+    /// without staging them again. `None`: the files are snapshots of the
+    /// outputs, stored with `Store::put_handed_off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<StagedPublish>,
+}
+
+/// A rustc entry the wrapper staged ([`RustcPublish::staged`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StagedPublish {
+    /// The entry's files as the wrapper staged them, one per
+    /// [`PublishCcRequest::files`] entry, in the same order.
+    pub files: Vec<kache_format::CachedFile>,
+    /// What the wrapper's staging found (`StorePutResult`).
+    pub output_blobs: u32,
+    pub duplicate_blobs: u32,
+    pub new_blobs: u32,
+}
+
+/// One snapshotted rustc output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RustcOutput {
+    /// The digest the wrapper read from the snapshot before it returned to
+    /// Cargo: the bytes the compiler wrote. The put refuses a snapshot that
+    /// no longer hashes to it.
+    pub hash: String,
+    /// The compiler's output the snapshot links, whose file-hash memo is
+    /// seeded once the entry is stored. `None` for a file of the wrapper's
+    /// own (normalized dep-info, a debug bundle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// The wrapper re-dated this check unit's `.rmeta` as Cargo is about to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redated: bool,
+}
+
+/// A large executable the next build may want staged ahead of its restore.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrestageHint {
+    pub target_dir: String,
+    pub dest: String,
+    pub store_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

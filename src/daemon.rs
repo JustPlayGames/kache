@@ -6,11 +6,13 @@ use kache_core::timeline::{
 };
 use kache_core::{PrefetchDisposition, PrefetchPlan};
 pub use kache_protocol::{
-    BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest, CompileStartedRequest,
-    DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome, HashFileRequest,
-    HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest, PrefetchRequest,
-    PrefetchStatsSnapshot, PrestageRequest, RemoteCheckRequest, SeedTargetRequest, StatsEntry,
-    StatsRequest, TransferDirection, TransferEvent, UploadJob,
+    AdoptEntriesRequest, BatchRemoteCheckRequest, BuildStartedRequest, CompileFinishedRequest,
+    CompileStartedRequest, DaemonHealth, EffectiveConfig, EventStatsResponse, GcPolicyOutcome,
+    HashFileRequest, HashFileResult, HashFilesRequest, InFlightEntry, PredictionFetchRequest,
+    PrefetchRequest, PrefetchStatsSnapshot, PrestageRequest, RecordEventsRequest,
+    RecordFileHashesRequest, RecordPredictionsRequest, RecordTargetRootsRequest,
+    RemoteCheckRequest, SeedTargetRequest, StampHitsRequest, StatsEntry, StatsRequest,
+    TransferDirection, TransferEvent, UploadJob,
 };
 pub use kache_protocol::{
     GcBreakdown, GcRequest, GcRequestMode, PredictionPublishRequest, Request, Response,
@@ -28,6 +30,9 @@ mod execution;
 mod execution;
 #[path = "daemon_control.rs"]
 mod lifecycle_control;
+#[path = "daemon_owner.rs"]
+mod owner;
+pub(crate) use owner::OWNER_PID_ENV;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -346,6 +351,71 @@ impl SocketCleanupGuard {
         {
             let _ = path;
             Ok(Self {})
+        }
+    }
+}
+
+/// The socket file this daemon bound, by its filesystem identity.
+///
+/// Clients find a daemon only through that path. Once the path is gone or
+/// names another socket, nothing can reach this daemon again and the next
+/// build starts another: a removed runtime directory (a test's temporary
+/// directory, a cleaned `/tmp`, a logout's `XDG_RUNTIME_DIR`) left the old
+/// one running for good, holding its store open and writing its state file
+/// back into the removed directory every heartbeat.
+#[derive(Clone, Debug)]
+struct BoundSocket {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl BoundSocket {
+    /// Capture right after binding, before anyone else can take the path.
+    fn capture(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::symlink_metadata(path)?;
+            Ok(Self {
+                path: path.to_owned(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                path: path.to_owned(),
+            })
+        }
+    }
+
+    /// Whether the path no longer leads to this daemon: removed, or replaced
+    /// by another file or socket. A lookup that fails for another reason
+    /// (permissions, I/O) proves nothing, so it keeps the daemon running. A
+    /// Windows named pipe is not a file and goes away only with the daemon.
+    fn is_lost(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(metadata) => {
+                    !(metadata.file_type().is_socket()
+                        && metadata.dev() == self.device
+                        && metadata.ino() == self.inode)
+                }
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
         }
     }
 }
@@ -1880,11 +1950,52 @@ pub(crate) struct Daemon {
     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
     file_hash_warmup: Arc<FileHashWarmup>,
+    /// HashFiles' own index connection ([`Daemon::with_hash_store`]): a
+    /// wrapper's prefetch never queues behind the store mutex.
+    hash_store: OnceLock<Mutex<Store>>,
+    /// The connection [`Daemon::checkpoint_index`] checkpoints through.
+    checkpoint_store: OnceLock<Mutex<Store>>,
+    /// File-hash rows HashFiles learned, written in one batch by
+    /// [`Daemon::flush_file_hash_records`].
+    pending_file_hashes: Mutex<Vec<(crate::cache_key::FileFingerprint, String)>>,
+    /// Memo rows wrappers handed over (RecordFileHashes), written by
+    /// [`Daemon::flush_file_hash_records`]; a batch the index refused stays.
+    pending_memo_rows: Mutex<Vec<crate::store::MemoRow>>,
+    /// Target roots wrappers handed over (RecordTargetRoots), by target
+    /// path, written by [`Daemon::flush_handed_rows`].
+    pending_target_roots: Mutex<HashMap<String, kache_protocol::TargetRootRow>>,
+    /// Requests of build events wrappers handed over (RecordEvents) that
+    /// are not logged yet ([`Daemon::handle_record_events`]).
+    events_pending: Arc<std::sync::atomic::AtomicUsize>,
+    /// Input prediction rows wrappers handed over (RecordPredictions), by
+    /// identity (the latest wins), written by [`Daemon::flush_handed_rows`].
+    pending_predictions: Mutex<HashMap<String, kache_protocol::PredictionRow>>,
+    /// Hits' access stamps taken by StampHits and not yet written, with the
+    /// number of hits each, written by [`Daemon::flush_hit_stamps`]. Until
+    /// then the daemon's sweeps keep these entries ([`Daemon::pending_pins`]).
+    pending_hit_stamps: Arc<Mutex<HashMap<String, u32>>>,
+    /// The connection [`Daemon::flush_hit_stamps`] writes through: a batch
+    /// may wait for the index's write lock, and nobody waits for it.
+    stamp_store: OnceLock<Mutex<Store>>,
+    /// Where [`Daemon::handle_adopt_entries`] queues the key-bridge
+    /// adoptions wrappers verified: a thread of their own registers them
+    /// ([`run_adoption_registrar`]), started on the first.
+    adoption_registrar: OnceLock<std::sync::mpsc::Sender<PendingAdoption>>,
+    /// The keys of adoptions taken and not yet registered, legacy and new:
+    /// the wrappers restore from their blobs meanwhile, so the daemon's
+    /// sweeps keep them ([`Daemon::pending_pins`]).
+    pending_adoptions: Arc<Mutex<HashSet<String>>>,
     /// When the last build request arrived. Index compaction waits for a
     /// gap here, because a build made of cache hits holds no compile permit.
     request_clock: Arc<crate::maintenance::RequestClock>,
     /// Set while a hinted sweep is queued or running; further hints coalesce.
     gc_hint_pending: AtomicBool,
+    /// When this daemon started: its size sweeps wait for
+    /// [`STARTUP_GC_DELAY`] after it, as its periodic one does.
+    started: Instant,
+    /// The stores whose sweep for a delegated compile is queued or running;
+    /// further requests for one of them coalesce into that sweep.
+    invocation_gc_pending: Mutex<HashSet<PathBuf>>,
     /// When this read-only daemon last warned that it skipped a writable
     /// build's upload.
     readonly_skip_warned: Mutex<Option<Instant>>,
@@ -1892,6 +2003,10 @@ pub(crate) struct Daemon {
     /// and publication requests. Compiler scheduling has its own permits.
     #[cfg(any(unix, windows))]
     execution_workers: Arc<tokio::sync::Semaphore>,
+    /// Compiles a client handed over (Commit accepted) whose worker has not
+    /// returned yet. Shutdown waits for them ([`COMPILE_DRAIN_BOUND`]), and
+    /// health reports them, so a restart can wait for none to be running.
+    compiles_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     capacity: DaemonCapacity,
 }
 
@@ -2369,11 +2484,25 @@ impl Daemon {
             recent_transfers: std::sync::Mutex::new(std::collections::VecDeque::new()),
             file_hash_cache: Arc::new(Mutex::new(HashMap::new())),
             file_hash_warmup: Arc::new(FileHashWarmup::default()),
+            hash_store: OnceLock::new(),
+            checkpoint_store: OnceLock::new(),
+            pending_file_hashes: Mutex::new(Vec::new()),
+            pending_memo_rows: Mutex::new(Vec::new()),
+            pending_target_roots: Mutex::new(HashMap::new()),
+            events_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pending_predictions: Mutex::new(HashMap::new()),
+            pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
+            adoption_registrar: OnceLock::new(),
+            pending_adoptions: Arc::new(Mutex::new(HashSet::new())),
+            stamp_store: OnceLock::new(),
             request_clock: Arc::new(crate::maintenance::RequestClock::new()),
             gc_hint_pending: AtomicBool::new(false),
+            started: Instant::now(),
+            invocation_gc_pending: Mutex::new(HashSet::new()),
             readonly_skip_warned: Mutex::new(None),
             #[cfg(any(unix, windows))]
             execution_workers: Arc::new(tokio::sync::Semaphore::new(capacity.executions)),
+            compiles_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             capacity,
             config,
         }
@@ -2385,6 +2514,7 @@ impl Daemon {
         }
 
         let store = Store::open(&self.config)?;
+        defer_checkpoints_under_mutex(&store);
         let _ = self.store.set(Mutex::new(store));
 
         self.store
@@ -2413,6 +2543,7 @@ impl Daemon {
         let mut cfg = self.config.clone();
         cfg.cache_dir = cache_dir.to_path_buf();
         let store = Store::open(&cfg)?;
+        defer_checkpoints_under_mutex(&store);
         let lock = Arc::new(Mutex::new(store));
         let mut map = self
             .shard_stores
@@ -3060,6 +3191,11 @@ impl Daemon {
             Request::Stats(sr) => self.handle_stats(sr),
             Request::Health => self.handle_health(),
             Request::HashFiles(req) => self.handle_hash_files(req),
+            Request::StampHits(req) => self.handle_stamp_hits(req),
+            Request::RecordFileHashes(req) => self.handle_record_file_hashes(req),
+            Request::RecordTargetRoots(req) => self.handle_record_target_roots(req),
+            Request::RecordPredictions(req) => self.handle_record_predictions(req),
+            Request::AdoptEntries(req) => self.handle_adopt_entries(req),
             Request::CompileStarted(req) => self.handle_compile_started(req.clone()),
             Request::CompileFinished(req) => self.handle_compile_finished(req),
             Request::Upload(_)
@@ -3070,8 +3206,10 @@ impl Daemon {
             | Request::HashFilesWarmup(_)
             | Request::Prefetch(_)
             | Request::PublishCc(_)
+            | Request::PublishRustc(_)
             | Request::PredictionFetch(_)
             | Request::PredictionPublish(_)
+            | Request::RecordEvents(_)
             | Request::Prestage(_)
             | Request::SeedTarget(_)
             | Request::BuildStarted(_) => {
@@ -3084,12 +3222,18 @@ impl Daemon {
         }
     }
 
+    /// Compiles handed over and still running ([`Daemon::compiles_in_flight`]).
+    fn compiles_in_flight(&self) -> usize {
+        self.compiles_in_flight.load(Ordering::Acquire)
+    }
+
     fn handle_health(&self) -> Response {
         Response {
             health: Some(DaemonHealth {
                 version: self.version.clone(),
                 build_epoch: build_epoch(),
                 remote_readonly: Some(self.config.remote_readonly),
+                compiles_in_flight: Some(self.compiles_in_flight() as u64),
             }),
             ..Response::ok()
         }
@@ -3217,6 +3361,8 @@ impl Daemon {
             },
             in_flight,
             effective_config: Some(self.effective_config.clone()),
+            publishes_pending: (self.publish_queue.progress().pending()
+                + self.events_pending.load(Ordering::Acquire)) as u64,
         })
     }
 
@@ -3229,6 +3375,36 @@ impl Daemon {
             map.insert(req.pid, req);
         }
         Response::ok()
+    }
+
+    /// Copy the WAL into the index without waiting for anyone (a passive
+    /// checkpoint), on a connection kept for it, every durability tick (2 s).
+    /// Every connection of the daemon and of the wrappers defers its own
+    /// checkpoints until the log reaches 256 MiB. Running it more often (every
+    /// 500 ms) synced the index four times as often, and each sync commits
+    /// the filesystem's journal: wrappers' restores, links and unlinks waited
+    /// for it, and kache's own time per rig round doubled. Returns the log's frames and how many are in the index.
+    pub(crate) fn checkpoint_index(&self) -> Option<(i64, i64)> {
+        let checkpointed = (|| -> Result<(i64, i64)> {
+            let lock = match self.checkpoint_store.get() {
+                Some(lock) => lock,
+                None => {
+                    let store = Store::open(&self.config)?;
+                    defer_checkpoints_under_mutex(&store);
+                    let _ = self.checkpoint_store.set(Mutex::new(store));
+                    self.checkpoint_store.get().ok_or_else(|| {
+                        anyhow::anyhow!("daemon checkpoint store failed to initialize")
+                    })?
+                }
+            };
+            let guard = lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("daemon checkpoint store mutex poisoned"))?;
+            guard.checkpoint_wal()
+        })();
+        checkpointed
+            .inspect_err(|error| tracing::debug!("index checkpoint skipped: {error:#}"))
+            .ok()
     }
 
     /// Flush a batch of entries stored without an fsync, in the main store and
@@ -3299,6 +3475,438 @@ impl Daemon {
         // Oldest first — the entry a user is most likely waiting on.
         entries.sort_by_key(|e| std::cmp::Reverse(e.elapsed_s));
         entries
+    }
+
+    /// The index connection HashFiles reads and writes its memo rows
+    /// through. The store mutex is held by commits that may wait seconds for
+    /// the index's write lock (a publish, an entry), and a wrapper's prefetch
+    /// gives up after 3 s, so HashFiles keeps out of it.
+    fn with_hash_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let lock = match self.hash_store.get() {
+            Some(lock) => lock,
+            None => {
+                let store = Store::open(&self.config)?;
+                defer_checkpoints_under_mutex(&store);
+                let _ = self.hash_store.set(Mutex::new(store));
+                self.hash_store
+                    .get()
+                    .ok_or_else(|| anyhow::anyhow!("daemon hash store failed to initialize"))?
+            }
+        };
+        let guard = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon hash store mutex poisoned"))?;
+        f(&guard)
+    }
+
+    /// Write the file-hash rows HashFiles requests learned since the last
+    /// call, in one transaction with a short wait. The rows only save later
+    /// reads (settled hashes are in the in-memory cache already), so a busy
+    /// index drops them rather than holding anyone up.
+    pub(crate) fn flush_file_hash_records(&self) {
+        self.flush_handed_memo_rows();
+        let batch = match self.pending_file_hashes.lock() {
+            Ok(mut pending) if !pending.is_empty() => std::mem::take(&mut *pending),
+            _ => return,
+        };
+        let rows: Vec<(crate::cache_key::FileFingerprint, &str)> = batch
+            .iter()
+            .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
+            .collect();
+        if let Err(error) = self.with_hash_store(|store| {
+            store.record_verified_file_hashes(&rows);
+            Ok(())
+        }) {
+            tracing::debug!("file hash rows not written: {error:#}");
+        }
+    }
+
+    /// Take memo rows a wrapper's index was too busy for. Refused for another
+    /// store, or when [`MAX_PENDING_MEMO_ROWS`] are waiting (an index that has
+    /// refused writes for that long): the wrapper then drops them.
+    pub fn handle_record_file_hashes(&self, req: &RecordFileHashesRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("memo rows for another store");
+        }
+        let Ok(mut pending) = self.pending_memo_rows.lock() else {
+            return Response::err("memo row queue poisoned");
+        };
+        if pending.len() + req.rows.len() > MAX_PENDING_MEMO_ROWS {
+            return Response::err("memo row queue full");
+        }
+        pending.extend(req.rows.iter().map(|row| crate::store::MemoRow {
+            fingerprint: crate::cache_key::FileFingerprint {
+                path: row.path.clone(),
+                size: row.size,
+                mtime_ns: row.mtime_ns,
+                ctime_ns: row.ctime_ns,
+                inode: row.inode,
+            },
+            hash: row.hash.clone(),
+            redated: row.redated,
+        }));
+        Response::ok()
+    }
+
+    /// Keep memo rows the publish worker could not write at once for the
+    /// next flush, as rows a wrapper hands over; past
+    /// [`MAX_PENDING_MEMO_ROWS`] waiting they are dropped (they only save a
+    /// later hash).
+    pub(crate) fn defer_memo_rows(&self, rows: Vec<crate::store::MemoRow>) {
+        if let Ok(mut pending) = self.pending_memo_rows.lock() {
+            let room = MAX_PENDING_MEMO_ROWS.saturating_sub(pending.len());
+            pending.extend(rows.into_iter().take(room));
+        }
+    }
+
+    /// Write the memo rows wrappers handed over, in one transaction on the
+    /// hash store's connection. Rows that no longer describe their file are
+    /// left out ([`Store::write_handed_memo_rows`]); a batch the index
+    /// refused stays for the next call.
+    fn flush_handed_memo_rows(&self) {
+        let batch = match self.pending_memo_rows.lock() {
+            Ok(mut pending) if !pending.is_empty() => std::mem::take(&mut *pending),
+            _ => return,
+        };
+        match self.with_hash_store(|store| Ok(store.write_handed_memo_rows(&batch)?)) {
+            Ok(written) => tracing::debug!(rows = batch.len(), written, "handed memo rows"),
+            Err(error) => {
+                tracing::debug!("handed memo rows not written yet: {error:#}");
+                if let Ok(mut pending) = self.pending_memo_rows.lock() {
+                    let room = MAX_PENDING_MEMO_ROWS.saturating_sub(pending.len());
+                    let kept: Vec<_> = batch.into_iter().take(room).collect();
+                    pending.splice(0..0, kept);
+                }
+            }
+        }
+    }
+
+    /// Take hits' access stamps: the entries stay pinned against this
+    /// daemon's sweeps until [`Self::flush_hit_stamps`] writes them. Refused
+    /// for another store, or when [`MAX_PENDING_HIT_STAMPS`] are waiting (an
+    /// index that has refused writes for that long): the wrapper then stamps
+    /// the index itself, as without a daemon.
+    pub fn handle_stamp_hits(&self, req: &StampHitsRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("hit stamps for another store");
+        }
+        let Ok(mut pending) = self.pending_hit_stamps.lock() else {
+            return Response::err("hit stamp queue poisoned");
+        };
+        if pending.len() + req.keys.len() > MAX_PENDING_HIT_STAMPS {
+            return Response::err("hit stamp queue full");
+        }
+        for key in &req.keys {
+            *pending.entry(key.clone()).or_insert(0) += 1;
+        }
+        Response::ok()
+    }
+
+    /// Write the hit stamps taken since the last call in one transaction on
+    /// the stamp connection. A stamp leaves the pending set only once its
+    /// transaction committed, so the sweeps' pin never has a gap; a batch the
+    /// index refused stays for the next call.
+    pub(crate) fn flush_hit_stamps(&self) {
+        let batch: Vec<(String, u32)> = match self.pending_hit_stamps.lock() {
+            Ok(pending) if !pending.is_empty() => {
+                pending.iter().map(|(k, n)| (k.clone(), *n)).collect()
+            }
+            _ => return,
+        };
+        let written = self.with_stamp_store(|store| store.stamp_hits(&batch));
+        if let Err(error) = written {
+            tracing::debug!("hit stamps not written yet: {error:#}");
+            return;
+        }
+        if let Ok(mut pending) = self.pending_hit_stamps.lock() {
+            for (key, count) in batch {
+                if let std::collections::hash_map::Entry::Occupied(mut slot) = pending.entry(key) {
+                    let left = slot.get().saturating_sub(count);
+                    if left == 0 {
+                        slot.remove();
+                    } else {
+                        *slot.get_mut() = left;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The stamp connection: writes on it may wait for the index's write
+    /// lock, and no wrapper waits for them.
+    fn with_stamp_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let lock = match self.stamp_store.get() {
+            Some(lock) => lock,
+            None => {
+                let store = Store::open(&self.config)?;
+                defer_checkpoints_under_mutex(&store);
+                let _ = self.stamp_store.set(Mutex::new(store));
+                self.stamp_store
+                    .get()
+                    .ok_or_else(|| anyhow::anyhow!("daemon stamp store failed to initialize"))?
+            }
+        };
+        let store = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("daemon stamp store mutex poisoned"))?;
+        f(&store)
+    }
+
+    /// Take key-bridge adoptions a wrapper verified under their keys' build
+    /// locks, and answer at once (lane KACHE-W23): the wrapper restores from
+    /// the verified legacy entry meanwhile, as a hit hands over its stamp.
+    /// For each entry the daemon takes the key's build lock, marks it
+    /// storing (a lookup that misses it waits for the commit, as for a
+    /// stored compile), pins both keys against its own sweeps, and queues
+    /// it for its registrar ([`run_adoption_registrar`]), which registers
+    /// everything queued in one transaction and then lets go of the locks
+    /// and pins. Each answer has `found`: taken (`skipped` when another
+    /// process held the key: it adopts or stores it itself). Refused for
+    /// another store, or when no registrar runs: the wrapper then registers
+    /// the adoption itself.
+    pub fn handle_adopt_entries(&self, req: &AdoptEntriesRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("adoptions for another store");
+        }
+        if req.entries.iter().any(|entry| {
+            !kache_format::is_valid_cache_key(&entry.cache_key)
+                || !kache_format::is_valid_cache_key(&entry.legacy_key)
+        }) {
+            return Response::err("adoption with an invalid cache key");
+        }
+        let registrar = self.adoption_registrar.get_or_init(|| {
+            let (queue, queued) = std::sync::mpsc::channel();
+            let config = self.config.clone();
+            let pins = Arc::clone(&self.pending_adoptions);
+            let spawned = std::thread::Builder::new()
+                .name("kache-adoptions".into())
+                .spawn(move || run_adoption_registrar(&config, queued, &pins));
+            if let Err(error) = spawned {
+                // The receiver went with the closure: every send fails and
+                // the wrappers register their adoptions themselves.
+                tracing::warn!("key bridge: no adoption registrar: {error}");
+            }
+            queue
+        });
+        let store_dir = self.config.store_dir();
+        let mut results = Vec::with_capacity(req.entries.len());
+        for entry in &req.entries {
+            let mut one = Response::ok();
+            one.found = Some(true);
+            let lock = match crate::store::try_lock_key_in(&store_dir, &entry.cache_key) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    one.skipped = true;
+                    results.push(one);
+                    continue;
+                }
+                Err(error) => return Response::err(format!("adoption lock: {error:#}")),
+            };
+            let mut lock = lock;
+            lock.mark_storing();
+            if let Ok(mut pins) = self.pending_adoptions.lock() {
+                pins.insert(entry.legacy_key.clone());
+                pins.insert(entry.cache_key.clone());
+            }
+            let pending = PendingAdoption {
+                request: crate::store::AdoptionRequest {
+                    legacy_key: entry.legacy_key.clone(),
+                    legacy_version: entry.legacy_version,
+                    cache_key: entry.cache_key.clone(),
+                    crate_name: entry.crate_name.clone(),
+                },
+                lock,
+            };
+            if let Err(std::sync::mpsc::SendError(pending)) = registrar.send(pending) {
+                unpin_adoption(&self.pending_adoptions, &pending.request);
+                return Response::err("adoption registrar gone");
+            }
+            results.push(one);
+        }
+        let mut response = Response::ok();
+        response.batch_results = Some(results);
+        response
+    }
+
+    /// Take target roots a wrapper's index was too busy to record. Refused
+    /// for another store, or when [`MAX_PENDING_HANDED_ROWS`] are waiting.
+    pub fn handle_record_target_roots(&self, req: &RecordTargetRootsRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("target roots for another store");
+        }
+        let Ok(mut pending) = self.pending_target_roots.lock() else {
+            return Response::err("target root queue poisoned");
+        };
+        if pending.len() + req.roots.len() > MAX_PENDING_HANDED_ROWS {
+            return Response::err("target root queue full");
+        }
+        for root in &req.roots {
+            pending.insert(root.target.clone(), root.clone());
+        }
+        Response::ok()
+    }
+
+    /// Log build events a wrapper's event log was too busy to take, on a
+    /// blocking thread that waits for the log as no build does. Counted
+    /// pending from before the answer until logged, so a build whose
+    /// wrappers have all exited is complete in the log once
+    /// `publishes_pending` reads 0. Refused for another event log, and when
+    /// [`MAX_PENDING_EVENT_REQUESTS`] are waiting.
+    pub fn handle_record_events(self: &Arc<Self>, req: RecordEventsRequest) -> Response {
+        if Path::new(&req.event_log) != self.config.event_log_path() {
+            return Response::err("events for another event log");
+        }
+        if self.events_pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_EVENT_REQUESTS {
+            self.events_pending.fetch_sub(1, Ordering::AcqRel);
+            return Response::err("event queue full");
+        }
+        let daemon = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            for event in &req.events {
+                crate::wrapper::write_daemon_event(&daemon.config, event);
+            }
+            daemon.events_pending.fetch_sub(1, Ordering::AcqRel);
+        });
+        Response::ok()
+    }
+
+    /// Take input prediction rows a wrapper's index was too busy for. Refused
+    /// for another store, or when [`MAX_PENDING_HANDED_ROWS`] are waiting.
+    pub fn handle_record_predictions(&self, req: &RecordPredictionsRequest) -> Response {
+        if Path::new(&req.cache_dir) != self.config.cache_dir {
+            return Response::err("prediction rows for another store");
+        }
+        let Ok(mut pending) = self.pending_predictions.lock() else {
+            return Response::err("prediction row queue poisoned");
+        };
+        if pending.len() + req.rows.len() > MAX_PENDING_HANDED_ROWS {
+            return Response::err("prediction row queue full");
+        }
+        for row in &req.rows {
+            pending.insert(row.identity.clone(), row.clone());
+        }
+        Response::ok()
+    }
+
+    /// Write the target roots and prediction rows wrappers handed over, in
+    /// one transaction on the stamp connection. A target root is recorded
+    /// under the wrapper's own checks, read again now: a directory gone or
+    /// replaced since is skipped or recorded as it is now, as a later unit
+    /// of its build would. A batch the busy index refused stays for the next
+    /// call, unless newer rows for the same target or identity arrived
+    /// meanwhile; one a store refuses otherwise (read-only) is dropped.
+    pub(crate) fn flush_handed_rows(&self) {
+        let roots = self
+            .pending_target_roots
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default();
+        let predictions = self
+            .pending_predictions
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default();
+        if roots.is_empty() && predictions.is_empty() {
+            return;
+        }
+        let written = self.with_stamp_store(|store| {
+            store.with_write_transaction(|store| {
+                for root in roots.values() {
+                    if let Err(error) = store.remember_target_root_built_by(
+                        Path::new(&root.target),
+                        Path::new(&root.workspace_root),
+                        root.rustc.as_deref(),
+                    ) {
+                        tracing::debug!(
+                            "handed target root {} not recorded: {error:#}",
+                            root.target
+                        );
+                    }
+                }
+                let cache = store.file_hash_cache();
+                for row in predictions.values() {
+                    let put = match &row.keep_under {
+                        Some((prefix, keep))
+                            if row.identity.len() > prefix.len()
+                                && row.identity.starts_with(prefix.as_str()) =>
+                        {
+                            cache.put_input_prediction_trimming(
+                                prefix,
+                                &row.identity,
+                                row.schema,
+                                row.crate_name.as_deref(),
+                                &row.json,
+                                *keep as usize,
+                            )
+                        }
+                        Some(_) => continue,
+                        None => cache.put_input_prediction(
+                            &row.identity,
+                            row.schema,
+                            row.crate_name.as_deref(),
+                            &row.json,
+                        ),
+                    };
+                    if let Err(error) = put {
+                        tracing::debug!("handed prediction row not written: {error}");
+                    }
+                }
+                Ok(())
+            })
+        });
+        match written {
+            Ok(()) => tracing::debug!(
+                roots = roots.len(),
+                predictions = predictions.len(),
+                "handed rows written"
+            ),
+            Err(error) if !crate::store::is_sqlite_contention(&error) => {
+                tracing::debug!("handed rows dropped: {error:#}");
+            }
+            Err(error) => {
+                tracing::debug!("handed rows not written yet: {error:#}");
+                if let Ok(mut pending) = self.pending_target_roots.lock() {
+                    for (target, root) in roots {
+                        if pending.len() >= MAX_PENDING_HANDED_ROWS {
+                            break;
+                        }
+                        pending.entry(target).or_insert(root);
+                    }
+                }
+                if let Ok(mut pending) = self.pending_predictions.lock() {
+                    for (identity, row) in predictions {
+                        if pending.len() >= MAX_PENDING_HANDED_ROWS {
+                            break;
+                        }
+                        pending.entry(identity).or_insert(row);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pin a sweep of the daemon's own store takes from the hit stamps
+    /// not yet written ([`Store::pin_entries_with`]).
+    fn pending_pins(&self) -> crate::store::PendingPins {
+        let pending = Arc::clone(&self.pending_hit_stamps);
+        let adoptions = Arc::clone(&self.pending_adoptions);
+        Arc::new(move |key: &str| {
+            pending.lock().map_or(true, |p| p.contains_key(key))
+                || adoptions.lock().map_or(true, |p| p.contains(key))
+        })
+    }
+
+    /// Open `config`'s store for a sweep. The daemon's own store first gets
+    /// the hit stamps taken so far, and keeps every entry whose stamp arrives
+    /// while it sweeps.
+    fn open_sweep_store(&self, config: &Config) -> Result<Store> {
+        if config.cache_dir != self.config.cache_dir {
+            return Store::open(config);
+        }
+        self.flush_hit_stamps();
+        let mut store = Store::open(config)?;
+        store.pin_entries_with(self.pending_pins());
+        Ok(store)
     }
 
     pub fn handle_hash_files(&self, req: &HashFilesRequest) -> Response {
@@ -3392,34 +4000,48 @@ impl Daemon {
             // A stamp that had changed within the settle window when it was
             // observed can be kept by a second write in the same tick, so
             // its hash goes back to this caller and is remembered nowhere.
+            let requested = crate::cache_key::FileFingerprint {
+                path: file.path.clone(),
+                size: file.size,
+                mtime_ns: file.mtime_ns,
+                ctime_ns: file.ctime_ns,
+                inode: file.inode,
+            };
             let settled = crate::cache_key::file_hash_memo_eligible(file.inode, cfg!(windows))
-                && crate::cache_key::stamp_is_settled(
-                    &crate::cache_key::FileFingerprint {
-                        path: file.path.clone(),
-                        size: file.size,
-                        mtime_ns: file.mtime_ns,
-                        ctime_ns: file.ctime_ns,
-                        inode: file.inode,
-                    },
-                    observed_ns,
-                );
+                && crate::cache_key::stamp_is_settled(&requested, observed_ns);
+            // Set when the bytes read match a re-dated row for the requested
+            // stamp: Cargo's re-date of an output kache wrote, which may be
+            // remembered like a settled stamp ([`FileHashCache::redated_pin`]).
+            // The units that read it next often ask at once, before the
+            // flush tick writes its row.
+            let mut pinned = false;
 
-            // #281: hold the store mutex only for the cheap cache lookup and
-            // record; run the blake3 read of the whole file OUTSIDE the lock so
-            // it can't stall a concurrent RemoteCheck's `import_restored_entry`.
+            // #281: hold the hash store only for the cheap cache lookup; run
+            // the blake3 read of the whole file OUTSIDE the lock, and leave the
+            // record to the batched flush, so nothing here waits for a writer.
             let path = Path::new(&file.path);
             let computed: anyhow::Result<(String, bool, u64)> =
-                match self.with_store(|store| Ok(store.file_hash_lookup(path))) {
+                match self.with_hash_store(|store| Ok(store.file_hash_lookup(path))) {
                     Ok(crate::cache_key::FileHashLookup::Hit(hash)) => Ok((hash, true, 0)),
                     Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
                         crate::cache_key::hash_file(path).map(|hash| {
                             // The lookup took its own stamp, after `observed_ns`.
-                            if crate::cache_key::stamp_is_settled(&fp, observed_ns) {
-                                // Brief re-lock just to persist the result.
-                                let _ = self.with_store(|store| {
-                                    store.file_hash_record(&fp, &hash);
-                                    Ok(())
-                                });
+                            // An unsettled one may be Cargo's re-date of an
+                            // output kache wrote with these bytes.
+                            let settled_now = crate::cache_key::stamp_is_settled(&fp, observed_ns);
+                            let redated = !settled_now
+                                && self
+                                    .with_hash_store(|store| {
+                                        Ok(store.file_hash_cache().redated_pin(&fp, &hash))
+                                    })
+                                    .unwrap_or(false);
+                            pinned = redated && fp == requested;
+                            if settled_now || redated {
+                                // Written in a batch by the flush tick, off
+                                // this request's path.
+                                if let Ok(mut pending) = self.pending_file_hashes.lock() {
+                                    pending.push((fp.clone(), hash.clone()));
+                                }
                             }
                             (hash, false, file.size.max(0) as u64)
                         })
@@ -3437,7 +4059,7 @@ impl Daemon {
                         &self.file_hash_cache,
                         &key,
                         &hash,
-                        settled,
+                        settled || pinned,
                         crate::cache_key::FileFingerprint::from_path,
                     );
 
@@ -6300,6 +6922,18 @@ impl Daemon {
         !self.gc_hint_pending.swap(true, Ordering::SeqCst)
     }
 
+    /// Whether the volume of the main store, or of a `[cache.volumes]`
+    /// shard with an index, is running low on free space.
+    fn any_store_low_on_disk(&self) -> bool {
+        crate::disk_recovery::low_on_disk(&self.config)
+            || self
+                .config
+                .volume_stores
+                .iter()
+                .filter(|shard| crate::volume_gc::shard_has_index(&shard.store))
+                .any(|shard| crate::disk_recovery::low_on_disk_at(&self.config, &shard.store))
+    }
+
     /// Stage the target directory's recorded executables in the background;
     /// the wrapper that hinted does not wait.
     fn handle_prestage(self: &Arc<Self>, req: &PrestageRequest) -> Response {
@@ -6319,24 +6953,104 @@ impl Daemon {
     /// that worker exits and has no later chance at entries a live build
     /// pins, while the daemon sweeps again on the next hint or upload after
     /// the backoff.
+    ///
+    /// A daemon that has just started defers the sweep to the end of
+    /// [`STARTUP_GC_DELAY`], as it does its periodic one: it starts while
+    /// builds wait on it (an update, a crash), they come back storing at
+    /// once, and a sweep then holds the index's write lock against them
+    /// (tasty.56 started 15:57:32Z and swept 670 GB at 15:57:39Z on the first
+    /// hint). The trigger and backoff it then asks are the ones every daemon
+    /// shares, so a fresh daemon sweeps no sooner than the previous one would
+    /// have. A disk running low ends the wait at once.
     fn handle_gc_hint(self: &Arc<Self>) -> Response {
         if self.claim_gc_hint() {
             let daemon = Arc::clone(self);
-            tokio::task::spawn_blocking(move || daemon.run_hinted_sweep());
+            match self.startup_sweep_deadline() {
+                None => {
+                    tokio::task::spawn_blocking(move || daemon.run_hinted_sweep());
+                }
+                Some(deadline) => {
+                    tracing::info!(
+                        "size sweep deferred: the daemon started {}s ago and sweeps from {}s on",
+                        self.started.elapsed().as_secs(),
+                        STARTUP_GC_DELAY.as_secs()
+                    );
+                    tokio::spawn(async move {
+                        while let Some(left) = deadline.checked_duration_since(Instant::now())
+                            && !left.is_zero()
+                        {
+                            tokio::time::sleep(left.min(FREE_SPACE_CHECK_INTERVAL)).await;
+                            if daemon.any_store_low_on_disk() {
+                                break;
+                            }
+                        }
+                        let _ =
+                            tokio::task::spawn_blocking(move || daemon.run_hinted_sweep()).await;
+                    });
+                }
+            }
         }
         Response::ok()
+    }
+
+    /// A daemon that has run [`STARTUP_GC_DELAY`]: its size sweeps start at
+    /// once, for tests of the sweeps themselves.
+    #[cfg(test)]
+    pub(crate) fn settled(mut self) -> Self {
+        self.started = Instant::now()
+            .checked_sub(STARTUP_GC_DELAY)
+            .unwrap_or(self.started);
+        self
+    }
+
+    /// When a size sweep a hint asks for may start: `None` (now) once the
+    /// daemon has run [`STARTUP_GC_DELAY`] or while a store's disk runs low,
+    /// else the end of that delay.
+    fn startup_sweep_deadline(&self) -> Option<Instant> {
+        let deadline = self.started + STARTUP_GC_DELAY;
+        (Instant::now() < deadline && !self.any_store_low_on_disk()).then_some(deadline)
     }
 
     /// A delegated compiler already resolved its cache policy. Keep that
     /// snapshot when it requests eviction after a put. The wrapper's shared
     /// throttle limits requests; each sweep also takes the store's gc.lock.
+    /// A request for a store whose sweep is already queued or running joins
+    /// it: that sweep measures the store when it starts, so it covers this
+    /// put too, and a burst of requests costs one blocking thread instead of
+    /// a recovery pass and a store open each.
     pub(crate) fn request_gc_for_invocation(self: &Arc<Self>, config: Config) {
+        if !self.claim_invocation_gc(&config.cache_dir) {
+            return;
+        }
         let daemon = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            if let Err(error) = daemon.sweep_invocation_under_size_pressure(&config) {
+            // Released on unwind too, or one panic would swallow every later request.
+            struct Release<'a>(&'a Daemon, &'a Path);
+            impl Drop for Release<'_> {
+                fn drop(&mut self) {
+                    self.0
+                        .invocation_gc_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(self.1);
+                }
+            }
+            let _release = Release(&daemon, &config.cache_dir);
+            if let Err(error) = crate::platform::below_normal(|| {
+                daemon.sweep_invocation_under_size_pressure(&config)
+            }) {
                 tracing::warn!("invocation GC sweep failed: {error:#}");
             }
         });
+    }
+
+    /// Claim the sweep for a delegated compile's store; false while one is
+    /// queued or running for it.
+    fn claim_invocation_gc(&self, cache_dir: &Path) -> bool {
+        self.invocation_gc_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(cache_dir.to_path_buf())
     }
 
     fn sweep_invocation_under_size_pressure(&self, config: &Config) -> Result<()> {
@@ -6356,7 +7070,7 @@ impl Daemon {
             }
         }
         let _release = Release(&self.gc_hint_pending);
-        if let Err(e) = self.sweep_under_size_pressure() {
+        if let Err(e) = crate::platform::below_normal(|| self.sweep_under_size_pressure()) {
             tracing::warn!("hinted GC sweep failed: {e:#}");
         }
     }
@@ -6414,8 +7128,12 @@ impl Daemon {
             return Ok(());
         }
         // Under gc.lock like every driver, so the totals cannot race.
-        let store = Store::open(config)?;
-        let stats = self.automatic_size_pass(config, &store, size)?;
+        let store = self.open_sweep_store(config)?;
+        let stats = self.automatic_size_pass(config, &store, size);
+        drop(store);
+        // The ranking of a large store takes hundreds of megabytes.
+        crate::platform::release_free_heap();
+        let stats = stats?;
         if let Err(e) = crate::report::record_gc_run(
             config,
             "daemon",
@@ -6436,16 +7154,35 @@ impl Daemon {
         store: &Store,
         size: u64,
     ) -> Result<crate::store::GcStats> {
+        // The size is every blob's, the shared ones too: say how much of it
+        // the last sweep found held by target directories, which the
+        // trigger leaves out and no eviction frees.
         tracing::info!(
-            "store {} size {} over the automatic trigger (max {}), running LRU eviction",
+            "store {} size {} over the automatic trigger (max {}; {} of it held by target \
+             directories at the last sweep), running LRU eviction",
             config.cache_dir.display(),
             size,
-            config.max_size
+            config.max_size,
+            crate::wrapper::recent_auto_gc_held(&config.cache_dir)
         );
         let started = Instant::now();
-        let mut stats = store.evict_for(crate::store::SweepOrigin::Automatic)?;
+        // Builds keep writing while it runs: it goes on past its byte
+        // target while the disk is low.
+        let mut stats = store.evict_for_free_space(crate::store::SweepOrigin::Automatic, || {
+            crate::disk_recovery::low_on_disk(config)
+        })?;
         stats.duration_ms = started.elapsed().as_millis() as u64;
-        if let Ok(after) = store.physical_size() {
+        if stats.cut_short {
+            // Stopped at its walk budget: more can go, so nothing backs off.
+            tracing::info!(
+                "auto-gc: sweep stopped after {} entries at its walk budget; the next \
+                 automatic sweep goes on",
+                stats.entries_evicted
+            );
+            if let Ok(after) = store.physical_size() {
+                crate::wrapper::record_auto_gc_cut_short(config, after, stats.bytes_held);
+            }
+        } else if let Ok(after) = store.physical_size() {
             crate::wrapper::record_auto_gc_outcome(config, after, stats.bytes_held);
         }
         Ok(stats)
@@ -6477,11 +7214,16 @@ impl Daemon {
     /// Each store's `gc.lock` is its own: a shard another GC holds is skipped,
     /// and a busy main store does not stop the shards from being swept.
     fn run_gc(&self, policy: GcPolicy, driver: GcDriver) -> Result<GcRunReport> {
-        let report = self.run_gc_store(&self.config, policy, driver)?;
-        crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
-            self.run_gc_store(shard, policy, driver)
-        });
-        Ok(report)
+        let report = (|| {
+            let report = self.run_gc_store(&self.config, policy, driver)?;
+            crate::volume_gc::run_on_volume_shards(&self.config, |shard| {
+                self.run_gc_store(shard, policy, driver)
+            });
+            Ok(report)
+        })();
+        // A sweep's ranking and housekeeping free hundreds of megabytes.
+        crate::platform::release_free_heap();
+        report
     }
 
     /// Core GC logic for the store of `config` with an explicit policy and
@@ -6500,7 +7242,7 @@ impl Daemon {
         // GC may scan and remove thousands of entries. Use its own connection
         // so daemon lookups and uploads can still reach the main Store mutex.
         // SQLite and gc.lock continue to serialize the actual writes.
-        let gc_store = Store::open(config)?;
+        let gc_store = self.open_sweep_store(config)?;
         let _gc_lock = match driver {
             GcDriver::Requested => gc_store.acquire_gc_lock()?,
             GcDriver::Periodic => match gc_store.try_gc_lock()? {
@@ -6683,18 +7425,31 @@ impl Daemon {
                 ))
             })()?;
 
-        // Clean up stale tool-version cache files (rustc-ver-*.txt, linker-ver-*.txt).
-        // Each toolchain update leaves behind orphaned files keyed by the old binary mtime.
-        Self::clean_tool_version_caches(&self.config.cache_dir);
-
         // Key lock files and input predictions grow with every distinct key
         // and eviction removes neither (#1126). Still under gc.lock.
-        let housekeeping = gc_store.sweep_housekeeping();
+        let mut housekeeping = gc_store.sweep_housekeeping();
+        // Flight files grow the same way, one per missed key (scheduler/).
+        if !gc_store.is_read_only() {
+            let flights = crate::scheduler::sweep_stale_flights(&config.cache_dir);
+            housekeeping.flights_removed = flights.removed;
+            housekeeping.flights_remaining = flights.remaining;
+        }
+        // Probe memos grow with every tool, checkout and environment.
+        let memos = crate::probe_memo::sweep_idle_memos(&crate::probe_memo::memo_sweep_roots(
+            &config.cache_dir,
+            !gc_store.is_read_only(),
+        ));
+        housekeeping.memos_removed = memos.removed;
+        housekeeping.memos_remaining = memos.remaining;
         let prestage_pruned =
             crate::prestage::prune(&self.config.cache_dir, std::time::SystemTime::now());
         tracing::info!(
             key_locks_removed = housekeeping.key_locks_removed,
             key_locks_remaining = housekeeping.key_locks_remaining,
+            flights_removed = housekeeping.flights_removed,
+            flights_remaining = housekeeping.flights_remaining,
+            memos_removed = housekeeping.memos_removed,
+            memos_remaining = housekeeping.memos_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
             file_hashes_pruned = housekeeping.file_hashes_pruned,
             prestage_pruned,
@@ -6731,6 +7486,7 @@ impl Daemon {
                 + age_evict_stats.entries_unreclaimable,
             // Only the size pass measures it.
             bytes_held: evict_stats.bytes_held,
+            cut_short: evict_stats.cut_short,
             disk_bytes_reclaimed: dedup_stats.disk_bytes_reclaimed
                 + evict_stats.disk_bytes_reclaimed
                 + age_evict_stats.disk_bytes_reclaimed,
@@ -6782,33 +7538,24 @@ impl Daemon {
             total: stats,
         })
     }
-
-    /// Remove tool-version cache files older than 7 days.
-    fn clean_tool_version_caches(cache_dir: &Path) {
-        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
-
-        let Ok(entries) = std::fs::read_dir(cache_dir) else {
-            return;
-        };
-
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if (name.starts_with("rustc-ver-") || name.starts_with("linker-ver-"))
-                && name.ends_with(".txt")
-                && let Ok(meta) = entry.metadata()
-                && let Ok(modified) = meta.modified()
-                && modified < cutoff
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
 }
 
 // ── Server (thin I/O shell) ──────────────────────────────────────
 
 /// Run the daemon server (foreground, blocking).
+/// A connection the daemon shares behind a mutex commits for many requests
+/// (file-hash records, published entries). Left at SQLite's default, the
+/// commit that takes the WAL past 1,000 pages checkpoints it, fsync
+/// included, while every request needing that mutex waits: on a busy shared
+/// store that was nearly every commit, and wrappers' file-hash prefetches
+/// ran into their 3 s timeout. [`Daemon::checkpoint_index`] checkpoints instead, on
+/// a connection of its own.
+fn defer_checkpoints_under_mutex(store: &Store) {
+    if let Err(error) = store.defer_wal_checkpoints_here() {
+        tracing::debug!("daemon store keeps automatic checkpoints: {error:#}");
+    }
+}
+
 pub fn run_server(
     config: &Config,
     provenance: &crate::config::ConfigFileProvenance,
@@ -6831,6 +7578,15 @@ pub fn run_server(
         tracing::info!("another daemon holds the run lock, exiting");
         return Ok(());
     };
+    // Every connection this process opens (GC, publishes, the durability
+    // tick's) leaves routine checkpoints to that tick's explicit passive one.
+    kache_store::defer_wal_checkpoints();
+    // Before the runtime starts its threads, each of which would otherwise
+    // take an arena of its own.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if let Some(arenas) = crate::platform::limit_malloc_arenas() {
+        tracing::debug!(arenas, "capped glibc's malloc arenas");
+    }
     #[cfg(unix)]
     match crate::platform::raise_open_file_limit() {
         Ok(Some((before, after))) => {
@@ -6838,6 +7594,12 @@ pub fn run_server(
         }
         Ok(None) => {}
         Err(error) => tracing::warn!("could not raise the open-file limit: {error}"),
+    }
+    #[cfg(windows)]
+    match crate::platform::set_daemon_priority() {
+        Ok(true) => tracing::info!("raised from below normal to normal priority"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("could not set the daemon's priority: {error}"),
     }
     let coord = DaemonCoordFile::for_socket(&socket_path);
     coord
@@ -6971,6 +7733,44 @@ fn daemon_idle_timeout(seconds: u64) -> Option<Duration> {
     std::num::NonZeroU64::new(seconds).map(|seconds| Duration::from_secs(seconds.get()))
 }
 
+/// Set on a daemon a build starts by itself ([`spawn_detached_daemon`]), never
+/// on one a login service (systemd, launchd, Task Scheduler) or a person runs
+/// with `kache daemon run`.
+pub(crate) const AUTO_STARTED_ENV: &str = "KACHE_DAEMON_AUTO_STARTED";
+
+/// How long an auto-started daemon waits without work before it stops, when
+/// no idle timeout is configured. Nothing supervises such a daemon, so with no
+/// timeout it held its memory and store open until the next reboot on every
+/// machine without the service; the next build starts it again.
+pub(crate) const AUTO_STARTED_IDLE_TIMEOUT_SECS: u64 = 3600;
+
+/// The idle timeout this daemon runs with: the configured one, except that an
+/// auto-started daemon whose timeout nobody configured stops after
+/// [`AUTO_STARTED_IDLE_TIMEOUT_SECS`]. A configured 0 keeps it running.
+fn effective_idle_timeout_secs(
+    configured: u64,
+    explicitly_configured: bool,
+    auto_started: bool,
+) -> u64 {
+    if auto_started && !explicitly_configured {
+        AUTO_STARTED_IDLE_TIMEOUT_SECS
+    } else {
+        configured
+    }
+}
+
+/// Whether `KACHE_DAEMON_IDLE_TIMEOUT` or the config file's
+/// `cache.daemon_idle_timeout_secs` sets the idle timeout (as the config
+/// resolves it: a value that is not a number is ignored there too).
+fn idle_timeout_is_configured() -> bool {
+    std::env::var("KACHE_DAEMON_IDLE_TIMEOUT").is_ok_and(|value| value.parse::<u64>().is_ok())
+        || Config::load_file_config()
+            .ok()
+            .and_then(|file| file.cache)
+            .and_then(|cache| cache.daemon_idle_timeout_secs)
+            .is_some()
+}
+
 /// The shutdown warning for `unpublished` hand-offs the publish worker never
 /// stored, or `None` when it stored them all.
 fn publish_drain_warning(unpublished: usize) -> Option<String> {
@@ -7028,6 +7828,14 @@ async fn server_main(
         return Ok(());
     };
     let _socket_guard = SocketCleanupGuard::new(&socket_path)?;
+    let bound_socket = BoundSocket::capture(&socket_path)?;
+    let daemon_owner = owner::DaemonOwner::from_env();
+    if let Some(owner) = &daemon_owner {
+        tracing::info!(
+            "this daemon belongs to process {} and stops once it ends",
+            owner.pid()
+        );
+    }
 
     let lifecycle = Arc::new(Lifecycle::default());
     let mut control = lifecycle_control::serve(config, Arc::clone(&lifecycle)).await?;
@@ -7152,6 +7960,73 @@ async fn server_main(
     // Short interval: until an entry is flushed every hit on it re-reads its
     // blobs to verify them, and the wrapper hands the work here precisely so
     // the build does not wait for the disk.
+    // File-hash rows HashFiles learned: one short transaction a quarter
+    // second, on the hash store's connection.
+    let hash_rows_daemon = daemon.clone();
+    let hash_rows_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let daemon = hash_rows_daemon.clone();
+            let _ = tokio::task::spawn_blocking(move || daemon.flush_file_hash_records()).await;
+        }
+    });
+
+    // Hits' access stamps: one transaction a quarter second, on the stamp
+    // connection, so a hit never waits for the index's write lock.
+    let hit_stamps_daemon = daemon.clone();
+    let hit_stamps_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let daemon = hit_stamps_daemon.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                daemon.flush_hit_stamps();
+                daemon.flush_handed_rows();
+            })
+            .await;
+        }
+    });
+
+    // Free heap the builds' requests leave behind, between sweeps (which
+    // trim on their own): see `HeapTrimGate`.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    tokio::spawn(async move {
+        let gate = Arc::new(std::sync::Mutex::new(
+            crate::platform::HeapTrimGate::default(),
+        ));
+        let mut interval = tokio::time::interval(HEAP_TRIM_CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let gate = Arc::clone(&gate);
+            let _ = tokio::task::spawn_blocking(move || {
+                let Some(before) = crate::platform::resident_bytes() else {
+                    return;
+                };
+                let Ok(mut gate) = gate.lock() else {
+                    return;
+                };
+                if !gate.due(before) {
+                    return;
+                }
+                let started = Instant::now();
+                crate::platform::below_normal(crate::platform::release_free_heap);
+                let after = crate::platform::resident_bytes().unwrap_or(before);
+                gate.trimmed(after);
+                tracing::info!(
+                    before_mib = before >> 20,
+                    after_mib = after >> 20,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "gave free heap back"
+                );
+            })
+            .await;
+        }
+    });
+
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -7160,12 +8035,75 @@ async fn server_main(
             interval.tick().await;
             let daemon = durability_daemon.clone();
             // Blocking: fsync per blob, off the async workers (#281).
-            let _ = tokio::task::spawn_blocking(move || daemon.flush_pending_durability()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                // Wrappers and the daemon's own connections defer routine
+                // checkpoints; this keeps the log short.
+                daemon.checkpoint_index();
+                daemon.flush_pending_durability();
+            })
+            .await;
         }
     });
 
+    // Copies staged for builds that did not come to take them (prestage).
+    let sweep_cache_dir = daemon.config.cache_dir.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crate::prestage::SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cache_dir = sweep_cache_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let removed = crate::platform::below_normal(|| {
+                    crate::prestage::sweep_staged(&cache_dir, std::time::SystemTime::now())
+                });
+                if removed > 0 {
+                    tracing::info!(removed, "prestage: swept untaken copies");
+                }
+            })
+            .await;
+        }
+    });
+
+    // Graphs of finished work, while builds run (incremental_policy).
+    if daemon.config.auto_clean_adaptive_idle_hours > 0 {
+        let config = daemon.config.clone();
+        tokio::spawn(async move {
+            let every = crate::incremental_policy::IDLE_SWEEP_INTERVAL;
+            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let config = config.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let pruned = crate::platform::below_normal(|| {
+                        crate::target_cleanup::prune_idle_adaptive(
+                            &config,
+                            std::time::SystemTime::now(),
+                        )
+                    });
+                    if pruned.units > 0 {
+                        tracing::info!(
+                            units = pruned.units,
+                            bytes = pruned.bytes,
+                            "adaptive incremental: dropped idle graphs"
+                        );
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
+    let first_gc = first_periodic_gc_delay(
+        crate::report::read_gc_stats(&daemon.config.cache_dir)
+            .and_then(|stats| chrono::DateTime::parse_from_rfc3339(&stats.last_run).ok())
+            .map(std::time::SystemTime::from),
+        std::time::SystemTime::now(),
+    );
     let gc_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + first_gc, PERIODIC_GC_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -7174,12 +8112,14 @@ async fn server_main(
             // the accept loop and in-flight RemoteCheck stay responsive (#281).
             let gc = gc_daemon.clone();
             match tokio::task::spawn_blocking(move || {
-                gc.run_gc(
-                    GcPolicy::Automatic {
-                        max_age_hours: gc.config.gc_max_age_hours,
-                    },
-                    GcDriver::Periodic,
-                )
+                crate::platform::below_normal(|| {
+                    gc.run_gc(
+                        GcPolicy::Automatic {
+                            max_age_hours: gc.config.gc_max_age_hours,
+                        },
+                        GcDriver::Periodic,
+                    )
+                })
             })
             .await
             {
@@ -7189,6 +8129,8 @@ async fn server_main(
             }
         }
     });
+
+    let free_space_handle = spawn_free_space_watch(daemon.clone(), FREE_SPACE_CHECK_INTERVAL);
 
     let maintenance_handle = config
         .index_auto_compact
@@ -7233,11 +8175,13 @@ async fn server_main(
     let migration_config = config.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            if let Ok(store) = Store::open(&migration_config) {
-                store.migrate_to_blobs(|_, _| {})
-            } else {
-                Err(anyhow::anyhow!("failed to open store for migration"))
-            }
+            crate::platform::below_normal(|| {
+                if let Ok(store) = Store::open(&migration_config) {
+                    store.migrate_to_blobs(|_, _| {})
+                } else {
+                    Err(anyhow::anyhow!("failed to open store for migration"))
+                }
+            })
         })
         .await;
 
@@ -7258,12 +8202,33 @@ async fn server_main(
         let _ = notifier.ready();
     }
     let heartbeat_coord = coord.clone();
+    let heartbeat_lifecycle = Arc::clone(&lifecycle);
     let heartbeat_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(DAEMON_COORD_HEARTBEAT_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
             interval.tick().await;
+            // Before the state write, which would recreate a removed runtime
+            // directory.
+            if bound_socket.is_lost() {
+                tracing::warn!(
+                    "daemon socket {} was removed or replaced, so nothing can reach this \
+                     daemon; shutting down",
+                    bound_socket.path.display()
+                );
+                heartbeat_lifecycle.start_drain();
+                break;
+            }
+            if let Some(owner) = daemon_owner.as_ref().filter(|owner| owner.is_gone()) {
+                tracing::warn!(
+                    "process {} that owns this daemon ({}) has ended; shutting down",
+                    owner.pid(),
+                    OWNER_PID_ENV
+                );
+                heartbeat_lifecycle.start_drain();
+                break;
+            }
             if let Err(e) = heartbeat_coord.write_phase(DaemonPhase::Ready) {
                 tracing::debug!("daemon coordinator heartbeat failed: {e}");
             }
@@ -7303,19 +8268,35 @@ async fn server_main(
     // Prevents zombie daemons from accumulating when the user isn't building.
     // The daemon will be auto-started again on the next build.
     // Configurable via KACHE_DAEMON_IDLE_TIMEOUT or config.toml; 0 = disabled.
-    let idle_timeout = daemon_idle_timeout(config.daemon_idle_timeout_secs);
+    // Unconfigured, an auto-started daemon stops after an hour and a service's
+    // daemon runs on.
+    let auto_started = std::env::var_os(AUTO_STARTED_ENV).is_some();
+    let idle_secs = effective_idle_timeout_secs(
+        config.daemon_idle_timeout_secs,
+        idle_timeout_is_configured(),
+        auto_started,
+    );
+    if auto_started && idle_secs != 0 {
+        tracing::info!(
+            idle_secs,
+            "auto-started daemon: stops after this long without work"
+        );
+    }
+    let idle_timeout = daemon_idle_timeout(idle_secs);
 
-    accept_loop(
+    accept_loop_with(
         &listener,
         &daemon,
         &lifecycle,
         idle_timeout,
         CONNECTION_HANDLER_DRAIN_TIMEOUT,
+        COMPILE_DRAIN_BOUND,
         shutdown_signal(),
     )
     .await;
 
     gc_handle.abort();
+    free_space_handle.abort();
     if let Some(h) = maintenance_handle {
         h.abort();
     }
@@ -7335,6 +8316,11 @@ async fn server_main(
     }
     heartbeat_handle.abort();
     config_watch_handle.abort();
+    hash_rows_handle.abort();
+    daemon.flush_file_hash_records();
+    hit_stamps_handle.abort();
+    daemon.flush_hit_stamps();
+    daemon.flush_handed_rows();
 
     drain_publications_then_close_uploads(&daemon, publish_done).await;
     drop(daemon);
@@ -7405,15 +8391,50 @@ const ACCEPT_LOOP_IDLE_TICK: Duration = Duration::from_secs(60);
 #[cfg(unix)]
 const ACCEPT_EXHAUSTED_BACKOFF: Duration = Duration::from_millis(50);
 
-/// The pause before accepting again after `error`, if any.
-fn accept_backoff(error: &std::io::Error) -> Option<Duration> {
+/// Longest pause between accept attempts that keep failing on Windows.
+#[cfg(windows)]
+const ACCEPT_FAILING_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// The pause before accepting again after `error`, the `failures`-th accept
+/// error in a row, if any.
+///
+/// On Windows every accept error pauses, growing from 10 ms to a second.
+/// interprocess's pipe listener connects a client and then creates the next
+/// pipe instance; when that creation fails (CreateNamedPipeW out of memory
+/// or quota under memory pressure) it keeps the connected instance and
+/// returns the error, and every later accept fails the same way at once
+/// until creation succeeds again. Retrying at once spun a core and wrote a
+/// warning per turn; the client already connected is handed out by the
+/// first accept that can create an instance, after a pause or not.
+fn accept_backoff(error: &std::io::Error, failures: u32) -> Option<Duration> {
     #[cfg(unix)]
-    if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
-        return Some(ACCEPT_EXHAUSTED_BACKOFF);
+    {
+        let _ = failures;
+        if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) {
+            return Some(ACCEPT_EXHAUSTED_BACKOFF);
+        }
+        None
     }
-    #[cfg(not(unix))]
-    let _ = error;
-    None
+    #[cfg(windows)]
+    {
+        let _ = error;
+        Some(
+            Duration::from_millis(10u64 << failures.saturating_sub(1).min(7))
+                .min(ACCEPT_FAILING_BACKOFF_MAX),
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (error, failures);
+        None
+    }
+}
+
+/// Whether the `failures`-th accept error in a row is logged: the first and
+/// then each power of two, so a listener that keeps failing cannot flood
+/// the log.
+fn accept_error_logged(failures: u32) -> bool {
+    failures.is_power_of_two()
 }
 
 /// Maximum time to let accepted IPC handlers finish their current response
@@ -7421,6 +8442,26 @@ fn accept_backoff(error: &std::io::Error) -> Option<Duration> {
 /// shutdown acknowledgement) without letting a silent client hold the daemon
 /// open forever.
 const CONNECTION_HANDLER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long shutdown waits for compiles clients already handed over
+/// (`compiles_in_flight`) before it cancels them, counted from the start of
+/// the drain. A stop or restart used to cut them at
+/// [`CONNECTION_HANDLER_DRAIN_TIMEOUT`] and fail other people's builds.
+///
+/// Ten minutes: on the build machine (2026-10-27/29, 315,711 compiles) the
+/// p99.9 compile took 250 s, the p99.99 423 s, the longest 849 s (5 over
+/// 600 s). The drain ends when the last of them does, which is seconds in
+/// the usual case; the bound is only for a stop in the middle of the longest
+/// ones, and a compile cut there is run again by its client
+/// (`Attempt::Lost`). A service manager must give the daemon longer than
+/// this to stop: systemd's `TimeoutStopSec` at least
+/// [`SERVICE_STOP_TIMEOUT`], or it kills the daemon first.
+pub(crate) const COMPILE_DRAIN_BOUND: Duration = Duration::from_secs(600);
+
+/// The stop timeout the daemon's service needs: [`COMPILE_DRAIN_BOUND`], plus
+/// what shutdown does after the handlers (prefetch 5 s, uploads 30 s, the
+/// index's quiet compaction) and a margin.
+pub(crate) const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(720);
 
 /// Overall budget a `RemoteCheck` waits behind another task's in-flight
 /// download of the same key before giving up and reporting a remote miss
@@ -7642,14 +8683,90 @@ impl Drop for DownloadingGuard {
     }
 }
 
+/// How often the daemon sweeps the store (age, housekeeping, size).
+const PERIODIC_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+/// How often the daemon reads its resident memory to see whether a heap
+/// trim is due (`HeapTrimGate`): one small `/proc` read.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const HEAP_TRIM_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often the daemon reads free space on its own, a `statvfs` per store.
+/// Wrappers ask at most once in five minutes, and only after storing: builds
+/// filling a disk at 3 GiB a minute take 16 GiB in that time, more than the
+/// default floor.
+const FREE_SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The daemon's own free-space timer: every `period`, a store whose volume
+/// runs low gets the sweep a wrapper's hint starts, with disk recovery
+/// first. The hint's claim keeps one such sweep at a time.
+fn spawn_free_space_watch(daemon: Arc<Daemon>, period: Duration) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if daemon.any_store_low_on_disk() {
+                daemon.handle_gc_hint();
+            }
+        }
+    })
+}
+
+/// The soonest a started daemon sweeps, on its timer or on a size hint
+/// ([`Daemon::handle_gc_hint`]). A daemon restarts while builds wait
+/// on it (an update, a crash), and its clients come back storing at once:
+/// a sweep then holds the index's write lock while they store, and their
+/// stores give up as "database is locked".
+const STARTUP_GC_DELAY: Duration = Duration::from_secs(5 * 60);
+
+/// When a started daemon first sweeps: when the last sweep, by any daemon on
+/// this store, is [`PERIODIC_GC_INTERVAL`] old, and never sooner than
+/// [`STARTUP_GC_DELAY`]. Without a record (or one from the future, a clock
+/// step) the sweep is due.
+fn first_periodic_gc_delay(
+    last_run: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Duration {
+    let due = last_run
+        .and_then(|last| now.duration_since(last).ok())
+        .map_or(Duration::ZERO, |since| {
+            PERIODIC_GC_INTERVAL.saturating_sub(since)
+        });
+    due.max(STARTUP_GC_DELAY)
+}
+
 /// Accept until the shared lifecycle closes admission, an idle budget expires,
 /// or the OS requests shutdown. Per-request guards include response delivery.
+#[cfg(test)]
 async fn accept_loop(
     listener: &TokioListener,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
     idle_timeout: Option<Duration>,
     handler_drain_timeout: Duration,
+    shutdown_signal: impl std::future::Future<Output = ()>,
+) {
+    accept_loop_with(
+        listener,
+        daemon,
+        lifecycle,
+        idle_timeout,
+        handler_drain_timeout,
+        COMPILE_DRAIN_BOUND,
+        shutdown_signal,
+    )
+    .await;
+}
+
+/// [`accept_loop`], with handed-over compiles given `compile_drain_bound`
+/// (from the start of the drain) to finish before they are cancelled.
+async fn accept_loop_with(
+    listener: &TokioListener,
+    daemon: &Arc<Daemon>,
+    lifecycle: &Arc<Lifecycle>,
+    idle_timeout: Option<Duration>,
+    handler_drain_timeout: Duration,
+    compile_drain_bound: Duration,
     shutdown_signal: impl std::future::Future<Output = ()>,
 ) {
     tokio::pin!(shutdown_signal);
@@ -7661,6 +8778,8 @@ async fn accept_loop(
     // concurrently, so a burst of local clients can't pile up active handlers.
     let conn_limiter = Arc::new(tokio::sync::Semaphore::new(daemon.capacity.connections));
 
+    // Accept errors in a row, for the backoff and the log's rate.
+    let mut accept_failures: u32 = 0;
     loop {
         if !lifecycle.accepting_calls() {
             tracing::info!("shutdown requested via protocol, draining...");
@@ -7684,6 +8803,7 @@ async fn accept_loop(
                 // interprocess returns `Stream` directly (no peer address tuple)
                 match accept {
                     Ok(stream) => {
+                        accept_failures = 0;
                         // Capture the request's monotonic age before it can park
                         // behind the handler limiter. A later dispatch must not
                         // restart a client whose end-to-end budget already ran
@@ -7718,8 +8838,11 @@ async fn accept_loop(
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("accept error: {e}");
-                        if let Some(pause) = accept_backoff(&e) {
+                        accept_failures = accept_failures.saturating_add(1);
+                        if accept_error_logged(accept_failures) {
+                            tracing::warn!("accept error ({accept_failures} in a row): {e}");
+                        }
+                        if let Some(pause) = accept_backoff(&e, accept_failures) {
                             tokio::time::sleep(pause).await;
                         }
                     }
@@ -7747,16 +8870,55 @@ async fn accept_loop(
     lifecycle.start_drain();
     daemon.stop_prefetch_admission();
     daemon.file_hash_warmup.stop();
-    let drain_deadline = tokio::time::Instant::now() + handler_drain_timeout;
-    let _ = lifecycle.drain_until(drain_deadline).await;
+    let drain_started = tokio::time::Instant::now();
+    let handler_deadline = drain_started + handler_drain_timeout;
+    let compile_deadline = drain_started + compile_drain_bound.max(handler_drain_timeout);
+    let mut waited_for_compiles = false;
+    loop {
+        if lifecycle.snapshot().active == 0 {
+            break;
+        }
+        let now = tokio::time::Instant::now();
+        let compiles = daemon.compiles_in_flight();
+        // Handed-over compiles run on to the compile bound; anything else
+        // gets the handler deadline, as before.
+        if now >= compile_deadline || (now >= handler_deadline && compiles == 0) {
+            break;
+        }
+        if now >= handler_deadline && !waited_for_compiles {
+            waited_for_compiles = true;
+            tracing::info!(
+                compiles,
+                bound_s = compile_drain_bound.as_secs(),
+                "waiting for compiles handed over before shutdown"
+            );
+        }
+        tokio::select! {
+            biased;
+            _ = lifecycle.drain() => break,
+            // A client arriving now gets its connection closed at once, so it
+            // compiles locally instead of waiting in the listen queue for an
+            // answer that cannot come.
+            accepted = listener.accept() => drop(accepted),
+            Some(result) = handlers.join_next(), if !handlers.is_empty() => {
+                observe_connection_handler(result);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+    // Requests' guards end after their replies are written, so whatever is
+    // still running at the deadline is cancelled; a handed-over compile's
+    // client then runs it again itself.
+    let compiles = daemon.compiles_in_flight();
     if drain_connection_handlers(
         &mut handlers,
-        drain_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        handler_deadline.saturating_duration_since(tokio::time::Instant::now()),
     )
     .await
     {
         tracing::warn!(
             timeout_ms = handler_drain_timeout.as_millis() as u64,
+            compiles,
             "connection handler drain timed out; aborted remaining handlers"
         );
     }
@@ -8326,7 +9488,10 @@ async fn handle_connection_started_at(
     // Do NOT use stream.split() — interprocess docs warn that "dropping a half
     // does not shut it down", which causes the reader to never see EOF and
     // hangs the server loop (and tarpaulin coverage runs).
-    let mut reader = BufReader::new(&stream);
+    // Shared so a handed-over compile's worker holds the connection open
+    // until it returns (`execution::handle`).
+    let stream = Arc::new(stream);
+    let mut reader = BufReader::new(&*stream);
     let mut frame = Vec::new();
 
     loop {
@@ -8432,11 +9597,22 @@ async fn handle_connection_started_at(
                 offload(move || d.handle_hash_files(&req)).await
             }
             Ok(Request::HashFilesWarmup(req)) => daemon.handle_hash_files_warmup(&req),
+            Ok(Request::StampHits(req)) => daemon.handle_stamp_hits(&req),
+            Ok(Request::RecordFileHashes(req)) => daemon.handle_record_file_hashes(&req),
+            Ok(Request::RecordTargetRoots(req)) => daemon.handle_record_target_roots(&req),
+            Ok(Request::RecordPredictions(req)) => daemon.handle_record_predictions(&req),
+            Ok(Request::RecordEvents(req)) => daemon.handle_record_events(req),
+            Ok(Request::AdoptEntries(req)) => {
+                // Offload: the registration may wait for the index's write lock.
+                let d = Arc::clone(daemon);
+                offload(move || d.handle_adopt_entries(&req)).await
+            }
             Ok(Request::Prefetch(req)) => daemon.handle_prefetch(&req).await,
             Ok(Request::BuildStarted(req)) => daemon.handle_build_started(&req).await,
             Ok(Request::CompileStarted(req)) => daemon.handle_compile_started(req),
             Ok(Request::CompileFinished(req)) => daemon.handle_compile_finished(&req),
             Ok(Request::PublishCc(req)) => daemon.handle_publish_cc(*req).await,
+            Ok(Request::PublishRustc(req)) => daemon.handle_publish_rustc(*req).await,
             Ok(Request::PredictionFetch(req)) => daemon.handle_prediction_fetch(&req).await,
             Ok(Request::PredictionPublish(req)) => daemon.handle_prediction_publish(req),
             Ok(Request::Shutdown) => {
@@ -8467,7 +9643,7 @@ async fn handle_connection_started_at(
 
         let mut resp_line = serde_json::to_string(&resp)?;
         resp_line.push('\n');
-        if let Err(e) = (&stream).write_all(resp_line.as_bytes()).await {
+        if let Err(e) = (&*stream).write_all(resp_line.as_bytes()).await {
             // Client closed without reading (fire-and-forget mode) — not an error.
             tracing::debug!("response write failed (client likely closed): {e}");
             break;
@@ -8870,6 +10046,291 @@ pub fn send_prediction_publish(
     }
 }
 
+/// Hit stamps the daemon holds before it refuses more ([`Daemon::handle_stamp_hits`]).
+const MAX_PENDING_HIT_STAMPS: usize = 1 << 16;
+
+/// One adoption queued for [`run_adoption_registrar`]: the key's build
+/// lock, marked storing, goes once its registration is written.
+struct PendingAdoption {
+    request: crate::store::AdoptionRequest,
+    lock: crate::store::KeyLock,
+}
+
+/// The most adoptions one registration transaction takes, so a burst's
+/// batch holds the index's write lock for well under a second.
+const MAX_ADOPTION_BATCH: usize = 256;
+
+/// Let the daemon's sweeps take `request`'s keys again.
+fn unpin_adoption(pins: &Mutex<HashSet<String>>, request: &crate::store::AdoptionRequest) {
+    if let Ok(mut pins) = pins.lock() {
+        pins.remove(&request.legacy_key);
+        pins.remove(&request.cache_key);
+    }
+}
+
+/// The daemon's adoption registrar ([`Daemon::handle_adopt_entries`]): wait
+/// for one adoption, take every other already queued, register them in one
+/// transaction, then release their locks and pins; until the daemon drops
+/// the queue. A failed transaction leaves those keys unregistered: their
+/// next lookup adopts them again.
+fn run_adoption_registrar(
+    config: &Config,
+    queued: std::sync::mpsc::Receiver<PendingAdoption>,
+    pins: &Mutex<HashSet<String>>,
+) {
+    let store = match Store::open(config) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!("key bridge: adoption registrar cannot open the store: {error:#}");
+            for pending in queued {
+                unpin_adoption(pins, &pending.request);
+            }
+            return;
+        }
+    };
+    defer_checkpoints_under_mutex(&store);
+    while let Ok(first) = queued.recv() {
+        let mut batch = vec![first];
+        while batch.len() < MAX_ADOPTION_BATCH {
+            match queued.try_recv() {
+                Ok(next) => batch.push(next),
+                Err(_) => break,
+            }
+        }
+        let requests: Vec<_> = batch.iter().map(|p| p.request.clone()).collect();
+        let started = std::time::Instant::now();
+        match store.register_adoptions(&requests) {
+            // Only a key bridge's release adopts, once per entry.
+            Ok(results) => tracing::info!(
+                "key bridge: registered {} adoptions in one transaction in {:.1} ms ({} refused)",
+                results.len(),
+                started.elapsed().as_secs_f64() * 1e3,
+                results
+                    .iter()
+                    .filter(|r| **r == crate::store::Registered::Refused)
+                    .count()
+            ),
+            Err(error) => tracing::warn!(
+                "key bridge: registering {} adoptions failed: {error:#}",
+                batch.len()
+            ),
+        }
+        for pending in batch {
+            unpin_adoption(pins, &pending.request);
+            drop(pending.lock);
+        }
+    }
+}
+
+/// Memo rows the daemon holds before it refuses more
+/// ([`Daemon::handle_record_file_hashes`]).
+const MAX_PENDING_MEMO_ROWS: usize = 1 << 16;
+
+/// Target roots, and prediction rows, the daemon holds before it refuses more
+/// ([`Daemon::handle_record_target_roots`], [`Daemon::handle_record_predictions`]).
+const MAX_PENDING_HANDED_ROWS: usize = 1 << 12;
+
+/// How long a hit waits for the daemon's answer to its access stamp
+/// ([`send_hit_stamp`]). A daemon that refuses (an older release, another
+/// store) answers well within it; one slower than this still reads the
+/// request and takes the stamp, so the hit does not wait for it.
+#[cfg(unix)]
+const HIT_STAMP_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Hand a hit's access stamp to the daemon ([`Request::StampHits`]). True
+/// when the daemon took it, or will (no answer within
+/// [`HIT_STAMP_HANDOFF_WAIT`]: the request is in its socket; at worst, like
+/// a stamp the index refused before, it is lost). False when no daemon took it: none runs, or one that refused (an
+/// older release, another store, a full queue); the hit then stamps the
+/// index itself.
+#[cfg(unix)]
+pub fn send_hit_stamp(socket_path: &Path, cache_dir: &Path, key: &str) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::StampHits(StampHitsRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        keys: vec![key.to_string()],
+    });
+    match send_request_with_timeout(socket_path, &req, HIT_STAMP_HANDOFF_WAIT) {
+        Ok(line) => serde_json::from_str::<Response>(&line).is_ok_and(|resp| resp.ok),
+        // Written, no answer in time: the daemon may hold it.
+        Err(error) => error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            })
+        }),
+    }
+}
+
+/// Hand memo rows the index was too busy for to the daemon
+/// ([`Request::RecordFileHashes`]), without waiting for its answer: a
+/// restore must not wait on a daemon busy with other work for rows that only
+/// save a later hash. True once the request is in the daemon's socket; a
+/// daemon that refuses it (an older release, another store, a full queue)
+/// drops the rows, which then cost only that later hash. False when no
+/// daemon runs or none could be reached.
+#[cfg(unix)]
+pub fn send_memo_rows(
+    socket_path: &Path,
+    cache_dir: &Path,
+    rows: &[crate::store::MemoRow],
+) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::RecordFileHashes(RecordFileHashesRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        rows: rows
+            .iter()
+            .map(|row| kache_protocol::FileHashRow {
+                path: row.fingerprint.path.clone(),
+                size: row.fingerprint.size,
+                mtime_ns: row.fingerprint.mtime_ns,
+                ctime_ns: row.fingerprint.ctime_ns,
+                inode: row.fingerprint.inode,
+                hash: row.hash.clone(),
+                redated: row.redated,
+            })
+            .collect(),
+    });
+    send_request_fire_and_forget(socket_path, &req).is_ok()
+}
+
+/// How long a wrapper waits for the daemon's answer to an adoption it
+/// handed over ([`send_adoption`]), as for a hit's stamp
+/// (`HIT_STAMP_HANDOFF_WAIT`): a daemon that refuses (an older release,
+/// another store) answers well within it, and one slower than this still
+/// reads the request and takes it. At 2 s, waiting for the answer summed to
+/// 15-42 s of a 3-build burst's wrappers at load ~70-120 (lane KACHE-W23).
+const ADOPTION_HANDOFF_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Hand a verified key-bridge adoption to the daemon to register later, in a
+/// batch ([`Request::AdoptEntries`]); the wrapper restores from the verified
+/// entry without waiting for that. True when the daemon took it, or another
+/// process holds the key, or no answer came within [`ADOPTION_HANDOFF_WAIT`]
+/// (the request is in its socket; at worst it is lost, and the key's next
+/// lookup adopts it again). False when no daemon took it (none runs, an
+/// older release, another store, an error): the wrapper then registers it
+/// itself.
+pub fn send_adoption(
+    socket_path: &Path,
+    cache_dir: &Path,
+    request: &crate::store::AdoptionRequest,
+) -> bool {
+    #[cfg(unix)]
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::AdoptEntries(AdoptEntriesRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        entries: vec![kache_protocol::AdoptEntry {
+            legacy_key: request.legacy_key.clone(),
+            legacy_version: request.legacy_version,
+            cache_key: request.cache_key.clone(),
+            crate_name: request.crate_name.clone(),
+        }],
+    });
+    match send_request_with_timeout(socket_path, &req, ADOPTION_HANDOFF_WAIT) {
+        Ok(line) => serde_json::from_str::<Response>(&line).is_ok_and(|response| {
+            response.ok
+                && response
+                    .batch_results
+                    .as_ref()
+                    .and_then(|results| results.first())
+                    .is_some_and(|one| one.found == Some(true))
+        }),
+        Err(error) => error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                )
+            })
+        }),
+    }
+}
+
+/// Hand a target root the index was too busy to record to the daemon
+/// ([`Request::RecordTargetRoots`]), without waiting for its answer. True
+/// once the request is in the daemon's socket; a daemon that refuses it
+/// leaves the root to the build's next unit. False when no daemon runs or
+/// none could be reached.
+pub fn send_target_root(
+    socket_path: &Path,
+    cache_dir: &Path,
+    root: kache_protocol::TargetRootRow,
+) -> bool {
+    #[cfg(unix)]
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::RecordTargetRoots(RecordTargetRootsRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        roots: vec![root],
+    });
+    send_request_fire_and_forget(socket_path, &req).is_ok()
+}
+
+/// Build events a wrapper may hand over waiting to be logged at once; past
+/// it the daemon refuses more and the wrappers drop theirs, as before.
+const MAX_PENDING_EVENT_REQUESTS: usize = 4096;
+
+/// How long a wrapper waits for the daemon to take events the event log was
+/// too busy for. The answer comes before the daemon logs them, so it is a
+/// round trip; past it the events are dropped, as a busy log drops them.
+const EVENT_HANDOFF_WAIT: Duration = Duration::from_millis(500);
+
+/// Hand build events the event log was too busy to take to the daemon
+/// ([`Request::RecordEvents`]) and wait for it to count them. True once the
+/// daemon took them; false when no daemon runs, none answered in time, or
+/// it refused them (an older daemon does).
+pub fn send_events(
+    socket_path: &Path,
+    event_log: &Path,
+    events: Vec<kache_protocol::BuildEvent>,
+) -> bool {
+    #[cfg(unix)]
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::RecordEvents(RecordEventsRequest {
+        event_log: event_log.to_string_lossy().into_owned(),
+        events,
+    });
+    send_request_with_timeout(socket_path, &req, EVENT_HANDOFF_WAIT)
+        .ok()
+        .and_then(|line| serde_json::from_str::<Response>(&line).ok())
+        .is_some_and(|response| response.ok)
+}
+
+/// Hand input prediction rows the index was too busy for to the daemon
+/// ([`Request::RecordPredictions`]), without waiting for its answer. True
+/// once the request is in the daemon's socket; a daemon that refuses them
+/// drops them, which costs a later pre-pass. False when no daemon runs or
+/// none could be reached.
+pub fn send_prediction_rows(
+    socket_path: &Path,
+    cache_dir: &Path,
+    rows: Vec<kache_protocol::PredictionRow>,
+) -> bool {
+    if rows.is_empty() {
+        return false;
+    }
+    #[cfg(unix)]
+    if !socket_path.exists() {
+        return false;
+    }
+    let req = Request::RecordPredictions(RecordPredictionsRequest {
+        cache_dir: cache_dir.to_string_lossy().into_owned(),
+        rows,
+    });
+    send_request_fire_and_forget(socket_path, &req).is_ok()
+}
+
 pub fn send_hash_files_request(
     socket_path: &Path,
     files: Vec<HashFileRequest>,
@@ -8993,57 +10454,115 @@ fn send_build_started_with(
 
 /// Seed a new target directory from the most recently used tracked targets
 /// (see [`crate::target_seed`]), within [`crate::target_seed::SEED_DEADLINE`].
+/// Only a wrapper from before seeding moved into the wrapper sends this.
 fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
-    let deadline = std::time::Instant::now() + crate::target_seed::SEED_DEADLINE;
     let target = crate::target_seed::NewTarget {
         target_dir: PathBuf::from(&req.target_dir),
         workspace_root: PathBuf::from(&req.workspace_root),
     };
-    let tracked = Store::open(config).and_then(|store| store.tracked_target_roots(0));
-    let donors: Vec<_> = match tracked {
-        Ok(tracked) => tracked
-            .into_iter()
-            .filter(|root| !root.discovered)
-            .rev()
-            .map(|root| crate::target_seed::Donor {
-                target_dir: root.path,
-                workspace_root: root.workspace_root,
-                rustc: root.rustc,
-            })
-            .collect(),
-        Err(error) => return Response::err(format!("reading tracked targets: {error:#}")),
-    };
-    let seeded = crate::target_seed::seed(
-        &target,
-        &req.rustc_version,
-        &donors,
-        &config.cache_dir,
-        deadline,
-    );
-    if let Some(donor) = &seeded.donor {
-        tracing::info!(
-            "seeded {} registry units into {} from {}",
-            seeded.units,
-            target.target_dir.display(),
-            donor.display()
-        );
+    match seed_new_target(config, &target, &req.rustc_version, req.check_lane, false) {
+        Ok(_) => Response::ok(),
+        Err(error) => Response::err(format!("{error:#}")),
     }
-    Response::ok()
 }
 
-/// Ask the daemon to seed a target directory Cargo has not built, and wait
-/// until it has, up to the seeding deadline. Never starts the daemon: a
-/// build without one simply is not seeded.
-pub fn send_seed_target(config: &Config, target: &crate::target_seed::NewTarget, version: &str) {
-    let req = Request::SeedTarget(SeedTargetRequest {
-        target_dir: target.target_dir.to_string_lossy().into_owned(),
-        workspace_root: target.workspace_root.to_string_lossy().into_owned(),
-        rustc_version: version.to_owned(),
-    });
-    let wait = crate::target_seed::seed_wait();
-    if let Err(e) = send_request_with_timeout(&config.socket_path(), &req, wait) {
-        tracing::debug!("seed request: daemon unreachable or slow ({e}), building unseeded");
+/// Seed `target` in this process from the most recently used tracked
+/// targets, within [`crate::target_seed::SEED_DEADLINE`].
+///
+/// The wrapper calls this for Cargo's target-info probe itself rather than
+/// asking the daemon: a build that started while no daemon ran, while one
+/// was still starting, or while one was busy with other builds' requests
+/// was not seeded, and restored every registry unit one compiler call at a
+/// time instead (62-110 CPU-s against 13-15 for a seeded first clippy of a
+/// 1,300-unit workspace). Cargo waits for the probe either way.
+///
+/// `note` also appends the outcome to the diagnostic log when no log layer
+/// writes it there: a wrapper's file log is off unless asked for.
+pub(crate) fn seed_new_target(
+    config: &Config,
+    target: &crate::target_seed::NewTarget,
+    rustc_version: &str,
+    check_lane: bool,
+    note: bool,
+) -> Result<crate::target_seed::Seeded> {
+    let started = std::time::Instant::now();
+    let since_ns = kache_store::file_hash::stamp_clock_ns();
+    let deadline = started + crate::target_seed::SEED_DEADLINE;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut store = Store::open(config).context("reading tracked targets")?;
+    #[cfg(unix)]
+    {
+        let socket = config.socket_path();
+        let cache_dir = config.cache_dir.clone();
+        store.send_busy_memo_rows_to(Box::new(move |rows| {
+            send_memo_rows(&socket, &cache_dir, rows)
+        }));
     }
+    let tracked = store
+        .tracked_target_roots(0)
+        .context("reading tracked targets")?;
+    let donors: Vec<_> = tracked
+        .into_iter()
+        .filter(|root| !root.discovered)
+        .rev()
+        .map(|root| crate::target_seed::Donor {
+            target_dir: root.path,
+            workspace_root: root.workspace_root,
+            rustc: root.rustc,
+        })
+        .collect();
+    let seeded = crate::target_seed::seed_for_lane(
+        target,
+        rustc_version,
+        &donors,
+        &config.cache_dir,
+        &|paths| store.recorded_file_hashes(paths),
+        deadline,
+        check_lane,
+    );
+    memoise_seeded_files(&store, &seeded.placed, since_ns);
+    if let Some(donor) = &seeded.donor {
+        let line = format!(
+            "seeded {} registry units ({} files hard-linked) into {} from {} in {} ms",
+            seeded.units,
+            seeded.linked,
+            target.target_dir.display(),
+            donor.display(),
+            started.elapsed().as_millis()
+        );
+        tracing::info!("{line}");
+        if note {
+            crate::target_seed::note_in_log(&line);
+        }
+    }
+    Ok(seeded)
+}
+
+/// Memoise the hashes of the files a seeding placed, from the donors' rows
+/// ([`crate::target_seed::PlacedFile::memo_rows`]), so the new target's first
+/// build does not read them again, and the donors' links keep their rows.
+/// A running daemon takes the rows and writes them in its next flush
+/// ([`Store::hand_off_verified_file_hashes`]): Cargo waits for the probe
+/// until this returns.
+fn memoise_seeded_files(store: &Store, placed: &[crate::target_seed::PlacedFile], since_ns: i64) {
+    if placed.is_empty() {
+        return;
+    }
+    let _trace = crate::phase_trace::phase("memo_seeded");
+    let mut rows: Vec<(kache_store::file_hash::FileFingerprint, String)> = Vec::new();
+    for file in placed {
+        let Some(hash) = store.file_hash_at(&file.before) else {
+            continue;
+        };
+        for fingerprint in file.memo_rows(since_ns) {
+            rows.push((fingerprint, hash.clone()));
+        }
+    }
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
+        .collect();
+    store.hand_off_verified_file_hashes(&rows);
 }
 
 /// Hint the daemon to stage `target_dir`'s recorded executables.
@@ -9144,6 +10663,7 @@ fn fetch_daemon_health(config: &Config) -> Result<DaemonHealth> {
             version: health.build,
             build_epoch: health.revision,
             remote_readonly: None,
+            compiles_in_flight: None,
         });
     }
     let response = send_request_with_timeout(
@@ -9166,6 +10686,20 @@ pub(crate) fn daemon_remote_readonly(config: &Config) -> Option<bool> {
     )
     .ok()?;
     parse_daemon_health(&response).ok()?.remote_readonly
+}
+
+/// How many compiles the daemon at `config`'s socket has taken from clients
+/// and not finished, from one legacy health round trip (no store access).
+/// `None` when no daemon answers (one that is draining no longer does) or it
+/// predates the field.
+pub(crate) fn daemon_compiles_in_flight(config: &Config) -> Option<u64> {
+    let response = send_request_with_timeout(
+        &config.socket_path(),
+        &Request::Health,
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    parse_daemon_health(&response).ok()?.compiles_in_flight
 }
 
 fn parse_daemon_health(response: &str) -> Result<DaemonHealth> {
@@ -9302,20 +10836,67 @@ fn fetch_stats(
 ///
 /// Wait for ownership release after a verified drain acknowledgement. A timeout
 /// leaves unfinished work running and reports failure.
+///
+/// A daemon that holds its run lock but does not answer in time is asked
+/// again until [`STOP_ANSWER_BUDGET`]: one starved behind a full machine
+/// (on Windows a below-normal daemon behind normal-priority compiles) or
+/// paused answers late, and giving up after one request's deadline left it
+/// running.
 pub fn send_shutdown_request(config: &Config) -> Result<()> {
-    if let Err(error) = request_shutdown(config) {
-        if daemon_is_absent(&error, daemon_run_lock_is_held(&config.socket_path())?) {
+    let socket_path = config.socket_path();
+    let deadline = Instant::now() + STOP_ANSWER_BUDGET;
+    while let Err(error) = request_shutdown(config) {
+        let held = daemon_run_lock_is_held(&socket_path)?;
+        if daemon_is_absent(&error, held) {
             eprintln!("daemon is not running");
             return Ok(());
         }
-        return Err(error);
+        if !held {
+            // It let go of the lock while we asked: it stopped.
+            break;
+        }
+        if !unanswered(&error) || Instant::now() >= deadline {
+            return Err(error);
+        }
+        tracing::debug!("daemon did not answer the stop request yet: {error:#}");
+        std::thread::sleep(Duration::from_millis(250));
     }
+    // The drain lets compiles clients handed over finish (up to
+    // COMPILE_DRAIN_BOUND), so this waits as long as a service manager would.
     anyhow::ensure!(
-        wait_for_run_lock_release(&config.socket_path(), Duration::from_secs(35))?,
+        wait_for_run_lock_release(&socket_path, SERVICE_STOP_TIMEOUT)?,
         "daemon is still draining; ownership has not been released"
     );
     eprintln!("daemon stopped");
     Ok(())
+}
+
+/// How long `kache daemon stop` keeps asking a daemon that holds its run
+/// lock and does not answer.
+const STOP_ANSWER_BUDGET: Duration = Duration::from_secs(35);
+
+/// Whether a request failed because nobody answered in time, which a daemon
+/// holding its run lock can still do, as opposed to an answer it gave.
+fn unanswered(error: &anyhow::Error) -> bool {
+    use kunobi_daemon::client::RequestError;
+    if lifecycle_client::transient(error) {
+        return true;
+    }
+    let timed_out = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        )
+    };
+    error.chain().any(|cause| {
+        match cause.downcast_ref::<RequestError>() {
+            Some(RequestError::Late) => return true,
+            Some(RequestError::Unavailable(_)) => return true,
+            Some(RequestError::Protocol(error)) if timed_out(error) => return true,
+            _ => {}
+        }
+        cause.downcast_ref::<std::io::Error>().is_some_and(timed_out)
+    })
 }
 
 fn request_shutdown(config: &Config) -> Result<()> {
@@ -9795,6 +11376,7 @@ fn spawn_detached_daemon(
 ) -> Result<kunobi_daemon::launch::DaemonChild> {
     let mut command = daemon_run_command(exe);
     strip_ambient_remote_env(&mut command);
+    command.env(AUTO_STARTED_ENV, "1");
     let mut daemon = detached_command(&command);
     daemon.stderr(stderr_target).readiness_channel();
     let child = {
