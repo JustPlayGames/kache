@@ -333,7 +333,7 @@ fn prestage_hints(
     args: &RustcArgs,
     files: &[(PathBuf, String)],
 ) -> Vec<PrestageHint> {
-    if !super::stores_prestage_candidate(files) {
+    if !crate::prestage::usable_here() || !super::stores_prestage_candidate(files) {
         return Vec::new();
     }
     let (Some(output_dir), Some(target_dir)) = (

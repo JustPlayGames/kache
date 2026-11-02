@@ -133,6 +133,7 @@ local_max_size = "200GiB"
 | `KACHE_MAX_SIZE` | `cache.local_max_size` | 20% of the cache disk, rounded to the nearest GiB, floored at 10GiB and capped at 100GiB; 50GiB when the disk size cannot be read | Registered blob bytes allowed before GC. An explicit size always wins. `none` is not allowed. |
 | `KACHE_AUTO_GC` | `cache.auto_gc` | `true` | Spawn throttled background GC under size pressure |
 | `KACHE_GC_MAX_AGE_HOURS` | `cache.gc_max_age_hours` | `0` | Automatic age retention; `0` disables it |
+| `KACHE_GC_SPARE_YOUNG_HOURS` | `cache.gc_spare_young_hours` | `12` | An automatic size sweep ranks entries used within this many hours that took 30 s or more to compile with ten times their score; `0` disables it |
 | `KACHE_GC_EVICT_SHARED` | `cache.gc_evict_shared` | `false` | Restore namespace-first GC for entries retained by build outputs |
 | `KACHE_INDEX_AUTO_COMPACT` | `cache.index_auto_compact` | `true` | Let the daemon heal the blob index and compact `index.db` when the machine is quiet. See [Daemon index maintenance](#daemon-index-maintenance). |
 | `KACHE_AUTO_CLEAN_ORPHANED_TARGETS` | `cache.auto_clean_orphaned_targets` | `true` | Let the daemon remove target directories whose workspace was deleted. See [Target directory cleanup](#target-directory-cleanup). |
@@ -143,6 +144,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_RECOVER_TARGETS` | `cache.auto_recover_targets` | `false` | Below the free-space floor, also remove idle target directories when the machine is quiet. `kache init` offers to turn it on. See [Target directory cleanup](#target-directory-cleanup). |
 | `KACHE_TARGET_LIVENESS` | `cache.target_liveness` | `false` | Record successful Cargo build/check commands for exact-scope unit cleanup; see [Recorded-command cleanup](#recorded-command-cleanup). |
 | `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` | `cache.auto_clean_unused_units_days` | `30` | Let the daemon remove, from target directories still in use, build units no build has used for this many days; `0` disables it. See [Unused build units](#unused-build-units). |
+| `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` | `cache.auto_clean_adaptive_idle_hours` | `0` | Let the daemon drop adaptive incremental state no compile used for this many hours; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
@@ -246,13 +248,15 @@ By default, GC keeps an entry when removing its last store name would reclaim ze
 
 A size-driven sweep leaves those held bytes out of its budget. Before it removes anything, it finds the entries whose last blob a build output still holds, and it evicts until the rest of the store is back under the target. A store whose registered size is mostly held by target directories is therefore not evicted further: removing other entries would lose cache hits without bringing the held bytes down.
 
-Automatic eviction has one trigger: a sweep starts when the store is above 110% of `local_max_size` and evicts down to 90%. Three things can ask for one: a build that has just stored an entry (checked at most every 5 minutes), the daemon after an upload, and the daemon's 6-hour sweep. `kache gc` evicts from 100%.
+Automatic eviction has one trigger: a sweep starts when the store is above 88% of `local_max_size` and evicts down to 78%, so that the store stays under `local_max_size` while builds write. Three things can ask for one: a build that has just stored an entry (checked at most every 5 minutes), the daemon after an upload, and the daemon's 6-hour sweep. `kache gc` evicts from 100% down to 90%.
+
+An automatic sweep values entries used within the last 12 hours that took 30 seconds or more to compile ten times higher than its ranking otherwise would (`cache.gc_spare_young_hours`): colder entries go before them, hotter ones still after them. A new worktree often asks again within hours for third-party crates a removed one used. `kache gc` ranks them as usual.
 
 While a daemon is running, it does the sweeping. A build that finds the store over the trigger sends the daemon a hint and continues; it does not wait for the sweep, and it never starts a daemon for this. Hints that arrive during a sweep are dropped. With no daemon, or a daemon too old to accept the hint, the build starts a detached `kache gc`. That worker sweeps a second time two minutes later only if the first sweep had to skip entries a running build was using.
 
 Every automatic sweep records the store size it ended at, whichever of the three started it. When an automatic sweep leaves the store over budget, the next automatic sweep waits 10 minutes. Each further sweep that ends over budget doubles the wait, up to 2 hours. The wait ends early when the store grows by more than 10% of `local_max_size`, and resets once a sweep brings the store back under budget. The wait applies to all three, so one sweep that cannot free enough holds the others back too. The 6-hour sweep still expires entries by `cache.gc_max_age_hours` and removes duplicates during a wait; only its size eviction is skipped. The state lives in `auto-gc-backoff.json` in the cache dir. `kache gc` ignores it.
 
-`auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. For 6 hours the trigger compares the store size minus those bytes with 110% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
+`auto-gc-backoff.json` also keeps the bytes the last sweep found held by target directories. For 6 hours the trigger compares the store size minus those bytes with 88% of `local_max_size`, so a store over budget only on held bytes starts no sweep. Deleting a worktree frees what it held without changing the store size; after 6 hours the trigger uses the full size again, and the next sweep measures anew.
 
 Automatic sweeps also keep entries downloaded from the remote in the last 6 hours, whether a build has used them yet or not. A CI job that downloads entries from the remote and then runs several cargo commands keeps them for the whole job; without this, an upload between two commands could evict what the next command needs. If those entries alone keep the store over budget, the sweep stops and backs off as described above. `kache gc` does not keep them.
 
@@ -414,6 +418,8 @@ A unit whose build script or output files name the donor checkout, other than it
 When the cache already holds a checkout's dependencies, seeding copies the same units it would otherwise restore one compiler call at a time.
 
 ### Unused build units
+
+Adaptive incremental state, rustc's private graph for a unit you edit, sits in `incremental.kache-auto` in the target directory, outside the store. With `cache.auto_clean_adaptive_idle_hours` set, the daemon checks every 15 minutes, busy machine or not, and drops the graphs no compile used for that many hours, in target directories this account owns. A dropped graph makes that unit's next two edits ordinary compiles, until it has learned again. A unit a compile holds is left alone, and a compile that starts meanwhile only goes without a graph.
 
 A target directory in regular use still collects dead weight. A lockfile update, a feature change or a new toolchain moves the build on to new units and Cargo leaves the old ones behind. The same hourly check removes, from every tracked target directory that stays, the units no build used for `cache.auto_clean_unused_units_days` days (30 by default; `0` turns it off).
 

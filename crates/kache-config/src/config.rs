@@ -264,6 +264,12 @@ pub struct Config {
     /// disabled). Set via `KACHE_GC_MAX_AGE_HOURS` or
     /// `[cache] gc_max_age_hours`.
     pub gc_max_age_hours: u64,
+    /// Entries idle under this many hours, and slow to compile, that an
+    /// automatic size sweep ranks with ten times their score; `0` turns it
+    /// off.
+    /// Default [`DEFAULT_GC_SPARE_YOUNG_HOURS`]. Set via
+    /// `KACHE_GC_SPARE_YOUNG_HOURS` or `[cache] gc_spare_young_hours`.
+    pub gc_spare_young_hours: u64,
     /// Permit GC to evict an entry even when its last store blob is still
     /// hardlinked or block-cloned into a build target. Off by default because
     /// that eviction frees no disk and destroys a usable cache hit. Enable it
@@ -607,6 +613,11 @@ pub struct Config {
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
     /// `[cache] auto_clean_unused_units_days`.
     pub auto_clean_unused_units_days: u64,
+    /// Let the daemon drop adaptive incremental state no compile used for
+    /// this many hours (`0`, the default, disables it). Set via
+    /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` or `[cache]
+    /// auto_clean_adaptive_idle_hours`.
+    pub auto_clean_adaptive_idle_hours: u64,
     /// Copy another checkout's registry build units into a target directory
     /// Cargo has not built yet, before Cargo checks freshness. On by
     /// default. Set via `KACHE_SEED_NEW_TARGETS=0`/`=false` or `[cache]
@@ -1000,6 +1011,8 @@ pub struct CacheFileConfig {
     pub scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub auto_clean_unused_units_days: Option<u64>,
+    /// See [`Config::auto_clean_adaptive_idle_hours`].
+    pub auto_clean_adaptive_idle_hours: Option<u64>,
     /// See [`Config::seed_new_targets`].
     pub seed_new_targets: Option<bool>,
     /// See [`Config::build_script_hermetic`].
@@ -1049,6 +1062,8 @@ pub struct CacheFileConfig {
     pub min_store_compile_ms: Option<u64>,
     /// Automatic GC age retention. See [`Config::gc_max_age_hours`].
     pub gc_max_age_hours: Option<u64>,
+    /// Young entries an automatic sweep spares. See [`Config::gc_spare_young_hours`].
+    pub gc_spare_young_hours: Option<u64>,
     pub daemon_idle_timeout_secs: Option<u64>,
     pub s3_pool_idle_secs: Option<u64>,
     /// Restore deadline. See [`Config::remote_restore_timeout_secs`].
@@ -1398,6 +1413,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_REMOTE_NEGATIVE_TTL_SECS",
     "KACHE_MIN_STORE_COMPILE_MS",
     "KACHE_GC_MAX_AGE_HOURS",
+    "KACHE_GC_SPARE_YOUNG_HOURS",
     "KACHE_DAEMON_IDLE_TIMEOUT",
     "KACHE_S3_POOL_IDLE_SECS",
     "KACHE_FALLBACK",
@@ -1436,6 +1452,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
+    "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
     "KACHE_STORAGE_LAYOUT_ADVICE",
@@ -1504,6 +1521,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ),
     ("KACHE_MIN_STORE_COMPILE_MS", "cache.min_store_compile_ms"),
     ("KACHE_GC_MAX_AGE_HOURS", "cache.gc_max_age_hours"),
+    ("KACHE_GC_SPARE_YOUNG_HOURS", "cache.gc_spare_young_hours"),
     ("KACHE_GC_EVICT_SHARED", "cache.gc_evict_shared"),
     (
         "KACHE_DAEMON_IDLE_TIMEOUT",
@@ -1572,6 +1590,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
         "cache.auto_clean_unused_units_days",
+    ),
+    (
+        "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
+        "cache.auto_clean_adaptive_idle_hours",
     ),
     ("KACHE_SEED_NEW_TARGETS", "cache.seed_new_targets"),
     ("KACHE_BUILD_SCRIPT_HERMETIC", "cache.build_script_hermetic"),
@@ -2010,6 +2032,18 @@ impl Config {
                     .and_then(|c| c.gc_max_age_hours)
             })
             .unwrap_or(DEFAULT_GC_MAX_AGE_HOURS);
+        let gc_spare_young_hours =
+            env_or_ignored_for(invocation, "KACHE_GC_SPARE_YOUNG_HOURS", ignore_env)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.gc_spare_young_hours)
+                })
+                .unwrap_or(DEFAULT_GC_SPARE_YOUNG_HOURS);
 
         let s3_concurrency = env_or_ignored_for(invocation, "KACHE_S3_CONCURRENCY", ignore_env)
             .ok()
@@ -2284,6 +2318,8 @@ impl Config {
             Self::scheduler_memory_pressure_enabled_for(invocation, &file_config);
         let auto_clean_unused_units_days =
             Self::auto_clean_unused_units_days_for(invocation, &file_config);
+        let auto_clean_adaptive_idle_hours =
+            Self::auto_clean_adaptive_idle_hours_for(invocation, &file_config);
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
         let build_script_hermetic =
             Self::build_script_hermetic_enabled_for(invocation, &file_config);
@@ -2427,6 +2463,7 @@ impl Config {
             auto_recover_targets,
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
+            auto_clean_adaptive_idle_hours,
             seed_new_targets,
             build_script_hermetic,
             gc_evict_shared,
@@ -2475,6 +2512,7 @@ impl Config {
             prefetch_deadline_secs,
             min_store_compile_ms,
             gc_max_age_hours,
+            gc_spare_young_hours,
             daemon_idle_timeout_secs,
             s3_pool_idle_secs,
             remote_restore_timeout_secs,
@@ -3358,6 +3396,27 @@ impl Config {
                     .and_then(|c| c.auto_clean_unused_units_days)
             })
             .unwrap_or(DEFAULT_UNUSED_UNITS_DAYS)
+    }
+
+    /// Adaptive incremental idle window in hours, off (`0`) by default.
+    /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` (env wins), else `[cache]
+    /// auto_clean_adaptive_idle_hours`.
+    fn auto_clean_adaptive_idle_hours_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored_for(invocation, "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS", ignore_env)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.cache.as_ref())
+                    .and_then(|c| c.auto_clean_adaptive_idle_hours)
+            })
+            .unwrap_or(0)
     }
 
     /// Memory-pressure admission, on by default.
@@ -5186,12 +5245,20 @@ fn isolate_cache_dir_for_trust_domain(base: PathBuf, domain: Option<&str>) -> Pa
     }
 }
 
+/// How long an entry that took 30 s or more to compile stays young for an
+/// automatic size sweep, in hours: the sweep ranks it with ten times its score
+/// (see `kache_store::eviction::SizePressureSparingYoungPolicy`). Replaying the
+/// build machine's sweeps of 2026-11-01/02, 12 h cut the compile time lost to
+/// re-misses of evicted entries by 77 %.
+pub const DEFAULT_GC_SPARE_YOUNG_HOURS: u64 = 12;
+
 impl From<&Config> for kache_core::store_config::Config {
     fn from(config: &Config) -> Self {
         Self {
             cache_dir: config.cache_dir.clone(),
             max_size: config.max_size,
             gc_evict_shared: config.gc_evict_shared,
+            gc_spare_young_hours: config.gc_spare_young_hours,
             upload_spool_max_jobs: UPLOAD_SPOOL_MAX_JOBS,
             deferred_durability: config.deferred_durability,
         }

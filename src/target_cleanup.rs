@@ -403,6 +403,34 @@ pub(crate) fn plan(config: &Config, tracked: &TrackedTargetRoot, now: u64) -> Pl
     }
 }
 
+/// One pass of `[cache] auto_clean_adaptive_idle_hours` over the targets
+/// builds recorded, for the daemon's timer: it runs while builds do, unlike
+/// [`sweep`]. Another account's target sharing the store stays its own.
+pub(crate) fn prune_idle_adaptive(config: &Config, at: SystemTime) -> crate::unit_prune::Pruned {
+    let mut total = crate::unit_prune::Pruned::default();
+    let window = Duration::from_secs(config.auto_clean_adaptive_idle_hours.saturating_mul(3600));
+    if window.is_zero() {
+        return total;
+    }
+    let targets = Store::open(config).and_then(|store| store.tracked_target_roots(0));
+    let targets = match targets {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::debug!("adaptive idle sweep: tracked targets unknown: {error:#}");
+            return total;
+        }
+    };
+    for tracked in targets {
+        if tracked.discovered || !intact(&tracked) || !crate::platform::owned_by_us(&tracked.path) {
+            continue;
+        }
+        let pruned = crate::incremental_policy::prune_idle(&tracked.path, window, at);
+        total.units += pruned.units;
+        total.bytes += pruned.bytes;
+    }
+    total
+}
+
 fn prune_units(
     config: &Config,
     tracked: &TrackedTargetRoot,
@@ -1142,6 +1170,36 @@ mod tests {
             .into_iter()
             .find(|tracked| tracked.path == path)
             .unwrap()
+    }
+
+    #[test]
+    fn the_idle_pass_is_off_by_default_and_drops_old_graphs_of_recorded_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut config = config(cache.path(), false, 0);
+        let store = Store::open(&config).unwrap();
+        let (_, target) = tracked_target(&store, root.path(), "live");
+        let unit = target
+            .join("debug/incremental.kache-auto/v2")
+            .join("a".repeat(64));
+        std::fs::create_dir_all(unit.join("rustc")).unwrap();
+        std::fs::write(unit.join("rustc/graph.bin"), b"payload").unwrap();
+        std::fs::write(unit.join("unit.lock"), b"").unwrap();
+        let used = SystemTime::now();
+        filetime::set_file_mtime(&unit, filetime::FileTime::from_system_time(used)).unwrap();
+        let at = used + Duration::from_secs(3 * 3600);
+
+        assert_eq!(prune_idle_adaptive(&config, at).units, 0, "off");
+        assert!(unit.join("rustc").exists());
+        config.auto_clean_adaptive_idle_hours = 4;
+        assert_eq!(
+            prune_idle_adaptive(&config, at).units,
+            0,
+            "not idle long enough"
+        );
+        config.auto_clean_adaptive_idle_hours = 3;
+        assert_eq!(prune_idle_adaptive(&config, at).units, 1);
+        assert!(!unit.join("rustc").exists());
     }
 
     #[cfg(unix)]

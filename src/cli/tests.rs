@@ -757,16 +757,9 @@ fn storage_splits_exclusive_and_shared_bytes_only_when_blocks_are_shared() {
         shared.contains("; Cache reads 10 B over Limit, 7 B of it held there"),
         "{shared}"
     );
-    // Past what targets hold, the store's own excess is either inside the
-    // 10 % it may pass Limit by before a sweep starts, or due for a sweep.
+    // Past what targets hold, the store's own excess is due for a sweep.
     disk.store_limit_bytes = 1000;
     disk.cloned_into_targets_bytes = 70;
-    disk.store_bytes = 1100;
-    let shared = text(&disk).pop().unwrap();
-    assert!(
-        shared.contains("70 B of it held there, the other 30 B within the 10 % a store may grow"),
-        "{shared}"
-    );
     disk.store_bytes = 1200;
     let shared = text(&disk).pop().unwrap();
     assert!(
@@ -3888,6 +3881,7 @@ fn save_manifest_config(
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        auto_clean_adaptive_idle_hours: 0,
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
@@ -3927,6 +3921,7 @@ fn save_manifest_config(
         prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
         gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
+        gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,

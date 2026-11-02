@@ -6814,6 +6814,9 @@ impl Daemon {
                  automatic sweep goes on",
                 stats.entries_evicted
             );
+            if let Ok(after) = store.physical_size() {
+                crate::wrapper::record_auto_gc_cut_short(config, after, stats.bytes_held);
+            }
         } else if let Ok(after) = store.physical_size() {
             crate::wrapper::record_auto_gc_outcome(config, after, stats.bytes_held);
         }
@@ -7696,6 +7699,36 @@ async fn server_main(
             .await;
         }
     });
+
+    // Graphs of finished work, while builds run (incremental_policy).
+    if daemon.config.auto_clean_adaptive_idle_hours > 0 {
+        let config = daemon.config.clone();
+        tokio::spawn(async move {
+            let every = crate::incremental_policy::IDLE_SWEEP_INTERVAL;
+            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let config = config.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let pruned = crate::platform::below_normal(|| {
+                        crate::target_cleanup::prune_idle_adaptive(
+                            &config,
+                            std::time::SystemTime::now(),
+                        )
+                    });
+                    if pruned.units > 0 {
+                        tracing::info!(
+                            units = pruned.units,
+                            bytes = pruned.bytes,
+                            "adaptive incremental: dropped idle graphs"
+                        );
+                    }
+                })
+                .await;
+            }
+        });
+    }
 
     let first_gc = first_periodic_gc_delay(
         crate::report::read_gc_stats(&daemon.config.cache_dir)
