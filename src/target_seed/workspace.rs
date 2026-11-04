@@ -842,7 +842,7 @@ fn compare_trees(theirs: &Path, ours: &Path, deadline: Instant) -> Option<System
                 pending.push((their_path, our_path));
             } else if their_kind.is_file() && our_kind.is_file() {
                 if their_meta.len() != our_meta.len()
-                    || !same_bytes(&their_path, &our_path, deadline)
+                    || !same_bytes_of(&their_path, &our_path, their_meta.len(), deadline)
                 {
                     return None;
                 }
@@ -862,6 +862,30 @@ fn sorted_entries(dir: &Path) -> Option<Vec<std::ffi::OsString>> {
         .ok()?;
     names.sort();
     Some(names)
+}
+
+/// [`same_bytes`] of two files whose stats both say `len` bytes. One under
+/// [`COMPARE_CHUNK`], as nearly every source file a checkout holds, is read
+/// in one call a side: a read of one byte more than `len` finds the end in
+/// the same call, where filling a whole chunk took a second read to find it,
+/// and only `len` bytes are set aside for it. Either side read short or long
+/// is not the file its stat said, and the two are not taken for the same.
+fn same_bytes_of(a: &Path, b: &Path, len: u64, deadline: Instant) -> bool {
+    let Some(len) = usize::try_from(len).ok().filter(|len| *len < COMPARE_CHUNK) else {
+        return same_bytes(a, b, deadline);
+    };
+    if Instant::now() >= deadline {
+        return false;
+    }
+    let (Ok(mut a), Ok(mut b)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    let mut left = vec![0u8; len + 1];
+    let mut right = vec![0u8; len + 1];
+    matches!(
+        (a.read(&mut left), b.read(&mut right)),
+        (Ok(read), Ok(other)) if read == len && other == len
+    ) && left == right
 }
 
 /// Whether two files hold the same bytes, read side by side.
