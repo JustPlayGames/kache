@@ -1060,8 +1060,9 @@ fn place_tree(
     deadline: Instant,
     relocation: Option<&relocation::Relocation<'_>>,
 ) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(from)?;
     #[cfg(unix)]
-    if link_in_place(from, to, counts, relocation, deadline)? {
+    if link_in_place(from, &metadata, to, counts, relocation, deadline)? {
         return Ok(());
     }
     let staging = staging.path_for(to);
@@ -1077,7 +1078,7 @@ fn place_tree(
     // Held past the rename, so a sweep keeps each run the tree links to until
     // its recorded `OUT_DIR` does.
     let mut runs = Vec::new();
-    let copied = copy_tree(from, &staging, tree, &mut runs, deadline)
+    let copied = copy_tree(from, &metadata, &staging, tree, &mut runs, deadline)
         .and_then(|()| std::fs::rename(&staging, to));
     if copied.is_ok() {
         let placed = placed.into_inner().unwrap_or_default();
@@ -1140,15 +1141,16 @@ impl Staging {
     }
 }
 
-/// Link the donor file `from` straight to its final name `to`, once this
-/// seeding knows clones fail ([`FileCounts::no_clones`]) and when
-/// [`shares_inode`] allows a link: a link makes the name whole at once, as
-/// the rename of a staged copy does, and spares the journal that rename.
+/// Link the donor file `from`, of `metadata`, straight to its final name
+/// `to`, once this seeding knows clones fail ([`FileCounts::no_clones`]) and
+/// when [`shares_inode`] allows a link: a link makes the name whole at once,
+/// as the rename of a staged copy does, and spares the journal that rename.
 /// False when `from` is not such a file or the link cannot be made: the
 /// caller stages it as before.
 #[cfg(unix)]
 fn link_in_place(
     from: &Path,
+    metadata: &std::fs::Metadata,
     to: &Path,
     counts: &FileCounts,
     relocation: Option<&relocation::Relocation<'_>>,
@@ -1157,8 +1159,7 @@ fn link_in_place(
     if !counts.no_clones.load(Ordering::Relaxed) {
         return Ok(false);
     }
-    let metadata = std::fs::symlink_metadata(from)?;
-    if !metadata.is_file() || !shares_inode(Path::new(""), &metadata) {
+    if !metadata.is_file() || !shares_inode(Path::new(""), metadata) {
         return Ok(false);
     }
     if Instant::now() >= deadline {
@@ -1173,7 +1174,7 @@ fn link_in_place(
         return Ok(false);
     }
     counts.linked.fetch_add(1, Ordering::Relaxed);
-    if let Some(placed) = placed_file(from, &metadata, to) {
+    if let Some(placed) = placed_file(from, metadata, to) {
         counts
             .placed
             .lock()
@@ -1273,25 +1274,26 @@ impl PlacedFile {
     }
 }
 
-/// Copy `from`, a file or directory in `tree`, to `to`, keeping every file's
-/// modification time. A symbolic link that stays inside the tree is copied
-/// as a link, and a build script's `OUT_DIR` linked to its sealed hermetic
-/// run is linked to the same run; any other symbolic link fails the copy,
-/// and so does reaching `deadline` before a file. The runs linked to are
-/// added to `runs`, held.
+/// Copy `from`, a file or directory in `tree` whose status (not following
+/// a link) is `metadata`, to `to`, keeping every file's modification time.
+/// A symbolic link that stays inside the tree is copied as a link, and a
+/// build script's `OUT_DIR` linked to its sealed hermetic run is linked to
+/// the same run; any other symbolic link fails the copy, and so does
+/// reaching `deadline` before a file. The runs linked to are added to
+/// `runs`, held.
 #[cfg_attr(not(unix), allow(clippy::only_used_in_recursion))]
 fn copy_tree(
     from: &Path,
+    metadata: &std::fs::Metadata,
     to: &Path,
     tree: Placing,
     runs: &mut Vec<HeldRun>,
     deadline: Instant,
 ) -> std::io::Result<()> {
-    let metadata = std::fs::symlink_metadata(from)?;
     if metadata.is_dir() {
         std::fs::create_dir(to)?;
-        for entry in entries(from) {
-            copy_tree(&entry, &to.join(file_name(&entry)), tree, runs, deadline)?;
+        for (entry, metadata) in entries_with_status(from)? {
+            copy_tree(&entry, &metadata, &to.join(file_name(&entry)), tree, runs, deadline)?;
         }
         return Ok(());
     }
@@ -1334,16 +1336,16 @@ fn copy_tree(
     // as the donor's bytes.
     let contents = tree
         .relocation
-        .map(|relocation| relocation.contents(from, &metadata, deadline))
+        .map(|relocation| relocation.contents(from, metadata, deadline))
         .transpose()?
         .flatten();
     if let Some(contents) = contents {
-        write_stamped(to, &mut &contents[..], &metadata, tree.counts.umask)?;
+        write_stamped(to, &mut &contents[..], metadata, tree.counts.umask)?;
         tree.counts.copied.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    place_file(from, below, to, &metadata, tree.counts)?;
-    if let Some(placed) = placed_file(from, &metadata, to) {
+    place_file(from, below, to, metadata, tree.counts)?;
+    if let Some(placed) = placed_file(from, metadata, to) {
         tree.placed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2245,6 +2247,24 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
 /// by the kind the listing gives each entry, where the filesystem records it
 /// (ext4, XFS, btrfs): a stat of each entry was 2,188 calls a listing of a
 /// large donor's `.fingerprint/`.
+/// The entries of `dir`, sorted, each with its status, not following a link.
+/// The status is asked of `dir`'s open descriptor by the entry's name, where
+/// a stat of each entry's full path walked every directory above it again
+/// (a unit's fingerprint directory in a target 9 levels deep). A directory
+/// that cannot be listed has no entries, as for [`entries`]; an entry gone
+/// before its status is read fails the listing.
+fn entries_with_status(dir: &Path) -> std::io::Result<Vec<(PathBuf, std::fs::Metadata)>> {
+    let Ok(listed) = std::fs::read_dir(dir) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = listed
+        .flatten()
+        .map(|entry| Ok((entry.path(), entry.metadata()?)))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
 fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|entries| {
