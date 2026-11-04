@@ -560,6 +560,39 @@ fn out_dir_names_the_donor(
     OutScan::new(needles, deadline).keeps_out(&build_script_out_dir(profile, layout, unit))
 }
 
+/// The units of a donor's shared-layout profile that have a directory in its
+/// `build/`, listed once a seeding, under the donor's lock. Only those hold a
+/// build script's binary or a run's records (`output`, `root-output`, a
+/// launcher's record, `out/`). Most units are a library's compilation and
+/// have none, and looking for their records one by one cost each of them two
+/// failed opens and four failed status calls (a 600-crate workspace: 2,188
+/// units, 262 of them in `build/`). In the per-unit layout every unit's
+/// directory is in `build/`.
+struct BuildDirs(Option<std::collections::HashSet<std::ffi::OsString>>);
+
+impl BuildDirs {
+    fn of(profile: &Path, layout: Layout) -> Self {
+        Self(match layout {
+            Layout::PerUnit => None,
+            Layout::Shared => Some(
+                std::fs::read_dir(profile.join("build"))
+                    .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
+                    .unwrap_or_default(),
+            ),
+        })
+    }
+
+    /// Whether `unit` has its directory in `build/`.
+    fn holds(&self, layout: Layout, unit: &Unit) -> bool {
+        match (&self.0, layout) {
+            (Some(names), Layout::Shared) => {
+                names.contains(OsStr::new(&format!("{}-{}", unit.package, unit.hash)))
+            }
+            _ => true,
+        }
+    }
+}
+
 /// `out/` of a build script: `<unit>/out` since Cargo 1.100, and
 /// `build/<pkg>-<hash>/out` before that.
 fn build_script_out_dir(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
@@ -910,6 +943,8 @@ fn artifacts_stored(
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
 /// goes last, by rename. `deps` is [`outputs_by_hash`] of the donor's profile
 /// for the shared layout; `rebase` moves dep-info from `from` to `to`.
+/// `build_dir`: whether the donor holds the unit's directory in `build/`
+/// ([`BuildDirs`]), where a build script's binary or a run's records are.
 fn copy_unit(
     from: &Path,
     to: &Path,
@@ -921,12 +956,16 @@ fn copy_unit(
     staging: &Staging,
     rebase: &kache_store::link::DepinfoRebase,
     checkout: Option<(&Path, &Path)>,
+    build_dir: bool,
     deadline: Instant,
 ) -> std::io::Result<()> {
-    let relocation =
-        relocation::Relocation::for_unit(from, to, rebase, layout, unit, checkout, deadline)?;
+    let relocation = if build_dir {
+        relocation::Relocation::for_unit(from, to, rebase, layout, unit, checkout, deadline)?
+    } else {
+        relocation::Relocation::without_build_dir(from, rebase, unit)
+    };
     #[cfg(unix)]
-    {
+    if build_dir {
         let out = build_script_out_dir(from, layout, unit);
         let record = match layout {
             Layout::PerUnit => out.join(crate::build_script::LAUNCH_RECORD),
@@ -971,7 +1010,7 @@ fn copy_unit(
                 }
             }
             let build = from.join("build").join(&named);
-            if build.is_dir() {
+            if build_dir {
                 counts.make_dir(&to.join("build"))?;
                 place_tree(
                     &build,
@@ -1763,6 +1802,7 @@ pub(crate) fn seed_for_lane(
                 units.len()
             );
         }
+        let build_dirs = BuildDirs::of(&from, layout);
         let limit = deadline.limit;
         let recorded = recorded_for_units(&from, layout, &units, &deps, recorded, limit);
         let progress = Progress::new(deadline);
@@ -1784,6 +1824,7 @@ pub(crate) fn seed_for_lane(
                 let progress = &progress;
                 let target_needles = &target_needles;
                 let workspace = &workspace;
+                let build_dirs = &build_dirs;
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
@@ -1805,9 +1846,11 @@ pub(crate) fn seed_for_lane(
                         } else {
                             needles
                         };
+                        let build_dir = build_dirs.holds(layout, unit);
                         if marker(to, layout, unit).exists()
-                            || names_the_donor(from, layout, unit, record_needles)
-                            || out_dir_names_the_donor(from, layout, unit, needles, limit)
+                            || (build_dir
+                                && (names_the_donor(from, layout, unit, record_needles)
+                                    || out_dir_names_the_donor(from, layout, unit, needles, limit)))
                             || !artifacts_stored(
                                 from, layout, unit, deps, cache_dir, recorded, limit,
                             )
@@ -1845,7 +1888,7 @@ pub(crate) fn seed_for_lane(
                         };
                         match copy_unit(
                             from, to, layout, unit, deps, cache_dir, files, &staging, rebase,
-                            checkout, limit,
+                            checkout, build_dir, limit,
                         ) {
                             Ok(()) => {
                                 // Cargo waits on our lock until the dep-info
