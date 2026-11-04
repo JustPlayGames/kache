@@ -106,10 +106,25 @@ pub(crate) const SEED_LIMIT: Duration = Duration::from_secs(60);
 /// this long: it no longer gives Cargo anything for its wait.
 const SEED_STALL: Duration = Duration::from_secs(2);
 
-/// Units copied at once. A copy is mostly metadata calls, which overlap: on
-/// btrfs, 1159 units took 2.9 s on one thread, 0.6 s on four and 0.5 s on
-/// eight.
-const COPY_THREADS: usize = 4;
+/// Units copied at once: half the machine's threads, at least four and at
+/// most eight ([`copy_threads`]). A copy is mostly metadata calls, which
+/// overlap: on btrfs, 1159 units took 2.9 s on one thread, 0.6 s on four
+/// and 0.5 s on eight.
+const COPY_THREADS: std::ops::RangeInclusive<usize> = 4..=8;
+
+/// How many units a seeding copies at once ([`COPY_THREADS`]).
+///
+/// While every thread staged its units beside the others' in the target's
+/// shared directories, more threads only waited longer for those
+/// directories' locks. Staged in directories of their own ([`Staging`]),
+/// eight copied 2,188 units in 5.7-11.5 s at load 156-193 where four took
+/// 7.6-9.0 s (medians 5.9 and 7.6 s); twelve and sixteen were no faster
+/// and burned more of the kernel's time. A machine of fewer than sixteen
+/// threads keeps four.
+fn copy_threads() -> usize {
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    (threads / 2).clamp(*COPY_THREADS.start(), *COPY_THREADS.end())
+}
 
 /// The profile directory seeded.
 const PROFILE: &str = "debug";
@@ -1747,7 +1762,7 @@ pub(crate) fn seed_for_lane(
         let rebase = kache_store::link::DepinfoRebase::new(&from, &to);
         let cancellation = crate::invocation::process::current();
         std::thread::scope(|scope| {
-            for _ in 0..COPY_THREADS {
+            for _ in 0..copy_threads() {
                 let cancellation = cancellation.clone();
                 let (units, next, copied, from, to, deps, files, recorded, needles, cross) = (
                     &units, &next, &copied, &from, &to, &deps, &files, &recorded, &needles, &cross,
