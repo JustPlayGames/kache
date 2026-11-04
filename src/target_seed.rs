@@ -1267,7 +1267,7 @@ fn copy_tree(
         .transpose()?
         .flatten();
     if let Some(contents) = contents {
-        write_stamped(to, &mut &contents[..], &metadata)?;
+        write_stamped(to, &mut &contents[..], &metadata, tree.counts.umask)?;
         tree.counts.copied.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
@@ -1297,11 +1297,16 @@ fn stamp(to: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
 /// metadata call waits its turn: `std::fs::copy` and [`stamp`] made five of
 /// them (create, mode, write, time by path, mode again by path), this makes
 /// three, and a fourth only when the umask took bits from the mode.
+///
+/// `umask`, the process's file creation mask when known, tells when the
+/// mode is the one asked for without asking the file: no set-id bit, which
+/// a write clears, and no bit the mask takes away.
 #[cfg(unix)]
 fn write_stamped(
     to: &Path,
     contents: &mut impl std::io::Read,
     metadata: &std::fs::Metadata,
+    umask: Option<u32>,
 ) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mode = metadata.permissions().mode() & 0o7777;
@@ -1312,8 +1317,9 @@ fn write_stamped(
         .mode(mode)
         .open(to)?;
     std::io::copy(contents, &mut file)?;
+    let kept = mode & 0o6000 == 0 && umask.is_some_and(|umask| mode & umask == 0);
     // After the write, which clears set-id bits.
-    if file.metadata()?.permissions().mode() & 0o7777 != mode {
+    if !kept && file.metadata()?.permissions().mode() & 0o7777 != mode {
         file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
     filetime::set_file_handle_times(
@@ -1329,9 +1335,55 @@ fn write_stamped(
     to: &Path,
     contents: &mut impl std::io::Read,
     metadata: &std::fs::Metadata,
+    _: Option<u32>,
 ) -> std::io::Result<()> {
     std::io::copy(contents, &mut std::fs::File::create(to)?)?;
     stamp(to, metadata)
+}
+
+/// The process's file creation mask, where it can be read without changing
+/// it ([`write_stamped`]).
+fn creation_mask() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        kache_client::creation_mask()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Files up to this size are copied through memory ([`copy_file`]).
+const SMALL_COPY: u64 = 64 << 10;
+
+/// Copy the donor file `from`, of `metadata`, to a new file `to`
+/// ([`write_stamped`]). A file of at most [`SMALL_COPY`] bytes, as nearly
+/// every one a seeding copies (a unit's fingerprint files, a run's records),
+/// is read in one call and written in one: copying file to file asked the
+/// kernel for both files' kinds and for its in-kernel copy twice, the second
+/// time to find the end, which is as costly for a few bytes. A read of one
+/// byte more than the stat says finds the end in the same call.
+fn copy_file(
+    from: &Path,
+    to: &Path,
+    metadata: &std::fs::Metadata,
+    umask: Option<u32>,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut source = std::fs::File::open(from)?;
+    if metadata.len() > SMALL_COPY {
+        return write_stamped(to, &mut source, metadata, umask);
+    }
+    let len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let mut bytes = vec![0; len + 1];
+    let read = source.read(&mut bytes)?;
+    bytes.truncate(read);
+    if read != len {
+        // Not the size the stat said: copy what it holds now.
+        source.read_to_end(&mut bytes)?;
+    }
+    write_stamped(to, &mut &bytes[..], metadata, umask)
 }
 
 /// Whether a clone failed because this filesystem, or this pair of
@@ -1369,6 +1421,9 @@ struct FileCounts {
     placed: std::sync::Mutex<Vec<PlacedFile>>,
     /// The new profile's directories this seeding made or found.
     made: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// The process's file creation mask, read once a seeding
+    /// ([`write_stamped`]).
+    umask: Option<u32>,
 }
 
 impl FileCounts {
@@ -1421,7 +1476,7 @@ fn place_file(
         counts.linked.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
-    write_stamped(to, &mut std::fs::File::open(from)?, metadata)?;
+    copy_file(from, to, metadata, counts.umask)?;
     counts.copied.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -1685,7 +1740,10 @@ pub(crate) fn seed_for_lane(
         let progress = Progress::new(deadline);
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
-        let files = FileCounts::default();
+        let files = FileCounts {
+            umask: creation_mask(),
+            ..FileCounts::default()
+        };
         let rebase = kache_store::link::DepinfoRebase::new(&from, &to);
         let cancellation = crate::invocation::process::current();
         std::thread::scope(|scope| {
@@ -4956,18 +5014,27 @@ source = "git+https://example.com/gitdep#abc"
         let recorded = dir.path().join("recorded");
         write(&recorded, "");
         std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o757)).unwrap();
-        let to = dir.path().join("copy");
-        place_file(
-            &from,
-            Path::new(""),
-            &to,
-            &std::fs::metadata(&recorded).unwrap(),
-            &FileCounts::default(),
-        )
-        .unwrap();
-        let mode = std::fs::metadata(&to).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o757);
-        assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary");
+        // Without the process's creation mask, and with it as a seeding
+        // reads it, which takes the file's word for no mode it may change.
+        let known = FileCounts {
+            umask: creation_mask(),
+            ..FileCounts::default()
+        };
+        for (name, counts) in [("copy", FileCounts::default()), ("known", known)] {
+            let to = dir.path().join(name);
+            place_file(
+                &from,
+                Path::new(""),
+                &to,
+                &std::fs::metadata(&recorded).unwrap(),
+                &counts,
+            )
+            .unwrap();
+            let mode = std::fs::metadata(&to).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o757, "{name}");
+            // The recorded stat is not the file's: what it holds is copied.
+            assert_eq!(std::fs::read_to_string(&to).unwrap(), "binary", "{name}");
+        }
     }
 
     /// Whether this process writes files whatever their mode (root).
