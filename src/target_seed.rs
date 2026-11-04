@@ -2185,11 +2185,22 @@ fn entries(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// The directories in `dir`, sorted; a symbolic link is not one. Told apart
+/// by the kind the listing gives each entry, where the filesystem records it
+/// (ext4, XFS, btrfs): a stat of each entry was 2,188 calls a listing of a
+/// large donor's `.fingerprint/`.
 fn subdirectories(dir: &Path) -> Vec<PathBuf> {
-    entries(dir)
-        .into_iter()
-        .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
-        .collect()
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    paths
 }
 
 fn file_name(path: &Path) -> String {
