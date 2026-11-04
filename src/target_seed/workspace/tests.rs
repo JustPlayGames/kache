@@ -254,6 +254,50 @@ fn files_outside_the_package_are_checked_and_some_paths_refused() {
     write(&dep_info, &encoded(&[(1, ours.to_str().unwrap())], &[]));
     at(&dep_info, BUILT);
     assert_eq!(fixture.verify(), None);
+    // The donor's checkout in full, climbing out of the package as Cargo
+    // writes an `include_bytes!("../../../shared/x.txt")` from `src/`:
+    // compared as above; climbing above the checkout or into its target is
+    // refused.
+    for (case, climbing, ours, kept) in [
+        (
+            "same bytes",
+            "crates/p/src/../../../shared/x.txt",
+            None,
+            true,
+        ),
+        (
+            "different bytes",
+            "crates/p/src/../../../shared/x.txt",
+            Some(b"SHARED\n"),
+            false,
+        ),
+        (
+            "above the checkout",
+            "crates/../../elsewhere.txt",
+            None,
+            false,
+        ),
+        (
+            "into the target",
+            "crates/p/../../target/debug/x.txt",
+            None,
+            false,
+        ),
+    ] {
+        let fixture = Fixture::new(&[]);
+        for root in [&fixture.donor, &fixture.ours] {
+            write(&root.join("target/debug/x.txt"), b"generated\n");
+        }
+        at(&fixture.donor.join("target/debug/x.txt"), BUILT - 1);
+        let path = fixture.donor.join(climbing);
+        let dep_info = fixture.fingerprint.join("dep-lib-p");
+        write(&dep_info, &encoded(&[(1, path.to_str().unwrap())], &[]));
+        at(&dep_info, BUILT);
+        if let Some(bytes) = ours {
+            write(&fixture.ours.join("shared/x.txt"), bytes);
+        }
+        assert_eq!(fixture.verify().is_some(), kept, "{case}");
+    }
     // The same file for both, outside both checkouts: its age decides.
     let outside = tempfile::tempdir().unwrap();
     let header = outside.path().join("h.txt");
