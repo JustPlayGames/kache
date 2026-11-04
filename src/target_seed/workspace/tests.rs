@@ -64,7 +64,10 @@ fn reads_cargos_encoded_dep_info_and_refuses_any_other_shape() {
             env: vec![("A".into(), Some("1".into())), ("B".into(), None)],
         })
     );
-    assert_eq!(EncodedDepInfo::parse(&bytes).unwrap().encode(), Some(bytes.clone()));
+    assert_eq!(
+        EncodedDepInfo::parse(&bytes).unwrap().encode(),
+        Some(bytes.clone())
+    );
     // As Cargo 1.99 writes `pub fn f() {}` in src/lib.rs.
     let cargo = [
         1, 0, 0, 0, 0xff, 1, 1, 0, 0, 0, 0, 10, 0, 0, 0, b's', b'r', b'c', b'/', b'l', b'i', b'b',
@@ -116,7 +119,10 @@ impl Fixture {
         let donor = dir.path().join("donor");
         let ours = dir.path().join("ours");
         for root in [&donor, &ours] {
-            write(&root.join("Cargo.toml"), b"[workspace]\nmembers = [\"crates/p\"]\n");
+            write(
+                &root.join("Cargo.toml"),
+                b"[workspace]\nmembers = [\"crates/p\"]\n",
+            );
             write(
                 &root.join("crates/p/Cargo.toml"),
                 b"[package]\nname = \"p\"\nversion = \"0.1.0\"\n",
@@ -149,8 +155,10 @@ impl Fixture {
     fn check(&self) -> Option<CrossCheckout> {
         CrossCheckout::new(
             &self.donor,
+            &self.donor.join("target"),
             &self.ours,
             &BTreeSet::from(["p".to_owned()]),
+            true,
             later(),
         )
     }
@@ -173,7 +181,11 @@ fn a_unit_built_from_this_checkouts_bytes_is_verified_and_dated_to_the_check() {
         std::fs::copy(fixture.fingerprint.join(name), copy.join(name)).unwrap();
         at(&copy.join(name), BUILT);
     }
-    fixture.check().unwrap().date(&copy, verified.stamp).unwrap();
+    fixture
+        .check()
+        .unwrap()
+        .date(&copy, verified.stamp)
+        .unwrap();
     assert_eq!(modified(&copy.join("dep-lib-p")), Some(verified.stamp));
     assert_eq!(
         modified(&copy.join("lib-p")),
@@ -261,10 +273,17 @@ fn a_package_is_compared_once_per_seeding() {
     let first = check.verify("p", &fixture.fingerprint).unwrap();
     // A later change is seen by Cargo through its newer time, not by
     // comparing again within this seeding.
-    write(&fixture.ours.join("crates/p/src/lib.rs"), b"pub fn g() {}\n");
-    assert_eq!(check.verify("p", &fixture.fingerprint), Some(first));
+    write(
+        &fixture.ours.join("crates/p/src/lib.rs"),
+        b"pub fn g() {}\n",
+    );
+    assert_eq!(check.verify("p", &fixture.fingerprint), Some(first.clone()));
     assert!(modified(&fixture.ours.join("crates/p/src/lib.rs")).unwrap() >= first.stamp);
-    assert_eq!(check.verify("q", &fixture.fingerprint), None, "not a package here");
+    assert_eq!(
+        check.verify("q", &fixture.fingerprint),
+        None,
+        "not a package here"
+    );
 }
 
 #[test]
@@ -296,7 +315,11 @@ fn a_donor_file_written_out_in_full_is_compared_and_renamed_in_the_copy() {
     let verified = fixture.verify().expect("same manifest");
     let copy = fixture.donor.join("copy");
     write(&copy.join("dep-lib-p"), &std::fs::read(&dep_info).unwrap());
-    fixture.check().unwrap().date(&copy, verified.stamp).unwrap();
+    fixture
+        .check()
+        .unwrap()
+        .date(&copy, verified.stamp)
+        .unwrap();
     let ours = fixture.ours.join("Cargo.toml");
     let rebased = [(0, "src/lib.rs"), (1, ours.to_str().unwrap())];
     assert_eq!(
@@ -305,18 +328,275 @@ fn a_donor_file_written_out_in_full_is_compared_and_renamed_in_the_copy() {
     );
     assert_eq!(modified(&copy.join("dep-lib-p")), Some(verified.stamp));
     // Another manifest, or a donor copy newer than the build, keeps it out.
-    write(&fixture.ours.join("Cargo.toml"), b"[workspace]\nmembers = []\n");
+    write(
+        &fixture.ours.join("Cargo.toml"),
+        b"[workspace]\nmembers = []\n",
+    );
     assert_eq!(fixture.verify(), None);
     let fixture = Fixture::new(&[]);
     let theirs = fixture.donor.join("Cargo.toml");
     let listed = [(1, theirs.to_str().unwrap())];
-    write(&fixture.fingerprint.join("dep-lib-p"), &encoded(&listed, &[]));
+    write(
+        &fixture.fingerprint.join("dep-lib-p"),
+        &encoded(&listed, &[]),
+    );
     at(&fixture.fingerprint.join("dep-lib-p"), BUILT);
     at(&fixture.donor.join("Cargo.toml"), BUILT + 1);
     assert_eq!(fixture.verify(), None);
     // An unreadable dep-info in the copy is removed, so the unit is built.
     let bad = fixture.donor.join("bad");
     write(&bad.join("dep-lib-p"), b"junk");
-    assert!(fixture.check().unwrap().date(&bad, SystemTime::now()).is_err());
+    assert!(
+        fixture
+            .check()
+            .unwrap()
+            .date(&bad, SystemTime::now())
+            .is_err()
+    );
     assert!(!bad.join("dep-lib-p").exists());
+}
+
+/// A run of `p`'s build script in the donor, built at [`BUILT`], whose record
+/// holds `local` (Cargo's `local` list), next to the fixture's compiled unit.
+fn run_record(fixture: &Fixture, local: &str) -> PathBuf {
+    let run = fixture
+        .donor
+        .join("target/debug/.fingerprint/p-fedcba9876543210");
+    write(
+        &run.join("run-build-script-build-script-build"),
+        b"8899aabbccddeeff",
+    );
+    write(
+        &run.join("run-build-script-build-script-build.json"),
+        format!(r#"{{"rustc":1,"local":{local},"deps":[]}}"#).as_bytes(),
+    );
+    let output = fixture
+        .donor
+        .join("target/debug/build/p-fedcba9876543210/output");
+    write(&output, b"cargo:rerun-if-changed=build.rs\n");
+    at(&output, BUILT);
+    run
+}
+
+const DECLARED: &str = r#"[{"RerunIfChanged":{"output":"debug/build/p-fedcba9876543210/output","paths":["build.rs","assets/a.txt","../../shared/x.txt"]}},{"RerunIfEnvChanged":{"var":"V","val":null}}]"#;
+
+fn run_fixture() -> (Fixture, PathBuf) {
+    let fixture = Fixture::new(&[(0, "src/lib.rs")]);
+    for root in [&fixture.donor, &fixture.ours] {
+        write(&root.join("crates/p/build.rs"), b"fn main() {}\n");
+    }
+    at(&fixture.donor.join("crates/p/build.rs"), BUILT - 100);
+    // This checkout came after the donor's build.
+    for file in ["crates/p/build.rs", "crates/p/assets/a.txt", "shared/x.txt"] {
+        at(&fixture.ours.join(file), BUILT + 1_000);
+    }
+    let run = run_record(&fixture, DECLARED);
+    (fixture, run)
+}
+
+fn secs(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A run's declared files take the donor's times here, so Cargo finds the
+/// copied output (which keeps the donor's time) no older than them, and the
+/// units above it keep theirs.
+#[test]
+fn a_run_on_the_same_declared_bytes_gives_its_files_the_donors_times() {
+    let (fixture, run) = run_fixture();
+    let check = fixture.check().unwrap();
+    let verified = check.verify("p", &run).expect("same declared bytes");
+    // An untouched file already older than the run keeps its time.
+    let shared = fixture.ours.join("shared/x.txt");
+    at(&shared, BUILT - 5_000);
+    check.finish(&run, &verified).unwrap();
+    for file in ["crates/p/build.rs", "crates/p/assets/a.txt"] {
+        assert_eq!(
+            secs(modified(&fixture.ours.join(file)).unwrap()),
+            (BUILT - 100) as u64,
+            "{file}"
+        );
+    }
+    assert_eq!(secs(modified(&shared).unwrap()), (BUILT - 5_000) as u64);
+    assert_eq!(
+        std::fs::read(fixture.ours.join("crates/p/build.rs")).unwrap(),
+        b"fn main() {}\n"
+    );
+}
+
+#[test]
+fn a_run_is_kept_out_unless_every_declared_file_checks_out() {
+    let cases: [(&str, Change); 4] = [
+        ("declared file differs", |f| {
+            write(&f.ours.join("crates/p/assets/a.txt"), b"other\n")
+        }),
+        ("declared file outside the package differs", |f| {
+            write(&f.ours.join("shared/x.txt"), b"other\n")
+        }),
+        ("donor's file newer than its run", |f| {
+            at(&f.donor.join("crates/p/build.rs"), BUILT + 1)
+        }),
+        ("declared file gone here", |f| {
+            std::fs::remove_file(f.ours.join("crates/p/build.rs")).unwrap()
+        }),
+    ];
+    for (case, change) in cases {
+        let (fixture, run) = run_fixture();
+        assert!(fixture.verify_at(&run).is_some(), "{case}: before");
+        change(&fixture);
+        assert_eq!(fixture.verify_at(&run), None, "{case}");
+    }
+    let records = [
+        (
+            "a directory with a donor file newer than the run",
+            r#"[{"RerunIfChanged":{"output":"debug/build/p-fedcba9876543210/output","paths":["src"]}}]"#,
+        ),
+        (
+            "a package's time beside declared files",
+            r#"[{"Precalculated":"1.5s (src/lib.rs)"},{"RerunIfEnvChanged":{"var":"V","val":null}},{"RerunIfChanged":{"output":"debug/build/p-fedcba9876543210/output","paths":["build.rs"]}}]"#,
+        ),
+        (
+            "a checkout file in full",
+            r#"[{"RerunIfChanged":{"output":"debug/build/p-fedcba9876543210/output","paths":["DONOR/crates/p/build.rs"]}}]"#,
+        ),
+        (
+            "an output outside the target",
+            r#"[{"RerunIfChanged":{"output":"../output","paths":["build.rs"]}}]"#,
+        ),
+        ("a record of another shape", r#"{"local":7}"#),
+    ];
+    for (case, local) in records {
+        let (fixture, _) = run_fixture();
+        let local = local.replace("DONOR", fixture.donor.to_str().unwrap());
+        at(&fixture.donor.join("crates/p/src/lib.rs"), BUILT + 1);
+        let run = run_record(&fixture, &local);
+        assert_eq!(fixture.verify_at(&run), None, "{case}");
+    }
+    // Environment alone: Cargo compares it itself.
+    let (fixture, _) = run_fixture();
+    let run = run_record(&fixture, r#"[{"RerunIfEnvChanged":{"var":"V","val":"1"}}]"#);
+    assert!(fixture.verify_at(&run).is_some());
+}
+
+/// A file written between the check and the new time gets the present time
+/// back, and the copied run loses its fingerprint: Cargo runs it.
+#[test]
+fn a_declared_file_changed_while_seeding_keeps_the_run_out() {
+    let (fixture, run) = run_fixture();
+    let check = fixture.check().unwrap();
+    let verified = check.verify("p", &run).unwrap();
+    let copy = fixture.donor.join("copy");
+    for name in [
+        "run-build-script-build-script-build",
+        "run-build-script-build-script-build.json",
+    ] {
+        write(&copy.join(name), &std::fs::read(run.join(name)).unwrap());
+    }
+    write(&fixture.ours.join("crates/p/assets/a.txt"), b"edited\n");
+    at(&fixture.ours.join("crates/p/assets/a.txt"), BUILT + 2_000);
+    let before = SystemTime::now() - Duration::from_secs(1);
+    assert!(check.finish(&copy, &verified).is_err());
+    assert!(modified(&fixture.ours.join("crates/p/assets/a.txt")).unwrap() >= before);
+    assert!(super::super::entries(&copy).is_empty());
+}
+
+impl Fixture {
+    fn verify_at(&self, fingerprint: &Path) -> Option<Verified> {
+        self.check()?.verify("p", fingerprint)
+    }
+}
+
+/// A declared directory, and a run Cargo judges by its package's newest file,
+/// take the donor's time for every entry under them: Cargo's walk of a
+/// directory takes directories' times too, and a package's newest time is
+/// hashed into the run's fingerprint, so that one must be the very same.
+#[test]
+fn a_declared_directory_and_a_package_judged_by_time_take_every_time() {
+    for (case, local, exact) in [
+        (
+            "directory",
+            r#"[{"RerunIfChanged":{"output":"debug/build/p-fedcba9876543210/output","paths":["assets"]}}]"#,
+            false,
+        ),
+        (
+            "package",
+            r#"[{"Precalculated":"1799999900.0s (Cargo.toml)"}]"#,
+            true,
+        ),
+    ] {
+        let (fixture, _) = run_fixture();
+        let run = run_record(&fixture, local);
+        for dir in ["crates/p", "crates/p/src", "crates/p/assets"] {
+            at(&fixture.donor.join(dir), BUILT - 50);
+            at(&fixture.ours.join(dir), BUILT + 1_000);
+        }
+        let check = fixture.check().unwrap();
+        let verified = check.verify("p", &run).unwrap_or_else(|| panic!("{case}"));
+        // Older than the run is not enough for a package's time.
+        at(&fixture.ours.join("crates/p/src/lib.rs"), BUILT - 7_000);
+        check.finish(&run, &verified).unwrap();
+        for (path, want) in [
+            ("crates/p/assets", BUILT - 50),
+            ("crates/p/assets/a.txt", BUILT - 100),
+        ] {
+            assert_eq!(
+                secs(modified(&fixture.ours.join(path)).unwrap()),
+                want as u64,
+                "{case}: {path}"
+            );
+        }
+        let lib = secs(modified(&fixture.ours.join("crates/p/src/lib.rs")).unwrap());
+        assert_eq!(
+            lib,
+            if exact { BUILT - 100 } else { BUILT - 7_000 } as u64,
+            "{case}"
+        );
+    }
+    // An entry more on one side keeps the directory out.
+    let (fixture, _) = run_fixture();
+    let run = run_record(
+        &fixture,
+        r#"[{"RerunIfChanged":{"output":"debug/build/p-fedcba9876543210/output","paths":["assets"]}}]"#,
+    );
+    write(&fixture.ours.join("crates/p/assets/new.txt"), b"x");
+    assert_eq!(fixture.verify_at(&run), None);
+}
+
+/// A compiled unit may read files its own package's run wrote (Cargo then
+/// rebuilds it if that run is not copied and runs), never another's.
+#[test]
+fn generated_sources_count_only_from_the_units_own_run() {
+    for (path, ok) in [
+        ("debug/build/p-fedcba9876543210/out/gen.rs", true),
+        ("debug/build/q-fedcba9876543210/out/gen.rs", false),
+        ("debug/build/p-fedcba9876543210/output", false),
+        ("debug/build/p-fedcba9876543210/out/../../x.rs", false),
+        ("debug/deps/p.rs", false),
+    ] {
+        let fixture = Fixture::new(&[(0, "src/lib.rs"), (1, path)]);
+        assert_eq!(fixture.verify().is_some(), ok, "{path}");
+    }
+}
+
+/// No run is copied into a checkout whose other targets could take its
+/// files' older times for fresh.
+#[test]
+fn no_run_without_leave_to_adopt_times() {
+    let (fixture, run) = run_fixture();
+    let check = CrossCheckout::new(
+        &fixture.donor,
+        &fixture.donor.join("target"),
+        &fixture.ours,
+        &BTreeSet::from(["p".to_owned()]),
+        false,
+        later(),
+    )
+    .unwrap();
+    assert_eq!(check.verify("p", &run), None);
+    assert!(
+        check.verify("p", &fixture.fingerprint).is_some(),
+        "compiled units still"
+    );
 }

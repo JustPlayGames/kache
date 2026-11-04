@@ -297,6 +297,33 @@ fn needles_for(donor: &Donor, same_checkout: bool) -> Vec<String> {
     }
 }
 
+/// Whether the checkout `target` is for has a target other than it, which a
+/// run's files taking older times could make look fresh ([`workspace`]):
+/// one kache built into, or a Cargo target directory under the checkout's
+/// `target/` (two levels down, as integrate's are).
+fn checkout_has_other_targets(target: &NewTarget, donors: &[Donor]) -> bool {
+    let ours = |dir: &Path| dir == target.target_dir || dir.starts_with(&target.target_dir);
+    if donors.iter().any(|donor| {
+        same_checkout(donor, target) && !ours(&donor.target_dir) && donor.target_dir.exists()
+    }) {
+        return true;
+    }
+    let root = target.workspace_root.join("target");
+    let mut pending = vec![(root, 0)];
+    while let Some((dir, depth)) = pending.pop() {
+        if ours(&dir) {
+            continue;
+        }
+        if dir.join("CACHEDIR.TAG").exists() || dir.join(PROFILE).join(".fingerprint").exists() {
+            return true;
+        }
+        if depth < 2 {
+            pending.extend(subdirectories(&dir).into_iter().map(|sub| (sub, depth + 1)));
+        }
+    }
+    false
+}
+
 /// A target directory units may be copied from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Donor {
@@ -1394,8 +1421,10 @@ pub(crate) fn seed_for_lane(
             .then(|| {
                 workspace::CrossCheckout::new(
                     &donor.workspace_root,
+                    &donor.target_dir,
                     &target.workspace_root,
                     &workspace,
+                    !checkout_has_other_targets(target, donors),
                     deadline,
                 )
             })
@@ -1478,7 +1507,7 @@ pub(crate) fn seed_for_lane(
                                 // the unit.
                                 if let (Some(verified), Some(cross)) = (verified, cross.as_ref())
                                     && let Err(error) = cross
-                                        .date(&fingerprint_dir(to, layout, unit), verified.stamp)
+                                        .finish(&fingerprint_dir(to, layout, unit), &verified)
                                 {
                                     tracing::debug!(
                                         "could not date {}-{}: {error}",
@@ -1620,8 +1649,9 @@ fn ranked_donors<'a>(
             .map(|(&(donor, layout), count)| (donor, layout, count.join().unwrap_or(0)))
             .collect()
     });
-    // Stable: equals keep their order of use.
-    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+    // A target of the same checkout first: it gives every unit without
+    // touching the checkout. Stable: equals keep their order of use.
+    ranked.sort_by_key(|entry| (!same_checkout(entry.0, target), std::cmp::Reverse(entry.2)));
     ranked
         .into_iter()
         .map(|(donor, layout, _)| (donor, layout))
@@ -2883,6 +2913,45 @@ source = "git+https://example.com/gitdep#abc"
                 Seeded::default()
             );
         }
+    }
+
+    /// A run's files take older times only in a checkout with no other
+    /// target, which could take them for fresh.
+    #[test]
+    fn other_targets_of_the_checkout_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ws");
+        let target = NewTarget {
+            target_dir: root.join("target"),
+            workspace_root: root.clone(),
+        };
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        assert!(!checkout_has_other_targets(&target, &[]));
+        let elsewhere = Donor {
+            target_dir: dir.path().join("other/target"),
+            workspace_root: dir.path().join("other"),
+            rustc: None,
+        };
+        std::fs::create_dir_all(&elsewhere.target_dir).unwrap();
+        assert!(!checkout_has_other_targets(
+            &target,
+            std::slice::from_ref(&elsewhere)
+        ));
+        let tracked = Donor {
+            target_dir: dir.path().join("outside-target"),
+            workspace_root: root.clone(),
+            rustc: None,
+        };
+        std::fs::create_dir_all(&tracked.target_dir).unwrap();
+        assert!(checkout_has_other_targets(&target, &[elsewhere, tracked]));
+        // An untracked target below this one's sibling folders.
+        let target = NewTarget {
+            target_dir: root.join("target/clippy"),
+            workspace_root: root.clone(),
+        };
+        assert!(!checkout_has_other_targets(&target, &[]));
+        std::fs::create_dir_all(root.join("target/integrate-x/debug/.fingerprint")).unwrap();
+        assert!(checkout_has_other_targets(&target, &[]));
     }
 
     /// A path package's units come from a target of the same checkout, whose

@@ -29,6 +29,18 @@
 //! after the check. Environment variables a unit read keep their recorded values, and
 //! Cargo compares them itself, as it does flags, features and dependencies
 //! through the unit's fingerprint hash.
+//!
+//! A build script's run has no dep-info. Cargo keeps it fresh while no file
+//! its output declared with `rerun-if-changed` is newer than that output,
+//! and the units above it while the output is no newer than theirs, so
+//! dating the copied output would rebuild everything above it. Instead each
+//! declared file, once found the same bytes as the donor's and no newer
+//! than the donor's run, takes the donor's time in this checkout
+//! ([`CrossCheckout::finish`]); it is compared again after, and a file that
+//! changed meanwhile gets the present time back and keeps the run out. A
+//! run whose package Cargo judges by its newest file (no `rerun-if-changed`),
+//! that declares a directory, or names a file of either checkout in full is
+//! not copied.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -51,6 +63,12 @@ const COMPARE_CHUNK: usize = 1 << 16;
 pub(super) struct CrossCheckout {
     donor_root: PathBuf,
     our_root: PathBuf,
+    /// The donor's target directory, which a run's record names its output
+    /// from.
+    donor_target: PathBuf,
+    /// Whether this checkout's files may take the donor's times: only while
+    /// no other target of this checkout could take them for fresh.
+    adopt: bool,
     /// Each path package's directory, relative to the workspace root, as
     /// this checkout's manifests place it.
     roots: HashMap<String, PathBuf>,
@@ -70,9 +88,134 @@ struct PackageCheck {
 }
 
 /// A unit that may be copied, and the time its dep-info takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Verified {
     pub(super) stamp: SystemTime,
+    /// For a build script's run: the files whose times this checkout takes.
+    run: Option<RunInputs>,
+}
+
+/// What a copied run needs before Cargo looks at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunInputs {
+    /// The time of the donor's run output, which the copy keeps.
+    output_time: SystemTime,
+    /// Every input takes the donor's very time (a run judged by its
+    /// package's newest file), not just one no later than the run.
+    exact: bool,
+    inputs: Vec<Adopted>,
+}
+
+/// A declared input of a run, a file with the same bytes or a directory with
+/// the same entries in both checkouts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Adopted {
+    theirs: PathBuf,
+    ours: PathBuf,
+    /// The donor's modification time, no later than its run.
+    time: SystemTime,
+    directory: bool,
+}
+
+impl Adopted {
+    /// Whether this checkout's copy still matches the donor's.
+    fn still_same(&self, deadline: Instant) -> bool {
+        if self.directory {
+            sorted_entries(&self.theirs)
+                .is_some_and(|theirs| Some(theirs) == sorted_entries(&self.ours))
+        } else {
+            same_bytes(&self.theirs, &self.ours, deadline)
+        }
+    }
+}
+
+/// `theirs` and `ours` and everything under them, when they hold the same
+/// entries and bytes (no symbolic link) and nothing of the donor's is newer
+/// than `limit`. Directories count: Cargo's walk of a declared directory
+/// takes theirs too.
+fn tree_inputs(
+    theirs: &Path,
+    ours: &Path,
+    limit: Option<SystemTime>,
+    deadline: Instant,
+) -> Option<Vec<Adopted>> {
+    let mut found = Vec::new();
+    let mut pending = vec![(theirs.to_path_buf(), ours.to_path_buf())];
+    while let Some((their_path, our_path)) = pending.pop() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let their_meta = std::fs::symlink_metadata(&their_path).ok()?;
+        let our_meta = std::fs::symlink_metadata(&our_path).ok()?;
+        let time = their_meta.modified().ok()?;
+        if limit.is_some_and(|limit| time > limit) {
+            return None;
+        }
+        let directory = their_meta.is_dir();
+        if directory && our_meta.is_dir() {
+            let names = sorted_entries(&their_path)?;
+            if sorted_entries(&our_path)? != names {
+                return None;
+            }
+            for name in names {
+                pending.push((their_path.join(&name), our_path.join(&name)));
+            }
+        } else if !(their_meta.is_file()
+            && our_meta.is_file()
+            && their_meta.len() == our_meta.len()
+            && same_bytes(&their_path, &our_path, deadline))
+        {
+            return None;
+        }
+        found.push(Adopted {
+            theirs: their_path,
+            ours: our_path,
+            time,
+            directory,
+        });
+    }
+    Some(found)
+}
+
+/// Whether `path` (from the target directory, as a dep-info writes it) is
+/// under `package`'s own build-script `OUT_DIR`:
+/// `<profile>/build/<package>-<hash>/out/...`.
+fn in_own_out_dir(path: &Path, package: &str) -> bool {
+    let parts: Vec<_> = path.components().collect();
+    match parts.as_slice() {
+        [
+            Component::Normal(_),
+            Component::Normal(build),
+            Component::Normal(unit),
+            Component::Normal(out),
+            rest @ ..,
+        ] if *build == "build" && *out == "out" && !rest.is_empty() => {
+            rest.iter().all(|c| matches!(c, Component::Normal(_)))
+                && unit
+                    .to_str()
+                    .and_then(|unit| unit.rsplit_once('-'))
+                    .is_some_and(|(name, hash)| {
+                        name == package && crate::cargo_layout::is_unit_hash(hash)
+                    })
+        }
+        _ => false,
+    }
+}
+
+/// How a run's fingerprint record (`run-build-script-*.json`) says Cargo
+/// judges it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunCheck {
+    /// `rerun-if-changed`: these files (from the package root, or in full)
+    /// against the output at `output` (from the target directory).
+    Files {
+        output: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    /// `rerun-if-env-changed`: compared by Cargo itself.
+    Env,
+    /// No `rerun-if-changed`: the package's newest file and its time.
+    Package,
 }
 
 impl CrossCheckout {
@@ -80,8 +223,10 @@ impl CrossCheckout {
     /// checkout's manifests cannot be read by `deadline`.
     pub(super) fn new(
         donor_root: &Path,
+        donor_target: &Path,
         our_root: &Path,
         packages: &BTreeSet<String>,
+        adopt: bool,
         deadline: Instant,
     ) -> Option<Self> {
         // A checkout inside the other would make one path name both.
@@ -92,6 +237,8 @@ impl CrossCheckout {
         Some(Self {
             donor_root: donor_root.to_path_buf(),
             our_root: our_root.to_path_buf(),
+            donor_target: donor_target.to_path_buf(),
+            adopt,
             roots,
             packages: Mutex::new(HashMap::new()),
             deadline,
@@ -108,7 +255,7 @@ impl CrossCheckout {
             .filter(|file| super::file_name(file).starts_with("dep-"))
             .collect();
         if dep_infos.is_empty() {
-            return None;
+            return self.verify_run(relative, fingerprint, check);
         }
         let theirs = self.donor_root.join(relative);
         let ours = self.our_root.join(relative);
@@ -120,9 +267,16 @@ impl CrossCheckout {
             let info = EncodedDepInfo::parse(&std::fs::read(dep_info).ok()?)?;
             for file in &info.files {
                 let path = Path::new(&file.path);
-                // Relative to the target: generated by the donor's run.
-                if (file.kind == PathKind::TargetRoot && !path.is_absolute())
-                    || Instant::now() >= self.deadline
+                // Relative to the target: generated by a run. Its own
+                // package's run is a dependency of the unit, so Cargo
+                // rebuilds the unit when that run is not copied and runs.
+                if file.kind == PathKind::TargetRoot && !path.is_absolute() {
+                    if Instant::now() >= self.deadline || !in_own_out_dir(path, package) {
+                        return None;
+                    }
+                    continue;
+                }
+                if Instant::now() >= self.deadline
                     || !self.outside_file_holds(&theirs, &ours, path, reference)
                 {
                     return None;
@@ -131,7 +285,133 @@ impl CrossCheckout {
         }
         Some(Verified {
             stamp: check.checked_from,
+            run: None,
         })
+    }
+
+    /// Whether the donor's build-script run at `fingerprint`, of the package
+    /// at `relative`, ran on the bytes its declared files hold here.
+    fn verify_run(
+        &self,
+        relative: &Path,
+        fingerprint: &Path,
+        check: PackageCheck,
+    ) -> Option<Verified> {
+        if !self.adopt {
+            return None;
+        }
+        let checks = run_checks(fingerprint)?;
+        let theirs = self.donor_root.join(relative);
+        let ours = self.our_root.join(relative);
+        if checks == [RunCheck::Package] {
+            // Cargo hashes the package's newest file and its time into the
+            // run's fingerprint: the same bytes need the same times.
+            return Some(Verified {
+                stamp: check.checked_from,
+                run: Some(RunInputs {
+                    output_time: SystemTime::UNIX_EPOCH,
+                    exact: true,
+                    inputs: tree_inputs(&theirs, &ours, None, self.deadline)?,
+                }),
+            });
+        }
+        let mut output_time = None;
+        let mut inputs = Vec::new();
+        for run_check in checks {
+            let RunCheck::Files { output, paths } = run_check else {
+                if run_check == RunCheck::Package {
+                    return None;
+                }
+                continue;
+            };
+            if !output
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+            {
+                return None;
+            }
+            let time = modified(&self.donor_target.join(output))?;
+            if output_time.is_some_and(|known| known != time) {
+                return None;
+            }
+            output_time = Some(time);
+            for path in paths {
+                if Instant::now() >= self.deadline {
+                    return None;
+                }
+                inputs.extend(self.run_input(&theirs, &ours, &path, time)?);
+            }
+        }
+        Some(Verified {
+            stamp: check.checked_from,
+            run: Some(RunInputs {
+                output_time: output_time.unwrap_or(SystemTime::UNIX_EPOCH),
+                exact: false,
+                inputs,
+            }),
+        })
+    }
+
+    /// `None` when the declared file `path` keeps the run out; else the file
+    /// whose time this checkout takes, if any. A file outside both checkouts
+    /// is the same file for both, and holds while no newer than the run.
+    fn run_input(
+        &self,
+        theirs: &Path,
+        ours: &Path,
+        path: &Path,
+        output_time: SystemTime,
+    ) -> Option<Vec<Adopted>> {
+        if path.is_absolute() {
+            // Cargo keeps a checkout's file in full only when it is outside
+            // the package, and the copied output names the donor's.
+            if path.starts_with(&self.donor_root) || path.starts_with(&self.our_root) {
+                return None;
+            }
+            return (modified(path)? <= output_time).then(Vec::new);
+        }
+        let (their_file, our_file) = (normal(&theirs.join(path))?, normal(&ours.join(path))?);
+        if !their_file.starts_with(&self.donor_root)
+            || !our_file.starts_with(&self.our_root)
+            || their_file.starts_with(&self.donor_target)
+        {
+            return None;
+        }
+        // A directory: Cargo takes the newest time of everything under it.
+        tree_inputs(&their_file, &our_file, Some(output_time), self.deadline)
+    }
+
+    /// Ready the copied unit at `fingerprint` for Cargo: a compiled unit's
+    /// dep-info dated and rebased ([`date_and_rebase`]); a run's declared
+    /// files given the donor's times where theirs are newer than the run.
+    /// On an error the unit's fingerprint is gone and Cargo builds it.
+    pub(super) fn finish(&self, fingerprint: &Path, verified: &Verified) -> std::io::Result<()> {
+        let Some(run) = &verified.run else {
+            return self.date(fingerprint, verified.stamp);
+        };
+        for input in &run.inputs {
+            let current = modified(&input.ours).ok_or_else(|| std::io::Error::other("gone"))?;
+            if current == input.time || (!run.exact && current <= run.output_time) {
+                continue;
+            }
+            let adopted = filetime::set_file_mtime(
+                &input.ours,
+                filetime::FileTime::from_system_time(input.time),
+            );
+            // A write that ended before the new time is caught here; one
+            // after it leaves a newer time, which Cargo sees.
+            if adopted.is_err() || !input.still_same(self.deadline) {
+                let _ = filetime::set_file_mtime(&input.ours, filetime::FileTime::now());
+                for file in super::entries(fingerprint) {
+                    let _ = std::fs::remove_file(file);
+                }
+                return Err(std::io::Error::other(format!(
+                    "{} changed while seeding",
+                    input.ours.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Date and rebase the copied unit's dep-infos at `fingerprint`
@@ -159,11 +439,14 @@ impl CrossCheckout {
                 return modified(path).is_some_and(|time| time <= reference);
             };
             let our_file = self.our_root.join(within);
-            return within.components().all(|c| matches!(c, Component::Normal(_)))
+            return within
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
                 && modified(path).is_some_and(|time| time <= reference)
                 && same_bytes(path, &our_file, self.deadline);
         }
-        let (Some(their_file), Some(our_file)) = (normal(&theirs.join(path)), normal(&ours.join(path)))
+        let (Some(their_file), Some(our_file)) =
+            (normal(&theirs.join(path)), normal(&ours.join(path)))
         else {
             return false;
         };
@@ -191,10 +474,7 @@ impl CrossCheckout {
             checked_from,
             donor_newest,
         });
-        self.packages
-            .lock()
-            .ok()?
-            .insert(package.to_owned(), found);
+        self.packages.lock().ok()?.insert(package.to_owned(), found);
         found
     }
 }
@@ -215,6 +495,51 @@ fn normal(path: &Path) -> Option<PathBuf> {
         }
     }
     Some(out)
+}
+
+/// What a run's fingerprint record checks, or `None` for a run Cargo judges
+/// otherwise (by the package's newest file) or a record this cannot read.
+fn run_checks(fingerprint: &Path) -> Option<Vec<RunCheck>> {
+    let records: Vec<PathBuf> = super::entries(fingerprint)
+        .into_iter()
+        .filter(|file| {
+            let name = super::file_name(file);
+            name.starts_with("run-build-script-") && name.ends_with(".json")
+        })
+        .collect();
+    let [record] = records.as_slice() else {
+        return None;
+    };
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(record).ok()?).ok()?;
+    let mut checks = Vec::new();
+    for local in json.get("local")?.as_array()? {
+        let local = local.as_object()?;
+        if local.len() != 1 {
+            return None;
+        }
+        if let Some(files) = local.get("RerunIfChanged") {
+            let paths = files
+                .get("paths")?
+                .as_array()?
+                .iter()
+                .map(|path| path.as_str().map(PathBuf::from))
+                .collect::<Option<Vec<_>>>()?;
+            checks.push(RunCheck::Files {
+                output: PathBuf::from(files.get("output")?.as_str()?),
+                paths,
+            });
+        } else if local.contains_key("RerunIfEnvChanged") {
+            checks.push(RunCheck::Env);
+        } else if local
+            .get("Precalculated")
+            .is_some_and(serde_json::Value::is_string)
+        {
+            checks.push(RunCheck::Package);
+        } else {
+            return None;
+        }
+    }
+    Some(checks)
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -302,7 +627,8 @@ fn compare_trees(theirs: &Path, ours: &Path, deadline: Instant) -> Option<System
             let (their_kind, our_kind) = (their_meta.file_type(), our_meta.file_type());
             if their_kind.is_symlink() || our_kind.is_symlink() {
                 if !(their_kind.is_symlink() && our_kind.is_symlink())
-                    || std::fs::read_link(&their_path).ok()? != std::fs::read_link(&our_path).ok()?
+                    || std::fs::read_link(&their_path).ok()?
+                        != std::fs::read_link(&our_path).ok()?
                 {
                     return None;
                 }
@@ -528,8 +854,9 @@ pub(super) fn date_and_rebase(
             info.encode()
         });
         let written = match rebased {
-            Some(bytes) => std::fs::write(&file, bytes)
-                .and_then(|()| filetime::set_file_mtime(&file, time)),
+            Some(bytes) => {
+                std::fs::write(&file, bytes).and_then(|()| filetime::set_file_mtime(&file, time))
+            }
             None => Err(std::io::Error::other("unreadable dep-info")),
         };
         if let Err(error) = written {
