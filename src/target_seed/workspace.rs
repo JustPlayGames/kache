@@ -821,14 +821,18 @@ fn compare_trees(theirs: &Path, ours: &Path, deadline: Instant) -> Option<System
         if Instant::now() >= deadline {
             return None;
         }
-        let their_entries = sorted_entries(&their_dir)?;
-        if their_entries != sorted_entries(&our_dir)? {
+        let their_entries = entries_with_status(&their_dir)?;
+        let our_entries = entries_with_status(&our_dir)?;
+        if their_entries.len() != our_entries.len()
+            || their_entries
+                .iter()
+                .zip(&our_entries)
+                .any(|(theirs, ours)| theirs.0 != ours.0)
+        {
             return None;
         }
-        for name in their_entries {
+        for ((name, their_meta), (_, our_meta)) in their_entries.into_iter().zip(our_entries) {
             let (their_path, our_path) = (their_dir.join(&name), our_dir.join(&name));
-            let their_meta = std::fs::symlink_metadata(&their_path).ok()?;
-            let our_meta = std::fs::symlink_metadata(&our_path).ok()?;
             newest = newest.max(their_meta.modified().ok()?);
             let (their_kind, our_kind) = (their_meta.file_type(), our_meta.file_type());
             if their_kind.is_symlink() || our_kind.is_symlink() {
@@ -852,6 +856,20 @@ fn compare_trees(theirs: &Path, ours: &Path, deadline: Instant) -> Option<System
         }
     }
     Some(newest)
+}
+
+/// The names in `dir`, sorted, each with its status, not following a link,
+/// asked of `dir`'s open descriptor by the name: a stat of each entry's full
+/// path walked the checkout's directories above it again, two calls for
+/// each of the 17,000 files a 600-crate workspace's packages hold.
+fn entries_with_status(dir: &Path) -> Option<Vec<(std::ffi::OsString, std::fs::Metadata)>> {
+    let mut entries = std::fs::read_dir(dir)
+        .ok()?
+        .map(|entry| entry.and_then(|entry| Ok((entry.file_name(), entry.metadata()?))))
+        .collect::<std::io::Result<Vec<_>>>()
+        .ok()?;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(entries)
 }
 
 fn sorted_entries(dir: &Path) -> Option<Vec<std::ffi::OsString>> {
