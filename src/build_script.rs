@@ -972,7 +972,7 @@ fn cache_bypass_exit_code(error: &anyhow::Error) -> Option<i32> {
 /// one-second timestamps, is coarser than any floor worth paying for.
 const FS_CLOCK_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
-fn write_floor(now: std::time::SystemTime) -> std::time::SystemTime {
+pub(crate) fn write_floor(now: std::time::SystemTime) -> std::time::SystemTime {
     now - FS_CLOCK_TICK
 }
 
