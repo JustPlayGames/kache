@@ -11,9 +11,9 @@ use super::{Layout, Unit, build_script_out_dir};
 // unbounded allocation on the target-info probe's seeding path.
 const MAX_METADATA_BYTES: u64 = 16 << 20;
 
-pub(super) struct Relocation {
-    from: PathBuf,
-    to: PathBuf,
+pub(super) struct Relocation<'a> {
+    /// The seeding's rebase from the donor's profile to this one.
+    rebase: &'a kache_store::link::DepinfoRebase,
     depinfo_dirs: Vec<PathBuf>,
     script: Option<Script>,
 }
@@ -31,14 +31,15 @@ struct Script {
     translated_root: String,
 }
 
-impl Relocation {
+impl<'a> Relocation<'a> {
     /// `checkout`, the donor's checkout and this one, is given for a run of
     /// another checkout that [`super::workspace`] verified: its directives
     /// that name the donor's checkout then name this one
-    /// ([`rebase_checkout`]).
+    /// ([`rebase_checkout`]). `rebase` moves dep-info from `from` to `to`.
     pub(super) fn for_unit(
         from: &Path,
         to: &Path,
+        rebase: &'a kache_store::link::DepinfoRebase,
         layout: Layout,
         unit: &Unit,
         checkout: Option<(&Path, &Path)>,
@@ -93,8 +94,7 @@ impl Relocation {
             _ => return Err(io::Error::other("unpaired seeded build-script records")),
         };
         Ok(Self {
-            from: from.to_path_buf(),
-            to: to.to_path_buf(),
+            rebase,
             depinfo_dirs,
             script,
         })
@@ -142,7 +142,9 @@ impl Relocation {
         }
         let original = read_text(path, deadline)?
             .ok_or_else(|| io::Error::other("seeded dep-info disappeared"))?;
-        let translated = kache_store::link::rebase_depinfo_content(&original, &self.from, &self.to)
+        let translated = self
+            .rebase
+            .rebase(&original)
             .ok_or_else(|| io::Error::other("seeded dep-info does not belong to this donor"))?;
         Ok((translated != original).then(|| Cow::Owned(translated.into_bytes())))
     }
@@ -377,9 +379,11 @@ mod tests {
             recorded.to_str().unwrap(),
         )
         .unwrap();
+        let rebase = kache_store::link::DepinfoRebase::new(&from, &to);
         let relocation = Relocation::for_unit(
             &from,
             &to,
+            &rebase,
             Layout::Shared,
             &unit,
             None,
@@ -459,9 +463,11 @@ mod tests {
             .unwrap();
             let root = stdout.with_file_name("root-output");
             std::fs::write(&root, old.to_str().unwrap()).unwrap();
+            let rebase = kache_store::link::DepinfoRebase::new(&from, &to);
             let relocation = Relocation::for_unit(
                 &from,
                 &to,
+                &rebase,
                 layout,
                 &unit,
                 None,
