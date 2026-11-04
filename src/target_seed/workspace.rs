@@ -46,7 +46,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
 /// Entries a walk for the workspace's manifests looks at before it gives up:
@@ -73,15 +73,17 @@ pub(super) struct CrossCheckout {
     /// this checkout's manifests place it.
     roots: HashMap<String, PathBuf>,
     /// What each package's directory comparison found, once made.
-    packages: Mutex<HashMap<String, Option<PackageCheck>>>,
+    /// A copy thread that needs a package another is comparing waits for
+    /// that comparison rather than making its own.
+    packages: Mutex<HashMap<String, Arc<OnceLock<Option<PackageCheck>>>>>,
     deadline: Instant,
 }
 
 /// A package directory found the same in both checkouts.
 #[derive(Debug, Clone, Copy)]
 struct PackageCheck {
-    /// When the comparison started: no later change to this checkout's
-    /// copy went unseen by it.
+    /// When the comparison started, less a file system clock tick: no later
+    /// change to this checkout's copy went unseen by it.
     checked_from: SystemTime,
     /// The newest modification time of the donor's copy.
     donor_newest: SystemTime,
@@ -93,6 +95,13 @@ pub(super) struct Verified {
     pub(super) stamp: SystemTime,
     /// For a build script's run: the files whose times this checkout takes.
     run: Option<RunInputs>,
+}
+
+impl Verified {
+    /// Whether this is a build script's run.
+    pub(super) fn is_run(&self) -> bool {
+        self.run.is_some()
+    }
 }
 
 /// What a copied run needs before Cargo looks at it.
@@ -352,6 +361,44 @@ impl CrossCheckout {
         })
     }
 
+    /// Whether the compiler read the donor's checkout from the environment,
+    /// as the unit's compiler dep-info files `dep_infos` (`deps/*.d`, with
+    /// `# env-dep:NAME=VALUE` lines) record it, or one cannot be read. Cargo
+    /// leaves the variables it sets (`CARGO_MANIFEST_DIR`, a build script's
+    /// `rustc-env`) out of its own dep-info and does not compare them, so a
+    /// copy would keep the donor's `env!("CARGO_MANIFEST_DIR")`; kache's key
+    /// keeps that path, and such a crate builds in each checkout.
+    pub(super) fn reads_checkout_from_env(&self, dep_infos: &[PathBuf]) -> bool {
+        dep_infos.is_empty()
+            || dep_infos.iter().any(|file| match std::fs::read(file) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("# env-dep:"))
+                    .any(|dep| {
+                        dep.split_once('=')
+                            .is_some_and(|(_, value)| self.names_checkout(value))
+                    }),
+                Err(_) => true,
+            })
+    }
+
+    /// Whether `value` names the donor's checkout outside its target. An
+    /// `OUT_DIR` in the target does not count: a seed into a target of the
+    /// same checkout keeps it too, and kache's key does not hold it.
+    fn names_checkout(&self, value: &str) -> bool {
+        let value = match self.donor_target.to_str() {
+            Some(target) => value.replace(target, ""),
+            None => value.to_owned(),
+        };
+        super::donor_needles(&super::Donor {
+            target_dir: PathBuf::new(),
+            workspace_root: self.donor_root.clone(),
+            rustc: None,
+        })
+        .iter()
+        .any(|needle| super::contains_path(value.as_bytes(), needle))
+    }
+
     /// `None` when the declared file `path` keeps the run out; else the file
     /// whose time this checkout takes, if any. A file outside both checkouts
     /// is the same file for both, and holds while no newer than the run.
@@ -461,21 +508,27 @@ impl CrossCheckout {
 
     /// The comparison of `package`'s directory, made once.
     fn package(&self, package: &str, relative: &Path) -> Option<PackageCheck> {
-        if let Some(known) = self.packages.lock().ok()?.get(package) {
-            return *known;
-        }
-        let checked_from = SystemTime::now();
-        let found = compare_trees(
-            &self.donor_root.join(relative),
-            &self.our_root.join(relative),
-            self.deadline,
-        )
-        .map(|donor_newest| PackageCheck {
-            checked_from,
-            donor_newest,
-        });
-        self.packages.lock().ok()?.insert(package.to_owned(), found);
-        found
+        let comparison = Arc::clone(
+            self.packages
+                .lock()
+                .ok()?
+                .entry(package.to_owned())
+                .or_default(),
+        );
+        *comparison.get_or_init(|| {
+            // A write just after this may carry an mtime a clock tick before
+            // `now`; dated from the floor, the copy is older than it.
+            let checked_from = crate::build_script::write_floor(SystemTime::now());
+            compare_trees(
+                &self.donor_root.join(relative),
+                &self.our_root.join(relative),
+                self.deadline,
+            )
+            .map(|donor_newest| PackageCheck {
+                checked_from,
+                donor_newest,
+            })
+        })
     }
 }
 

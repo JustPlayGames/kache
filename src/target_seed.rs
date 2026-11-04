@@ -437,6 +437,36 @@ fn marker(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
     }
 }
 
+/// The compiler's dep-info files of a compiled unit: `deps/<crate>-<hash>.d`,
+/// and a build script's own beside it in `build/<pkg>-<hash>/` (or, since
+/// Cargo 1.100, in the unit's `out/`).
+fn compiler_dep_infos(
+    from: &Path,
+    layout: Layout,
+    unit: &Unit,
+    deps: &HashMap<String, Vec<PathBuf>>,
+) -> Vec<PathBuf> {
+    let dep_info = |file: &PathBuf| file.extension() == Some(OsStr::new("d")) && file.is_file();
+    match layout {
+        Layout::Shared => deps
+            .get(&unit.hash)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .chain(entries(
+                &from
+                    .join("build")
+                    .join(format!("{}-{}", unit.package, unit.hash)),
+            ))
+            .filter(dep_info)
+            .collect(),
+        Layout::PerUnit => entries(&build_script_out_dir(from, layout, unit))
+            .into_iter()
+            .filter(dep_info)
+            .collect(),
+    }
+}
+
 /// A path into the donor in the unit's recorded build-script output, other
 /// than its own `OUT_DIR`, which Cargo rewrites when it replays the output.
 fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, needles: &[String]) -> bool {
@@ -1493,8 +1523,15 @@ pub(crate) fn seed_for_lane(
                                     &unit.package,
                                     &fingerprint_dir(from, layout, unit),
                                 ) {
-                                    Some(verified) => Some(verified),
-                                    None => continue,
+                                    Some(verified)
+                                        if verified.is_run()
+                                            || !cross.reads_checkout_from_env(
+                                                &compiler_dep_infos(from, layout, unit, deps),
+                                            ) =>
+                                    {
+                                        Some(verified)
+                                    }
+                                    _ => continue,
                                 }
                             }
                             _ => None,

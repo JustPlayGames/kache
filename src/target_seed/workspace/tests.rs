@@ -173,7 +173,10 @@ fn a_unit_built_from_this_checkouts_bytes_is_verified_and_dated_to_the_check() {
     let fixture = Fixture::new(&[(0, "src/lib.rs"), (0, "../../shared/x.txt")]);
     let before = SystemTime::now();
     let verified = fixture.verify().expect("same bytes");
-    assert!(verified.stamp >= before && verified.stamp <= SystemTime::now());
+    assert!(
+        verified.stamp >= crate::build_script::write_floor(before)
+            && verified.stamp <= SystemTime::now()
+    );
     // Only the dep-info takes the date.
     let copy = fixture.donor.join("copy");
     std::fs::create_dir_all(&copy).unwrap();
@@ -264,6 +267,48 @@ fn files_outside_the_package_are_checked_and_some_paths_refused() {
     let fixture = Fixture::new(&[(0, "src/lib.rs")]);
     std::fs::remove_file(fixture.fingerprint.join("dep-lib-p")).unwrap();
     assert_eq!(fixture.verify(), None);
+}
+
+/// Cargo leaves the variables it sets out of its own dep-info and does not
+/// compare them, so a copy would keep the donor's
+/// `env!("CARGO_MANIFEST_DIR")`: the compiler's dep-info decides.
+#[test]
+fn a_unit_that_read_the_donors_checkout_from_the_environment_stays_out() {
+    let fixture = Fixture::new(&[]);
+    let check = fixture.check().unwrap();
+    let donor = fixture.donor.to_str().unwrap().to_owned();
+    let dep_info = fixture.donor.join("target/debug/deps/p-0123456789abcdef.d");
+    for (case, env, kept_out) in [
+        (
+            "its package's folder",
+            format!("CARGO_MANIFEST_DIR={donor}/crates/p"),
+            true,
+        ),
+        (
+            "the checkout in a longer value",
+            format!("V=x:{donor}/y"),
+            true,
+        ),
+        (
+            "its OUT_DIR in the target",
+            format!("OUT_DIR={donor}/target/debug/build/p-1/out"),
+            false,
+        ),
+        ("another path", "V=/usr/share/x".to_owned(), false),
+        ("no value", "V".to_owned(), false),
+    ] {
+        write(
+            &dep_info,
+            format!("x.d: src/lib.rs\n\nsrc/lib.rs:\n\n# env-dep:{env}\n").as_bytes(),
+        );
+        assert_eq!(
+            check.reads_checkout_from_env(std::slice::from_ref(&dep_info)),
+            kept_out,
+            "{case}"
+        );
+    }
+    assert!(check.reads_checkout_from_env(&[]), "no dep-info to read");
+    assert!(check.reads_checkout_from_env(&[fixture.donor.join("gone.d")]));
 }
 
 #[test]
