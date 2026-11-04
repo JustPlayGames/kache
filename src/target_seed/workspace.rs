@@ -485,10 +485,12 @@ impl CrossCheckout {
                 // The same file for both checkouts.
                 return modified(path).is_some_and(|time| time <= reference);
             };
+            // `src/../../assets/x` (an `include_bytes!` that climbs out of
+            // its package) stays below the checkout; each side's path is
+            // compared as the compiler opened it there.
             let our_file = self.our_root.join(within);
-            return within
-                .components()
-                .all(|c| matches!(c, Component::Normal(_)))
+            return normal(within)
+                .is_some_and(|below| !self.donor_root.join(below).starts_with(&self.donor_target))
                 && modified(path).is_some_and(|time| time <= reference)
                 && same_bytes(path, &our_file, self.deadline);
         }
