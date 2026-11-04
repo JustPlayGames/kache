@@ -95,6 +95,8 @@ fn build(workspace: &Path, target: &Path, cache: &Path, mode: &str) -> Vec<serde
         .env("DECLARATION_MODE", mode)
         .env("KACHE_BUILD_SCRIPT_CACHE", "1")
         .env("KACHE_BUILD_SCRIPT_HERMETIC", "0")
+        // The store's answers, not a target seeded from another.
+        .env("KACHE_SEED_WORKSPACE_UNITS", "0")
         .env_remove("KACHE_BASE_DIR")
         .env_remove("KACHE_DISABLED")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
