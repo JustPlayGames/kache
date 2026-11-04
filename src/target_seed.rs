@@ -899,6 +899,7 @@ fn copy_unit(
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
     counts: &FileCounts,
+    staging: &Staging,
     rebase: &kache_store::link::DepinfoRebase,
     checkout: Option<(&Path, &Path)>,
     deadline: Instant,
@@ -917,12 +918,13 @@ fn copy_unit(
     match layout {
         Layout::PerUnit => {
             let package = to.join("build").join(&unit.package);
-            std::fs::create_dir_all(&package)?;
+            counts.make_dir(&package)?;
             place_tree(
                 &from.join("build").join(&unit.package).join(&unit.hash),
                 &package.join(&unit.hash),
                 cache_dir,
                 counts,
+                staging,
                 deadline,
                 Some(&relocation),
             )
@@ -935,7 +937,7 @@ fn copy_unit(
                     continue;
                 };
                 let to_dir = to.join(dir);
-                std::fs::create_dir_all(&to_dir)?;
+                counts.make_dir(&to_dir)?;
                 let at = to_dir.join(file_name(file));
                 if !at.exists() {
                     place_tree(
@@ -943,6 +945,7 @@ fn copy_unit(
                         &at,
                         cache_dir,
                         counts,
+                        staging,
                         deadline,
                         Some(&relocation),
                     )?;
@@ -950,22 +953,24 @@ fn copy_unit(
             }
             let build = from.join("build").join(&named);
             if build.is_dir() {
-                std::fs::create_dir_all(to.join("build"))?;
+                counts.make_dir(&to.join("build"))?;
                 place_tree(
                     &build,
                     &to.join("build").join(&named),
                     cache_dir,
                     counts,
+                    staging,
                     deadline,
                     Some(&relocation),
                 )?;
             }
-            std::fs::create_dir_all(to.join(".fingerprint"))?;
+            counts.make_dir(&to.join(".fingerprint"))?;
             place_tree(
                 &from.join(".fingerprint").join(&named),
                 &to.join(".fingerprint").join(&named),
                 cache_dir,
                 counts,
+                staging,
                 deadline,
                 Some(&relocation),
             )
@@ -973,12 +978,13 @@ fn copy_unit(
     }
 }
 
-/// Copy `from` (a file or a directory) beside `to` and rename it there.
+/// Copy `from` (a file or a directory) into `staging` and rename it to `to`.
 fn place_tree(
     from: &Path,
     to: &Path,
     cache_dir: &Path,
     counts: &FileCounts,
+    staging: &Staging,
     deadline: Instant,
     relocation: Option<&relocation::Relocation<'_>>,
 ) -> std::io::Result<()> {
@@ -986,7 +992,7 @@ fn place_tree(
     if link_in_place(from, to, counts, relocation, deadline)? {
         return Ok(());
     }
-    let staging = to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id()));
+    let staging = staging.path_for(to);
     let placed = std::sync::Mutex::new(Vec::new());
     let tree = Placing {
         from,
@@ -1018,6 +1024,48 @@ fn place_tree(
         let _ = std::fs::remove_file(&staging);
     }
     copied
+}
+
+/// Where a copy thread builds what it places by rename: in a directory of
+/// the thread's own in the new profile, else beside each final name.
+///
+/// Making a directory is the costliest change a seeding asks of the
+/// filesystem (ext4: an inode and a block, 0.4-0.5 ms against 26-38 µs to
+/// create a file or rename one), and the parent stays locked meanwhile. Four
+/// threads making each unit's staging directory beside the others in
+/// `.fingerprint/` took turns, no faster than one, and under load each turn
+/// grew: a seeding's copy was 85-95 % of it. In a directory of its own each
+/// thread makes them side by side, and the parents shared by every unit
+/// (`.fingerprint/`, `build/`, `deps/`) see one rename a placement, which
+/// still makes each name whole at once.
+struct Staging(Option<tempfile::TempDir>);
+
+impl Staging {
+    /// A directory of this thread's own in `profile`, removed with whatever
+    /// a failed copy left in it when the thread is done; beside each final
+    /// name when it cannot be made.
+    fn in_profile(profile: &Path) -> Self {
+        Self(
+            tempfile::Builder::new()
+                .prefix(STAGING)
+                .tempdir_in(profile)
+                .ok(),
+        )
+    }
+
+    /// Beside each final name.
+    #[cfg(test)]
+    fn beside() -> Self {
+        Self(None)
+    }
+
+    /// Where `to` is built before its rename.
+    fn path_for(&self, to: &Path) -> PathBuf {
+        match &self.0 {
+            Some(dir) => dir.path().join(file_name(to)),
+            None => to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id())),
+        }
+    }
 }
 
 /// Link the donor file `from` straight to its final name `to`, once this
@@ -1306,7 +1354,8 @@ fn cannot_clone(error: &anyhow::Error) -> bool {
     error.kind() == std::io::ErrorKind::Unsupported
 }
 
-/// Files a seeding gave by hard link and by copy or clone.
+/// Files a seeding gave by hard link and by copy or clone, and the
+/// directories it made for them.
 #[derive(Debug, Default)]
 struct FileCounts {
     linked: AtomicUsize,
@@ -1318,6 +1367,28 @@ struct FileCounts {
     no_clones: std::sync::atomic::AtomicBool,
     /// Files placed for good, at their final paths.
     placed: std::sync::Mutex<Vec<PlacedFile>>,
+    /// The new profile's directories this seeding made or found.
+    made: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+}
+
+impl FileCounts {
+    /// Make the directory `dir` once a seeding: each unit placed into
+    /// `deps/`, `build/` or `.fingerprint/` asked for its directory again,
+    /// a lookup and a refused `mkdir`, which waits for the directory's lock
+    /// like a change of it.
+    fn make_dir(&self, dir: &Path) -> std::io::Result<()> {
+        let lock = || {
+            self.made
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        if lock().contains(dir) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(dir)?;
+        lock().insert(dir.to_path_buf());
+        Ok(())
+    }
 }
 
 /// Give `to` the donor file `from` (`below` is its path inside the unit's
@@ -1630,6 +1701,7 @@ pub(crate) fn seed_for_lane(
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
+                    let staging = Staging::in_profile(to);
                     loop {
                         // Taken only while the deadline allows: a unit
                         // left at the end counts as left.
@@ -1686,8 +1758,8 @@ pub(crate) fn seed_for_lane(
                             _ => None,
                         };
                         match copy_unit(
-                            from, to, layout, unit, deps, cache_dir, files, rebase, checkout,
-                            limit,
+                            from, to, layout, unit, deps, cache_dir, files, &staging, rebase,
+                            checkout, limit,
                         ) {
                             Ok(()) => {
                                 // Cargo waits on our lock until the dep-info
@@ -4623,6 +4695,7 @@ source = "git+https://example.com/gitdep#abc"
             &to,
             no_runs().path(),
             &FileCounts::default(),
+            &Staging::beside(),
             later(),
             None,
         )
@@ -4645,6 +4718,7 @@ source = "git+https://example.com/gitdep#abc"
                 &dir.path().join("escaped"),
                 no_runs().path(),
                 &FileCounts::default(),
+                &Staging::beside(),
                 later(),
                 None
             )
@@ -4660,6 +4734,7 @@ source = "git+https://example.com/gitdep#abc"
                 &dir.path().join("whole"),
                 no_runs().path(),
                 &FileCounts::default(),
+                &Staging::beside(),
                 later(),
                 None
             )
@@ -4800,6 +4875,7 @@ source = "git+https://example.com/gitdep#abc"
             &to,
             no_runs().path(),
             &FileCounts::default(),
+            &Staging::beside(),
             Instant::now(),
             None,
         )
@@ -4811,6 +4887,7 @@ source = "git+https://example.com/gitdep#abc"
             &to,
             no_runs().path(),
             &FileCounts::default(),
+            &Staging::beside(),
             later(),
             None,
         )
@@ -4913,7 +4990,16 @@ source = "git+https://example.com/gitdep#abc"
         write(&dep_info, "d");
         let to = dir.path().join("placed");
         let counts = FileCounts::default();
-        place_tree(&from, &to, no_runs().path(), &counts, later(), None).unwrap();
+        place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &counts,
+            &Staging::beside(),
+            later(),
+            None,
+        )
+        .unwrap();
         let linked = to.join("libdep-0123456789abcdef.rlib");
         let copied = to.join("dep-0123456789abcdef.d");
         assert_eq!(std::fs::read_to_string(&linked).unwrap(), "rlib");
@@ -5026,9 +5112,20 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::create_dir(&deps).unwrap();
         let watch = Watch::new(&deps);
         let counts = FileCounts::default();
+        // As a copy thread stages: in a directory of its own.
+        let staging = Staging::in_profile(dir.path());
         for file in blobs.iter().chain([&dep_info]) {
             let to = deps.join(file_name(file));
-            place_tree(file, &to, no_runs().path(), &counts, later(), None).unwrap();
+            place_tree(
+                file,
+                &to,
+                no_runs().path(),
+                &counts,
+                &staging,
+                later(),
+                None,
+            )
+            .unwrap();
             assert_eq!(
                 std::fs::read(&to).unwrap(),
                 std::fs::read(file).unwrap(),
@@ -5074,7 +5171,16 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::set_permissions(&generated, std::fs::Permissions::from_mode(0o444)).unwrap();
         let to = dir.path().join("placed");
         let counts = FileCounts::default();
-        place_tree(&from, &to, no_runs().path(), &counts, later(), None).unwrap();
+        place_tree(
+            &from,
+            &to,
+            no_runs().path(),
+            &counts,
+            &Staging::beside(),
+            later(),
+            None,
+        )
+        .unwrap();
         let placed = to.join("out/bindings.rs");
         assert_ne!(
             std::fs::metadata(&generated).unwrap().ino(),
