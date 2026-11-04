@@ -396,7 +396,11 @@ struct Unit {
 /// whose dependencies it copied too: Cargo rebuilds a unit whose dependency
 /// it rebuilds, so a unit copied without its dependencies is copied in vain.
 fn units(profile: &Path, layout: Layout, packages: &BTreeSet<String>) -> Vec<Unit> {
-    let mut units = units_by_name(profile, layout, packages);
+    in_build_order(profile, layout, units_by_name(profile, layout, packages))
+}
+
+/// `units` of `profile` in the order the donor built them ([`units`]).
+fn in_build_order(profile: &Path, layout: Layout, mut units: Vec<Unit>) -> Vec<Unit> {
     // Stable: units built at the same time keep their names' order, and a
     // unit without a time goes last.
     units.sort_by_cached_key(|unit| {
@@ -1696,7 +1700,7 @@ pub(crate) fn seed_for_lane(
         return Seeded::default();
     }
     let checked = mode == WorkspaceUnits::Checked;
-    for (tried, (donor, layout)) in
+    for (tried, (donor, layout, read)) in
         ranked_donors(target, rustc_version, donors, &registry, &both, checked, check_lane)
             .enumerate()
     {
@@ -1734,15 +1738,24 @@ pub(crate) fn seed_for_lane(
         let Some(_theirs) = try_lock_shared(&from.join(".cargo-lock")) else {
             continue;
         };
-        let deps = match layout {
-            Layout::Shared => outputs_by_hash(&from),
-            Layout::PerUnit => HashMap::new(),
+        // A check's donor ranked first was read whole by the ranking: its
+        // outputs, units and demand are not read a second time.
+        let (deps, mut units, demand) = match (layout, read) {
+            (Layout::Shared, Some(read)) => {
+                let mut held = read.held;
+                held.retain(|unit| packages.contains(&unit.package));
+                (read.deps, in_build_order(&from, layout, held), read.demand)
+            }
+            (Layout::Shared, None) => {
+                let deps = outputs_by_hash(&from);
+                let demand = check_lane
+                    .then(|| check_demand(&from, &registry, &deps))
+                    .flatten();
+                (deps, units(&from, layout, packages), demand)
+            }
+            (Layout::PerUnit, _) => (HashMap::new(), units(&from, layout, packages), None),
         };
-        let mut units = units(&from, layout, packages);
-        if check_lane
-            && layout == Layout::Shared
-            && let Some(demand) = check_demand(&from, &registry, &deps)
-        {
+        if let Some(demand) = demand {
             let all = units.len();
             units.retain(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)));
             tracing::info!(
@@ -1939,6 +1952,9 @@ const RANKED_DONORS: usize = 8;
 /// `cargo xtask` command builds the dependencies of one crate, 361 units of
 /// a 1,900-unit workspace. Seeding stops at the first donor it copies from,
 /// so taking the most recent one alone left a new checkout with those 361.
+///
+/// A check's ranked donor of the shared layout comes with what ranking read
+/// of it ([`CheckRead`]), which seeding it uses again.
 fn ranked_donors<'a>(
     target: &'a NewTarget,
     rustc_version: &'a str,
@@ -1947,7 +1963,7 @@ fn ranked_donors<'a>(
     both: &BTreeSet<String>,
     checked: bool,
     check_lane: bool,
-) -> impl Iterator<Item = (&'a Donor, Layout)> + 'a {
+) -> impl Iterator<Item = (&'a Donor, Layout, Option<CheckRead>)> + 'a {
     let mut usable = donors.iter().filter_map(move |donor| {
         if donor.target_dir == target.target_dir
             || seed_lane(&donor.target_dir) != seed_lane(&target.target_dir)
@@ -1972,9 +1988,10 @@ fn ranked_donors<'a>(
                         registry
                     };
                     if check_lane && layout == Layout::Shared {
-                        check_units(&profile, registry, packages)
+                        let read = CheckRead::of(&profile, registry, packages);
+                        (read.units(), Some(read))
                     } else {
-                        units_by_name(&profile, layout, packages).len()
+                        (units_by_name(&profile, layout, packages).len(), None)
                     }
                 })
             })
@@ -1982,7 +1999,10 @@ fn ranked_donors<'a>(
         candidates
             .iter()
             .zip(counts)
-            .map(|(&(donor, layout), count)| (donor, layout, count.join().unwrap_or(0)))
+            .map(|(&(donor, layout), count)| {
+                let (count, read) = count.join().unwrap_or((0, None));
+                (donor, layout, count, read)
+            })
             .collect()
     });
     // A target of the same checkout first: it gives every unit without
@@ -1990,8 +2010,8 @@ fn ranked_donors<'a>(
     ranked.sort_by_key(|entry| (!same_checkout(entry.0, target), std::cmp::Reverse(entry.2)));
     ranked
         .into_iter()
-        .map(|(donor, layout, _)| (donor, layout))
-        .chain(usable)
+        .map(|(donor, layout, _, read)| (donor, layout, read))
+        .chain(usable.map(|(donor, layout)| (donor, layout, None)))
 }
 
 /// The units of `packages` in a donor's shared-layout `profile` a check
@@ -2004,22 +2024,51 @@ fn ranked_donors<'a>(
 /// seeded from a checkout's test-build target, whose checks had used 808 to
 /// 1,000 registry units, while another checkout's workspace check, which
 /// used 1,285, held fewer units in all.
+#[cfg(test)]
 fn check_units(
     profile: &Path,
     registry: &BTreeSet<String>,
     packages: &BTreeSet<String>,
 ) -> usize {
-    let deps = outputs_by_hash(profile);
-    let held = units_by_name(profile, Layout::Shared, packages);
-    match check_demand(profile, registry, &deps) {
-        Some(demand) => held
-            .iter()
-            .filter(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)))
-            .count(),
-        None => held
-            .iter()
-            .filter(|unit| metadata_only(&deps, &unit.hash))
-            .count(),
+    CheckRead::of(profile, registry, packages).units()
+}
+
+/// What ranking reads of a shared-layout donor for a check: its outputs by
+/// unit hash ([`outputs_by_hash`]), its units of the packages asked for, and
+/// what its workspace check used ([`check_demand`]). The donor ranked first
+/// is seeded from the same read, taken moments before: every file a unit's
+/// copy takes is still read under the donor's lock, and a unit Cargo builds
+/// meanwhile is left to the wrapper. Read a second time, the 2,188
+/// fingerprints of a 600-crate workspace's donor were listed and parsed
+/// twice before the first unit was copied.
+struct CheckRead {
+    deps: HashMap<String, Vec<PathBuf>>,
+    held: Vec<Unit>,
+    demand: Option<std::collections::HashSet<String>>,
+}
+
+impl CheckRead {
+    fn of(profile: &Path, registry: &BTreeSet<String>, packages: &BTreeSet<String>) -> Self {
+        let deps = outputs_by_hash(profile);
+        let held = units_by_name(profile, Layout::Shared, packages);
+        let demand = check_demand(profile, registry, &deps);
+        Self { deps, held, demand }
+    }
+
+    /// How many units a check would be given ([`check_units`]).
+    fn units(&self) -> usize {
+        match &self.demand {
+            Some(demand) => self
+                .held
+                .iter()
+                .filter(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)))
+                .count(),
+            None => self
+                .held
+                .iter()
+                .filter(|unit| metadata_only(&self.deps, &unit.hash))
+                .count(),
+        }
     }
 }
 
