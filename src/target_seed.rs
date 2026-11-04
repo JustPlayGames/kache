@@ -26,7 +26,11 @@
 //!   ([`same_checkout`]), where Cargo compares the very files the donor's
 //!   units were built from, as it would in the donor target itself.
 //!   Integrate builds a new target per check in the checkout the work was
-//!   done in. `KACHE_SEED_WORKSPACE_UNITS=0` leaves them out.
+//!   done in. From another checkout's target, a path unit is copied only
+//!   when its package's files are the same bytes in both checkouts, and
+//!   its copied dep-info is dated to when that was checked
+//!   ([`workspace`]). `KACHE_SEED_WORKSPACE_UNITS=same` keeps them to the
+//!   same checkout, `0` leaves them out.
 //! - Modification times are kept: Cargo rebuilds a unit whose dependencies'
 //!   outputs are newer than its own.
 //! - Files are cloned where the filesystem can. Otherwise a file nobody may
@@ -62,6 +66,7 @@
 
 mod placement;
 mod relocation;
+mod workspace;
 
 use crate::invocation::process::CommandExt as _;
 use std::collections::{BTreeSet, HashMap};
@@ -232,15 +237,38 @@ pub(crate) fn path_packages(lockfile: &str) -> BTreeSet<String> {
     &path - &registry
 }
 
-/// Whether workspace (path) units are seeded from a donor target of the same
-/// checkout: on unless `KACHE_SEED_WORKSPACE_UNITS` is `0`, `false`, `no` or
-/// `off`.
-fn workspace_units_wanted(value: Option<&OsStr>) -> bool {
-    !value.and_then(OsStr::to_str).map(str::trim).is_some_and(|value| {
-        ["0", "false", "no", "off"]
-            .iter()
-            .any(|off| value.eq_ignore_ascii_case(off))
-    })
+/// Which donors give workspace (path) units, from
+/// `KACHE_SEED_WORKSPACE_UNITS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceUnits {
+    /// `0`, `false`, `no` or `off`: none.
+    Off,
+    /// `same`: targets of the same checkout only.
+    SameCheckout,
+    /// Anything else, or unset: also another checkout's, checked by content.
+    Checked,
+}
+
+fn workspace_units_wanted(value: Option<&OsStr>) -> WorkspaceUnits {
+    match value.and_then(OsStr::to_str).map(str::trim) {
+        Some(value)
+            if ["0", "false", "no", "off"]
+                .iter()
+                .any(|off| value.eq_ignore_ascii_case(off)) =>
+        {
+            WorkspaceUnits::Off
+        }
+        Some(value) if value.eq_ignore_ascii_case("same") => WorkspaceUnits::SameCheckout,
+        _ => WorkspaceUnits::Checked,
+    }
+}
+
+/// The directory holding a unit's fingerprint and dep-info.
+fn fingerprint_dir(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
+    match layout {
+        Layout::PerUnit => marker(profile, layout, unit).join("fingerprint"),
+        Layout::Shared => marker(profile, layout, unit),
+    }
 }
 
 /// Whether `donor` was built from the checkout `target` is for. Cargo then
@@ -1328,12 +1356,12 @@ pub(crate) fn seed_for_lane(
         return Seeded::default();
     };
     let registry = registry_packages(&lockfile);
-    let workspace =
-        if workspace_units_wanted(std::env::var_os("KACHE_SEED_WORKSPACE_UNITS").as_deref()) {
-            path_packages(&lockfile)
-        } else {
-            BTreeSet::new()
-        };
+    let mode = workspace_units_wanted(std::env::var_os("KACHE_SEED_WORKSPACE_UNITS").as_deref());
+    let workspace = if mode == WorkspaceUnits::Off {
+        BTreeSet::new()
+    } else {
+        path_packages(&lockfile)
+    };
     if (registry.is_empty() && workspace.is_empty()) || rustc_version.trim().is_empty() {
         return Seeded::default();
     }
@@ -1353,13 +1381,30 @@ pub(crate) fn seed_for_lane(
     if built(&target.target_dir) {
         return Seeded::default();
     }
-    for (donor, layout) in ranked_donors(target, rustc_version, donors, &registry, &both, check_lane)
+    let checked = mode == WorkspaceUnits::Checked;
+    for (donor, layout) in
+        ranked_donors(target, rustc_version, donors, &registry, &both, checked, check_lane)
     {
         if Instant::now() >= deadline {
             break;
         }
         let same_checkout = same_checkout(donor, target);
-        let packages = if same_checkout { &both } else { &registry };
+        // Another checkout's workspace units, each checked by content.
+        let cross = (!same_checkout && checked && !workspace.is_empty())
+            .then(|| {
+                workspace::CrossCheckout::new(
+                    &donor.workspace_root,
+                    &target.workspace_root,
+                    &workspace,
+                    deadline,
+                )
+            })
+            .flatten();
+        let packages = if same_checkout || cross.is_some() {
+            &both
+        } else {
+            &registry
+        };
         let needles = needles_for(donor, same_checkout);
         let from = donor.target_dir.join(PROFILE);
         let Some(_theirs) = try_lock_shared(&from.join(".cargo-lock")) else {
@@ -1389,9 +1434,10 @@ pub(crate) fn seed_for_lane(
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
                 let cancellation = cancellation.clone();
-                let (units, next, copied, from, to, deps, files, recorded, needles) = (
-                    &units, &next, &copied, &from, &to, &deps, &files, &recorded, &needles,
+                let (units, next, copied, from, to, deps, files, recorded, needles, cross) = (
+                    &units, &next, &copied, &from, &to, &deps, &files, &recorded, &needles, &cross,
                 );
+                let workspace = &workspace;
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
@@ -1410,8 +1456,36 @@ pub(crate) fn seed_for_lane(
                         {
                             continue;
                         }
+                        // A workspace unit from another checkout goes only
+                        // once its sources are this checkout's bytes.
+                        let verified = match cross {
+                            Some(cross) if workspace.contains(&unit.package) => {
+                                match cross.verify(
+                                    &unit.package,
+                                    &fingerprint_dir(from, layout, unit),
+                                ) {
+                                    Some(verified) => Some(verified),
+                                    None => continue,
+                                }
+                            }
+                            _ => None,
+                        };
                         match copy_unit(from, to, layout, unit, deps, cache_dir, files, deadline) {
                             Ok(()) => {
+                                // Cargo waits on our lock until the dep-info
+                                // is dated and names this checkout's files.
+                                // One that fails is removed: Cargo builds
+                                // the unit.
+                                if let (Some(verified), Some(cross)) = (verified, cross.as_ref())
+                                    && let Err(error) = cross
+                                        .date(&fingerprint_dir(to, layout, unit), verified.stamp)
+                                {
+                                    tracing::debug!(
+                                        "could not date {}-{}: {error}",
+                                        unit.package,
+                                        unit.hash
+                                    );
+                                }
                                 copied.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(error) => {
@@ -1506,6 +1580,7 @@ fn ranked_donors<'a>(
     donors: &'a [Donor],
     registry: &BTreeSet<String>,
     both: &BTreeSet<String>,
+    checked: bool,
     check_lane: bool,
 ) -> impl Iterator<Item = (&'a Donor, Layout)> + 'a {
     let mut usable = donors.iter().filter_map(move |donor| {
@@ -1526,7 +1601,7 @@ fn ranked_donors<'a>(
             .map(|&(donor, layout)| {
                 scope.spawn(move || {
                     let profile = donor.target_dir.join(PROFILE);
-                    let packages = if same_checkout(donor, target) {
+                    let packages = if checked || same_checkout(donor, target) {
                         both
                     } else {
                         registry
@@ -2810,12 +2885,13 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
-    /// A path package's units come only from a target of the same checkout,
-    /// whose files Cargo then compares as it would in the donor target. A
-    /// script output naming that checkout does not keep them out; one naming
-    /// the donor's target still does.
+    /// A path package's units come from a target of the same checkout, whose
+    /// files Cargo then compares as it would in the donor target, and from
+    /// another checkout only with a dep-info whose files check out
+    /// ([`workspace`]; these fixtures have none). A script output naming that
+    /// checkout does not keep them out; one naming the donor's target does.
     #[test]
-    fn workspace_units_are_seeded_from_the_same_checkout_only() {
+    fn workspace_units_are_seeded_from_the_same_checkout_or_checked() {
         for layout in [Layout::PerUnit, Layout::Shared] {
             let dir = tempfile::tempdir().unwrap();
             let donor = donor(dir.path(), "a", layout);
@@ -2903,10 +2979,24 @@ source = "git+https://example.com/gitdep#abc"
         assert!(path_packages(&shadowed).is_empty());
         assert!(path_packages("not toml [").is_empty());
         for on in [None, Some(""), Some("1"), Some("on"), Some("yes")] {
-            assert!(workspace_units_wanted(on.map(OsStr::new)), "{on:?}");
+            assert_eq!(
+                workspace_units_wanted(on.map(OsStr::new)),
+                WorkspaceUnits::Checked,
+                "{on:?}"
+            );
+        }
+        for same in ["same", " Same "] {
+            assert_eq!(
+                workspace_units_wanted(Some(OsStr::new(same))),
+                WorkspaceUnits::SameCheckout
+            );
         }
         for off in ["0", "false", "No", " off "] {
-            assert!(!workspace_units_wanted(Some(OsStr::new(off))), "{off}");
+            assert_eq!(
+                workspace_units_wanted(Some(OsStr::new(off))),
+                WorkspaceUnits::Off,
+                "{off}"
+            );
         }
     }
 
