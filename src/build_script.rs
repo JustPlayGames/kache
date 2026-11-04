@@ -187,11 +187,8 @@ pub fn install_shim(config: &Config, args: &RustcArgs) {
     let Some(executable) = compiled_build_script(args) else {
         return;
     };
-    let installed = kache_store::file_hash::hash_file(&executable).and_then(|binary_hash| {
-        if leaves_bound_runs_to_cargo(config, &executable, &binary_hash) {
-            return Ok(());
-        }
-        install_hashed(&executable, &binary_hash)
+    let installed = install_unless(&executable, |binary_hash| {
+        leaves_bound_runs_to_cargo(config, &executable, binary_hash)
     });
     if let Err(error) = installed {
         log_bypass(&error.context("installing the build-script launcher"));
@@ -305,15 +302,23 @@ fn record_bytes(path: &OsStr) -> Result<&[u8]> {
     }
 }
 
-/// [`install_shim`]'s launcher for one binary, hashed here.
+/// [`install_shim`]'s launcher for one binary.
 #[cfg(all(test, unix))]
 pub(crate) fn install(executable: &Path) -> Result<()> {
-    install_hashed(executable, &kache_store::file_hash::hash_file(executable)?)
+    install_unless(executable, |_| false)
 }
 
-/// [`install`], given the binary's hash.
+/// Put the launcher in place of the build script `executable`, unless
+/// `leave`, given the script's hash, says its runs stay Cargo's.
+///
+/// The script is hashed under the unit directory's lock. Two wrappers that
+/// restored the same script install at once (kunobi-ninja/kache#1808): the
+/// second one to take the lock finds the launcher in place and leaves it.
+/// Hashed before the lock, it could open the path in the moment between the
+/// first one preserving the script and renaming the launcher in, when no
+/// file has that name, and fail.
 #[cfg(any(unix, windows))]
-fn install_hashed(executable: &Path, binary_hash: &str) -> Result<()> {
+fn install_unless(executable: &Path, leave: impl FnOnce(&str) -> bool) -> Result<()> {
     let directory = executable
         .parent()
         .context("build script has no parent directory")?;
@@ -322,6 +327,10 @@ fn install_hashed(executable: &Path, binary_hash: &str) -> Result<()> {
     // An earlier install already put the launcher here and preserved the
     // script. Preserving the launcher in its place would lose the script.
     if is_launcher(executable) {
+        return Ok(());
+    }
+    let binary_hash = kache_store::file_hash::hash_file(executable)?;
+    if leave(&binary_hash) {
         return Ok(());
     }
     let metadata = std::fs::metadata(executable)?;
@@ -350,7 +359,7 @@ fn install_hashed(executable: &Path, binary_hash: &str) -> Result<()> {
 
     std::fs::rename(executable, &real).context("preserving the build script")?;
     let installed = (|| -> Result<()> {
-        std::fs::write(&action, binary_hash)?;
+        std::fs::write(&action, &binary_hash)?;
         let real_name = real.file_name().context("preserved script has no name")?;
         std::fs::write(
             &record,
@@ -457,7 +466,7 @@ fn is_launcher(path: &Path) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn install_hashed(_executable: &Path, _binary_hash: &str) -> Result<()> {
+fn install_unless(_executable: &Path, _leave: impl FnOnce(&str) -> bool) -> Result<()> {
     anyhow::bail!("build-script launchers are only installed on Unix and Windows")
 }
 
