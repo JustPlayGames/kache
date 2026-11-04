@@ -768,7 +768,34 @@ fn package_roots(
             return None;
         }
         let manifest = dir.join("Cargo.toml");
-        if manifest.is_file()
+        // Whether the directory holds a manifest, from its listing: asked of
+        // every directory of the checkout, it was 1,670 failed calls for a
+        // 600-crate workspace. A link is followed, as before.
+        let mut holds_manifest = None;
+        if let Ok(listed) = std::fs::read_dir(&dir) {
+            holds_manifest = Some(false);
+            for entry in listed.flatten() {
+                seen += 1;
+                if seen > MAX_MANIFEST_WALK {
+                    return None;
+                }
+                let name = entry.file_name();
+                let kind = entry.file_type().ok();
+                if name == OsStr::new("Cargo.toml") {
+                    holds_manifest = Some(kind.is_some_and(|kind| {
+                        kind.is_file() || (kind.is_symlink() && manifest.is_file())
+                    }));
+                }
+                if SKIPPED_DIRS.iter().any(|skip| name == OsStr::new(skip)) {
+                    continue;
+                }
+                if kind.is_some_and(|kind| kind.is_dir()) {
+                    dirs.push(entry.path());
+                }
+            }
+        }
+        // A directory that cannot be listed may still be searched.
+        if holds_manifest.unwrap_or_else(|| manifest.is_file())
             && let Some(name) = package_name(&manifest)
             && packages.contains(&name)
         {
@@ -777,22 +804,6 @@ fn package_roots(
                 .entry(name)
                 .and_modify(|known| *known = None)
                 .or_insert(Some(relative));
-        }
-        let Ok(listed) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in listed.flatten() {
-            seen += 1;
-            if seen > MAX_MANIFEST_WALK {
-                return None;
-            }
-            let name = entry.file_name();
-            if SKIPPED_DIRS.iter().any(|skip| name == OsStr::new(skip)) {
-                continue;
-            }
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                dirs.push(entry.path());
-            }
         }
     }
     Some(
