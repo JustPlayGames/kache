@@ -19,9 +19,14 @@
 //! with the same hash in another target directory is the same unit. The copy
 //! keeps what Cargo's freshness check relies on:
 //!
-//! - Only packages with a `source` in `Cargo.lock` are copied. A path
-//!   package's fingerprint trusts its sources' modification times, so a copy
-//!   from a checkout with different sources could pass as fresh.
+//! - Packages with a `source` in `Cargo.lock` are copied from any checkout.
+//!   A path package's fingerprint trusts its sources' modification times,
+//!   so a copy from a checkout with different sources could pass as fresh:
+//!   its units are copied only from a donor target of the same checkout
+//!   ([`same_checkout`]), where Cargo compares the very files the donor's
+//!   units were built from, as it would in the donor target itself.
+//!   Integrate builds a new target per check in the checkout the work was
+//!   done in. `KACHE_SEED_WORKSPACE_UNITS=0` leaves them out.
 //! - Modification times are kept: Cargo rebuilds a unit whose dependencies'
 //!   outputs are newer than its own.
 //! - Files are cloned where the filesystem can. Otherwise a file nobody may
@@ -200,6 +205,70 @@ pub(crate) fn registry_packages(lockfile: &str) -> BTreeSet<String> {
     &registry - &path
 }
 
+/// The path packages in a lockfile: those without a `source`, less any name
+/// a registry or git package also uses (a unit's directory names only the
+/// package, so the two could not be told apart).
+pub(crate) fn path_packages(lockfile: &str) -> BTreeSet<String> {
+    let Ok(lock) = lockfile.parse::<toml::Table>() else {
+        return BTreeSet::new();
+    };
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut registry = BTreeSet::new();
+    let mut path = BTreeSet::new();
+    for package in packages {
+        let Some(name) = package.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        if package.get("source").is_some() {
+            registry.insert(name.to_owned());
+        } else {
+            path.insert(name.to_owned());
+        }
+    }
+    &path - &registry
+}
+
+/// Whether workspace (path) units are seeded from a donor target of the same
+/// checkout: on unless `KACHE_SEED_WORKSPACE_UNITS` is `0`, `false`, `no` or
+/// `off`.
+fn workspace_units_wanted(value: Option<&OsStr>) -> bool {
+    !value.and_then(OsStr::to_str).map(str::trim).is_some_and(|value| {
+        ["0", "false", "no", "off"]
+            .iter()
+            .any(|off| value.eq_ignore_ascii_case(off))
+    })
+}
+
+/// Whether `donor` was built from the checkout `target` is for. Cargo then
+/// judges a copied path unit against the files the donor built it from, by
+/// the same modification times it would compare in the donor target, so a
+/// copy is fresh exactly when it would be fresh there.
+fn same_checkout(donor: &Donor, target: &NewTarget) -> bool {
+    let canonical = |path: &Path| std::fs::canonicalize(path).ok();
+    donor.workspace_root == target.workspace_root
+        || canonical(&donor.workspace_root)
+            .is_some_and(|root| Some(root) == canonical(&target.workspace_root))
+}
+
+/// The paths that keep a donor's build-script unit out when its recorded
+/// output or `out/` names one ([`names_the_donor`]): the donor's target and
+/// its checkout. A donor of the same checkout names that checkout's files
+/// as this build does, so only its target counts.
+fn needles_for(donor: &Donor, same_checkout: bool) -> Vec<String> {
+    if same_checkout {
+        donor_needles(&Donor {
+            workspace_root: PathBuf::new(),
+            ..donor.clone()
+        })
+    } else {
+        donor_needles(donor)
+    }
+}
+
 /// A target directory units may be copied from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Donor {
@@ -315,7 +384,7 @@ fn marker(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
 
 /// A path into the donor in the unit's recorded build-script output, other
 /// than its own `OUT_DIR`, which Cargo rewrites when it replays the output.
-fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, donor: &Donor) -> bool {
+fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, needles: &[String]) -> bool {
     let run = match layout {
         Layout::PerUnit => profile
             .join("build")
@@ -339,7 +408,7 @@ fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, donor: &Donor) -
         "" => output.into_owned(),
         out_dir => output.replace(out_dir, ""),
     };
-    donor_needles(donor)
+    needles
         .iter()
         .any(|needle| contains_path(rest.as_bytes(), needle))
 }
@@ -359,7 +428,7 @@ fn out_dir_names_the_donor(
     profile: &Path,
     layout: Layout,
     unit: &Unit,
-    donor: &Donor,
+    needles: &[String],
     deadline: Instant,
 ) -> bool {
     let stdout = match layout {
@@ -376,8 +445,7 @@ fn out_dir_names_the_donor(
     if !stdout.is_file() {
         return false;
     }
-    let needles = donor_needles(donor);
-    OutScan::new(&needles, deadline).keeps_out(&build_script_out_dir(profile, layout, unit))
+    OutScan::new(needles, deadline).keeps_out(&build_script_out_dir(profile, layout, unit))
 }
 
 /// `out/` of a build script: `<unit>/out` since Cargo 1.100, and
@@ -1259,10 +1327,17 @@ pub(crate) fn seed_for_lane(
     let Ok(lockfile) = std::fs::read_to_string(target.workspace_root.join("Cargo.lock")) else {
         return Seeded::default();
     };
-    let packages = registry_packages(&lockfile);
-    if packages.is_empty() || rustc_version.trim().is_empty() {
+    let registry = registry_packages(&lockfile);
+    let workspace =
+        if workspace_units_wanted(std::env::var_os("KACHE_SEED_WORKSPACE_UNITS").as_deref()) {
+            path_packages(&lockfile)
+        } else {
+            BTreeSet::new()
+        };
+    if (registry.is_empty() && workspace.is_empty()) || rustc_version.trim().is_empty() {
         return Seeded::default();
     }
+    let both: BTreeSet<String> = &registry | &workspace;
     let to = target.target_dir.join(PROFILE);
     let creates_target = !target.target_dir.exists();
     if std::fs::create_dir_all(&to).is_err() {
@@ -1278,10 +1353,14 @@ pub(crate) fn seed_for_lane(
     if built(&target.target_dir) {
         return Seeded::default();
     }
-    for (donor, layout) in ranked_donors(target, rustc_version, donors, &packages, check_lane) {
+    for (donor, layout) in ranked_donors(target, rustc_version, donors, &registry, &both, check_lane)
+    {
         if Instant::now() >= deadline {
             break;
         }
+        let same_checkout = same_checkout(donor, target);
+        let packages = if same_checkout { &both } else { &registry };
+        let needles = needles_for(donor, same_checkout);
         let from = donor.target_dir.join(PROFILE);
         let Some(_theirs) = try_lock_shared(&from.join(".cargo-lock")) else {
             continue;
@@ -1290,15 +1369,15 @@ pub(crate) fn seed_for_lane(
             Layout::Shared => deps_by_hash(&from.join("deps")),
             Layout::PerUnit => HashMap::new(),
         };
-        let mut units = units(&from, layout, &packages);
+        let mut units = units(&from, layout, packages);
         if check_lane
             && layout == Layout::Shared
-            && let Some(demand) = check_demand(&from, &packages, &deps)
+            && let Some(demand) = check_demand(&from, &registry, &deps)
         {
             let all = units.len();
             units.retain(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)));
             tracing::info!(
-                "check build: seeding {} of {all} registry units the donor's check used",
+                "check build: seeding {} of {all} units the donor's check used",
                 units.len()
             );
         }
@@ -1310,8 +1389,9 @@ pub(crate) fn seed_for_lane(
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
                 let cancellation = cancellation.clone();
-                let (units, next, copied, from, to, deps, files, recorded) =
-                    (&units, &next, &copied, &from, &to, &deps, &files, &recorded);
+                let (units, next, copied, from, to, deps, files, recorded, needles) = (
+                    &units, &next, &copied, &from, &to, &deps, &files, &recorded, &needles,
+                );
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
@@ -1322,8 +1402,8 @@ pub(crate) fn seed_for_lane(
                             break;
                         }
                         if marker(to, layout, unit).exists()
-                            || names_the_donor(from, layout, unit, donor)
-                            || out_dir_names_the_donor(from, layout, unit, donor, deadline)
+                            || names_the_donor(from, layout, unit, needles)
+                            || out_dir_names_the_donor(from, layout, unit, needles, deadline)
                             || !artifacts_stored(
                                 from, layout, unit, deps, cache_dir, recorded, deadline,
                             )
@@ -1424,7 +1504,8 @@ fn ranked_donors<'a>(
     target: &'a NewTarget,
     rustc_version: &'a str,
     donors: &'a [Donor],
-    packages: &BTreeSet<String>,
+    registry: &BTreeSet<String>,
+    both: &BTreeSet<String>,
     check_lane: bool,
 ) -> impl Iterator<Item = (&'a Donor, Layout)> + 'a {
     let mut usable = donors.iter().filter_map(move |donor| {
@@ -1445,8 +1526,13 @@ fn ranked_donors<'a>(
             .map(|&(donor, layout)| {
                 scope.spawn(move || {
                     let profile = donor.target_dir.join(PROFILE);
+                    let packages = if same_checkout(donor, target) {
+                        both
+                    } else {
+                        registry
+                    };
                     if check_lane && layout == Layout::Shared {
-                        check_units(&profile, packages)
+                        check_units(&profile, registry, packages)
                     } else {
                         units_by_name(&profile, layout, packages).len()
                     }
@@ -1477,10 +1563,14 @@ fn ranked_donors<'a>(
 /// seeded from a checkout's test-build target, whose checks had used 808 to
 /// 1,000 registry units, while another checkout's workspace check, which
 /// used 1,285, held fewer units in all.
-fn check_units(profile: &Path, packages: &BTreeSet<String>) -> usize {
+fn check_units(
+    profile: &Path,
+    registry: &BTreeSet<String>,
+    packages: &BTreeSet<String>,
+) -> usize {
     let deps = deps_by_hash(&profile.join("deps"));
     let held = units_by_name(profile, Layout::Shared, packages);
-    match check_demand(profile, packages, &deps) {
+    match check_demand(profile, registry, &deps) {
         Some(demand) => held
             .iter()
             .filter(|unit| demand.contains(&format!("{}-{}", unit.package, unit.hash)))
@@ -2720,6 +2810,106 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    /// A path package's units come only from a target of the same checkout,
+    /// whose files Cargo then compares as it would in the donor target. A
+    /// script output naming that checkout does not keep them out; one naming
+    /// the donor's target still does.
+    #[test]
+    fn workspace_units_are_seeded_from_the_same_checkout_only() {
+        for layout in [Layout::PerUnit, Layout::Shared] {
+            let dir = tempfile::tempdir().unwrap();
+            let donor = donor(dir.path(), "a", layout);
+            let from = donor.target_dir.join(PROFILE);
+            if layout == Layout::Shared {
+                write(
+                    &from.join(format!("build/app-{OTHER}/output")),
+                    &format!(
+                        "cargo:rerun-if-changed={}\n",
+                        donor.workspace_root.join("app/migrations").display()
+                    ),
+                );
+            }
+            let same = NewTarget {
+                target_dir: donor.workspace_root.join("target/integrate-clippy"),
+                workspace_root: donor.workspace_root.clone(),
+            };
+            let seeded = seed(
+                &same,
+                VERSION,
+                std::slice::from_ref(&donor),
+                no_runs().path(),
+                later(),
+            );
+            assert_eq!(seeded.units, 2, "{layout:?}");
+            let to = same.target_dir.join(PROFILE);
+            for (package, hash) in [("dep", HASH), ("app", OTHER)] {
+                assert!(
+                    marker(&to, layout, &unit(package, hash)).exists(),
+                    "{layout:?} {package}"
+                );
+            }
+
+            let other = checkout(dir.path(), "b");
+            let seeded = seed(
+                &other,
+                VERSION,
+                std::slice::from_ref(&donor),
+                no_runs().path(),
+                later(),
+            );
+            assert_eq!(seeded.units, 1, "{layout:?}: only the registry unit");
+            assert!(
+                !marker(&other.target_dir.join(PROFILE), layout, &unit("app", OTHER)).exists(),
+                "{layout:?}"
+            );
+        }
+        // The donor's own target named in a script's output keeps that unit
+        // out of the same checkout too.
+        let dir = tempfile::tempdir().unwrap();
+        let donor = donor(dir.path(), "a", Layout::Shared);
+        let from = donor.target_dir.join(PROFILE);
+        write(
+            &from.join(format!("build/app-{OTHER}/output")),
+            &format!(
+                "cargo:rustc-link-search=native={}\n",
+                donor.target_dir.join("debug/native").display()
+            ),
+        );
+        let app = unit("app", OTHER);
+        assert!(names_the_donor(
+            &from,
+            Layout::Shared,
+            &app,
+            &needles_for(&donor, true)
+        ));
+        assert!(names_the_donor(
+            &from,
+            Layout::Shared,
+            &app,
+            &needles_for(&donor, false)
+        ));
+    }
+
+    #[test]
+    fn path_packages_and_the_workspace_switch() {
+        assert_eq!(
+            path_packages(LOCK).into_iter().collect::<Vec<_>>(),
+            vec!["app".to_owned()]
+        );
+        // A registry package sharing the name keeps it out.
+        let shadowed = format!(
+            "{LOCK}\n[[package]]\nname = \"app\"\nversion = \"2.0.0\"\nsource = \"registry+x\"\n"
+        );
+        assert!(path_packages(&shadowed).is_empty());
+        assert!(path_packages("not toml [").is_empty());
+        for on in [None, Some(""), Some("1"), Some("on"), Some("yes")] {
+            assert!(workspace_units_wanted(on.map(OsStr::new)), "{on:?}");
+        }
+        for off in ["0", "false", "No", " off "] {
+            assert!(!workspace_units_wanted(Some(OsStr::new(off))), "{off}");
+        }
+    }
+
     /// A cache at `cache` whose store holds each of `contents` as a blob, as
     /// kache stores what it compiles.
     fn cache_storing(cache: &Path, contents: &[&str]) -> PathBuf {
@@ -3481,7 +3671,7 @@ source = "git+https://example.com/gitdep#abc"
                     &format!("cargo:rustc-link-search={}\n", recorded.display()),
                 );
                 assert!(
-                    !names_the_donor(&from, layout, &dep, &donor),
+                    !names_the_donor(&from, layout, &dep, &donor_needles(&donor)),
                     "the lexical donor scan cannot resolve this old or aliased record"
                 );
                 let current = checkout(dir.path(), &format!("consumer-{index}"));
@@ -3542,13 +3732,13 @@ source = "git+https://example.com/gitdep#abc"
                 };
                 write(&run.join(root), &recorded);
                 assert_eq!(
-                    names_the_donor(&from, layout, &dep, &donor),
+                    names_the_donor(&from, layout, &dep, &donor_needles(&donor)),
                     named,
                     "{layout:?}: {text}"
                 );
             }
             std::fs::remove_file(run.join(stdout)).unwrap();
-            assert!(!names_the_donor(&from, layout, &dep, &donor));
+            assert!(!names_the_donor(&from, layout, &dep, &donor_needles(&donor)));
             // A unit that names the donor is not copied.
             write(
                 &run.join(stdout),
@@ -3583,11 +3773,11 @@ source = "git+https://example.com/gitdep#abc"
                 &format!("CMAKE_CACHEFILE_DIR:INTERNAL={}/build\n", out_dir.display()),
             );
             assert!(
-                !names_the_donor(&from, layout, &dep, &donor),
+                !names_the_donor(&from, layout, &dep, &donor_needles(&donor)),
                 "{layout:?}: stdout only names OUT_DIR"
             );
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                 "{layout:?}"
             );
             let new = checkout(dir.path(), "b");
@@ -3620,7 +3810,7 @@ source = "git+https://example.com/gitdep#abc"
             let cache = "portable-cache\n";
             write(&cmake_cache(&from, layout), cache);
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                 "{layout:?}"
             );
             let new = checkout(dir.path(), "b");
@@ -3663,24 +3853,24 @@ source = "git+https://example.com/gitdep#abc"
             named.workspace_root = PathBuf::from("/needle-workspace");
             write(&cache, "see /needle-workspace/src\n");
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &named, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&named), later()),
                 "{layout:?} workspace"
             );
             write(&cache, "see /needle-target/debug\n");
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &named, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&named), later()),
                 "{layout:?} target"
             );
             write(&cache, "see /neither\n");
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &named, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&named), later()),
                 "{layout:?}"
             );
             // Longer than both needles, and neither needle is in it. A
             // shorter miss makes `windows` empty, so `==` and `!=` agree.
             write(&cache, "xxxx see /neither xxxxxxxxx\n");
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &named, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&named), later()),
                 "{layout:?}: a longer file that names neither path"
             );
 
@@ -3689,7 +3879,7 @@ source = "git+https://example.com/gitdep#abc"
             blank.workspace_root.clear();
             write(&cache, "x\n");
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &blank, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&blank), later()),
                 "{layout:?} empty"
             );
 
@@ -3697,7 +3887,7 @@ source = "git+https://example.com/gitdep#abc"
             std::fs::remove_file(script_stdout(&from, layout)).unwrap();
             write(&cache, &format!("{needle}\n"));
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                 "{layout:?}: no script record, so out/ is the unit's artifact"
             );
 
@@ -3713,14 +3903,14 @@ source = "git+https://example.com/gitdep#abc"
                     "{layout:?}: mode 000 must be unreadable here"
                 );
                 assert!(
-                    out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                    out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                     "{layout:?}: an unreadable output file is not copied"
                 );
                 std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
 
                 std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o000)).unwrap();
                 assert!(
-                    out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                    out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                     "{layout:?}: an unlisted out/ is not copied"
                 );
                 std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -3731,7 +3921,7 @@ source = "git+https://example.com/gitdep#abc"
                 let link = out.join("linked-cache");
                 std::os::unix::fs::symlink(&outside, &link).unwrap();
                 assert!(
-                    !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                    !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                     "{layout:?}: a symlink is not followed"
                 );
             }
@@ -3783,11 +3973,11 @@ source = "git+https://example.com/gitdep#abc"
             write_script_stdout(&from, layout, "cargo:rustc-cfg=x\n");
             write(&cache, "CMAKE_HOME_DIRECTORY:INTERNAL=C:/Users/me/vendor\n");
             assert!(
-                !names_the_donor(&from, layout, &dep, &windows),
+                !names_the_donor(&from, layout, &dep, &donor_needles(&windows)),
                 "{layout:?}"
             );
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&windows), later()),
                 "{layout:?}"
             );
 
@@ -3796,7 +3986,7 @@ source = "git+https://example.com/gitdep#abc"
                 "CMAKE_CACHEFILE_DIR:INTERNAL=D:/target/ws-a/debug/build/dep/out/build\n",
             );
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&windows), later()),
                 "{layout:?}: the target directory"
             );
             write(
@@ -3804,7 +3994,7 @@ source = "git+https://example.com/gitdep#abc"
                 "CMAKE_HOME_DIRECTORY:INTERNAL=C:/Users/me/ws-a/vendor\n",
             );
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&windows), later()),
                 "{layout:?}: the workspace"
             );
             write(
@@ -3812,7 +4002,7 @@ source = "git+https://example.com/gitdep#abc"
                 r#"include_bytes!("D:\\target\\ws-a\\debug\\build\\dep\\out\\t.bin")"#,
             );
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&windows), later()),
                 "{layout:?}: doubled backslashes"
             );
             for (text, named) in [
@@ -3823,7 +4013,7 @@ source = "git+https://example.com/gitdep#abc"
             ] {
                 write(&cache, text);
                 assert_eq!(
-                    out_dir_names_the_donor(&from, layout, &dep, &windows, later()),
+                    out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&windows), later()),
                     named,
                     "{layout:?}: {text}"
                 );
@@ -3832,7 +4022,7 @@ source = "git+https://example.com/gitdep#abc"
             lowercase.workspace_root = PathBuf::from(r"c:\Users\me\ws-a");
             write(&cache, "C:/Users/me/ws-a/vendor\n");
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &lowercase, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&lowercase), later()),
                 "{layout:?}: a lowercase drive in the donor"
             );
 
@@ -3840,12 +4030,12 @@ source = "git+https://example.com/gitdep#abc"
                 &stdout,
                 "cargo:rustc-link-search=native=D:/target/ws-a/debug/gn_out/obj\n",
             );
-            assert!(names_the_donor(&from, layout, &dep, &windows), "{layout:?}");
+            assert!(names_the_donor(&from, layout, &dep, &donor_needles(&windows)), "{layout:?}");
             write(
                 &stdout,
                 r#"cargo:warning=using "c:\\Users\\me\\ws-a\\vendor""#,
             );
-            assert!(names_the_donor(&from, layout, &dep, &windows), "{layout:?}");
+            assert!(names_the_donor(&from, layout, &dep, &donor_needles(&windows)), "{layout:?}");
         }
     }
 
@@ -3939,13 +4129,13 @@ source = "git+https://example.com/gitdep#abc"
                 file.seek(std::io::SeekFrom::Start(at)).unwrap();
                 file.write_all(needle.as_bytes()).unwrap();
                 assert!(
-                    out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                    out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                     "{layout:?}: at {at}"
                 );
             }
             std::fs::File::create(&cache).unwrap().set_len(len).unwrap();
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                 "{layout:?}: clean"
             );
         }
@@ -4023,16 +4213,16 @@ source = "git+https://example.com/gitdep#abc"
                 .unwrap();
             file.set_len(OUT_SCAN_BYTES + 1).unwrap();
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                 "{layout:?}: past the budget"
             );
             file.set_len(0).unwrap();
             assert!(
-                !out_dir_names_the_donor(&from, layout, &dep, &donor, later()),
+                !out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), later()),
                 "{layout:?}"
             );
             assert!(
-                out_dir_names_the_donor(&from, layout, &dep, &donor, Instant::now()),
+                out_dir_names_the_donor(&from, layout, &dep, &donor_needles(&donor), Instant::now()),
                 "{layout:?}: the deadline passed"
             );
         }
@@ -4853,9 +5043,9 @@ source = "git+https://example.com/gitdep#abc"
         fingerprinted_unit(&profile, "dep", &h(2), 12, &[], &["rmeta"]);
         fingerprinted_unit(&profile, "app", &h(3), 13, &[11], &["rlib", "rmeta"]);
         let registry: BTreeSet<String> = ["dep"].map(String::from).into();
-        assert_eq!(check_units(&profile, &registry), 1);
+        assert_eq!(check_units(&profile, &registry, &registry), 1);
         fingerprinted_unit(&profile, "app", &h(4), 14, &[11, 12], &["rmeta"]);
-        assert_eq!(check_units(&profile, &registry), 2);
+        assert_eq!(check_units(&profile, &registry, &registry), 2);
     }
 
     /// Without a checked workspace unit, nothing says what a check needs.

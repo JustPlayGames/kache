@@ -10523,7 +10523,7 @@ pub(crate) fn seed_new_target(
     memoise_seeded_files(&store, &seeded.placed, since_ns);
     if let Some(donor) = &seeded.donor {
         let line = format!(
-            "seeded {} registry units ({} files hard-linked) into {} from {} in {} ms",
+            "seeded {} units ({} files hard-linked) into {} from {} in {} ms",
             seeded.units,
             seeded.linked,
             target.target_dir.display(),

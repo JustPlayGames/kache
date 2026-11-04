@@ -178,6 +178,8 @@ fn build_units(
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
         .env("KACHE_CACHE_EXECUTABLES", "1")
+        // The store's answers, not a target seeded from another.
+        .env("KACHE_SEED_WORKSPACE_UNITS", "0")
         .env_remove("APP_MODE")
         .env_remove("KACHE_BASE_DIR")
         .env_remove("KACHE_DISABLED")

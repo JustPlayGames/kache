@@ -153,6 +153,9 @@ fn cargo(
         .env("CARGO_INCREMENTAL", "0")
         .env("RUSTC_WRAPPER", kache_binary())
         .env("KACHE_LOG", "off")
+        // These tests read the store's answers: a target seeded with the
+        // workspace's units from another target would ask for none.
+        .env("KACHE_SEED_WORKSPACE_UNITS", "0")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS")
