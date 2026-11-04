@@ -2040,15 +2040,46 @@ pub fn rewrite_depinfo_content(content: &str, project_dir: &Path, mode: DepInfoM
 /// Existing cache sentinels are refused rather than interpreted as paths.
 /// The primary rule must name outputs under the donor, including its aliases.
 pub fn rebase_depinfo_content(content: &str, from: &Path, to: &Path) -> Option<String> {
+    DepinfoRebase::new(from, to).rebase(content)
+}
+
+/// [`rebase_depinfo_content`] between two fixed roots, their prefixes worked
+/// out once. Working them out resolves the donor root's links, a lookup of
+/// every one of its components: a seeding rebases a dep-info for nearly
+/// every unit it copies, all between the same two profiles.
+#[derive(Debug, Clone)]
+pub struct DepinfoRebase {
+    from_prefixes: Vec<String>,
+    to_prefixes: Vec<String>,
+}
+
+impl DepinfoRebase {
+    /// The rebase of dep-info from the target root `from` to `to`.
+    pub fn new(from: &Path, to: &Path) -> Self {
+        Self {
+            from_prefixes: depinfo_prefixes_for_path(from, DepInfoMode::Relativize, cfg!(windows)),
+            to_prefixes: depinfo_prefixes_for_path(to, DepInfoMode::Expand, cfg!(windows)),
+        }
+    }
+
+    /// `content` moved between the two roots, as [`rebase_depinfo_content`].
+    pub fn rebase(&self, content: &str) -> Option<String> {
+        rebase_with_prefixes(content, &self.from_prefixes, &self.to_prefixes)
+    }
+}
+
+fn rebase_with_prefixes(
+    content: &str,
+    from_prefixes: &[String],
+    to_prefixes: &[String],
+) -> Option<String> {
     if content.contains(DEPINFO_ROOT_SENTINEL) {
         return None;
     }
-    let from_prefixes = depinfo_prefixes_for_path(from, DepInfoMode::Relativize, cfg!(windows));
-    let to_prefixes = depinfo_prefixes_for_path(to, DepInfoMode::Expand, cfg!(windows));
     let (outputs, _) = content.lines().next()?.split_once(": ")?;
     let outputs = rewrite_depinfo_content_with_prefixes_and_sentinel(
         outputs,
-        &from_prefixes,
+        from_prefixes,
         DEPINFO_ROOT_SENTINEL,
         DepInfoMode::Relativize,
     );
@@ -2073,13 +2104,13 @@ pub fn rebase_depinfo_content(content: &str, from: &Path, to: &Path) -> Option<S
                 }
                 let relative = rewrite_depinfo_content_with_prefixes_and_sentinel(
                     line,
-                    &from_prefixes,
+                    from_prefixes,
                     DEPINFO_ROOT_SENTINEL,
                     DepInfoMode::Relativize,
                 );
                 rewrite_depinfo_content_with_prefixes_and_sentinel(
                     &relative,
-                    &to_prefixes,
+                    to_prefixes,
                     DEPINFO_ROOT_SENTINEL,
                     DepInfoMode::Expand,
                 )

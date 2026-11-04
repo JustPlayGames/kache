@@ -890,7 +890,7 @@ fn artifacts_stored(
 
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
 /// goes last, by rename. `deps` is [`outputs_by_hash`] of the donor's profile
-/// for the shared layout.
+/// for the shared layout; `rebase` moves dep-info from `from` to `to`.
 fn copy_unit(
     from: &Path,
     to: &Path,
@@ -899,10 +899,12 @@ fn copy_unit(
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
     counts: &FileCounts,
+    rebase: &kache_store::link::DepinfoRebase,
     checkout: Option<(&Path, &Path)>,
     deadline: Instant,
 ) -> std::io::Result<()> {
-    let relocation = relocation::Relocation::for_unit(from, to, layout, unit, checkout, deadline)?;
+    let relocation =
+        relocation::Relocation::for_unit(from, to, rebase, layout, unit, checkout, deadline)?;
     #[cfg(unix)]
     {
         let out = build_script_out_dir(from, layout, unit);
@@ -978,7 +980,7 @@ fn place_tree(
     cache_dir: &Path,
     counts: &FileCounts,
     deadline: Instant,
-    relocation: Option<&relocation::Relocation>,
+    relocation: Option<&relocation::Relocation<'_>>,
 ) -> std::io::Result<()> {
     #[cfg(unix)]
     if link_in_place(from, to, counts, relocation, deadline)? {
@@ -1029,7 +1031,7 @@ fn link_in_place(
     from: &Path,
     to: &Path,
     counts: &FileCounts,
-    relocation: Option<&relocation::Relocation>,
+    relocation: Option<&relocation::Relocation<'_>>,
     deadline: Instant,
 ) -> std::io::Result<bool> {
     if !counts.no_clones.load(Ordering::Relaxed) {
@@ -1090,7 +1092,7 @@ struct Placing<'a> {
     /// Files placed under the staging path, before the tree's rename.
     placed: &'a std::sync::Mutex<Vec<PlacedFile>>,
     /// Target-local metadata rewritten for the new target.
-    relocation: Option<&'a relocation::Relocation>,
+    relocation: Option<&'a relocation::Relocation<'a>>,
 }
 
 /// A donor file a seeding placed, large enough for the hash memo: the donor
@@ -1613,6 +1615,7 @@ pub(crate) fn seed_for_lane(
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
         let files = FileCounts::default();
+        let rebase = kache_store::link::DepinfoRebase::new(&from, &to);
         let cancellation = crate::invocation::process::current();
         std::thread::scope(|scope| {
             for _ in 0..COPY_THREADS {
@@ -1620,6 +1623,7 @@ pub(crate) fn seed_for_lane(
                 let (units, next, copied, from, to, deps, files, recorded, needles, cross) = (
                     &units, &next, &copied, &from, &to, &deps, &files, &recorded, &needles, &cross,
                 );
+                let rebase = &rebase;
                 let progress = &progress;
                 let target_needles = &target_needles;
                 let workspace = &workspace;
@@ -1682,7 +1686,8 @@ pub(crate) fn seed_for_lane(
                             _ => None,
                         };
                         match copy_unit(
-                            from, to, layout, unit, deps, cache_dir, files, checkout, limit,
+                            from, to, layout, unit, deps, cache_dir, files, rebase, checkout,
+                            limit,
                         ) {
                             Ok(()) => {
                                 // Cargo waits on our lock until the dep-info
