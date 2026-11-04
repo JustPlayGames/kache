@@ -123,9 +123,32 @@ impl<'a> Relocation<'a> {
         })
     }
 
+    /// Whether [`Self::contents`] may give `path` bytes of its own: a run's
+    /// records, or dep-info where the compiler writes it. Told by the path
+    /// alone, without reading the file. Only Unix links a file in place.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn rewrites(&self, path: &Path) -> bool {
+        self.script
+            .as_ref()
+            .is_some_and(|script| path == script.stdout || path == script.root_output)
+            || self.is_depinfo(path)
+    }
+
+    fn is_depinfo(&self, path: &Path) -> bool {
+        path.extension() == Some(std::ffi::OsStr::new("d"))
+            && self
+                .depinfo_dirs
+                .iter()
+                .any(|dir| path.parent() == Some(dir.as_path()))
+    }
+
+    /// The bytes the copy of the donor file `path`, of status `metadata`
+    /// (not following a link), takes in this target, when they are not the
+    /// donor's.
     pub(super) fn contents(
         &self,
         path: &Path,
+        metadata: &std::fs::Metadata,
         deadline: Instant,
     ) -> io::Result<Option<Cow<'_, [u8]>>> {
         if let Some(script) = &self.script {
@@ -136,16 +159,13 @@ impl<'a> Relocation<'a> {
                 return Ok(Some(Cow::Borrowed(script.translated_root.as_bytes())));
             }
         }
-        if path.extension() != Some(std::ffi::OsStr::new("d"))
-            || !self
-                .depinfo_dirs
-                .iter()
-                .any(|dir| path.parent() == Some(dir.as_path()))
-        {
+        if !self.is_depinfo(path) {
             return Ok(None);
         }
-        let original = read_text(path, deadline)?
-            .ok_or_else(|| io::Error::other("seeded dep-info disappeared"))?;
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let original = read_sized_text(path, metadata)?;
         let translated = self
             .rebase
             .rebase(&original)
@@ -179,10 +199,31 @@ fn read_text(path: &Path, deadline: Instant) -> io::Result<Option<String>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    read_sized_text(path, &metadata).map(Some)
+}
+
+/// The text of the file at `path`, whose status (not following a link) is
+/// `metadata`. A file that is no regular one or longer than
+/// [`MAX_METADATA_BYTES`] is refused. It is read in one call of one byte more
+/// than its status says, which finds the end in the same call: read as a
+/// stream of unknown length, a dep-info took about nine reads, the buffer
+/// doubling from 32 bytes. One whose length is not the one its status said
+/// is read again from the start, bounded.
+fn read_sized_text(path: &Path, metadata: &std::fs::Metadata) -> io::Result<String> {
+    use std::io::Seek as _;
     if !metadata.is_file() || metadata.len() > MAX_METADATA_BYTES {
         return Err(io::Error::other("unsupported seeded metadata"));
     }
-    read_bounded_text(std::fs::File::open(path)?).map(Some)
+    let mut file = std::fs::File::open(path)?;
+    let len = usize::try_from(metadata.len()).map_err(io::Error::other)?;
+    let mut bytes = vec![0; len + 1];
+    if file.read(&mut bytes)? == len {
+        bytes.truncate(len);
+        return String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "metadata is not UTF-8"));
+    }
+    file.rewind()?;
+    read_bounded_text(file)
 }
 
 fn read_bounded_text(reader: impl Read) -> io::Result<String> {
@@ -501,14 +542,22 @@ mod tests {
             std::fs::write(&generated_data, &data).unwrap();
             assert!(
                 relocation
-                    .contents(&generated_data, Instant::now())
+                    .contents(
+                        &generated_data,
+                        &std::fs::symlink_metadata(&generated_data).unwrap(),
+                        Instant::now(),
+                    )
                     .unwrap()
                     .is_none(),
                 "script-generated .d data is not compiler dep-info"
             );
             assert_eq!(
                 relocation
-                    .contents(&root, Instant::now())
+                    .contents(
+                        &root,
+                        &std::fs::symlink_metadata(&root).unwrap(),
+                        Instant::now(),
+                    )
                     .unwrap()
                     .unwrap()
                     .as_ref(),
@@ -516,7 +565,11 @@ mod tests {
             );
             assert_eq!(
                 relocation
-                    .contents(&stdout, Instant::now())
+                    .contents(
+                        &stdout,
+                        &std::fs::symlink_metadata(&stdout).unwrap(),
+                        Instant::now(),
+                    )
                     .unwrap()
                     .unwrap()
                     .as_ref(),
