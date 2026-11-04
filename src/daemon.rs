@@ -10453,7 +10453,7 @@ fn send_build_started_with(
 }
 
 /// Seed a new target directory from the most recently used tracked targets
-/// (see [`crate::target_seed`]), within [`crate::target_seed::SEED_DEADLINE`].
+/// (see [`crate::target_seed`]), within [`crate::target_seed::SeedDeadline`].
 /// Only a wrapper from before seeding moved into the wrapper sends this.
 fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
     let target = crate::target_seed::NewTarget {
@@ -10467,7 +10467,7 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
 }
 
 /// Seed `target` in this process from the most recently used tracked
-/// targets, within [`crate::target_seed::SEED_DEADLINE`].
+/// targets, within [`crate::target_seed::SeedDeadline`].
 ///
 /// The wrapper calls this for Cargo's target-info probe itself rather than
 /// asking the daemon: a build that started while no daemon ran, while one
@@ -10487,7 +10487,7 @@ pub(crate) fn seed_new_target(
 ) -> Result<crate::target_seed::Seeded> {
     let started = std::time::Instant::now();
     let since_ns = kache_store::file_hash::stamp_clock_ns();
-    let deadline = started + crate::target_seed::SEED_DEADLINE;
+    let deadline = crate::target_seed::SeedDeadline::from_start(started);
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut store = Store::open(config).context("reading tracked targets")?;
     #[cfg(unix)]
@@ -10522,7 +10522,7 @@ pub(crate) fn seed_new_target(
     );
     memoise_seeded_files(&store, &seeded.placed, since_ns);
     if let Some(donor) = &seeded.donor {
-        let line = format!(
+        let mut line = format!(
             "seeded {} units ({} files hard-linked) into {} from {} in {} ms",
             seeded.units,
             seeded.linked,
@@ -10530,6 +10530,9 @@ pub(crate) fn seed_new_target(
             donor.display(),
             started.elapsed().as_millis()
         );
+        if seeded.left > 0 {
+            line.push_str(&format!(", {} left at the deadline", seeded.left));
+        }
         tracing::info!("{line}");
         if note {
             crate::target_seed::note_in_log(&line);
