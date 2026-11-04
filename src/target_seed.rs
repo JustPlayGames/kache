@@ -818,6 +818,11 @@ fn is_artifact(file: &Path) -> bool {
 }
 
 /// The unit's artifacts ([`is_artifact`]), or `None` once `deadline` passes.
+///
+/// A shared-layout unit's are its files in `deps/` and `examples/` named as
+/// artifacts, told by name alone: Cargo keeps no unit's directory there, and
+/// a status call for each of a unit's files, made once for the store's rows
+/// and again for the check, was 2 of the 4 or 5 a seeding asked of each.
 fn unit_artifacts(
     from: &Path,
     layout: Layout,
@@ -827,7 +832,16 @@ fn unit_artifacts(
 ) -> Option<Vec<PathBuf>> {
     let mut files = match layout {
         Layout::PerUnit => vec![from.join("build").join(&unit.package).join(&unit.hash)],
-        Layout::Shared => deps.get(&unit.hash).cloned().unwrap_or_default(),
+        Layout::Shared => {
+            return (Instant::now() < deadline).then(|| {
+                deps.get(&unit.hash)
+                    .into_iter()
+                    .flatten()
+                    .filter(|file| is_artifact(file))
+                    .cloned()
+                    .collect()
+            });
+        }
     };
     let mut artifacts = Vec::new();
     while let Some(file) = files.pop() {
