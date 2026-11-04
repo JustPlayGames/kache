@@ -21,6 +21,12 @@ pub(super) struct Relocation {
 struct Script {
     stdout: PathBuf,
     root_output: PathBuf,
+    /// The run's `OUT_DIR` as the donor holds it and as its record names it,
+    /// and as this target has it. Only Unix copies symbolic links.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    out_dirs: [PathBuf; 2],
+    #[cfg_attr(not(unix), allow(dead_code))]
+    current_out_dir: PathBuf,
     translated_stdout: String,
     translated_root: String,
 }
@@ -47,7 +53,7 @@ impl Relocation {
                 from.join("build")
                     .join(format!("{}-{}", unit.package, unit.hash)),
             ],
-            Layout::PerUnit if output.is_none() => vec![out_dir],
+            Layout::PerUnit if output.is_none() => vec![out_dir.clone()],
             Layout::PerUnit => Vec::new(),
         };
         let script = match (root, output) {
@@ -66,6 +72,8 @@ impl Relocation {
                 Some(Script {
                     stdout,
                     root_output,
+                    out_dirs: [out_dir.clone(), PathBuf::from(recorded)],
+                    current_out_dir: PathBuf::from(current),
                     translated_stdout: rebase_stdout(&output, recorded, current),
                     translated_root: current.to_owned(),
                 })
@@ -78,6 +86,25 @@ impl Relocation {
             to: to.to_path_buf(),
             depinfo_dirs,
             script,
+        })
+    }
+
+    /// Where a symbolic link of the run's `OUT_DIR` points in this target,
+    /// when the donor's points by an absolute path into that very
+    /// `OUT_DIR` (cxx's headers name their `.rs.h` beside them so): the
+    /// same entry of this target's `OUT_DIR`, as the script writes it here.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn out_dir_link(&self, target: &Path) -> Option<PathBuf> {
+        let script = self.script.as_ref()?;
+        script.out_dirs.iter().find_map(|out_dir| {
+            let rest = target.strip_prefix(out_dir).ok()?;
+            // An entry inside it: a link to the directory itself is a
+            // hermetic run's sealed `OUT_DIR`, which has a way of its own.
+            (rest.components().next().is_some()
+                && rest
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))))
+            .then(|| script.current_out_dir.join(rest))
         })
     }
 
@@ -244,6 +271,61 @@ mod tests {
             "opaque /old/out\ncargo:warning=/new/out/value\n cargo::rustc-env=PATH=/new/out/native\ncargo::rerun-if-changed=/new/out/source\n"
         );
         assert_eq!(rebase_stdout("", "/old/out", "/new/out"), "");
+    }
+
+    #[test]
+    fn a_link_into_the_runs_own_out_dir_points_into_this_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (
+            dir.path().join("donor/debug"),
+            dir.path().join("ours/debug"),
+        );
+        let unit = Unit {
+            package: "dep".into(),
+            hash: "0123456789abcdef".into(),
+        };
+        let out = build_script_out_dir(&from, Layout::Shared, &unit);
+        let recorded = dir
+            .path()
+            .join("moved/debug/build/dep-0123456789abcdef/out");
+        let stdout = crate::cargo_layout::build_script_stdout(&out).unwrap();
+        std::fs::create_dir_all(stdout.parent().unwrap()).unwrap();
+        std::fs::write(&stdout, "cargo:rustc-cfg=x\n").unwrap();
+        std::fs::write(
+            stdout.with_file_name("root-output"),
+            recorded.to_str().unwrap(),
+        )
+        .unwrap();
+        let relocation = Relocation::for_unit(
+            &from,
+            &to,
+            Layout::Shared,
+            &unit,
+            Instant::now() + std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let current = build_script_out_dir(&to, Layout::Shared, &unit);
+        for base in [&out, &recorded] {
+            assert_eq!(
+                relocation.out_dir_link(&base.join("include/a.rs.h")),
+                Some(current.join("include/a.rs.h"))
+            );
+        }
+        for elsewhere in [
+            out.clone(),
+            recorded.clone(),
+            out.join("../output"),
+            out.join("include/../../output"),
+            PathBuf::from("/usr/include/a.h"),
+            from.join("deps/libx.rlib"),
+        ] {
+            assert_eq!(
+                relocation.out_dir_link(&elsewhere),
+                None,
+                "{}",
+                elsewhere.display()
+            );
+        }
     }
 
     #[test]

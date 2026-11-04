@@ -1155,6 +1155,12 @@ fn copy_tree(
             runs.push(run);
             return Ok(());
         }
+        if let Some(rebased) = tree
+            .relocation
+            .and_then(|relocation| relocation.out_dir_link(&target))
+        {
+            return std::os::unix::fs::symlink(rebased, to);
+        }
     }
     if !metadata.is_file() {
         return Err(std::io::Error::other(format!(
