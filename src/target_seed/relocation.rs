@@ -55,6 +55,7 @@ impl Relocation {
         let depinfo_dirs = match layout {
             Layout::Shared => vec![
                 from.join("deps"),
+                from.join("examples"),
                 from.join("build")
                     .join(format!("{}-{}", unit.package, unit.hash)),
             ],

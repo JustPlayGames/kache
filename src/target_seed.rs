@@ -689,6 +689,32 @@ fn deps_by_hash(deps: &Path) -> HashMap<String, Vec<PathBuf>> {
     index
 }
 
+/// The directories of a shared-layout profile where the compiler writes a
+/// unit's outputs: `deps/` for libraries, binaries, tests and benches, and
+/// `examples/` for examples (`lib<name>-<hash>.rmeta` and `<name>-<hash>.d`
+/// for a check, `<name>-<hash>` for a build). Cargo's own copies without the
+/// hash (an uplifted `examples/<name>`) are not a unit's.
+const OUTPUT_DIRS: [&str; 2] = ["deps", "examples"];
+
+/// [`deps_by_hash`] of every [`OUTPUT_DIRS`] directory of a shared-layout
+/// `profile`. A unit's file keeps its directory: it is copied to the same
+/// one in the new target ([`copy_unit`]).
+///
+/// Indexed from `deps/` alone, an example's check was no root of a check's
+/// demand ([`check_demand`]), whose outputs it could not find, and a copy
+/// of its fingerprint without them would have been rebuilt anyway: in a new
+/// checkout of a 600-crate workspace, the 43 examples were the only units a
+/// workspace clippy still compiled.
+fn outputs_by_hash(profile: &Path) -> HashMap<String, Vec<PathBuf>> {
+    let mut index = deps_by_hash(&profile.join(OUTPUT_DIRS[0]));
+    for dir in &OUTPUT_DIRS[1..] {
+        for (hash, files) in deps_by_hash(&profile.join(dir)) {
+            index.entry(hash).or_default().extend(files);
+        }
+    }
+    index
+}
+
 /// Every unit hash in a `deps/` file name: 16 hex digits after a `-`,
 /// followed by a `.` or the end of the name.
 fn unit_hashes(name: &str) -> impl Iterator<Item = &str> {
@@ -847,7 +873,7 @@ fn artifacts_stored(
 }
 
 /// Copy one unit from the donor profile `from` to `to`. The unit's marker
-/// goes last, by rename. `deps` is [`deps_by_hash`] of the donor's `deps/`
+/// goes last, by rename. `deps` is [`outputs_by_hash`] of the donor's profile
 /// for the shared layout.
 fn copy_unit(
     from: &Path,
@@ -885,14 +911,18 @@ fn copy_unit(
         }
         Layout::Shared => {
             let named = format!("{}-{}", unit.package, unit.hash);
-            let to_deps = to.join("deps");
-            std::fs::create_dir_all(&to_deps)?;
             for file in deps.get(&unit.hash).into_iter().flatten() {
-                let name = file_name(file);
-                if !to_deps.join(&name).exists() {
+                // In `deps/` or `examples/`, as in the donor.
+                let Some(dir) = file.parent().and_then(Path::file_name) else {
+                    continue;
+                };
+                let to_dir = to.join(dir);
+                std::fs::create_dir_all(&to_dir)?;
+                let at = to_dir.join(file_name(file));
+                if !at.exists() {
                     place_tree(
                         file,
-                        &to_deps.join(&name),
+                        &at,
                         cache_dir,
                         counts,
                         deadline,
@@ -1473,7 +1503,7 @@ pub(crate) fn seed_for_lane(
             continue;
         };
         let deps = match layout {
-            Layout::Shared => deps_by_hash(&from.join("deps")),
+            Layout::Shared => outputs_by_hash(&from),
             Layout::PerUnit => HashMap::new(),
         };
         let mut units = units(&from, layout, packages);
@@ -1730,7 +1760,7 @@ fn check_units(
     registry: &BTreeSet<String>,
     packages: &BTreeSet<String>,
 ) -> usize {
-    let deps = deps_by_hash(&profile.join("deps"));
+    let deps = outputs_by_hash(profile);
     let held = units_by_name(profile, Layout::Shared, packages);
     match check_demand(profile, registry, &deps) {
         Some(demand) => held
@@ -5166,6 +5196,67 @@ source = "git+https://example.com/gitdep#abc"
         for unwanted in [format!("dep-{}", h(2)), format!("only_test-{}", h(5))] {
             assert!(!demand.contains(&unwanted), "{unwanted}");
         }
+    }
+
+    /// An example's check is a root of a check's demand, as a library's is,
+    /// and is seeded with its outputs, which Cargo keeps in `examples/`, not
+    /// `deps/`: there the copy finds them, puts them and rebases their
+    /// dep-info. Cargo's uplifted copy without a hash is no unit's.
+    #[test]
+    fn a_checked_example_is_seeded_with_its_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        let donor = empty_donor(dir.path(), "d");
+        let profile = donor.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(2), 12, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(3), 13, &[11], &["rmeta"]);
+        // `app`'s example `demo`, checked against `app` and the built `dep`.
+        fingerprinted_unit(&profile, "app", &h(4), 14, &[13, 12], &[]);
+        let examples = profile.join("examples");
+        let rmeta = examples.join(format!("libdemo-{}.rmeta", h(4)));
+        write(&rmeta, "x");
+        write(
+            &examples.join(format!("demo-{}.d", h(4))),
+            &format!("{}: examples/demo.rs\n", rmeta.display()),
+        );
+        write(&examples.join("demo"), "uplifted");
+        let registry: BTreeSet<String> = ["dep"].map(String::from).into();
+        let demand = check_demand(&profile, &registry, &outputs_by_hash(&profile)).unwrap();
+        for wanted in [h(1), h(2), h(3), h(4)] {
+            assert!(demand.iter().any(|unit| unit.ends_with(&wanted)), "{wanted}");
+        }
+        assert!(check_demand(&profile, &registry, &deps_by_hash(&profile.join("deps")))
+            .unwrap()
+            .iter()
+            .all(|unit| !unit.ends_with(&h(2)) && !unit.ends_with(&h(4))));
+
+        let same = NewTarget {
+            target_dir: donor.workspace_root.join("target/integrate-clippy"),
+            workspace_root: donor.workspace_root.clone(),
+        };
+        let stored = cache_storing(&dir.path().join("cache"), &["x"]);
+        let seeded = seed_for_lane(
+            &same,
+            VERSION,
+            std::slice::from_ref(&donor),
+            &stored,
+            &no_recorded_hashes,
+            later(),
+            true,
+        );
+        assert_eq!(seeded.units, 4);
+        let to = same.target_dir.join(PROFILE);
+        let seeded_rmeta = to.join("examples").join(format!("libdemo-{}.rmeta", h(4)));
+        assert_eq!(std::fs::read_to_string(&seeded_rmeta).unwrap(), "x");
+        let dep_info =
+            std::fs::read_to_string(to.join("examples").join(format!("demo-{}.d", h(4)))).unwrap();
+        assert!(
+            dep_info.starts_with(&format!("{}: ", seeded_rmeta.display())),
+            "{dep_info}"
+        );
+        assert!(!to.join("examples/demo").exists());
+        assert!(!to.join("deps").join(format!("libdemo-{}.rmeta", h(4))).exists());
     }
 
     /// A checkout at `root/name` with `LOCK`, whose target `VERSION` built:
