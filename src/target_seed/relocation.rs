@@ -51,18 +51,7 @@ impl<'a> Relocation<'a> {
         let root_output = stdout.with_file_name("root-output");
         let root = read_text(&root_output, deadline)?;
         let output = read_text(&stdout, deadline)?;
-        // Generated OUT_DIR files are script-owned data, even when their
-        // names end in .d. Only rustc's direct output locations are dep-info.
-        let depinfo_dirs = match layout {
-            Layout::Shared => vec![
-                from.join("deps"),
-                from.join("examples"),
-                from.join("build")
-                    .join(format!("{}-{}", unit.package, unit.hash)),
-            ],
-            Layout::PerUnit if output.is_none() => vec![out_dir.clone()],
-            Layout::PerUnit => Vec::new(),
-        };
+        let depinfo_dirs = depinfo_dirs(from, layout, unit, output.is_some());
         let script = match (root, output) {
             (Some(root), Some(output)) => {
                 let recorded = root.trim();
@@ -104,6 +93,21 @@ impl<'a> Relocation<'a> {
     /// when the donor's points by an absolute path into that very
     /// `OUT_DIR` (cxx's headers name their `.rs.h` beside them so): the
     /// same entry of this target's `OUT_DIR`, as the script writes it here.
+    /// [`Self::for_unit`] of a shared-layout unit the donor's `build/` holds
+    /// no directory of: no run's records to read, only its dep-info to
+    /// rebase.
+    pub(super) fn without_build_dir(
+        from: &Path,
+        rebase: &'a kache_store::link::DepinfoRebase,
+        unit: &Unit,
+    ) -> Self {
+        Self {
+            rebase,
+            depinfo_dirs: depinfo_dirs(from, Layout::Shared, unit, false),
+            script: None,
+        }
+    }
+
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(super) fn out_dir_link(&self, target: &Path) -> Option<PathBuf> {
         let script = self.script.as_ref()?;
@@ -147,6 +151,22 @@ impl<'a> Relocation<'a> {
             .rebase(&original)
             .ok_or_else(|| io::Error::other("seeded dep-info does not belong to this donor"))?;
         Ok((translated != original).then(|| Cow::Owned(translated.into_bytes())))
+    }
+}
+
+/// Where the compiler writes the unit's dep-info in the donor's profile
+/// `from`. Generated OUT_DIR files are script-owned data, even when their
+/// names end in .d. Only rustc's direct output locations are dep-info.
+fn depinfo_dirs(from: &Path, layout: Layout, unit: &Unit, run: bool) -> Vec<PathBuf> {
+    match layout {
+        Layout::Shared => vec![
+            from.join("deps"),
+            from.join("examples"),
+            from.join("build")
+                .join(format!("{}-{}", unit.package, unit.hash)),
+        ],
+        Layout::PerUnit if !run => vec![build_script_out_dir(from, layout, unit)],
+        Layout::PerUnit => Vec::new(),
     }
 }
 
