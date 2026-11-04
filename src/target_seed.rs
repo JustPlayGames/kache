@@ -6,9 +6,10 @@
 //! before it takes the build lock and before it checks any unit's freshness.
 //! Cargo caches the answer in `<target>/.rustc_info.json`, so a target
 //! directory without that file is one Cargo has not built yet. The wrapper
-//! seeds it before it answers the probe, for up to [`SEED_DEADLINE`]: it
-//! copies the units another checkout already built for the same registry and
-//! git packages, and Cargo then finds them fresh and skips them. The wrapper
+//! seeds it before it answers the probe, for up to [`SEED_DEADLINE`], and
+//! longer while the copy keeps going ([`SeedDeadline`]): it copies the units
+//! another checkout already built for the same registry and git packages,
+//! and Cargo then finds them fresh and skips them. The wrapper
 //! does this itself rather than through the daemon, so a build that starts
 //! while no daemon runs, or while the daemon is starting or busy, is seeded
 //! all the same.
@@ -81,14 +82,29 @@ use crate::build_script::HeldRun;
 #[cfg(not(unix))]
 type HeldRun = std::convert::Infallible;
 
-/// How long seeding copies for. Copying stops at this deadline, between
-/// files, and Cargo builds whatever was not copied.
+/// How long seeding copies for in any case. Past it, the copy goes on while
+/// units keep coming ([`SeedDeadline`]), up to [`SEED_LIMIT`]. Copying stops
+/// between files, and Cargo builds whatever was not copied.
 ///
 /// A unit left out costs far more later than copying it now: the wrapper
 /// restores it from the store in a compiler call of its own (about 50 ms of
 /// CPU each in a 1,300-unit workspace, against about 1 ms to copy). On a
 /// loaded machine 3 s cut seedings of 1,400-1,500 units to 78-166.
 pub(crate) const SEED_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long a seeding that keeps copying may go on past [`SEED_DEADLINE`].
+///
+/// Under load a copy slows down far less than what it saves. A workspace
+/// clippy in a new checkout of a 600-crate workspace (2,188 units) seeded
+/// for 10 s at most was cut at load 62-198 with 817-1,809 units copied, and
+/// restoring the rest one compiler call at a time took it to 75-250 s.
+/// Going on past 10 s, eleven seedings at load 118-272 copied every unit
+/// in 10.7-21.3 s, and the clippy took 18-37 s.
+pub(crate) const SEED_LIMIT: Duration = Duration::from_secs(60);
+
+/// Past [`SEED_DEADLINE`], the copy stops once no unit has been copied for
+/// this long: it no longer gives Cargo anything for its wait.
+const SEED_STALL: Duration = Duration::from_secs(2);
 
 /// Units copied at once. A copy is mostly metadata calls, which overlap: on
 /// btrfs, 1159 units took 2.9 s on one thread, 0.6 s on four and 0.5 s on
@@ -1382,11 +1398,80 @@ fn link_read_only(from: &Path, to: &Path) -> bool {
     }
 }
 
+/// When a seeding stops taking units: at `soft`, or past it while units keep
+/// coming, at least one every [`SEED_STALL`], until `limit`. Everything a
+/// unit's copy waits on (reading and comparing files, the store's rows)
+/// gives up at `limit`.
+///
+/// A deadline that does not move with the copy cut it short exactly when it
+/// was worth the most: on a loaded machine, where each unit left to the
+/// wrapper costs more again ([`SEED_LIMIT`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SeedDeadline {
+    pub(crate) soft: Instant,
+    pub(crate) limit: Instant,
+}
+
+impl SeedDeadline {
+    /// [`SEED_DEADLINE`] and [`SEED_LIMIT`] from `started`.
+    pub(crate) fn from_start(started: Instant) -> Self {
+        Self {
+            soft: started + SEED_DEADLINE,
+            limit: started + SEED_LIMIT,
+        }
+    }
+
+    /// A deadline that never moves.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn fixed(at: Instant) -> Self {
+        Self {
+            soft: at,
+            limit: at,
+        }
+    }
+}
+
+/// The copy's progress against a [`SeedDeadline`], shared by its threads.
+struct Progress {
+    deadline: SeedDeadline,
+    started: Instant,
+    /// When the last unit was copied, in nanoseconds from `started`.
+    copied_at: std::sync::atomic::AtomicU64,
+}
+
+impl Progress {
+    fn new(deadline: SeedDeadline) -> Self {
+        Self {
+            deadline,
+            started: Instant::now(),
+            copied_at: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn copied(&self, now: Instant) {
+        let at = now.saturating_duration_since(self.started).as_nanos();
+        self.copied_at
+            .fetch_max(u64::try_from(at).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Whether another unit may be taken at `now`.
+    fn takes_more(&self, now: Instant) -> bool {
+        if now < self.deadline.soft {
+            return true;
+        }
+        let last = self.started
+            + Duration::from_nanos(self.copied_at.load(Ordering::Relaxed));
+        now < self.deadline.limit && now.saturating_duration_since(last) < SEED_STALL
+    }
+}
+
 /// What a seeding did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seeded {
     pub(crate) units: usize,
     pub(crate) donor: Option<PathBuf>,
+    /// The donor's units the deadline left untried ([`SeedDeadline`]).
+    pub(crate) left: usize,
     /// Files given as hard links rather than copies ([`shares_inode`]).
     pub(crate) linked: usize,
     /// Files large enough for the hash memo, for [`PlacedFile::memo_rows`].
@@ -1420,7 +1505,7 @@ pub(crate) fn seed(
         donors,
         cache_dir,
         &no_recorded_hashes,
-        deadline,
+        SeedDeadline::fixed(deadline),
         false,
     )
 }
@@ -1435,7 +1520,7 @@ pub(crate) fn seed_for_lane(
     donors: &[Donor],
     cache_dir: &Path,
     recorded: RecordedLookup,
-    deadline: Instant,
+    deadline: SeedDeadline,
     check_lane: bool,
 ) -> Seeded {
     let Ok(lockfile) = std::fs::read_to_string(target.workspace_root.join("Cargo.lock")) else {
@@ -1468,10 +1553,14 @@ pub(crate) fn seed_for_lane(
         return Seeded::default();
     }
     let checked = mode == WorkspaceUnits::Checked;
-    for (donor, layout) in
+    for (tried, (donor, layout)) in
         ranked_donors(target, rustc_version, donors, &registry, &both, checked, check_lane)
+            .enumerate()
     {
-        if Instant::now() >= deadline {
+        // The first donor goes on past `soft` while it copies; another, tried
+        // when the one before copied nothing, only before it.
+        let now = Instant::now();
+        if now >= deadline.limit || (tried > 0 && now >= deadline.soft) {
             break;
         }
         let same_checkout = same_checkout(donor, target);
@@ -1484,7 +1573,7 @@ pub(crate) fn seed_for_lane(
                     &target.workspace_root,
                     &workspace,
                     !checkout_has_other_targets(target, donors),
-                    deadline,
+                    deadline.limit,
                 )
             })
             .flatten();
@@ -1518,7 +1607,9 @@ pub(crate) fn seed_for_lane(
                 units.len()
             );
         }
-        let recorded = recorded_for_units(&from, layout, &units, &deps, recorded, deadline);
+        let limit = deadline.limit;
+        let recorded = recorded_for_units(&from, layout, &units, &deps, recorded, limit);
+        let progress = Progress::new(deadline);
         let next = AtomicUsize::new(0);
         let copied = AtomicUsize::new(0);
         let files = FileCounts::default();
@@ -1529,17 +1620,23 @@ pub(crate) fn seed_for_lane(
                 let (units, next, copied, from, to, deps, files, recorded, needles, cross) = (
                     &units, &next, &copied, &from, &to, &deps, &files, &recorded, &needles, &cross,
                 );
+                let progress = &progress;
                 let target_needles = &target_needles;
                 let workspace = &workspace;
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
-                    while let Some(unit) = units.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if Instant::now() >= deadline
+                    loop {
+                        // Taken only while the deadline allows: a unit
+                        // left at the end counts as left.
+                        if !progress.takes_more(Instant::now())
                             || crate::invocation::process::check().is_err()
                         {
                             break;
                         }
+                        let Some(unit) = units.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                            break;
+                        };
                         let checked_here = cross.is_some() && workspace.contains(&unit.package);
                         let record_needles = if checked_here {
                             target_needles
@@ -1548,9 +1645,9 @@ pub(crate) fn seed_for_lane(
                         };
                         if marker(to, layout, unit).exists()
                             || names_the_donor(from, layout, unit, record_needles)
-                            || out_dir_names_the_donor(from, layout, unit, needles, deadline)
+                            || out_dir_names_the_donor(from, layout, unit, needles, limit)
                             || !artifacts_stored(
-                                from, layout, unit, deps, cache_dir, recorded, deadline,
+                                from, layout, unit, deps, cache_dir, recorded, limit,
                             )
                         {
                             continue;
@@ -1585,7 +1682,7 @@ pub(crate) fn seed_for_lane(
                             _ => None,
                         };
                         match copy_unit(
-                            from, to, layout, unit, deps, cache_dir, files, checkout, deadline,
+                            from, to, layout, unit, deps, cache_dir, files, checkout, limit,
                         ) {
                             Ok(()) => {
                                 // Cargo waits on our lock until the dep-info
@@ -1603,6 +1700,7 @@ pub(crate) fn seed_for_lane(
                                     );
                                 }
                                 copied.fetch_add(1, Ordering::Relaxed);
+                                progress.copied(Instant::now());
                             }
                             Err(error) => {
                                 tracing::debug!(
@@ -1621,6 +1719,7 @@ pub(crate) fn seed_for_lane(
             return Seeded {
                 units: copied,
                 donor: Some(donor.workspace_root.clone()),
+                left: units.len().saturating_sub(next.into_inner()),
                 linked: files.linked.into_inner(),
                 placed: files.placed.into_inner().unwrap_or_default(),
             };
@@ -5242,7 +5341,7 @@ source = "git+https://example.com/gitdep#abc"
             std::slice::from_ref(&donor),
             &stored,
             &no_recorded_hashes,
-            later(),
+            SeedDeadline::fixed(later()),
             true,
         );
         assert_eq!(seeded.units, 4);
@@ -5257,6 +5356,57 @@ source = "git+https://example.com/gitdep#abc"
         );
         assert!(!to.join("examples/demo").exists());
         assert!(!to.join("deps").join(format!("libdemo-{}.rmeta", h(4))).exists());
+    }
+
+    /// Units are taken until the deadline, and past it while one keeps
+    /// being copied at least every [`SEED_STALL`], until the limit.
+    #[test]
+    fn past_the_deadline_units_are_taken_while_they_keep_coming() {
+        let second = |n: u64| Duration::from_secs(n);
+        let progress = Progress::new(SeedDeadline::from_start(Instant::now()));
+        let at = |n: u64| progress.started + second(n);
+        assert!(progress.takes_more(at(9)));
+        // Nothing copied since the copy began.
+        assert!(!progress.takes_more(at(11)));
+        progress.copied(at(20));
+        assert!(progress.takes_more(at(21)));
+        assert!(!progress.takes_more(at(20) + SEED_STALL));
+        progress.copied(at(59));
+        assert!(progress.takes_more(at(60) - Duration::from_millis(1)));
+        assert!(!progress.takes_more(at(60)));
+        // A copy from another thread that ran late moves nothing back.
+        progress.copied(at(30));
+        assert!(progress.takes_more(at(60) - Duration::from_millis(1)));
+        assert_eq!(SEED_LIMIT, second(60));
+    }
+
+    /// A seeding whose deadline passed before the copy began still copies
+    /// what it can before its limit, and none past the limit.
+    #[test]
+    fn a_seeding_past_its_deadline_copies_until_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let donor = donor(dir.path(), "a", Layout::Shared);
+        let seed_by = |name: &str, deadline: SeedDeadline| {
+            seed_for_lane(
+                &checkout(dir.path(), name),
+                VERSION,
+                std::slice::from_ref(&donor),
+                no_runs().path(),
+                &no_recorded_hashes,
+                deadline,
+                false,
+            )
+        };
+        let passed = Instant::now();
+        let late = seed_by(
+            "late",
+            SeedDeadline {
+                soft: passed,
+                limit: later(),
+            },
+        );
+        assert_eq!((late.units, late.left), (1, 0));
+        assert_eq!(seed_by("over", SeedDeadline::fixed(passed)), Seeded::default());
     }
 
     /// A checkout at `root/name` with `LOCK`, whose target `VERSION` built:
@@ -5310,7 +5460,7 @@ source = "git+https://example.com/gitdep#abc"
                 &donors,
                 &stored,
                 &no_recorded_hashes,
-                later(),
+                SeedDeadline::fixed(later()),
                 true
             ),
             Seeded {
@@ -5328,7 +5478,7 @@ source = "git+https://example.com/gitdep#abc"
                 &donors,
                 &stored,
                 &no_recorded_hashes,
-                later(),
+                SeedDeadline::fixed(later()),
                 false
             ),
             Seeded {
