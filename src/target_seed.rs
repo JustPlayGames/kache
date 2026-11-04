@@ -467,28 +467,31 @@ fn compiler_dep_infos(
     }
 }
 
-/// A path into the donor in the unit's recorded build-script output, other
-/// than its own `OUT_DIR`, which Cargo rewrites when it replays the output.
-fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, needles: &[String]) -> bool {
-    let run = match layout {
+/// Where a run's output is recorded (`stdout`, beside `root-output`); only a
+/// build script's run has one.
+fn run_record(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
+    match layout {
         Layout::PerUnit => profile
             .join("build")
             .join(&unit.package)
             .join(&unit.hash)
-            .join("run"),
+            .join("run/stdout"),
         Layout::Shared => profile
             .join("build")
-            .join(format!("{}-{}", unit.package, unit.hash)),
-    };
-    let stdout = match layout {
-        Layout::PerUnit => run.join("stdout"),
-        Layout::Shared => run.join("output"),
-    };
-    let Ok(output) = std::fs::read(stdout) else {
+            .join(format!("{}-{}", unit.package, unit.hash))
+            .join("output"),
+    }
+}
+
+/// A path into the donor in the unit's recorded build-script output, other
+/// than its own `OUT_DIR`, which Cargo rewrites when it replays the output.
+fn names_the_donor(profile: &Path, layout: Layout, unit: &Unit, needles: &[String]) -> bool {
+    let stdout = run_record(profile, layout, unit);
+    let Ok(output) = std::fs::read(&stdout) else {
         return false;
     };
     let output = String::from_utf8_lossy(&output);
-    let out_dir = std::fs::read_to_string(run.join("root-output")).unwrap_or_default();
+    let out_dir = std::fs::read_to_string(stdout.with_file_name("root-output")).unwrap_or_default();
     let rest = match out_dir.trim() {
         "" => output.into_owned(),
         out_dir => output.replace(out_dir, ""),
@@ -516,18 +519,7 @@ fn out_dir_names_the_donor(
     needles: &[String],
     deadline: Instant,
 ) -> bool {
-    let stdout = match layout {
-        Layout::PerUnit => profile
-            .join("build")
-            .join(&unit.package)
-            .join(&unit.hash)
-            .join("run/stdout"),
-        Layout::Shared => profile
-            .join("build")
-            .join(format!("{}-{}", unit.package, unit.hash))
-            .join("output"),
-    };
-    if !stdout.is_file() {
+    if !run_record(profile, layout, unit).is_file() {
         return false;
     }
     OutScan::new(needles, deadline).keeps_out(&build_script_out_dir(profile, layout, unit))
@@ -865,9 +857,10 @@ fn copy_unit(
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
     counts: &FileCounts,
+    checkout: Option<(&Path, &Path)>,
     deadline: Instant,
 ) -> std::io::Result<()> {
-    let relocation = relocation::Relocation::for_unit(from, to, layout, unit, deadline)?;
+    let relocation = relocation::Relocation::for_unit(from, to, layout, unit, checkout, deadline)?;
     #[cfg(unix)]
     {
         let out = build_script_out_dir(from, layout, unit);
@@ -1471,6 +1464,10 @@ pub(crate) fn seed_for_lane(
             &registry
         };
         let needles = needles_for(donor, same_checkout);
+        // A workspace run of another checkout may name the checkout where
+        // its copy can name this one ([`workspace::CrossCheckout::verify`]);
+        // the donor's target still keeps it out.
+        let target_needles = needles_for(donor, true);
         let from = donor.target_dir.join(PROFILE);
         let Some(_theirs) = try_lock_shared(&from.join(".cargo-lock")) else {
             continue;
@@ -1502,6 +1499,7 @@ pub(crate) fn seed_for_lane(
                 let (units, next, copied, from, to, deps, files, recorded, needles, cross) = (
                     &units, &next, &copied, &from, &to, &deps, &files, &recorded, &needles, &cross,
                 );
+                let target_needles = &target_needles;
                 let workspace = &workspace;
                 scope.spawn(move || {
                     let _cancellation =
@@ -1512,8 +1510,14 @@ pub(crate) fn seed_for_lane(
                         {
                             break;
                         }
+                        let checked_here = cross.is_some() && workspace.contains(&unit.package);
+                        let record_needles = if checked_here {
+                            target_needles
+                        } else {
+                            needles
+                        };
                         if marker(to, layout, unit).exists()
-                            || names_the_donor(from, layout, unit, needles)
+                            || names_the_donor(from, layout, unit, record_needles)
                             || out_dir_names_the_donor(from, layout, unit, needles, deadline)
                             || !artifacts_stored(
                                 from, layout, unit, deps, cache_dir, recorded, deadline,
@@ -1524,10 +1528,11 @@ pub(crate) fn seed_for_lane(
                         // A workspace unit from another checkout goes only
                         // once its sources are this checkout's bytes.
                         let verified = match cross {
-                            Some(cross) if workspace.contains(&unit.package) => {
+                            Some(cross) if checked_here => {
                                 match cross.verify(
                                     &unit.package,
                                     &fingerprint_dir(from, layout, unit),
+                                    &run_record(from, layout, unit),
                                 ) {
                                     Some(verified)
                                         if verified.is_run()
@@ -1542,7 +1547,16 @@ pub(crate) fn seed_for_lane(
                             }
                             _ => None,
                         };
-                        match copy_unit(from, to, layout, unit, deps, cache_dir, files, deadline) {
+                        // A verified run's directives name this checkout.
+                        let checkout = match (&verified, cross) {
+                            (Some(verified), Some(cross)) if verified.is_run() => {
+                                Some(cross.checkouts())
+                            }
+                            _ => None,
+                        };
+                        match copy_unit(
+                            from, to, layout, unit, deps, cache_dir, files, checkout, deadline,
+                        ) {
                             Ok(()) => {
                                 // Cargo waits on our lock until the dep-info
                                 // is dated and names this checkout's files.
