@@ -474,12 +474,14 @@ fn marker(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
 
 /// The compiler's dep-info files of a compiled unit: `deps/<crate>-<hash>.d`,
 /// and a build script's own beside it in `build/<pkg>-<hash>/` (or, since
-/// Cargo 1.100, in the unit's `out/`).
+/// Cargo 1.100, in the unit's `out/`). `build_dir`: whether the donor holds
+/// the unit's directory in `build/` ([`BuildDirs`]).
 fn compiler_dep_infos(
     from: &Path,
     layout: Layout,
     unit: &Unit,
     deps: &HashMap<String, Vec<PathBuf>>,
+    build_dir: bool,
 ) -> Vec<PathBuf> {
     let dep_info = |file: &PathBuf| file.extension() == Some(OsStr::new("d")) && file.is_file();
     match layout {
@@ -488,11 +490,15 @@ fn compiler_dep_infos(
             .into_iter()
             .flatten()
             .cloned()
-            .chain(entries(
-                &from
-                    .join("build")
-                    .join(format!("{}-{}", unit.package, unit.hash)),
-            ))
+            .chain(if build_dir {
+                entries(
+                    &from
+                        .join("build")
+                        .join(format!("{}-{}", unit.package, unit.hash)),
+                )
+            } else {
+                Vec::new()
+            })
             .filter(dep_info)
             .collect(),
         Layout::PerUnit => entries(&build_script_out_dir(from, layout, unit))
@@ -1884,7 +1890,9 @@ pub(crate) fn seed_for_lane(
                                     Some(verified)
                                         if verified.is_run()
                                             || !cross.reads_checkout_from_env(
-                                                &compiler_dep_infos(from, layout, unit, deps),
+                                                &compiler_dep_infos(
+                                                    from, layout, unit, deps, build_dir,
+                                                ),
                                             ) =>
                                     {
                                         Some(verified)
