@@ -599,6 +599,39 @@ impl BuildDirs {
     }
 }
 
+/// What a shared-layout profile seeding copies into held when the seeding
+/// began: the entries of its `.fingerprint/`, `deps/` and `examples/`. The
+/// seeding holds the target's lock and copies each unit once, so a unit's
+/// marker or file is there only if it was then; asking for each (a new
+/// target holds none) was 6,150 failed status calls for a 600-crate
+/// workspace. A file two units share may be placed twice, the second time
+/// by rename over the first. In the per-unit layout each path is asked.
+struct Present(Option<std::collections::HashSet<PathBuf>>);
+
+impl Present {
+    fn of(profile: &Path, layout: Layout) -> Self {
+        Self(match layout {
+            Layout::PerUnit => None,
+            Layout::Shared => Some(
+                std::iter::once(".fingerprint")
+                    .chain(OUTPUT_DIRS)
+                    .flat_map(|dir| std::fs::read_dir(profile.join(dir)).into_iter().flatten())
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .collect(),
+            ),
+        })
+    }
+
+    /// Whether `path` was there when the seeding began.
+    fn holds(&self, path: &Path) -> bool {
+        match &self.0 {
+            Some(present) => present.contains(path),
+            None => path.exists(),
+        }
+    }
+}
+
 /// `out/` of a build script: `<unit>/out` since Cargo 1.100, and
 /// `build/<pkg>-<hash>/out` before that.
 fn build_script_out_dir(profile: &Path, layout: Layout, unit: &Unit) -> PathBuf {
@@ -965,6 +998,8 @@ fn artifacts_stored(
 /// for the shared layout; `rebase` moves dep-info from `from` to `to`.
 /// `build_dir`: whether the donor holds the unit's directory in `build/`
 /// ([`BuildDirs`]), where a build script's binary or a run's records are.
+/// A file of the unit `to` already held when the seeding began ([`Present`])
+/// is left as it is.
 fn copy_unit(
     from: &Path,
     to: &Path,
@@ -977,6 +1012,7 @@ fn copy_unit(
     rebase: &kache_store::link::DepinfoRebase,
     checkout: Option<(&Path, &Path)>,
     build_dir: bool,
+    present: &Present,
     deadline: Instant,
 ) -> std::io::Result<()> {
     let relocation = if build_dir {
@@ -1017,7 +1053,7 @@ fn copy_unit(
                 let to_dir = to.join(dir);
                 counts.make_dir(&to_dir)?;
                 let at = to_dir.join(file_name(file));
-                if !at.exists() {
+                if !present.holds(&at) {
                     place_tree(
                         file,
                         &at,
@@ -1824,6 +1860,7 @@ pub(crate) fn seed_for_lane(
             );
         }
         let build_dirs = BuildDirs::of(&from, layout);
+        let present = Present::of(&to, layout);
         let limit = deadline.limit;
         let recorded = recorded_for_units(&from, layout, &units, &deps, recorded, limit);
         let progress = Progress::new(deadline);
@@ -1846,6 +1883,7 @@ pub(crate) fn seed_for_lane(
                 let target_needles = &target_needles;
                 let workspace = &workspace;
                 let build_dirs = &build_dirs;
+                let present = &present;
                 scope.spawn(move || {
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
@@ -1868,7 +1906,7 @@ pub(crate) fn seed_for_lane(
                             needles
                         };
                         let build_dir = build_dirs.holds(layout, unit);
-                        if marker(to, layout, unit).exists()
+                        if present.holds(&marker(to, layout, unit))
                             || (build_dir
                                 && (names_the_donor(from, layout, unit, record_needles)
                                     || out_dir_names_the_donor(from, layout, unit, needles, limit)))
@@ -1911,7 +1949,7 @@ pub(crate) fn seed_for_lane(
                         };
                         match copy_unit(
                             from, to, layout, unit, deps, cache_dir, files, &staging, rebase,
-                            checkout, build_dir, limit,
+                            checkout, build_dir, present, limit,
                         ) {
                             Ok(()) => {
                                 // Cargo waits on our lock until the dep-info
