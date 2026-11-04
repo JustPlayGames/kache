@@ -1164,10 +1164,9 @@ fn link_in_place(
     if Instant::now() >= deadline {
         return Err(std::io::ErrorKind::TimedOut.into());
     }
-    // Dep-info and a build script's records are written anew, never linked.
-    if let Some(relocation) = relocation
-        && relocation.contents(from, deadline)?.is_some()
-    {
+    // Dep-info and a build script's records may be written anew, and are
+    // staged: their bytes are read once, where the staged copy is made.
+    if relocation.is_some_and(|relocation| relocation.rewrites(from)) {
         return Ok(false);
     }
     if !link_read_only(from, to) {
@@ -1335,7 +1334,7 @@ fn copy_tree(
     // as the donor's bytes.
     let contents = tree
         .relocation
-        .map(|relocation| relocation.contents(from, deadline))
+        .map(|relocation| relocation.contents(from, &metadata, deadline))
         .transpose()?
         .flatten();
     if let Some(contents) = contents {
