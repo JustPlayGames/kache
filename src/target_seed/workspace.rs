@@ -141,11 +141,14 @@ impl Adopted {
 /// `theirs` and `ours` and everything under them, when they hold the same
 /// entries and bytes (no symbolic link) and nothing of the donor's is newer
 /// than `limit`. Directories count: Cargo's walk of a declared directory
-/// takes theirs too.
+/// takes theirs too. `Bytes::Compared` skips reading files a package
+/// comparison already found the same; [`CrossCheckout::finish`] reads again
+/// each file whose time it changes.
 fn tree_inputs(
     theirs: &Path,
     ours: &Path,
     limit: Option<SystemTime>,
+    bytes: Bytes,
     deadline: Instant,
 ) -> Option<Vec<Adopted>> {
     let mut found = Vec::new();
@@ -172,7 +175,7 @@ fn tree_inputs(
         } else if !(their_meta.is_file()
             && our_meta.is_file()
             && their_meta.len() == our_meta.len()
-            && same_bytes(&their_path, &our_path, deadline))
+            && (bytes == Bytes::Compared || same_bytes(&their_path, &our_path, deadline)))
         {
             return None;
         }
@@ -184,6 +187,15 @@ fn tree_inputs(
         });
     }
     Some(found)
+}
+
+/// Whether [`tree_inputs`] reads the files it walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bytes {
+    /// Read and compared.
+    Read,
+    /// Inside a package found the same in both checkouts.
+    Compared,
 }
 
 /// Whether `path` (from the target directory, as a dep-info writes it) is
@@ -254,9 +266,21 @@ impl CrossCheckout {
         })
     }
 
+    /// The donor's checkout and this one.
+    pub(super) fn checkouts(&self) -> (&Path, &Path) {
+        (&self.donor_root, &self.our_root)
+    }
+
     /// Whether the donor's unit of `package`, whose fingerprint directory is
-    /// `fingerprint`, was built from this checkout's bytes.
-    pub(super) fn verify(&self, package: &str, fingerprint: &Path) -> Option<Verified> {
+    /// `fingerprint`, was built from this checkout's bytes. `record` is
+    /// where a run's output would be recorded (`stdout`), which only runs
+    /// have.
+    pub(super) fn verify(
+        &self,
+        package: &str,
+        fingerprint: &Path,
+        record: &Path,
+    ) -> Option<Verified> {
         let relative = self.roots.get(package)?;
         let check = self.package(package, relative)?;
         let dep_infos: Vec<PathBuf> = super::entries(fingerprint)
@@ -264,7 +288,7 @@ impl CrossCheckout {
             .filter(|file| super::file_name(file).starts_with("dep-"))
             .collect();
         if dep_infos.is_empty() {
-            return self.verify_run(relative, fingerprint, check);
+            return self.verify_run(relative, fingerprint, record, check);
         }
         let theirs = self.donor_root.join(relative);
         let ours = self.our_root.join(relative);
@@ -304,9 +328,10 @@ impl CrossCheckout {
         &self,
         relative: &Path,
         fingerprint: &Path,
+        record: &Path,
         check: PackageCheck,
     ) -> Option<Verified> {
-        if !self.adopt {
+        if !self.adopt || !self.record_rebases(record) {
             return None;
         }
         let checks = run_checks(fingerprint)?;
@@ -320,7 +345,7 @@ impl CrossCheckout {
                 run: Some(RunInputs {
                     output_time: SystemTime::UNIX_EPOCH,
                     exact: true,
-                    inputs: tree_inputs(&theirs, &ours, None, self.deadline)?,
+                    inputs: tree_inputs(&theirs, &ours, None, Bytes::Compared, self.deadline)?,
                 }),
             });
         }
@@ -399,6 +424,110 @@ impl CrossCheckout {
         .any(|needle| super::contains_path(value.as_bytes(), needle))
     }
 
+    /// Whether the run's recorded output `record` names the donor's checkout
+    /// only where its copy can name this one instead
+    /// ([`super::relocation::rebase_checkout`]): at the start of the path of
+    /// a `rerun-if-changed` (whose file [`Self::run_input`] then compares,
+    /// as Cargo's fingerprint names it from the package), or of a
+    /// `rustc-link-search` directory that holds the same files with the same
+    /// bytes here. The recorded `OUT_DIR`, which Cargo rewrites itself, does
+    /// not count; another spelling of the checkout (a Windows path with `/`)
+    /// keeps the run out. A run without a record names nothing.
+    fn record_rebases(&self, record: &Path) -> bool {
+        let text = match std::fs::read(record) {
+            Ok(bytes) => bytes,
+            Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+        };
+        let Ok(text) = String::from_utf8(text) else {
+            return false;
+        };
+        let out_dir =
+            std::fs::read_to_string(record.with_file_name("root-output")).unwrap_or_default();
+        let text = match out_dir.trim() {
+            "" => text,
+            out_dir => text.replace(out_dir, ""),
+        };
+        let Some(root) = self.donor_root.to_str() else {
+            return false;
+        };
+        let needles = super::donor_needles(&super::Donor {
+            target_dir: PathBuf::new(),
+            workspace_root: self.donor_root.clone(),
+            rustc: None,
+        });
+        let names_root = |text: &str| {
+            needles
+                .iter()
+                .any(|needle| super::contains_path(text.as_bytes(), needle))
+        };
+        for line in text.lines() {
+            if Instant::now() >= self.deadline {
+                return false;
+            }
+            if !names_root(line) {
+                continue;
+            }
+            let Some(span) = super::relocation::checkout_directive(line) else {
+                return false;
+            };
+            let (before, path) = (&line[..span.start], &line[span.clone()]);
+            let Some(rest) = super::relocation::below_root(path, root) else {
+                return false;
+            };
+            if names_root(before) || names_root(rest) {
+                return false;
+            }
+            if before.contains("rustc-link-search")
+                && !self.same_link_dir(Path::new(rest.trim_start_matches(['/', '\\'])))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether the directory `rest` below both checkouts (as a
+    /// `rustc-link-search` names it) holds the same files with the same
+    /// bytes in each: the files a linker may take from it. Its
+    /// subdirectories are not searched.
+    fn same_link_dir(&self, rest: &Path) -> bool {
+        let (Some(theirs), Some(ours)) = (
+            normal(&self.donor_root.join(rest)),
+            normal(&self.our_root.join(rest)),
+        ) else {
+            return false;
+        };
+        if !theirs.starts_with(&self.donor_root)
+            || !ours.starts_with(&self.our_root)
+            || theirs.starts_with(&self.donor_target)
+        {
+            return false;
+        }
+        let (Some(names), Some(our_names)) = (sorted_entries(&theirs), sorted_entries(&ours))
+        else {
+            return false;
+        };
+        if names != our_names {
+            return false;
+        }
+        names.iter().all(|name| {
+            let (their_file, our_file) = (theirs.join(name), ours.join(name));
+            match (
+                std::fs::symlink_metadata(&their_file),
+                std::fs::symlink_metadata(&our_file),
+            ) {
+                (Ok(their_meta), Ok(our_meta)) if their_meta.is_dir() && our_meta.is_dir() => true,
+                (Ok(their_meta), Ok(our_meta)) => {
+                    their_meta.is_file()
+                        && our_meta.is_file()
+                        && their_meta.len() == our_meta.len()
+                        && same_bytes(&their_file, &our_file, self.deadline)
+                }
+                _ => false,
+            }
+        })
+    }
+
     /// `None` when the declared file `path` keeps the run out; else the file
     /// whose time this checkout takes, if any. A file outside both checkouts
     /// is the same file for both, and holds while no newer than the run.
@@ -425,7 +554,29 @@ impl CrossCheckout {
             return None;
         }
         // A directory: Cargo takes the newest time of everything under it.
-        tree_inputs(&their_file, &our_file, Some(output_time), self.deadline)
+        let bytes = if self.in_compared_package(&their_file) {
+            Bytes::Compared
+        } else {
+            Bytes::Read
+        };
+        tree_inputs(
+            &their_file,
+            &our_file,
+            Some(output_time),
+            bytes,
+            self.deadline,
+        )
+    }
+
+    /// Whether the donor's `file` is inside a path package whose directory
+    /// [`Self::package`] found the same bytes in both checkouts (a run that
+    /// declares the sources of the crates it scans: Prism's app).
+    fn in_compared_package(&self, file: &Path) -> bool {
+        self.roots
+            .iter()
+            .filter(|(_, relative)| file.starts_with(self.donor_root.join(relative)))
+            .max_by_key(|(_, relative)| relative.components().count())
+            .is_some_and(|(package, relative)| self.package(package, relative).is_some())
     }
 
     /// Ready the copied unit at `fingerprint` for Cargo: a compiled unit's

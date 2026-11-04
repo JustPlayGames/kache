@@ -164,7 +164,8 @@ impl Fixture {
     }
 
     fn verify(&self) -> Option<Verified> {
-        self.check()?.verify("p", &self.fingerprint)
+        self.check()?
+            .verify("p", &self.fingerprint, &record_of(&self.fingerprint))
     }
 }
 
@@ -359,17 +360,22 @@ fn a_unit_that_read_the_donors_checkout_from_the_environment_stays_out() {
 fn a_package_is_compared_once_per_seeding() {
     let fixture = Fixture::new(&[(0, "src/lib.rs")]);
     let check = fixture.check().unwrap();
-    let first = check.verify("p", &fixture.fingerprint).unwrap();
+    let first = check
+        .verify("p", &fixture.fingerprint, &record_of(&fixture.fingerprint))
+        .unwrap();
     // A later change is seen by Cargo through its newer time, not by
     // comparing again within this seeding.
     write(
         &fixture.ours.join("crates/p/src/lib.rs"),
         b"pub fn g() {}\n",
     );
-    assert_eq!(check.verify("p", &fixture.fingerprint), Some(first.clone()));
+    assert_eq!(
+        check.verify("p", &fixture.fingerprint, &record_of(&fixture.fingerprint)),
+        Some(first.clone())
+    );
     assert!(modified(&fixture.ours.join("crates/p/src/lib.rs")).unwrap() >= first.stamp);
     assert_eq!(
-        check.verify("q", &fixture.fingerprint),
+        check.verify("q", &fixture.fingerprint, &record_of(&fixture.fingerprint)),
         None,
         "not a package here"
     );
@@ -445,6 +451,16 @@ fn a_donor_file_written_out_in_full_is_compared_and_renamed_in_the_copy() {
     assert!(!bad.join("dep-lib-p").exists());
 }
 
+/// Where the unit at `fingerprint` (`<target>/debug/.fingerprint/<unit>`) has
+/// its run's output recorded, if it is a run.
+fn record_of(fingerprint: &Path) -> PathBuf {
+    let profile = fingerprint.parent().unwrap().parent().unwrap();
+    profile
+        .join("build")
+        .join(fingerprint.file_name().unwrap())
+        .join("output")
+}
+
 /// A run of `p`'s build script in the donor, built at [`BUILT`], whose record
 /// holds `local` (Cargo's `local` list), next to the fixture's compiled unit.
 fn run_record(fixture: &Fixture, local: &str) -> PathBuf {
@@ -496,7 +512,9 @@ fn secs(time: SystemTime) -> u64 {
 fn a_run_on_the_same_declared_bytes_gives_its_files_the_donors_times() {
     let (fixture, run) = run_fixture();
     let check = fixture.check().unwrap();
-    let verified = check.verify("p", &run).expect("same declared bytes");
+    let verified = check
+        .verify("p", &run, &record_of(&run))
+        .expect("same declared bytes");
     // An untouched file already older than the run keeps its time.
     let shared = fixture.ours.join("shared/x.txt");
     at(&shared, BUILT - 5_000);
@@ -575,7 +593,7 @@ fn a_run_is_kept_out_unless_every_declared_file_checks_out() {
 fn a_declared_file_changed_while_seeding_keeps_the_run_out() {
     let (fixture, run) = run_fixture();
     let check = fixture.check().unwrap();
-    let verified = check.verify("p", &run).unwrap();
+    let verified = check.verify("p", &run, &record_of(&run)).unwrap();
     let copy = fixture.donor.join("copy");
     for name in [
         "run-build-script-build-script-build",
@@ -593,7 +611,8 @@ fn a_declared_file_changed_while_seeding_keeps_the_run_out() {
 
 impl Fixture {
     fn verify_at(&self, fingerprint: &Path) -> Option<Verified> {
-        self.check()?.verify("p", fingerprint)
+        self.check()?
+            .verify("p", fingerprint, &record_of(fingerprint))
     }
 }
 
@@ -622,7 +641,9 @@ fn a_declared_directory_and_a_package_judged_by_time_take_every_time() {
             at(&fixture.ours.join(dir), BUILT + 1_000);
         }
         let check = fixture.check().unwrap();
-        let verified = check.verify("p", &run).unwrap_or_else(|| panic!("{case}"));
+        let verified = check
+            .verify("p", &run, &record_of(&run))
+            .unwrap_or_else(|| panic!("{case}"));
         // Older than the run is not enough for a package's time.
         at(&fixture.ours.join("crates/p/src/lib.rs"), BUILT - 7_000);
         check.finish(&run, &verified).unwrap();
@@ -683,9 +704,92 @@ fn no_run_without_leave_to_adopt_times() {
         later(),
     )
     .unwrap();
-    assert_eq!(check.verify("p", &run), None);
+    assert_eq!(check.verify("p", &run, &record_of(&run)), None);
     assert!(
-        check.verify("p", &fixture.fingerprint).is_some(),
+        check
+            .verify("p", &fixture.fingerprint, &record_of(&fixture.fingerprint))
+            .is_some(),
         "compiled units still"
     );
+}
+
+/// A run of another checkout whose record names that checkout is copied
+/// only where the copy can name this one: at the start of a
+/// `rerun-if-changed` path, or of a `rustc-link-search` directory whose
+/// files are the same bytes in both checkouts.
+#[test]
+fn a_record_naming_the_donors_checkout_is_copied_only_where_it_rebases() {
+    type Edit = fn(&Fixture, &Path);
+    let cases: [(&str, &str, Edit, bool); 9] = [
+        (
+            "declared file and searched directory",
+            "cargo:rerun-if-changed=DONOR/shared/x.txt\ncargo::rustc-link-search=native=DONOR/crates/p/lib\ncargo:rustc-link-lib=static=q\n",
+            |_, _| {},
+            true,
+        ),
+        (
+            "a link search without a kind",
+            "cargo:rustc-link-search=DONOR/crates/p/lib\n",
+            |_, _| {},
+            true,
+        ),
+        (
+            "a library in the searched directory differs",
+            "cargo:rustc-link-search=native=DONOR/crates/p/lib\n",
+            |fixture, _| write(&fixture.ours.join("crates/p/lib/libq.a"), b"other"),
+            false,
+        ),
+        (
+            "the searched directory has one more file here",
+            "cargo:rustc-link-search=native=DONOR/crates/p/lib\n",
+            |fixture, _| write(&fixture.ours.join("crates/p/lib/libr.a"), b"r"),
+            false,
+        ),
+        (
+            "an environment variable a compiler reads",
+            "cargo:rustc-env=DIR=DONOR/crates/p\n",
+            |_, _| {},
+            false,
+        ),
+        (
+            "a link argument",
+            "cargo:rustc-link-arg=DONOR/crates/p/lib/libq.a\n",
+            |_, _| {},
+            false,
+        ),
+        (
+            "a line Cargo does not read",
+            "running DONOR/crates/p/build.rs\n",
+            |_, _| {},
+            false,
+        ),
+        (
+            "the checkout inside a path",
+            "cargo:rerun-if-changed=/x/DONOR/shared/x.txt\n",
+            |_, _| {},
+            false,
+        ),
+        (
+            "the donor's target beside its OUT_DIR",
+            "cargo:rustc-link-search=native=DONOR/target/debug/deps\n",
+            |_, _| {},
+            false,
+        ),
+    ];
+    for (case, record, change, copied) in cases {
+        let (fixture, run) = run_fixture();
+        for root in [&fixture.donor, &fixture.ours] {
+            write(&root.join("crates/p/lib/libq.a"), b"!<arch>\nq");
+        }
+        let output = record_of(&run);
+        write(
+            &output,
+            record
+                .replace("DONOR", fixture.donor.to_str().unwrap())
+                .as_bytes(),
+        );
+        at(&output, BUILT);
+        change(&fixture, &output);
+        assert_eq!(fixture.verify_at(&run).is_some(), copied, "{case}");
+    }
 }

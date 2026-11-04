@@ -32,11 +32,16 @@ struct Script {
 }
 
 impl Relocation {
+    /// `checkout`, the donor's checkout and this one, is given for a run of
+    /// another checkout that [`super::workspace`] verified: its directives
+    /// that name the donor's checkout then name this one
+    /// ([`rebase_checkout`]).
     pub(super) fn for_unit(
         from: &Path,
         to: &Path,
         layout: Layout,
         unit: &Unit,
+        checkout: Option<(&Path, &Path)>,
         deadline: Instant,
     ) -> io::Result<Self> {
         let out_dir = build_script_out_dir(from, layout, unit);
@@ -69,12 +74,17 @@ impl Relocation {
                 let current = current
                     .to_str()
                     .ok_or_else(|| io::Error::other("seeded OUT_DIR is not UTF-8"))?;
+                let mut translated_stdout = rebase_stdout(&output, recorded, current);
+                if let Some((theirs, ours)) = checkout {
+                    translated_stdout = rebase_checkout(&translated_stdout, theirs, ours)
+                        .ok_or_else(|| io::Error::other("checkout is not UTF-8"))?;
+                }
                 Some(Script {
                     stdout,
                     root_output,
                     out_dirs: [out_dir.clone(), PathBuf::from(recorded)],
                     current_out_dir: PathBuf::from(current),
-                    translated_stdout: rebase_stdout(&output, recorded, current),
+                    translated_stdout,
                     translated_root: current.to_owned(),
                 })
             }
@@ -177,6 +187,76 @@ fn rebase_stdout(output: &str, recorded: &str, current: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The directives whose path may name a checkout of the workspace when a
+/// run of another checkout is copied: Cargo watches the first for the run's
+/// freshness, and the linker searches the second when it links a unit above
+/// the run. Any other directive naming the donor's checkout (an environment
+/// variable or `cfg` a compiler reads, a link argument, metadata another
+/// script reads) keeps the run out.
+const CHECKOUT_DIRECTIVES: [&str; 2] = ["rerun-if-changed", "rustc-link-search"];
+
+/// The kinds `rustc-link-search` takes before a `=` (Cargo's
+/// `PathKind`); a value without one is a plain path.
+const LINK_SEARCH_KINDS: [&str; 5] = ["native", "crate", "dependency", "framework", "all"];
+
+/// The path of a directive line of [`CHECKOUT_DIRECTIVES`], in either
+/// syntax (`cargo:` or `cargo::`), as the range of `line` it takes; the
+/// line's ending is not part of it.
+pub(super) fn checkout_directive(line: &str) -> Option<std::ops::Range<usize>> {
+    let content = line.trim_end_matches(['\n', '\r']);
+    let trimmed = content.trim_start();
+    let body = trimmed
+        .strip_prefix("cargo::")
+        .or_else(|| trimmed.strip_prefix("cargo:"))?;
+    let (key, value) = body.split_once('=')?;
+    if !CHECKOUT_DIRECTIVES.contains(&key) {
+        return None;
+    }
+    let path = match value.split_once('=') {
+        Some((kind, path)) if key == "rustc-link-search" && LINK_SEARCH_KINDS.contains(&kind) => {
+            path
+        }
+        _ => value,
+    };
+    // `path` is a suffix of `content`.
+    Some(content.len() - path.len()..content.len())
+}
+
+/// The part of `path` after `root`, when `path` is `root` or a path below
+/// it: `/w/a` is below `/w`, `/w2/a` is not.
+pub(super) fn below_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(root)?;
+    (rest.is_empty() || rest.starts_with(['/', '\\'])).then_some(rest)
+}
+
+/// `output` with the donor's checkout `theirs` replaced by `ours` at the
+/// start of each [`checkout_directive`]'s path. [`super::workspace`] keeps
+/// out a run whose record names the donor's checkout anywhere else, so this
+/// is the output the run would have recorded here, as Cargo reads it: a
+/// `rerun-if-changed` path inside the package becomes the same path from
+/// the package in Cargo's fingerprint, and the linker searches this
+/// checkout's directory (whose files were found the same). `None` when a
+/// root is not UTF-8.
+pub(super) fn rebase_checkout(output: &str, theirs: &Path, ours: &Path) -> Option<String> {
+    let (theirs, ours) = (theirs.to_str()?, ours.to_str()?);
+    Some(
+        output
+            .split_inclusive('\n')
+            .map(|line| {
+                let Some(span) = checkout_directive(line) else {
+                    return line.to_owned();
+                };
+                match below_root(&line[span.clone()], theirs) {
+                    Some(rest) => {
+                        format!("{}{ours}{rest}{}", &line[..span.start], &line[span.end..])
+                    }
+                    None => line.to_owned(),
+                }
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -301,6 +381,7 @@ mod tests {
             &to,
             Layout::Shared,
             &unit,
+            None,
             Instant::now() + std::time::Duration::from_secs(60),
         )
         .unwrap();
@@ -326,6 +407,32 @@ mod tests {
                 elsewhere.display()
             );
         }
+    }
+
+    #[test]
+    fn a_verified_runs_checkout_directives_name_this_checkout() {
+        let output = concat!(
+            "cargo:rerun-if-changed=/w/a/crates/p/../../vendor/lib.a\n",
+            "cargo::rustc-link-search=native=/w/a/vendor\n",
+            "cargo:rustc-link-search=/w/a\r\n",
+            "cargo:rerun-if-changed=/w/ab/other\n",
+            "cargo:rustc-env=DIR=/w/a/x\n",
+            "/w/a/opaque\n",
+            "cargo:rerun-if-changed=build.rs",
+        );
+        assert_eq!(
+            rebase_checkout(output, Path::new("/w/a"), Path::new("/n/b")).unwrap(),
+            concat!(
+                "cargo:rerun-if-changed=/n/b/crates/p/../../vendor/lib.a\n",
+                "cargo::rustc-link-search=native=/n/b/vendor\n",
+                "cargo:rustc-link-search=/n/b\r\n",
+                "cargo:rerun-if-changed=/w/ab/other\n",
+                "cargo:rustc-env=DIR=/w/a/x\n",
+                "/w/a/opaque\n",
+                "cargo:rerun-if-changed=build.rs",
+            ),
+            "only the two directives' paths, and only below the checkout"
+        );
     }
 
     #[test]
@@ -356,6 +463,7 @@ mod tests {
                 &to,
                 layout,
                 &unit,
+                None,
                 Instant::now() + std::time::Duration::from_secs(60),
             )
             .unwrap();
