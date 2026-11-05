@@ -59,6 +59,11 @@ const SKIPPED_DIRS: [&str; 3] = ["target", ".git", "node_modules"];
 /// Bytes read at a time when two files are compared.
 const COMPARE_CHUNK: usize = 1 << 16;
 
+/// Files of a package compared at once ([`compare_trees`]). Each copy
+/// thread may be comparing a package, so this many again of short-lived
+/// threads that wait for the disk, not the processor.
+const COMPARE_THREADS: usize = 4;
+
 /// The check of one donor checkout's path units against this checkout.
 pub(super) struct CrossCheckout {
     donor_root: PathBuf,
@@ -884,8 +889,16 @@ fn package_name(manifest: &Path) -> Option<String> {
 /// with the same targets and files with the same bytes; then the newest
 /// modification time under `theirs`. `None` on any difference, an
 /// unreadable entry or `deadline`.
+///
+/// The trees are listed first and their files compared after, by
+/// [`COMPARE_THREADS`] at once: one copy thread compares a package while the
+/// others that need it wait, and on a loaded machine nearly every read waits
+/// for the disk. Compared one file after another, a new checkout's 13,484
+/// files took a seeding's copy threads 119-201 s at load 190-220, and the
+/// seeding reached its limit with 400-1,200 units left.
 fn compare_trees(theirs: &Path, ours: &Path, deadline: Instant) -> Option<SystemTime> {
     let mut newest = SystemTime::UNIX_EPOCH;
+    let mut files = Vec::new();
     let mut pending = vec![(theirs.to_path_buf(), ours.to_path_buf())];
     while let Some((their_dir, our_dir)) = pending.pop() {
         if Instant::now() >= deadline {
@@ -915,16 +928,18 @@ fn compare_trees(theirs: &Path, ours: &Path, deadline: Instant) -> Option<System
             } else if their_kind.is_dir() && our_kind.is_dir() {
                 pending.push((their_path, our_path));
             } else if their_kind.is_file() && our_kind.is_file() {
-                if their_meta.len() != our_meta.len()
-                    || !same_bytes_of(&their_path, &our_path, their_meta.len(), deadline)
-                {
+                if their_meta.len() != our_meta.len() {
                     return None;
                 }
+                files.push((their_path, our_path, their_meta.len()));
             } else {
                 return None;
             }
         }
     }
+    super::read_in_parallel(&files, COMPARE_THREADS, deadline, |(theirs, ours, len)| {
+        same_bytes_of(theirs, ours, *len, deadline).then_some(())
+    })?;
     Some(newest)
 }
 

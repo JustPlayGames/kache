@@ -869,3 +869,31 @@ fn a_record_naming_the_donors_checkout_is_copied_only_where_it_rebases() {
         assert_eq!(fixture.verify_at(&run).is_some(), copied, "{case}");
     }
 }
+
+/// A package's files are compared side by side; any one of them that
+/// differs, as deep and as late as it lies, keeps the package out.
+#[test]
+fn every_file_of_a_package_is_compared_whatever_its_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let (theirs, ours) = (dir.path().join("theirs"), dir.path().join("ours"));
+    for n in 0..40 {
+        let relative = format!("src/m{}/f{n}.rs", n % 5);
+        let bytes = format!("pub fn f{n}() {{}}\n");
+        write(&theirs.join(&relative), bytes.as_bytes());
+        write(&ours.join(&relative), bytes.as_bytes());
+        at(&theirs.join(&relative), 1_000 + i64::from(n));
+    }
+    for dir in ["src/m0", "src/m1", "src/m2", "src/m3", "src/m4", "src"] {
+        at(&theirs.join(dir), 900);
+    }
+    assert_eq!(
+        compare_trees(&theirs, &ours, later()),
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_039))
+    );
+    // Same length, one byte apart.
+    write(&ours.join("src/m3/f38.rs"), b"pub fn f39() {}\n");
+    assert_eq!(compare_trees(&theirs, &ours, later()), None);
+    write(&ours.join("src/m3/f38.rs"), b"pub fn f38() {}\n");
+    assert!(compare_trees(&theirs, &ours, later()).is_some());
+    assert_eq!(compare_trees(&theirs, &ours, Instant::now()), None);
+}
