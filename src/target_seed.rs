@@ -132,6 +132,17 @@ const PROFILE: &str = "debug";
 /// Where a unit is copied before it is renamed into place.
 const STAGING: &str = ".kache-seeding-";
 
+/// Units a copy thread copies before it places them ([`place_staged`]).
+///
+/// Few enough that a seeding cut short by its deadline still places what it
+/// copied in a moment, and that a thread's directory of staged names stays
+/// small; enough that a thread waits for each shared directory once for
+/// many names. Research bench (one production seeding of command-center's
+/// workspace clippy into a new checkout), at load 9-11, nine interleaved
+/// rounds: placing every 8 units, 32 or once a thread's units were all
+/// copied took 1,020, 1,156 and 1,252 ms (medians, within noise).
+const PLACE_BATCH: usize = 16;
+
 /// Bytes of a build script's `out/` read per unit while looking for a donor
 /// path. A unit whose files add up to more is not seeded: the unread bytes
 /// could name the donor. aws-lc-sys 0.45's `out/`, objects with debug info
@@ -993,8 +1004,9 @@ fn artifacts_stored(
         .all(|file| Instant::now() < deadline && is_stored_blob(file, recorded, &store))
 }
 
-/// Copy one unit from the donor profile `from` to `to`. The unit's marker
-/// goes last, by rename. `deps` is [`outputs_by_hash`] of the donor's profile
+/// Copy one unit from the donor profile `from` into `staging`, to be placed
+/// in `to` ([`StagedUnit`]); its marker goes last. `deps` is
+/// [`outputs_by_hash`] of the donor's profile
 /// for the shared layout; `rebase` moves dep-info from `from` to `to`.
 /// `build_dir`: whether the donor holds the unit's directory in `build/`
 /// ([`BuildDirs`]), where a build script's binary or a run's records are.
@@ -1014,7 +1026,7 @@ fn copy_unit(
     build_dir: bool,
     present: &Present,
     deadline: Instant,
-) -> std::io::Result<()> {
+) -> std::io::Result<StagedUnit> {
     let relocation = if build_dir {
         relocation::Relocation::for_unit(from, to, rebase, layout, unit, checkout, deadline)?
     } else {
@@ -1033,7 +1045,7 @@ fn copy_unit(
         Layout::PerUnit => {
             let package = to.join("build").join(&unit.package);
             counts.make_dir(&package)?;
-            place_tree(
+            let tree = stage_tree(
                 &from.join("build").join(&unit.package).join(&unit.hash),
                 &package.join(&unit.hash),
                 cache_dir,
@@ -1041,10 +1053,15 @@ fn copy_unit(
                 staging,
                 deadline,
                 Some(&relocation),
-            )
+            )?;
+            Ok(StagedUnit {
+                outputs: Vec::new(),
+                marker: tree,
+            })
         }
         Layout::Shared => {
             let named = format!("{}-{}", unit.package, unit.hash);
+            let mut outputs = Vec::new();
             for file in deps.get(&unit.hash).into_iter().flatten() {
                 // In `deps/` or `examples/`, as in the donor.
                 let Some(dir) = file.parent().and_then(Path::file_name) else {
@@ -1054,7 +1071,7 @@ fn copy_unit(
                 counts.make_dir(&to_dir)?;
                 let at = to_dir.join(file_name(file));
                 if !present.holds(&at) {
-                    place_tree(
+                    outputs.push(stage_tree(
                         file,
                         &at,
                         cache_dir,
@@ -1062,13 +1079,13 @@ fn copy_unit(
                         staging,
                         deadline,
                         Some(&relocation),
-                    )?;
+                    )?);
                 }
             }
             let build = from.join("build").join(&named);
             if build_dir {
                 counts.make_dir(&to.join("build"))?;
-                place_tree(
+                outputs.push(stage_tree(
                     &build,
                     &to.join("build").join(&named),
                     cache_dir,
@@ -1076,10 +1093,10 @@ fn copy_unit(
                     staging,
                     deadline,
                     Some(&relocation),
-                )?;
+                )?);
             }
             counts.make_dir(&to.join(".fingerprint"))?;
-            place_tree(
+            let marker = stage_tree(
                 &from.join(".fingerprint").join(&named),
                 &to.join(".fingerprint").join(&named),
                 cache_dir,
@@ -1087,12 +1104,201 @@ fn copy_unit(
                 staging,
                 deadline,
                 Some(&relocation),
-            )
+            )?;
+            Ok(StagedUnit { outputs, marker })
         }
     }
 }
 
+/// A unit a copy thread has copied and not yet given its final names: each
+/// output, then the marker that makes the unit whole for Cargo (its
+/// fingerprint directory, or the whole unit in the per-unit layout).
+///
+/// A copy thread places its units [`PLACE_BATCH`] at a time
+/// ([`place_staged`]), a directory at a time. Every unit's final names go
+/// into the same few directories (`deps/`, `build/`, `.fingerprint/`), which
+/// the kernel changes one name at a time; placed as each unit was copied,
+/// they were one wait for the directory a name, and on a loaded machine the
+/// thread holding it was often preempted while the seven others slept on
+/// it: at load 125-205 a seeding's renames waited 17.9 s, summed over its
+/// threads, for 1.4 s of their processor time.
+struct StagedUnit {
+    outputs: Vec<Place>,
+    marker: Place,
+}
+
+impl StagedUnit {
+    /// Where the unit's fingerprint directory is staged.
+    fn fingerprint(&self, layout: Layout) -> PathBuf {
+        let staged = self.marker.staged();
+        match layout {
+            Layout::PerUnit => staged.join("fingerprint"),
+            Layout::Shared => staged.to_path_buf(),
+        }
+    }
+}
+
+/// A name a seeding gives the new profile: a staged copy renamed to it, or a
+/// donor file linked to it ([`link_in_place`]).
+enum Place {
+    Rename {
+        staging: PathBuf,
+        to: PathBuf,
+        /// Files placed under `staging`, given their final paths once the
+        /// rename is made.
+        placed: Vec<PlacedFile>,
+        /// Held past the rename, so a sweep keeps each run the tree links
+        /// to until its recorded `OUT_DIR` does.
+        #[cfg_attr(not(unix), allow(dead_code))]
+        runs: Vec<HeldRun>,
+    },
+    /// Only Unix links a donor file in place ([`link_in_place`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Link {
+        from: PathBuf,
+        metadata: std::fs::Metadata,
+        to: PathBuf,
+        /// Where a copy is staged when the link cannot be made.
+        staging: PathBuf,
+    },
+}
+
+impl Place {
+    fn to(&self) -> &Path {
+        match self {
+            Self::Rename { to, .. } | Self::Link { to, .. } => to,
+        }
+    }
+
+    /// Where the name's contents are until it is placed. For a staged tree,
+    /// its fingerprint lives there too ([`StagedUnit::fingerprint`]).
+    fn staged(&self) -> &Path {
+        match self {
+            Self::Rename { staging, .. } => staging,
+            Self::Link { from, .. } => from,
+        }
+    }
+
+    /// Give the new profile this name.
+    fn apply(self, counts: &FileCounts) -> std::io::Result<()> {
+        match self {
+            Self::Rename {
+                staging,
+                to,
+                placed,
+                runs,
+            } => {
+                let renamed = std::fs::rename(&staging, &to);
+                drop(runs);
+                if let Err(error) = renamed {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(error);
+                }
+                let mut all = counts.placed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                all.extend(placed.into_iter().map(|mut file: PlacedFile| {
+                    file.at = match file.at.strip_prefix(&staging) {
+                        Ok(below) if below.as_os_str().is_empty() => to.clone(),
+                        Ok(below) => to.join(below),
+                        Err(_) => file.at,
+                    };
+                    file
+                }));
+                Ok(())
+            }
+            Self::Link {
+                from,
+                metadata,
+                to,
+                staging,
+            } => {
+                #[cfg(unix)]
+                if link_read_only(&from, &to) {
+                    counts.linked.fetch_add(1, Ordering::Relaxed);
+                    if let Some(placed) = placed_file(&from, &metadata, &to) {
+                        counts
+                            .placed
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(placed);
+                    }
+                    return Ok(());
+                }
+                copy_file(&from, &staging, &metadata, counts.umask)
+                    .and_then(|()| std::fs::rename(&staging, &to))
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(&staging);
+                    })?;
+                counts.copied.fetch_add(1, Ordering::Relaxed);
+                if let Some(placed) = placed_file(&from, &metadata, &to) {
+                    counts
+                        .placed
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(placed);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Leave the name out: what was staged for it goes.
+    fn discard(self) {
+        if let Self::Rename { staging, .. } = self {
+            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_file(&staging);
+        }
+    }
+}
+
+/// Place a copy thread's staged `units` in the new profile and say how many
+/// it placed whole: every unit's outputs first, then their markers, each
+/// directory's names together while the thread holds the directory
+/// ([`FileCounts::directory`]). A unit one of whose outputs could not be
+/// placed keeps out its marker: what is left of it is complete names, which
+/// Cargo builds the unit over. Holding a directory for a run of names, the
+/// thread sleeps for it once rather than once a name.
+///
+/// The seeding's deadline does not cut this short: each unit here is copied
+/// whole, and its names are a rename or a link each, so a seeding past its
+/// deadline keeps what it copied, as when each unit was placed as it was
+/// copied.
+fn place_staged(units: Vec<StagedUnit>, counts: &FileCounts) -> usize {
+    let mut failed = vec![false; units.len()];
+    let mut outputs = Vec::new();
+    let mut markers = Vec::new();
+    for (index, unit) in units.into_iter().enumerate() {
+        outputs.extend(unit.outputs.into_iter().map(|place| (index, place)));
+        markers.push((index, unit.marker));
+    }
+    let place = |names: Vec<(usize, Place)>, failed: &mut Vec<bool>| {
+        let mut names = names;
+        // Stable: a unit's names in one directory keep their order.
+        names.sort_by(|(_, a), (_, b)| a.to().parent().cmp(&b.to().parent()));
+        let mut names = names.into_iter().peekable();
+        while let Some((_, first)) = names.peek() {
+            let dir = first.to().parent().unwrap_or(first.to()).to_path_buf();
+            let lock = counts.directory(&dir);
+            let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while let Some((index, name)) =
+                names.next_if(|(_, name)| name.to().parent().unwrap_or(name.to()) == dir)
+            {
+                if failed[index] {
+                    name.discard();
+                } else if name.apply(counts).is_err() {
+                    failed[index] = true;
+                }
+            }
+        }
+    };
+    place(outputs, &mut failed);
+    place(markers, &mut failed);
+    failed.iter().filter(|failed| !**failed).count()
+}
+
 /// Copy `from` (a file or a directory) into `staging` and rename it to `to`.
+/// A copy thread stages a unit's names ([`stage_tree`]) and places them later.
+#[cfg(test)]
 fn place_tree(
     from: &Path,
     to: &Path,
@@ -1102,12 +1308,32 @@ fn place_tree(
     deadline: Instant,
     relocation: Option<&relocation::Relocation<'_>>,
 ) -> std::io::Result<()> {
+    stage_tree(from, to, cache_dir, counts, staging, deadline, relocation)?.apply(counts)
+}
+
+/// Copy `from` (a file or a directory) into `staging`, to be renamed to `to`
+/// ([`Place::apply`]); a file [`link_in_place`] allows is left to be linked
+/// there instead.
+fn stage_tree(
+    from: &Path,
+    to: &Path,
+    cache_dir: &Path,
+    counts: &FileCounts,
+    staging: &Staging,
+    deadline: Instant,
+    relocation: Option<&relocation::Relocation<'_>>,
+) -> std::io::Result<Place> {
     let metadata = std::fs::symlink_metadata(from)?;
-    #[cfg(unix)]
-    if link_in_place(from, &metadata, to, counts, relocation, deadline)? {
-        return Ok(());
-    }
     let staging = staging.path_for(to);
+    #[cfg(unix)]
+    if link_in_place(from, &metadata, counts, relocation, deadline)? {
+        return Ok(Place::Link {
+            from: from.to_path_buf(),
+            metadata,
+            to: to.to_path_buf(),
+            staging,
+        });
+    }
     let placed = std::sync::Mutex::new(Vec::new());
     let tree = Placing {
         from,
@@ -1117,28 +1343,18 @@ fn place_tree(
         placed: &placed,
         relocation,
     };
-    // Held past the rename, so a sweep keeps each run the tree links to until
-    // its recorded `OUT_DIR` does.
     let mut runs = Vec::new();
-    let copied = copy_tree(from, &metadata, &staging, tree, &mut runs, deadline)
-        .and_then(|()| counts.placing(to, || std::fs::rename(&staging, to)));
-    if copied.is_ok() {
-        let placed = placed.into_inner().unwrap_or_default();
-        let mut all = counts.placed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        all.extend(placed.into_iter().map(|mut file: PlacedFile| {
-            file.at = match file.at.strip_prefix(&staging) {
-                Ok(below) if below.as_os_str().is_empty() => to.to_path_buf(),
-                Ok(below) => to.join(below),
-                Err(_) => file.at,
-            };
-            file
-        }));
-    }
-    if copied.is_err() {
+    if let Err(error) = copy_tree(from, &metadata, &staging, tree, &mut runs, deadline) {
         let _ = std::fs::remove_dir_all(&staging);
         let _ = std::fs::remove_file(&staging);
+        return Err(error);
     }
-    copied
+    Ok(Place::Rename {
+        staging,
+        to: to.to_path_buf(),
+        placed: placed.into_inner().unwrap_or_default(),
+        runs,
+    })
 }
 
 /// Where a copy thread builds what it places by rename: in a directory of
@@ -1174,26 +1390,32 @@ impl Staging {
         Self(None)
     }
 
-    /// Where `to` is built before its rename.
+    /// Where `to` is built before its rename. A thread's directory holds
+    /// every unit it copied until they are placed ([`StagedUnit`]), so the
+    /// name of `to`'s directory is part of it: a unit's `build/` and
+    /// `.fingerprint/` directories have one name.
     fn path_for(&self, to: &Path) -> PathBuf {
         match &self.0 {
-            Some(dir) => dir.path().join(file_name(to)),
+            Some(dir) => dir.path().join(format!(
+                "{}~{}",
+                to.parent().map(file_name).unwrap_or_default(),
+                file_name(to)
+            )),
             None => to.with_file_name(format!("{STAGING}{}-{}", file_name(to), std::process::id())),
         }
     }
 }
 
-/// Link the donor file `from`, of `metadata`, straight to its final name
-/// `to`, once this seeding knows clones fail ([`FileCounts::no_clones`]) and
-/// when [`shares_inode`] allows a link: a link makes the name whole at once,
-/// as the rename of a staged copy does, and spares the journal that rename.
-/// False when `from` is not such a file or the link cannot be made: the
-/// caller stages it as before.
+/// Whether the donor file `from`, of `metadata`, is to be linked straight to
+/// its final name ([`Place::Link`]): once this seeding knows clones fail
+/// ([`FileCounts::no_clones`]) and when [`shares_inode`] allows a link. A
+/// link makes the name whole at once, as the rename of a staged copy does,
+/// and spares the journal that rename. False when `from` is not such a
+/// file: the caller stages it.
 #[cfg(unix)]
 fn link_in_place(
     from: &Path,
     metadata: &std::fs::Metadata,
-    to: &Path,
     counts: &FileCounts,
     relocation: Option<&relocation::Relocation<'_>>,
     deadline: Instant,
@@ -1209,21 +1431,7 @@ fn link_in_place(
     }
     // Dep-info and a build script's records may be written anew, and are
     // staged: their bytes are read once, where the staged copy is made.
-    if relocation.is_some_and(|relocation| relocation.rewrites(from)) {
-        return Ok(false);
-    }
-    if !counts.placing(to, || link_read_only(from, to)) {
-        return Ok(false);
-    }
-    counts.linked.fetch_add(1, Ordering::Relaxed);
-    if let Some(placed) = placed_file(from, metadata, to) {
-        counts
-            .placed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(placed);
-    }
-    Ok(true)
+    Ok(!relocation.is_some_and(|relocation| relocation.rewrites(from)))
 }
 
 /// The [`PlacedFile`] for the donor file `from`, with `metadata` read before
@@ -1569,7 +1777,7 @@ struct FileCounts {
     /// The new profile's directories this seeding made or found.
     made: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// A lock for each directory the copy threads place names into
-    /// ([`FileCounts::placing`]).
+    /// ([`FileCounts::directory`]).
     placing: std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>,
     /// The process's file creation mask, read once a seeding
     /// ([`write_stamped`]).
@@ -1595,8 +1803,9 @@ impl FileCounts {
         Ok(())
     }
 
-    /// Run `place`, which adds the name `to` to its directory, while no
-    /// other copy thread adds a name there.
+    /// The lock a copy thread holds while it adds names to the directory
+    /// `dir` ([`place_staged`]), so that no other one adds names there
+    /// meanwhile.
     ///
     /// The kernel changes a directory one name at a time, under the
     /// directory's lock, and every unit's final renames and links go into
@@ -1605,17 +1814,14 @@ impl FileCounts {
     /// waiting here, they sleep. Under a bounded load (load 119-195) a
     /// seeding's 5,037 renames took 0.7-1.2 s of the processor instead of
     /// 1.4-4.2 s, at the same wall time.
-    fn placing<T>(&self, to: &Path, place: impl FnOnce() -> T) -> T {
-        let parent = to.parent().unwrap_or(to);
-        let lock = std::sync::Arc::clone(
+    fn directory(&self, dir: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+        std::sync::Arc::clone(
             self.placing
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .entry(parent.to_path_buf())
+                .entry(dir.to_path_buf())
                 .or_default(),
-        );
-        let _placing = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        place()
+        )
     }
 }
 
@@ -1946,6 +2152,7 @@ pub(crate) fn seed_for_lane(
                     let _cancellation =
                         crate::invocation::process::CancellationScope::borrow(cancellation);
                     let staging = Staging::in_profile(to);
+                    let mut staged = Vec::new();
                     loop {
                         // Taken only while the deadline allows: a unit
                         // left at the end counts as left.
@@ -2009,14 +2216,13 @@ pub(crate) fn seed_for_lane(
                             from, to, layout, unit, deps, cache_dir, files, &staging, rebase,
                             checkout, build_dir, present, limit,
                         ) {
-                            Ok(()) => {
-                                // Cargo waits on our lock until the dep-info
-                                // is dated and names this checkout's files.
-                                // One that fails is removed: Cargo builds
-                                // the unit.
+                            Ok(unit_staged) => {
+                                // Dated before it is placed, its dep-info
+                                // naming this checkout's files. One that
+                                // fails is removed: Cargo builds the unit.
                                 if let (Some(verified), Some(cross)) = (verified, cross.as_ref())
-                                    && let Err(error) = cross
-                                        .finish(&fingerprint_dir(to, layout, unit), &verified)
+                                    && let Err(error) =
+                                        cross.finish(&unit_staged.fingerprint(layout), &verified)
                                 {
                                     tracing::debug!(
                                         "could not date {}-{}: {error}",
@@ -2024,8 +2230,14 @@ pub(crate) fn seed_for_lane(
                                         unit.hash
                                     );
                                 }
-                                copied.fetch_add(1, Ordering::Relaxed);
+                                staged.push(unit_staged);
                                 progress.copied(Instant::now());
+                                if staged.len() >= PLACE_BATCH {
+                                    copied.fetch_add(
+                                        place_staged(std::mem::take(&mut staged), files),
+                                        Ordering::Relaxed,
+                                    );
+                                }
                             }
                             Err(error) => {
                                 tracing::debug!(
@@ -2036,6 +2248,7 @@ pub(crate) fn seed_for_lane(
                             }
                         }
                     }
+                    copied.fetch_add(place_staged(staged, files), Ordering::Relaxed);
                 });
             }
         });
@@ -5508,6 +5721,50 @@ source = "git+https://example.com/gitdep#abc"
             assert!(renamed <= 1, "{events:?}");
             assert_eq!(counts.linked.load(Ordering::Relaxed), 4);
         }
+    }
+
+    /// A copy thread places its staged units' outputs before any marker, and
+    /// a unit one of whose outputs cannot be placed keeps out its marker;
+    /// the others are placed whole.
+    #[test]
+    fn a_unit_whose_output_cannot_be_placed_keeps_out_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staging, deps, fingerprints) = (
+            dir.path().join("staging"),
+            dir.path().join("deps"),
+            dir.path().join(".fingerprint"),
+        );
+        // A name a rename cannot take: a directory that holds a file.
+        write(&deps.join("taken/file"), "x");
+        std::fs::create_dir(&fingerprints).unwrap();
+        let rename = |name: &str, to: PathBuf| {
+            let at = staging.join(name);
+            write(&at.join("file"), name);
+            Place::Rename {
+                staging: at,
+                to,
+                placed: Vec::new(),
+                runs: Vec::new(),
+            }
+        };
+        let units = vec![
+            StagedUnit {
+                outputs: vec![rename("good-out", deps.join("good"))],
+                marker: rename("good-fp", fingerprints.join("good")),
+            },
+            StagedUnit {
+                outputs: vec![rename("bad-out", deps.join("taken"))],
+                marker: rename("bad-fp", fingerprints.join("bad")),
+            },
+        ];
+        assert_eq!(place_staged(units, &FileCounts::default()), 1);
+        assert!(deps.join("good/file").is_file());
+        assert!(fingerprints.join("good/file").is_file());
+        assert!(!fingerprints.join("bad").exists());
+        assert!(
+            entries(&staging).is_empty(),
+            "what was staged for the unit left out goes"
+        );
     }
 
     #[cfg(unix)]
