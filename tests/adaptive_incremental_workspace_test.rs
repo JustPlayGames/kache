@@ -284,6 +284,43 @@ fn unselected_workspace_crates_seed_then_stay_active() {
     );
 }
 
+/// The middle crate also builds a `staticlib` and `cdylib`, so Cargo gives it
+/// no extra filename. Edits to the library below it still put it in adaptive
+/// incremental mode. It links, and on this line a link of an incrementally
+/// compiled library is private (`a_link_of_incrementally_compiled_libraries_is_not_stored`):
+/// it compiles with its own incremental state, no key and no entry, an
+/// adaptive passthrough that only a unit with an id (here its `-C metadata`)
+/// takes.
+#[test]
+fn an_unselected_cdylib_crate_seeds_then_stays_active() {
+    let checkout = tempfile::tempdir().unwrap();
+    let project = checkout_path(checkout.path());
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let target = project.join("target");
+    create_workspace(&project);
+    let manifest = project.join("mid/Cargo.toml");
+    let mut contents = fs::read_to_string(&manifest).unwrap();
+    contents.push_str("\n[lib]\ncrate-type = [\"lib\", \"staticlib\", \"cdylib\"]\n");
+    fs::write(&manifest, contents).unwrap();
+    let future = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600;
+    let build = |mtime: Option<i64>, answer| {
+        build_unselected(&project, cache.path(), &target, mtime, answer)
+    };
+
+    let (_lib, mid) = build(None, 1);
+    assert_eq!(mid["result"], "miss", "event: {mid:#}");
+
+    for (mtime, answer) in [(future, 2), (future + 1, 3)] {
+        let (_lib, mid) = build(Some(mtime), answer);
+        assert_passthrough(&mid, "adaptive passthrough: private link: adaptive_lib");
+    }
+}
+
 /// A link that takes an rlib an incremental compile wrote keys on bytes no
 /// other build writes, so it compiles with no key and no entry. An example
 /// shows it: examples never take an incremental lane of their own, so each
