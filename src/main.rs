@@ -371,10 +371,18 @@ fn doctor_json_is_read_only(
     verify: bool,
     checksums: bool,
     repair: bool,
+    repair_build_scripts: bool,
 ) -> bool {
-    ![fix, purge_sccache, verify, checksums, repair]
-        .into_iter()
-        .any(|enabled| enabled)
+    ![
+        fix,
+        purge_sccache,
+        verify,
+        checksums,
+        repair,
+        repair_build_scripts,
+    ]
+    .into_iter()
+    .any(|enabled| enabled)
 }
 
 /// Diagnostic log file path.
@@ -654,6 +662,10 @@ fn report_main_error(error: &anyhow::Error) -> u8 {
 fn run_main() -> Result<()> {
     // Recover frontend timing before configuration, logging or worker threads.
     let entry = kache_client::engine_entry(std::env::args_os().collect(), VERSION)?;
+    // Windows frontends already try the daemon, bootstrap it, then retry before
+    // forwarding here. A local fallback must not repeat that startup budget.
+    let daemon_attempted =
+        frontend_completed_daemon_attempt(cfg!(windows), entry.frontend.is_some());
     opcounts::mark_process_start_at(entry.started_at);
     if let Some(frontend) = entry.frontend {
         platform::set_frontend_image(frontend)?;
@@ -739,7 +751,7 @@ fn run_main() -> Result<()> {
                 "compiler wrapper arguments contain non-UTF-8 bytes and cannot be cached safely"
             );
         }
-        return run_wrapper_mode(&shim_args);
+        return run_wrapper_mode(&shim_args, daemon_attempted);
     }
 
     let log_mode = detect_log_mode(detection_args);
@@ -751,7 +763,7 @@ fn run_main() -> Result<()> {
 
     if is_wrapper {
         if let Some(env_args) = env_args {
-            return run_wrapper_mode(&env_args[1..]);
+            return run_wrapper_mode(&env_args[1..], daemon_attempted);
         }
         anyhow::bail!(
             "compiler wrapper arguments contain non-UTF-8 bytes and cannot be cached safely"
@@ -969,12 +981,25 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             verify,
             checksums,
             repair,
+            repair_build_scripts,
             probe,
         }) => {
-            if json && !doctor_json_is_read_only(fix, purge_sccache, verify, checksums, repair) {
+            if json
+                && !doctor_json_is_read_only(
+                    fix,
+                    purge_sccache,
+                    verify,
+                    checksums,
+                    repair,
+                    repair_build_scripts.is_some(),
+                )
+            {
                 return Err(machine::invalid_arguments(
                     "`kache doctor --json` reports diagnostics only; run repair options without `--json`.",
                 ));
+            }
+            if let Some(target) = repair_build_scripts {
+                return cli::repair_build_scripts(&target);
             }
             cli::doctor(
                 fix,
@@ -1520,7 +1545,7 @@ enum WrapperTarget {
     Nvcc,
 }
 
-fn run_wrapper_mode(args: &[String]) -> Result<()> {
+fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
     let mut context = invocation::InvocationContext {
         daemon: None,
         env: invocation::InvocationEnv::capture(),
@@ -1554,7 +1579,7 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
         .is_some();
     context.env.remove(kache_client::FRONTEND_DAEMON_LOST_ENV);
     #[cfg(any(unix, windows))]
-    let config = if declined || lost {
+    let config = if declined || lost || daemon_attempted {
         Some(config::Config::load_for(&context.env)?)
     } else if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
         use invocation::execution::Attempt;
@@ -1604,6 +1629,14 @@ fn run_wrapper_mode(args: &[String]) -> Result<()> {
     }
     let exit = run_compiler_invocation_with_config(args, context, config)?;
     std::process::exit(exit);
+}
+
+/// Whether this engine runs a compile its Windows frontend already
+/// offered a daemon: the frontend asked it, started one when none ran and
+/// asked again before forwarding here, so the engine compiles locally
+/// rather than spending that startup budget a second time (upstream #1826).
+fn frontend_completed_daemon_attempt(windows: bool, forwarded: bool) -> bool {
+    windows && forwarded
 }
 
 /// Before compiling again what a daemon took and then lost (it was stopped,
@@ -1977,6 +2010,18 @@ fn daemon_restart_message(was_running: bool, ready: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    /// A Windows frontend asks the daemon, starts one when none runs and
+    /// asks again before it forwards a compile, so its engine compiles
+    /// locally; an engine run directly, or a Unix frontend's (which starts
+    /// no daemon), still may start one.
+    #[test]
+    fn only_a_windows_frontends_engine_has_had_its_daemon_attempt() {
+        assert!(frontend_completed_daemon_attempt(true, true));
+        assert!(!frontend_completed_daemon_attempt(true, false));
+        assert!(!frontend_completed_daemon_attempt(false, true));
+        assert!(!frontend_completed_daemon_attempt(false, false));
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn original_compiler_requests_use_only_the_supplied_arguments_and_environment() {
@@ -3260,7 +3305,12 @@ mod tests {
         })));
         assert!(!command_supports_json(&None));
 
-        assert!(doctor_json_is_read_only(false, false, false, false, false));
+        assert!(doctor_json_is_read_only(
+            false, false, false, false, false, false
+        ));
+        assert!(!doctor_json_is_read_only(
+            false, false, false, false, false, true
+        ));
         for flags in [
             (true, false, false, false, false),
             (false, true, false, false, false),
@@ -3269,8 +3319,32 @@ mod tests {
             (false, false, false, false, true),
         ] {
             assert!(!doctor_json_is_read_only(
-                flags.0, flags.1, flags.2, flags.3, flags.4
+                flags.0, flags.1, flags.2, flags.3, flags.4, false
             ));
+        }
+    }
+
+    #[test]
+    fn doctor_build_script_repair_requires_a_target_and_excludes_store_repairs() {
+        let cli =
+            Cli::try_parse_from(["kache", "doctor", "--repair-build-scripts", "target"]).unwrap();
+        assert!(
+            matches!(cli.command, Some(Commands::Doctor { repair_build_scripts: Some(target), .. }) if target == std::path::Path::new("target"))
+        );
+        assert!(Cli::try_parse_from(["kache", "doctor", "--repair-build-scripts"]).is_err());
+        for other in [
+            "--fix",
+            "--purge-sccache",
+            "--verify",
+            "--checksums",
+            "--repair",
+            "--probe",
+        ] {
+            assert!(
+                Cli::try_parse_from(["kache", "doctor", "--repair-build-scripts", "target", other])
+                    .is_err(),
+                "{other}"
+            );
         }
     }
 
