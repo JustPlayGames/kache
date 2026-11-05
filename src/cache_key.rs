@@ -11839,7 +11839,7 @@ fn parse_env_dep_info(dep_info: &str) -> Vec<(String, Option<String>)> {
 /// its absolute path into the key — defeating cross-path cache hits on
 /// Windows (kunobi-ninja/kache#201). On Unix, paths rarely contain
 /// backslashes, so this was latent.
-fn unescape_env_dep_value(s: &str) -> String {
+pub(crate) fn unescape_env_dep_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

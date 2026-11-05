@@ -427,9 +427,13 @@ impl CrossCheckout {
     /// `OUT_DIR` in the target does not count: a seed into a target of the
     /// same checkout keeps it too, and kache's key does not hold it.
     fn names_checkout(&self, value: &str) -> bool {
+        // rustc writes each backslash of a value doubled (`escape_dep_env`):
+        // read as written, no Windows `OUT_DIR` was found in the donor's
+        // target, and every unit that reads one built in each checkout.
+        let value = crate::cache_key::unescape_env_dep_value(value);
         let value = match self.donor_target.to_str() {
             Some(target) => value.replace(target, ""),
-            None => value.to_owned(),
+            None => value,
         };
         super::donor_needles(&super::Donor {
             target_dir: PathBuf::new(),
