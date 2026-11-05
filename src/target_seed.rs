@@ -1373,6 +1373,9 @@ fn copy_tree(
         )));
     }
     let below = from.strip_prefix(tree.from).unwrap_or(Path::new(""));
+    if is_invocation_stamp(below) {
+        return Ok(());
+    }
     // Dep-info and a build script's records name the donor's paths: they
     // are written anew for this target, never linked, and never memoised
     // as the donor's bytes.
@@ -1394,6 +1397,35 @@ fn copy_tree(
             .push(placed);
     }
     Ok(())
+}
+
+/// The name of Cargo's stamp of when it last started a unit.
+const INVOCATION_STAMP: &str = "invoked.timestamp";
+
+/// Whether `below`, a path inside a unit's tree, is Cargo's stamp of when it
+/// last started the unit: `invoked.timestamp` in a unit's fingerprint
+/// directory or a build script run's directory (`fingerprint/` and `run/`
+/// in the per-unit layout), never a file a build script wrote to `out/`.
+///
+/// Cargo writes the stamp anew just before it runs the unit and reads only
+/// the time of the one it just wrote, to date the unit's dep-info and
+/// outputs (cargo-util's `set_invocation_time`). Its freshness check never
+/// reads one, and kache reads only the stamp of the unit it is compiling
+/// (`cargo_check_redate_ns`), which Cargo has written by then, and leaves
+/// stamps out when it reads a donor's fingerprints ([`check_demand`]). A
+/// seeded stamp is never read, so a seeding leaves it out: one file a unit
+/// fewer to create, write, date and give a block of the disk (ext4 spends
+/// about as long allocating it as a `mkdir`): 2,188 of the 13,032 files a
+/// seeding of command-center's workspace clippy wrote.
+fn is_invocation_stamp(below: &Path) -> bool {
+    let mut parts = below.components().map(|part| part.as_os_str());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(name), None, None) => name == INVOCATION_STAMP,
+        (Some(dir), Some(name), None) => {
+            (dir == "fingerprint" || dir == "run") && name == INVOCATION_STAMP
+        }
+        _ => false,
+    }
 }
 
 /// Give a cloned or copied file `metadata`'s modification time and
@@ -2365,7 +2397,7 @@ fn check_demand(
                     let fingerprint = dep.as_array()?.get(3)?.as_u64()?;
                     wants.push(hex_le(fingerprint));
                 }
-            } else if file_name != "invoked.timestamp"
+            } else if file_name != INVOCATION_STAMP
                 && !file_name.starts_with("dep-")
                 && !file_name.contains('.')
             {
@@ -3372,6 +3404,26 @@ source = "git+https://example.com/gitdep#abc"
             let from = donor.target_dir.join(PROFILE);
             let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
             let marker_from = marker(&from, layout, &unit("dep", HASH));
+            // Cargo's invocation stamps stay behind; a file of that name a
+            // build script wrote to `out/` is copied.
+            let stamps = match layout {
+                Layout::PerUnit => vec![
+                    marker_from.join("fingerprint").join(INVOCATION_STAMP),
+                    marker_from.join("run").join(INVOCATION_STAMP),
+                    marker_from.join("out").join(INVOCATION_STAMP),
+                ],
+                Layout::Shared => {
+                    let run = from.join("build").join(format!("dep-{HASH}"));
+                    vec![
+                        marker_from.join(INVOCATION_STAMP),
+                        run.join(INVOCATION_STAMP),
+                        run.join("out").join(INVOCATION_STAMP),
+                    ]
+                }
+            };
+            for stamp in &stamps {
+                write(stamp, "This file has an mtime of when this was started.");
+            }
             for file in walk(&from) {
                 filetime::set_file_mtime(&file, old).unwrap();
             }
@@ -3407,10 +3459,18 @@ source = "git+https://example.com/gitdep#abc"
                 .filter(|file| !file.ends_with(".cargo-lock"))
                 .collect();
             let expected = match layout {
-                Layout::PerUnit => 2,
-                Layout::Shared => 5,
+                Layout::PerUnit => 3,
+                Layout::Shared => 6,
             };
             assert_eq!(copied.len(), expected, "{layout:?}: {copied:?}");
+            let stamps: Vec<_> = copied
+                .iter()
+                .filter(|file| file.ends_with(INVOCATION_STAMP))
+                .collect();
+            assert!(
+                stamps.len() == 1 && stamps[0].parent().is_some_and(|dir| dir.ends_with("out")),
+                "{layout:?}: only out/'s file of the stamp's name is copied: {stamps:?}"
+            );
             for file in &copied {
                 let mtime = filetime::FileTime::from_last_modification_time(
                     &std::fs::metadata(file).unwrap(),
