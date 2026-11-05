@@ -232,8 +232,8 @@ impl AdaptiveUnit {
     /// Eligible invocations must have a stable Cargo unit id
     /// ([`cargo_unit_id`]) and exactly: `<profile>/deps` (or the unit's own
     /// `out` in Cargo's per-unit layout) plus `<profile>/incremental`, both
-    /// absolute. A build script is not: Cargo gives it no extra filename, so
-    /// it has no unit id.
+    /// absolute. A build script is not: it compiles into its own
+    /// `build/<pkg>-<hash>` directory.
     pub(crate) fn eligible(args: &RustcArgs, policy_guard: &[u8]) -> Option<Self> {
         if !args.is_primary {
             return None;
@@ -995,13 +995,28 @@ pub(crate) fn key_fingerprint(
 }
 
 /// The Cargo unit id eligibility asks for: the `-C extra-filename` hash, or,
-/// for a `cdylib` or `dylib` with no `-C extra-filename` at all, its
-/// `-C metadata` hash. Cargo leaves the hash out of a path package's dynamic
-/// library so the file keeps the name its loader asks for (a web app's
-/// `.wasm`, a plugin's `.so`), but still passes `-C metadata`, which differs
-/// for every unit. Without this, such a crate never compiled incrementally:
-/// each edit was a full compile and a stored entry no build asked for again.
-/// A build script or other executable keeps needing the extra filename.
+/// for a unit Cargo deliberately names without one, its `-C metadata` hash.
+/// Cargo leaves the hash out of a path package's file wherever the name
+/// itself is read back, but still passes `-C metadata`, which differs for
+/// every unit:
+///
+/// - a `cdylib` or `dylib`, so the file keeps the name its loader asks for (a
+///   web app's `.wasm`, a plugin's `.so`);
+/// - on Windows MSVC (and wasm32-emscripten), a `[[bin]]` or binary example,
+///   because the executable records its `.pdb` by path. Every `--test` unit,
+///   and every build script, keeps its extra filename there.
+///
+/// Without this, such a crate never compiled incrementally: each edit was a
+/// full compile, a dependency's edit a plain relink of every program, and a
+/// stored entry no build asked for again. The id only admits the unit; its
+/// state stays keyed on the whole command line, so two units that shared a
+/// metadata hash would still keep apart.
+///
+/// An executable counts only when Cargo set `CARGO_BIN_NAME`, which it sets
+/// for a bin or binary example and never for a build script, so a build
+/// script never counts by its metadata, whatever directory it compiles into.
+/// A binary example still needs `<profile>/deps` or a unit `out` directory
+/// below, so in the classic layout it stays out as it does elsewhere.
 fn cargo_unit_id(args: &RustcArgs) -> Option<String> {
     if args.extra_filename.is_some() {
         return args.unit_id();
@@ -1016,7 +1031,9 @@ fn cargo_unit_id(args: &RustcArgs) -> Option<String> {
             "cdylib" | "dylib" | "rlib" | "lib" | "staticlib"
         )
     });
-    if !(dynamic && libraries_only) {
+    let cargo_program =
+        args.crate_types == ["bin"] && args.invocation_env().var_os("CARGO_BIN_NAME").is_some();
+    if !(dynamic && libraries_only) && !cargo_program {
         return None;
     }
     args.get_codegen_opt("metadata").map(str::to_owned)
@@ -2113,6 +2130,87 @@ mod tests {
         assert!(
             AdaptiveUnit::eligible(&argv(&empty_extra), b"").is_none(),
             "an extra filename that names no unit fails closed"
+        );
+    }
+
+    #[test]
+    fn a_windows_program_without_extra_filename_is_identified_by_its_metadata() {
+        // Cargo 1.99 for x86_64-pc-windows-msvc: `[[bin]]` units carry
+        // `-C metadata` and no `-C extra-filename`; build scripts keep theirs.
+        let (temp, _args, _unit) = fixture();
+        let profile = temp.path().join("target/debug");
+        let parse = |name: &str, source: &str, metadata: Option<&str>, bin_name: Option<&str>| {
+            let mut env = crate::invocation::InvocationEnv::from_parts(
+                Vec::<(std::ffi::OsString, std::ffi::OsString)>::new(),
+                Some(temp.path().to_path_buf()),
+                None,
+                temp.path().to_path_buf(),
+            );
+            if let Some(bin_name) = bin_name {
+                env.set("CARGO_BIN_NAME", bin_name);
+            }
+            let mut argv: Vec<String> = vec![
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                name.into(),
+                source.into(),
+                "--crate-type".into(),
+                "bin".into(),
+                "--out-dir".into(),
+                profile.join("deps").to_string_lossy().into_owned(),
+                "-C".into(),
+                format!("incremental={}", profile.join("incremental").display()),
+            ];
+            argv.extend(metadata.map(|metadata| format!("-Cmetadata={metadata}")));
+            RustcArgs::parse_for(&argv, &env).unwrap()
+        };
+        let app = AdaptiveUnit::eligible(
+            &parse("app", "src/main.rs", Some("1327a864bbe2578f"), Some("app")),
+            b"",
+        )
+        .expect("a program Cargo names without a hash is still a unit");
+        let tool = AdaptiveUnit::eligible(
+            &parse(
+                "tool",
+                "src/bin/tool.rs",
+                Some("de935b468037e6bb"),
+                Some("tool"),
+            ),
+            b"",
+        )
+        .expect("each program of the package is a unit");
+        assert_ne!(app.unit_dir, tool.unit_dir, "two programs, two states");
+        let same_metadata = AdaptiveUnit::eligible(
+            &parse(
+                "tool",
+                "src/bin/tool.rs",
+                Some("1327a864bbe2578f"),
+                Some("tool"),
+            ),
+            b"",
+        )
+        .unwrap();
+        assert_ne!(
+            app.unit_dir, same_metadata.unit_dir,
+            "the state is keyed on the command line, not on the id"
+        );
+
+        assert!(
+            AdaptiveUnit::eligible(
+                &parse(
+                    "build_script_build",
+                    "build.rs",
+                    Some("cac2e44ff742ad42"),
+                    None
+                ),
+                b""
+            )
+            .is_none(),
+            "a build script (no CARGO_BIN_NAME) still needs its extra filename"
+        );
+        assert!(
+            AdaptiveUnit::eligible(&parse("app", "src/main.rs", None, Some("app")), b"").is_none(),
+            "without -C metadata there is no unit id"
         );
     }
 
