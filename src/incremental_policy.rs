@@ -1001,7 +1001,8 @@ pub(crate) fn key_fingerprint(
 /// every unit:
 ///
 /// - a `cdylib` or `dylib`, so the file keeps the name its loader asks for (a
-///   web app's `.wasm`, a plugin's `.so`);
+///   web app's `.wasm`, a plugin's `.so`), or a `staticlib`, alone or beside
+///   other library types (upstream #1817);
 /// - on Windows MSVC (and wasm32-emscripten), a `[[bin]]` or binary example,
 ///   because the executable records its `.pdb` by path. Every `--test` unit,
 ///   and every build script, keeps its extra filename there.
@@ -1021,19 +1022,13 @@ fn cargo_unit_id(args: &RustcArgs) -> Option<String> {
     if args.extra_filename.is_some() {
         return args.unit_id();
     }
-    let dynamic = args
-        .crate_types
-        .iter()
-        .any(|kind| matches!(kind.as_str(), "cdylib" | "dylib"));
-    let libraries_only = args.crate_types.iter().all(|kind| {
-        matches!(
-            kind.as_str(),
-            "cdylib" | "dylib" | "rlib" | "lib" | "staticlib"
-        )
-    });
+    let unhashed_library =
+        args.has_crate_type(|kind| matches!(kind, "cdylib" | "dylib" | "staticlib"));
+    let libraries_only = !args
+        .has_crate_type(|kind| !matches!(kind, "cdylib" | "dylib" | "rlib" | "lib" | "staticlib"));
     let cargo_program =
         args.crate_types == ["bin"] && args.invocation_env().var_os("CARGO_BIN_NAME").is_some();
-    if !(dynamic && libraries_only) && !cargo_program {
+    if !(unhashed_library && libraries_only) && !cargo_program {
         return None;
     }
     args.get_codegen_opt("metadata").map(str::to_owned)
@@ -2130,6 +2125,79 @@ mod tests {
         assert!(
             AdaptiveUnit::eligible(&argv(&empty_extra), b"").is_none(),
             "an extra filename that names no unit fails closed"
+        );
+    }
+
+    #[test]
+    fn an_unhashed_library_is_identified_by_its_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("target/debug");
+        let deps = profile.join("deps");
+        let incremental = profile.join("incremental");
+        fs::create_dir_all(&deps).unwrap();
+        fs::create_dir(&incremental).unwrap();
+        let argv = |crate_name: &str, extra: &[&str]| {
+            let mut argv: Vec<String> = vec![
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                crate_name.into(),
+                "src/lib.rs".into(),
+                "--out-dir".into(),
+                deps.to_string_lossy().into_owned(),
+                "-C".into(),
+                format!("incremental={}", incremental.display()),
+            ];
+            argv.extend(extra.iter().map(|arg| arg.to_string()));
+            RustcArgs::parse(&argv).unwrap()
+        };
+        let metadata = "-Cmetadata=0123456789abcdef";
+
+        for crate_types in [
+            &["--crate-type", "cdylib"][..],
+            &["--crate-type", "staticlib"][..],
+            &[
+                "--crate-type",
+                "lib",
+                "--crate-type",
+                "staticlib",
+                "--crate-type",
+                "cdylib",
+            ][..],
+            &["--crate-type", "dylib"][..],
+            &["--crate-type", "lib,staticlib"][..],
+        ] {
+            let mut extra = crate_types.to_vec();
+            extra.push(metadata);
+            assert!(
+                AdaptiveUnit::eligible(&argv("sample", &extra), b"").is_some(),
+                "{crate_types:?} without an extra filename is identified by -C metadata"
+            );
+        }
+
+        assert!(
+            AdaptiveUnit::eligible(&argv("sample", &["--crate-type", "cdylib"]), b"").is_none(),
+            "a cdylib without -C metadata has no unit id"
+        );
+        assert!(
+            AdaptiveUnit::eligible(
+                &argv("sample", &["--crate-type", "cdylib", "-Cmetadata=not-hex"]),
+                b""
+            )
+            .is_none(),
+            "a non-hex -C metadata is rejected, like a non-hex extra filename"
+        );
+        assert!(
+            AdaptiveUnit::eligible(
+                &argv("build_script_build", &["--crate-type", "bin", metadata]),
+                b""
+            )
+            .is_none(),
+            "a build script stays out of adaptive incremental mode, even with -C metadata"
+        );
+        assert!(
+            AdaptiveUnit::eligible(&argv("sample", &["--crate-type", "lib", metadata]), b"")
+                .is_none(),
+            "a plain lib is identified only by its extra filename"
         );
     }
 
