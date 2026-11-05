@@ -372,8 +372,10 @@ fn a_link_of_incrementally_compiled_libraries_is_not_stored() {
 
 /// The middle crate also builds a `staticlib` and `cdylib`, so Cargo gives it
 /// no extra filename. Edits to the library below it still put it in adaptive
-/// incremental mode: the first rebuild seeds its incremental state, and later
-/// rebuilds reuse it.
+/// incremental mode. It links the library below, which an incremental compile
+/// wrote, so it is a private link: each rebuild compiles it through the
+/// adaptive lane with no key and no entry. Without an id from `-C metadata`
+/// it would compile as a plain passthrough, without incremental state.
 #[test]
 fn an_unselected_cdylib_crate_seeds_then_stays_active() {
     let checkout = tempfile::tempdir().unwrap();
@@ -398,11 +400,13 @@ fn an_unselected_cdylib_crate_seeds_then_stays_active() {
     let (_lib, mid) = build(None, 1);
     assert_eq!(mid["result"], "miss", "event: {mid:#}");
 
-    let (_lib, mid) = build(Some(future), 2);
-    assert_passthrough(&mid, "adaptive seed");
-
-    let (_lib, mid) = build(Some(future + 1), 3);
-    assert_passthrough(&mid, "adaptive active");
+    for (mtime, answer) in [(future, 2), (future + 1, 3)] {
+        let (_lib, mid) = build(Some(mtime), answer);
+        assert_passthrough(
+            &mid,
+            "adaptive passthrough: private link: adaptive_lib was compiled incrementally",
+        );
+    }
 }
 
 /// A rustc that writes `$RACE_NEXT` over `$RACE_SOURCE` once, just before
