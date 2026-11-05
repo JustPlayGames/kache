@@ -6056,7 +6056,7 @@ source = "git+https://example.com/gitdep#abc"
             .all(|unit| !unit.ends_with(&h(2)) && !unit.ends_with(&h(4))));
 
         let same = NewTarget {
-            target_dir: donor.workspace_root.join("target/integrate-clippy"),
+            target_dir: donor.workspace_root.join("target").join("integrate-clippy"),
             workspace_root: donor.workspace_root.clone(),
         };
         let stored = cache_storing(&dir.path().join("cache"), &["x"]);
