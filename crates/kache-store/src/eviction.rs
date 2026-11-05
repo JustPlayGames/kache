@@ -37,6 +37,8 @@ pub fn eviction_target(max_size: u64) -> u64 {
     percent_of(max_size, EVICT_TARGET_PERCENT)
 }
 
+pub use kache_core::store_config::HeldBytesBudget;
+
 /// Percentage of `max_size` an automatic sweep starts at.
 ///
 /// Below the cap, because the store goes on growing before the first removal.

@@ -1396,7 +1396,7 @@ fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
     let ttl = AUTO_GC_HELD_TTL.as_secs();
     // Under the trigger only once the held bytes are left out: no
     // backoff, but a record that carries them.
-    let record = next_auto_gc_backoff(None, 50, 5000, 4120, 1000).unwrap();
+    let record = next_auto_gc_backoff(None, 50, 5000, 4120, 1000, HeldBytesBudget::LeftOut).unwrap();
     assert_eq!(
         record,
         AutoGcBackoff {
@@ -1407,13 +1407,14 @@ fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
         }
     );
     assert_eq!(
-        next_auto_gc_backoff(None, 50, 5000, 0, 1000).map(|r| r.interval_secs),
+        next_auto_gc_backoff(None, 50, 5000, 0, 1000, HeldBytesBudget::LeftOut)
+            .map(|r| r.interval_secs),
         Some(600)
     );
-    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000), None);
+    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000, HeldBytesBudget::LeftOut), None);
     // Over it even so: a backoff, carrying the held bytes, doubling from
     // the check interval after a record that had none.
-    let backoff = next_auto_gc_backoff(Some(record), 60, 5000, 4119, 1000).unwrap();
+    let backoff = next_auto_gc_backoff(Some(record), 60, 5000, 4119, 1000, HeldBytesBudget::LeftOut).unwrap();
     assert_eq!((backoff.interval_secs, backoff.held), (600, 4119));
 
     assert_eq!(recent_held_bytes(None, 50), 0);
@@ -1421,17 +1422,40 @@ fn held_bytes_are_left_out_of_the_trigger_until_they_expire() {
     assert_eq!(recent_held_bytes(Some(record), 50 + ttl), 0);
 
     let healthy = || false;
-    assert!(!auto_gc_due_at(Some(record), 60, 5000, 1000, healthy));
+    assert!(!auto_gc_due_at(Some(record), 60, 5000, 1000, HeldBytesBudget::LeftOut, healthy));
     assert!(
-        auto_gc_due_at(Some(record), 60, 5001, 1000, healthy),
+        auto_gc_due_at(Some(record), 60, 5001, 1000, HeldBytesBudget::LeftOut, healthy),
         "new bytes past the trigger"
     );
     assert!(
-        auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000, healthy),
+        auto_gc_due_at(Some(record), 50 + ttl, 5000, 1000, HeldBytesBudget::LeftOut, healthy),
         "the figure expired"
     );
-    assert!(auto_gc_due_at(None, 60, 881, 1000, healthy));
-    assert!(!auto_gc_due_at(None, 60, 880, 1000, healthy));
+    assert!(auto_gc_due_at(None, 60, 881, 1000, HeldBytesBudget::LeftOut, healthy));
+    assert!(!auto_gc_due_at(None, 60, 880, 1000, HeldBytesBudget::LeftOut, healthy));
+}
+
+/// Counted toward `max_size`, held bytes keep a store over the trigger,
+/// so the next sweep evicts other entries to make up for them; and a sweep
+/// that left the store over only on held bytes still backs off.
+#[test]
+fn counted_held_bytes_keep_the_store_over_the_trigger() {
+    let counted = HeldBytesBudget::Counted;
+    let record = next_auto_gc_backoff(None, 50, 5000, 4200, 1000, counted).unwrap();
+    assert_eq!((record.interval_secs, record.held), (600, 4200));
+    let expired = AutoGcBackoff {
+        interval_secs: 0,
+        ..record
+    };
+    assert!(auto_gc_due_at(Some(expired), 60, 5000, 1000, counted, || false));
+    assert!(!auto_gc_due_at(
+        Some(expired),
+        60,
+        5000,
+        1000,
+        HeldBytesBudget::LeftOut,
+        || false
+    ));
 }
 
 #[test]
@@ -1873,8 +1897,8 @@ fn unix_now_secs_reads_the_wall_clock() {
 #[test]
 fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
     // max 1000: the trigger is 880.
-    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000), None);
-    let first = next_auto_gc_backoff(None, 50, 881, 0, 1000).unwrap();
+    assert_eq!(next_auto_gc_backoff(None, 50, 880, 0, 1000, HeldBytesBudget::LeftOut), None);
+    let first = next_auto_gc_backoff(None, 50, 881, 0, 1000, HeldBytesBudget::LeftOut).unwrap();
     assert_eq!(
         first,
         AutoGcBackoff {
@@ -1884,7 +1908,8 @@ fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
             held: 0,
         }
     );
-    let second = next_auto_gc_backoff(Some(first), 90, 2000, 0, 1000).unwrap();
+    let second =
+        next_auto_gc_backoff(Some(first), 90, 2000, 0, 1000, HeldBytesBudget::LeftOut).unwrap();
     assert_eq!(
         second,
         AutoGcBackoff {
@@ -1899,12 +1924,12 @@ fn next_auto_gc_backoff_doubles_to_the_cap_and_clears_under_budget() {
         ..second
     };
     assert_eq!(
-        next_auto_gc_backoff(Some(long), 90, 2000, 0, 1000)
+        next_auto_gc_backoff(Some(long), 90, 2000, 0, 1000, HeldBytesBudget::LeftOut)
             .unwrap()
             .interval_secs,
         7200
     );
-    assert_eq!(next_auto_gc_backoff(Some(second), 100, 880, 0, 1000), None);
+    assert_eq!(next_auto_gc_backoff(Some(second), 100, 880, 0, 1000, HeldBytesBudget::LeftOut), None);
 }
 
 #[test]
