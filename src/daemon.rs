@@ -10554,7 +10554,10 @@ fn memoise_seeded_files(store: &Store, placed: &[crate::target_seed::PlacedFile]
     let _trace = crate::phase_trace::phase("memo_seeded");
     let mut rows: Vec<(kache_store::file_hash::FileFingerprint, String)> = Vec::new();
     for file in placed {
-        let Some(hash) = store.file_hash_at(&file.before) else {
+        let Some(hash) = store
+            .file_hash_at(&file.before)
+            .or_else(|| file.hash.clone())
+        else {
             continue;
         };
         for fingerprint in file.memo_rows(since_ns) {
@@ -10565,8 +10568,17 @@ fn memoise_seeded_files(store: &Store, placed: &[crate::target_seed::PlacedFile]
         .iter()
         .map(|(fingerprint, hash)| (fingerprint.clone(), hash.as_str()))
         .collect();
-    store.hand_off_verified_file_hashes(&rows);
+    for rows in rows.chunks(SEEDED_MEMO_ROWS_PER_HANDOFF) {
+        store.hand_off_verified_file_hashes(rows);
+    }
 }
+
+/// Memo rows a seeding hands the daemon in one request
+/// ([`memoise_seeded_files`]). A seeding of a 6,000-unit workspace earns
+/// about 14,500 rows, some 4 MB of request, and a daemon refuses a request
+/// over [`MAX_REQUEST_FRAME_BYTES`] whole, which a sender that does not
+/// wait for the answer never learns.
+const SEEDED_MEMO_ROWS_PER_HANDOFF: usize = 2_048;
 
 /// Hint the daemon to stage `target_dir`'s recorded executables.
 /// Non-blocking, fire-and-forget.

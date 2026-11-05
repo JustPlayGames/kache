@@ -850,6 +850,12 @@ fn unit_hashes(name: &str) -> impl Iterator<Item = &str> {
 /// ([`kache_store::file_hash::FileHashCache::recorded_at`]).
 pub(crate) type RecordedHashes = HashMap<String, (kache_store::file_hash::FileFingerprint, String)>;
 
+/// The hashes a seeding learned of donor artifacts while it checked them
+/// ([`artifacts_stored`]), by donor path, each with the stamp it holds for:
+/// what [`PlacedFile::hash`] takes for a file placed at that stamp.
+type Learned =
+    std::sync::Mutex<HashMap<PathBuf, (kache_store::file_hash::FileFingerprint, String)>>;
+
 /// Reads the memo rows for the paths it is given; [`no_recorded_hashes`]
 /// when there is no store to ask.
 pub(crate) type RecordedLookup<'a> = &'a dyn Fn(&[&str]) -> RecordedHashes;
@@ -941,22 +947,40 @@ fn recorded_for_units(
 /// inode, which nobody may write ([`is_blob_inode`]). Links come and go on
 /// such an inode with every target that restores or seeds it, and each one
 /// moves its change time, so only this second check lasts on a busy store.
-fn is_stored_blob(file: &Path, recorded: &RecordedHashes, store: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(file) else {
-        return false;
-    };
-    let now = kache_store::file_hash::FileFingerprint::from_metadata(file, &metadata);
+///
+/// A file that is such a blob is `Some`, with the stamp it was checked at
+/// and its hash when the memo lacks that pair ([`Learned`]): for a file its
+/// row vouched for through the blob's inode, and for one read once its
+/// stamp had settled ([`kache_store::file_hash::stamp_is_settled`]) before
+/// the read. A row for the very stamp is the memo's already.
+/// The store's memo held no row for the stamp of most files a seeding read:
+/// a donor seeded itself had rows only where its own donor had, and every
+/// later seeding from it read those files again (4,901 of 8,585 artifacts,
+/// 7.3 GB of `.rmeta` among them, in a new checkout of a 6,000-unit
+/// workspace).
+fn is_stored_blob(
+    file: &Path,
+    recorded: &RecordedHashes,
+    store: &Path,
+) -> Option<Option<(kache_store::file_hash::FileFingerprint, String)>> {
+    use kache_store::file_hash::{FileFingerprint, stamp_clock_ns, stamp_is_settled};
+    let observed_ns = stamp_clock_ns();
+    let metadata = std::fs::metadata(file).ok()?;
+    let now = FileFingerprint::from_metadata(file, &metadata);
     if let Some((stamp, hash)) = recorded.get(&now.path) {
         let blob = kache_store::blob_path_in_store_dir(store, hash);
         if *stamp == now {
-            return blob.is_file();
+            return blob.is_file().then_some(None);
         }
         if is_blob_inode(&metadata, &blob) {
-            return true;
+            return Some(Some((now, hash.clone())));
         }
     }
-    kache_store::file_hash::hash_file(file)
-        .is_ok_and(|hash| kache_store::blob_path_in_store_dir(store, &hash).is_file())
+    let hash = kache_store::file_hash::hash_file(file).ok()?;
+    if !kache_store::blob_path_in_store_dir(store, &hash).is_file() {
+        return None;
+    }
+    Some(stamp_is_settled(&now, observed_ns).then_some((now, hash)))
 }
 
 /// Whether `metadata` is of the inode at `blob`, and nobody may write it.
@@ -985,7 +1009,9 @@ fn is_blob_inode(_: &std::fs::Metadata, _: &Path) -> bool {
 /// for the same Cargo unit; such a unit is left for Cargo to build through
 /// the cache. A file the store vouches for ([`is_stored_blob`]) is not read
 /// again: under load, reading every donor rlib back (0.7-1.2 GB a seeding)
-/// left hundreds of units past the deadline.
+/// left hundreds of units past the deadline. The hashes found go to
+/// `learned`.
+#[allow(clippy::too_many_arguments)]
 fn artifacts_stored(
     from: &Path,
     layout: Layout,
@@ -993,15 +1019,28 @@ fn artifacts_stored(
     deps: &HashMap<String, Vec<PathBuf>>,
     cache_dir: &Path,
     recorded: &RecordedHashes,
+    learned: &Learned,
     deadline: Instant,
 ) -> bool {
     let Some(files) = unit_artifacts(from, layout, unit, deps, deadline) else {
         return false;
     };
     let store = cache_dir.join("store");
-    files
-        .iter()
-        .all(|file| Instant::now() < deadline && is_stored_blob(file, recorded, &store))
+    files.into_iter().all(|file| {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let Some(memo) = is_stored_blob(&file, recorded, &store) else {
+            return false;
+        };
+        if let Some(memo) = memo {
+            learned
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(file, memo);
+        }
+        true
+    })
 }
 
 /// Copy one unit from the donor profile `from` into `staging`, to be placed
@@ -1221,7 +1260,7 @@ impl Place {
                 #[cfg(unix)]
                 if link_read_only(&from, &to) {
                     counts.linked.fetch_add(1, Ordering::Relaxed);
-                    if let Some(placed) = placed_file(&from, &metadata, &to) {
+                    if let Some(placed) = placed_file(&from, &metadata, &to, &counts.learned) {
                         counts
                             .placed
                             .lock()
@@ -1236,7 +1275,7 @@ impl Place {
                         let _ = std::fs::remove_file(&staging);
                     })?;
                 counts.copied.fetch_add(1, Ordering::Relaxed);
-                if let Some(placed) = placed_file(&from, &metadata, &to) {
+                if let Some(placed) = placed_file(&from, &metadata, &to, &counts.learned) {
                     counts
                         .placed
                         .lock()
@@ -1441,18 +1480,38 @@ fn link_in_place(
 }
 
 /// The [`PlacedFile`] for the donor file `from`, with `metadata` read before
-/// it was placed at `at`, when it is large enough for the hash memo.
-fn placed_file(from: &Path, metadata: &std::fs::Metadata, at: &Path) -> Option<PlacedFile> {
-    (metadata.len() >= crate::target_dedup::MIN_BYTES).then(|| PlacedFile {
+/// it was placed at `at`, when it is large enough for the hash memo. Its
+/// hash is the one the seeding learned of `from` at that very stamp.
+fn placed_file(
+    from: &Path,
+    metadata: &std::fs::Metadata,
+    at: &Path,
+    learned: &Learned,
+) -> Option<PlacedFile> {
+    if metadata.len() < crate::target_dedup::MIN_BYTES {
+        return None;
+    }
+    let before = kache_store::file_hash::FileFingerprint {
+        path: from.to_string_lossy().into_owned(),
+        size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+        mtime_ns: kache_store::file_hash::metadata_mtime_ns(metadata),
+        ctime_ns: kache_store::file_hash::metadata_ctime_ns(metadata),
+        inode: kache_store::file_hash::metadata_inode(metadata),
+    };
+    let hash = learned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(from)
+        .filter(|(stamp, _)| {
+            (stamp.size, stamp.mtime_ns, stamp.ctime_ns, stamp.inode)
+                == (before.size, before.mtime_ns, before.ctime_ns, before.inode)
+        })
+        .map(|(_, hash)| hash.clone());
+    Some(PlacedFile {
         from: from.to_path_buf(),
-        before: kache_store::file_hash::FileFingerprint {
-            path: from.to_string_lossy().into_owned(),
-            size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-            mtime_ns: kache_store::file_hash::metadata_mtime_ns(metadata),
-            ctime_ns: kache_store::file_hash::metadata_ctime_ns(metadata),
-            inode: kache_store::file_hash::metadata_inode(metadata),
-        },
+        before,
         at: at.to_path_buf(),
+        hash,
     })
 }
 
@@ -1481,6 +1540,10 @@ pub(crate) struct PlacedFile {
     pub(crate) from: PathBuf,
     pub(crate) before: kache_store::file_hash::FileFingerprint,
     pub(crate) at: PathBuf,
+    /// The donor's hash at `before` when the seeding learned it itself
+    /// ([`Learned`]), for a file whose donor path has no memo row for that
+    /// stamp.
+    pub(crate) hash: Option<String>,
 }
 
 impl PlacedFile {
@@ -1494,7 +1557,8 @@ impl PlacedFile {
     /// moved only during the seeding. That stamp then holds for the donor
     /// path too. A copy is a new inode with the donor's mtime; its bytes are
     /// the donor's when the donor's whole stamp did not move while it was
-    /// copied.
+    /// copied, and the donor path earns a row too when the hash is one the
+    /// seeding learned ([`Self::hash`]): the store had none for that stamp.
     pub(crate) fn memo_rows(
         &self,
         since_ns: i64,
@@ -1524,7 +1588,10 @@ impl PlacedFile {
             return Vec::new();
         }
         if from == *before && content_kept(&at) {
-            return vec![at];
+            return match self.hash {
+                Some(_) => vec![at, from],
+                None => vec![at],
+            };
         }
         Vec::new()
     }
@@ -1608,7 +1675,7 @@ fn copy_tree(
         return Ok(());
     }
     place_file(from, below, to, metadata, tree.counts)?;
-    if let Some(placed) = placed_file(from, metadata, to) {
+    if let Some(placed) = placed_file(from, metadata, to, &tree.counts.learned) {
         tree.placed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1784,6 +1851,8 @@ struct FileCounts {
     no_clones: std::sync::atomic::AtomicBool,
     /// Files placed for good, at their final paths.
     placed: std::sync::Mutex<Vec<PlacedFile>>,
+    /// The hashes of donor artifacts the seeding's checks learned.
+    learned: Learned,
     /// The new profile's directories this seeding made or found.
     made: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// A lock for each directory the copy threads place names into
@@ -2186,7 +2255,14 @@ pub(crate) fn seed_for_lane(
                                 && (names_the_donor(from, layout, unit, record_needles)
                                     || out_dir_names_the_donor(from, layout, unit, needles, limit)))
                             || !artifacts_stored(
-                                from, layout, unit, deps, cache_dir, recorded, limit,
+                                from,
+                                layout,
+                                unit,
+                                deps,
+                                cache_dir,
+                                recorded,
+                                &files.learned,
+                                limit,
                             )
                         {
                             continue;
@@ -2900,6 +2976,7 @@ mod tests {
             from: donor.clone(),
             before: FileFingerprint::from_path(&donor).unwrap(),
             at: at.to_path_buf(),
+            hash: None,
         };
         let since = stamp_clock_ns();
 
@@ -2925,6 +3002,15 @@ mod tests {
         let file = placed(&copied);
         copy(&copied, file.before.mtime_ns);
         assert_eq!(file.memo_rows(since).len(), 1, "the copy only");
+        let learned = PlacedFile {
+            hash: Some(HASH.into()),
+            ..file.clone()
+        };
+        assert_eq!(
+            learned.memo_rows(since).len(),
+            2,
+            "a hash the seeding learned is the donor's too"
+        );
 
         let late = dir.path().join("late.rlib");
         let file = placed(&late);
@@ -4010,6 +4096,7 @@ source = "git+https://example.com/gitdep#abc"
                     &deps,
                     &cache,
                     &recorded,
+                    &Learned::default(),
                     later(),
                 )
             };
@@ -4054,6 +4141,46 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    /// A donor artifact the store had no row for is read once, by the
+    /// seeding that checks it: the placed copy carries the hash it found, so
+    /// the memo gets rows for the copy and the donor, and neither a build in
+    /// the new target nor the next seeding from either reads it again. A file
+    /// read while its stamp may still move carries none.
+    #[cfg(unix)]
+    #[test]
+    fn a_seeding_hands_the_memo_the_hashes_it_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let donor = donor(dir.path(), "a", Layout::Shared);
+        let profile = donor.target_dir.join(PROFILE);
+        let rmeta = profile.join("deps").join(format!("libdep-{HASH}.rmeta"));
+        let bytes = "m".repeat(70_000);
+        write(&rmeta, &bytes);
+        let cache = cache_storing(&dir.path().join("cache"), &["rlib", &bytes]);
+        let learned_hash = |name: &str| {
+            let seeded = seed(
+                &checkout(dir.path(), name),
+                VERSION,
+                std::slice::from_ref(&donor),
+                &cache,
+                later(),
+            );
+            assert_eq!(seeded.units, 1, "{name}");
+            let placed = seeded
+                .placed
+                .iter()
+                .find(|file| file.from == rmeta)
+                .expect("the rmeta is placed")
+                .clone();
+            (placed.hash.clone(), placed.memo_rows(0).len())
+        };
+        assert_eq!(learned_hash("fresh"), (None, 1), "read before it settled");
+        std::thread::sleep(Duration::from_nanos(
+            kache_store::file_hash::HASH_SETTLE_NS as u64 + 100_000_000,
+        ));
+        let stored = blake3::hash(bytes.as_bytes()).to_hex().to_string();
+        assert_eq!(learned_hash("settled"), (Some(stored), 2));
+    }
+
     #[test]
     fn stored_artifact_validation_stops_at_the_seed_deadline() {
         for layout in [Layout::PerUnit, Layout::Shared] {
@@ -4070,6 +4197,7 @@ source = "git+https://example.com/gitdep#abc"
                 &deps,
                 &cache,
                 &RecordedHashes::new(),
+                &Learned::default(),
                 later()
             ));
             assert!(!artifacts_stored(
@@ -4079,6 +4207,7 @@ source = "git+https://example.com/gitdep#abc"
                 &deps,
                 &cache,
                 &RecordedHashes::new(),
+                &Learned::default(),
                 Instant::now(),
             ));
         }
