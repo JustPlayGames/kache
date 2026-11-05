@@ -7365,10 +7365,12 @@ mod tests {
             &unit,
             &env
         )));
+        // Nix can create the temp directory under /build, a Cargo unit shape.
+        let ordinary_output = dir.path().join("ordinary-output");
         assert!(!is_launcher_compilation(&parse(
             "build_script_build",
             "bin",
-            dir.path(),
+            &ordinary_output,
             &env
         )));
         env.set("CARGO_BIN_NAME", "build-script-build");
