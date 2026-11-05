@@ -321,22 +321,37 @@ fn files_outside_the_package_are_checked_and_some_paths_refused() {
 fn a_unit_that_read_the_donors_checkout_from_the_environment_stays_out() {
     let fixture = Fixture::new(&[]);
     let check = fixture.check().unwrap();
-    let donor = fixture.donor.to_str().unwrap().to_owned();
+    let donor = &fixture.donor;
+    // As rustc writes a value (`escape_dep_env`): each backslash doubled.
+    let escaped = |path: PathBuf| path.to_str().unwrap().replace('\\', r"\\");
     let dep_info = fixture.donor.join("target/debug/deps/p-0123456789abcdef.d");
     for (case, env, kept_out) in [
         (
             "its package's folder",
-            format!("CARGO_MANIFEST_DIR={donor}/crates/p"),
+            format!(
+                "CARGO_MANIFEST_DIR={}",
+                escaped(donor.join("crates").join("p"))
+            ),
             true,
         ),
         (
             "the checkout in a longer value",
-            format!("V=x:{donor}/y"),
+            format!("V=x:{}", escaped(donor.join("y"))),
             true,
         ),
         (
             "its OUT_DIR in the target",
-            format!("OUT_DIR={donor}/target/debug/build/p-1/out"),
+            format!(
+                "OUT_DIR={}",
+                escaped(
+                    donor
+                        .join("target")
+                        .join("debug")
+                        .join("build")
+                        .join("p-1")
+                        .join("out")
+                )
+            ),
             false,
         ),
         ("another path", "V=/usr/share/x".to_owned(), false),
