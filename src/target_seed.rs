@@ -1010,6 +1010,7 @@ fn artifacts_stored(
 /// for the shared layout; `rebase` moves dep-info from `from` to `to`.
 /// `build_dir`: whether the donor holds the unit's directory in `build/`
 /// ([`BuildDirs`]), where a build script's binary or a run's records are.
+/// `dep_info`: whether the unit's compiler dep-info is copied.
 /// A file of the unit `to` already held when the seeding began ([`Present`])
 /// is left as it is.
 fn copy_unit(
@@ -1024,6 +1025,7 @@ fn copy_unit(
     rebase: &kache_store::link::DepinfoRebase,
     checkout: Option<(&Path, &Path)>,
     build_dir: bool,
+    dep_info: relocation::DepInfo,
     present: &Present,
     deadline: Instant,
 ) -> std::io::Result<StagedUnit> {
@@ -1031,7 +1033,8 @@ fn copy_unit(
         relocation::Relocation::for_unit(from, to, rebase, layout, unit, checkout, deadline)?
     } else {
         relocation::Relocation::without_build_dir(from, rebase, unit)
-    };
+    }
+    .with_dep_info(dep_info);
     #[cfg(unix)]
     if build_dir {
         let out = build_script_out_dir(from, layout, unit);
@@ -1067,6 +1070,9 @@ fn copy_unit(
                 let Some(dir) = file.parent().and_then(Path::file_name) else {
                     continue;
                 };
+                if relocation.leaves_out(file) {
+                    continue;
+                }
                 let to_dir = to.join(dir);
                 counts.make_dir(&to_dir)?;
                 let at = to_dir.join(file_name(file));
@@ -1581,7 +1587,11 @@ fn copy_tree(
         )));
     }
     let below = from.strip_prefix(tree.from).unwrap_or(Path::new(""));
-    if is_invocation_stamp(below) {
+    if is_invocation_stamp(below)
+        || tree
+            .relocation
+            .is_some_and(|relocation| relocation.leaves_out(from))
+    {
         return Ok(());
     }
     // Dep-info and a build script's records name the donor's paths: they
@@ -2212,9 +2222,16 @@ pub(crate) fn seed_for_lane(
                             }
                             _ => None,
                         };
+                        // A registry unit's compiler dep-info is never read
+                        // again: neither Cargo nor kache reads it.
+                        let dep_info = if workspace.contains(&unit.package) {
+                            relocation::DepInfo::Copied
+                        } else {
+                            relocation::DepInfo::LeftOut
+                        };
                         match copy_unit(
                             from, to, layout, unit, deps, cache_dir, files, &staging, rebase,
-                            checkout, build_dir, present, limit,
+                            checkout, build_dir, dep_info, present, limit,
                         ) {
                             Ok(unit_staged) => {
                                 // Dated before it is placed, its dep-info
@@ -3697,9 +3714,10 @@ source = "git+https://example.com/gitdep#abc"
                 .into_iter()
                 .filter(|file| !file.ends_with(".cargo-lock"))
                 .collect();
+            // Not the registry unit's compiler dep-info (`deps/*.d`).
             let expected = match layout {
                 Layout::PerUnit => 3,
-                Layout::Shared => 6,
+                Layout::Shared => 5,
             };
             assert_eq!(copied.len(), expected, "{layout:?}: {copied:?}");
             let stamps: Vec<_> = copied
@@ -3809,6 +3827,13 @@ source = "git+https://example.com/gitdep#abc"
                     marker(&to, layout, &unit(package, hash)).exists(),
                     "{layout:?} {package}"
                 );
+            }
+            if layout == Layout::Shared {
+                // The workspace unit's compiler dep-info, which a seeding
+                // from this target into another checkout reads, comes
+                // along; the registry unit's, which nothing reads, does not.
+                assert!(to.join(format!("deps/app-{OTHER}.d")).is_file());
+                assert!(!to.join(format!("deps/dep-{HASH}.d")).exists());
             }
 
             let other = checkout(dir.path(), "b");
@@ -4322,10 +4347,13 @@ source = "git+https://example.com/gitdep#abc"
             let cache = no_runs();
             for name in ["b", "c"] {
                 let current = checkout(&root, name);
-                let original = std::fs::read(depinfo(&donor.target_dir.join(PROFILE))).unwrap();
-                let old_mtime = filetime::FileTime::from_unix_time(1_000_000_000, 0);
-                filetime::set_file_mtime(depinfo(&donor.target_dir.join(PROFILE)), old_mtime)
-                    .unwrap();
+                // The second donor, seeded by the first, has none.
+                let donor_depinfo = depinfo(&donor.target_dir.join(PROFILE));
+                let original = std::fs::read(&donor_depinfo).ok();
+                if original.is_some() {
+                    let old_mtime = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+                    filetime::set_file_mtime(&donor_depinfo, old_mtime).unwrap();
+                }
                 let seeded = seed(
                     &current,
                     VERSION,
@@ -4335,45 +4363,31 @@ source = "git+https://example.com/gitdep#abc"
                 );
                 assert_eq!(seeded.units, 2, "{layout:?}, {name}");
                 assert_eq!(
-                    std::fs::read(depinfo(&donor.target_dir.join(PROFILE))).unwrap(),
+                    std::fs::read(&donor_depinfo).ok(),
                     original,
                     "the donor is never rewritten"
                 );
                 std::fs::remove_dir_all(&donor.target_dir).unwrap();
                 let profile = current.target_dir.join(PROFILE);
-                assert_eq!(
-                    filetime::FileTime::from_last_modification_time(
-                        &std::fs::metadata(depinfo(&profile)).unwrap()
-                    ),
-                    old_mtime
-                );
+                // The registry unit's compiler dep-info is left out.
+                assert!(!depinfo(&profile).exists(), "{layout:?}, {name}");
                 let out = build_script_out_dir(&profile, layout, &script);
-                let text = std::fs::read_to_string(depinfo(&profile)).unwrap();
-                let inputs = crate::cache_key::parse_dep_info(&text);
                 assert_eq!(
-                    std::fs::read_to_string(&inputs[0]).unwrap(),
+                    std::fs::read_to_string(out.join("generated.rs")).unwrap(),
                     "pub const VALUE: u8 = 1;\n"
                 );
-                assert_eq!(inputs, [out.join("generated.rs")], "{layout:?}, {name}");
-                assert!(text.starts_with(&make_path(&depinfo(&profile).with_extension("rlib"))));
                 assert_eq!(
                     std::fs::read_to_string(data_file(&profile)).unwrap(),
                     opaque_data,
                     "nested .d files retain their data bytes"
                 );
-                if layout == Layout::Shared {
-                    let text = std::fs::read_to_string(
-                        profile
-                            .join("build")
-                            .join(format!("dep-{HASH}/build_script_build-{HASH}.d")),
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        crate::cache_key::parse_dep_info(&text),
-                        inputs,
-                        "direct build-script compile dep-info also moves"
-                    );
-                }
+                assert!(
+                    !profile
+                        .join("build")
+                        .join(format!("dep-{HASH}/build_script_build-{HASH}.d"))
+                        .exists(),
+                    "nor its build script's"
+                );
                 let stdout = crate::cargo_layout::build_script_stdout(&out).unwrap();
                 assert_eq!(
                     std::fs::read_to_string(stdout.with_file_name("root-output")).unwrap(),
@@ -4470,27 +4484,35 @@ source = "git+https://example.com/gitdep#abc"
         }
     }
 
+    /// Another target of `donor`'s checkout, named `name`.
+    fn second_target(donor: &Donor, name: &str) -> NewTarget {
+        NewTarget {
+            target_dir: donor.workspace_root.join(name),
+            workspace_root: donor.workspace_root.clone(),
+        }
+    }
+
+    /// A workspace unit's compiler dep-info, the only one a seeding copies
+    /// ([`relocation::DepInfo`]), that names another donor's outputs, as an
+    /// older kache copied it verbatim, keeps the unit out.
     #[test]
     fn an_older_donors_raw_depinfo_is_not_seeded_again() {
         for layout in [Layout::PerUnit, Layout::Shared] {
             let dir = tempfile::tempdir().unwrap();
             let older = donor(dir.path(), "older", layout);
             let borrower = donor(dir.path(), "borrower", layout);
+            let app = unit("app", OTHER);
             let depinfo = |profile: &Path| match layout {
-                Layout::PerUnit => {
-                    build_script_out_dir(profile, layout, &unit("dep", HASH)).join("dep.d")
-                }
-                Layout::Shared => profile.join("deps").join(format!("dep-{HASH}.d")),
+                Layout::PerUnit => build_script_out_dir(profile, layout, &app).join("app.d"),
+                Layout::Shared => profile.join("deps").join(format!("app-{OTHER}.d")),
             };
             let library = |profile: &Path| match layout {
-                Layout::PerUnit => {
-                    build_script_out_dir(profile, layout, &unit("dep", HASH)).join("lib.rlib")
-                }
-                Layout::Shared => profile.join("deps").join(format!("libdep-{HASH}.rlib")),
+                Layout::PerUnit => build_script_out_dir(profile, layout, &app).join("lib.rlib"),
+                Layout::Shared => profile.join("deps").join(format!("libapp-{OTHER}.rlib")),
             };
             let rule = |profile: &Path| {
                 format!(
-                    "{}: registry.rs\n",
+                    "{}: app.rs\n",
                     library(profile).to_str().unwrap().replace(' ', "\\ ")
                 )
             };
@@ -4499,44 +4521,26 @@ source = "git+https://example.com/gitdep#abc"
             write(&depinfo(&old_profile), &rule(&old_profile));
             std::fs::copy(depinfo(&old_profile), depinfo(&borrowed_profile)).unwrap();
             std::fs::remove_dir_all(&older.target_dir).unwrap();
-            let current = checkout(dir.path(), "consumer");
-            assert_eq!(
-                seed(
-                    &current,
-                    VERSION,
-                    std::slice::from_ref(&borrower),
-                    no_runs().path(),
-                    later()
-                )
-                .units,
-                0,
+            let current = second_target(&borrower, "consumer");
+            seed(
+                &current,
+                VERSION,
+                std::slice::from_ref(&borrower),
+                no_runs().path(),
+                later(),
+            );
+            assert!(
+                !marker(&current.target_dir.join(PROFILE), layout, &app).exists(),
                 "{layout:?}: older Kache copied the first donor's rule verbatim"
             );
-            assert!(
-                !marker(
-                    &current.target_dir.join(PROFILE),
-                    layout,
-                    &unit("dep", HASH)
-                )
-                .exists()
-            );
 
-            // Correct current-donor metadata remains eligible; the registry
-            // dependency is unchanged and is never treated as an output root.
+            // Correct current-donor metadata remains eligible.
             write(&depinfo(&borrowed_profile), &rule(&borrowed_profile));
-            let healthy = checkout(dir.path(), "healthy");
-            assert_eq!(
-                seed(&healthy, VERSION, &[borrower], no_runs().path(), later()).units,
-                1,
-                "{layout:?}: a donor-owned rule is still seeded"
-            );
+            let healthy = second_target(&borrower, "healthy");
+            seed(&healthy, VERSION, &[borrower], no_runs().path(), later());
             assert!(
-                marker(
-                    &healthy.target_dir.join(PROFILE),
-                    layout,
-                    &unit("dep", HASH)
-                )
-                .is_dir()
+                marker(&healthy.target_dir.join(PROFILE), layout, &app).is_dir(),
+                "{layout:?}: a donor-owned rule is still seeded"
             );
             assert_eq!(
                 std::fs::read_to_string(depinfo(&healthy.target_dir.join(PROFILE))).unwrap(),
@@ -4560,11 +4564,20 @@ source = "git+https://example.com/gitdep#abc"
                 let dir = tempfile::tempdir().unwrap();
                 let donor = donor(dir.path(), "a", layout);
                 let from = donor.target_dir.join(PROFILE);
+                // Compiler dep-info is copied only for a workspace unit, which
+                // another target of the donor's checkout takes; a build
+                // script's records, for the registry unit too.
+                let dep_info = matches!(malformed, "reserved" | "binary" | "oversized");
+                let (refused, current) = if dep_info {
+                    (unit("app", OTHER), second_target(&donor, "b"))
+                } else {
+                    (unit("dep", HASH), checkout(dir.path(), "b"))
+                };
                 let depinfo = match layout {
-                    Layout::PerUnit => {
-                        build_script_out_dir(&from, layout, &unit("dep", HASH)).join("dep.d")
-                    }
-                    Layout::Shared => from.join("deps").join(format!("dep-{HASH}.d")),
+                    Layout::PerUnit => build_script_out_dir(&from, layout, &refused).join("u.d"),
+                    Layout::Shared => from
+                        .join("deps")
+                        .join(format!("{}-{}.d", refused.package, refused.hash)),
                 };
                 match malformed {
                     "reserved" => write(&depinfo, "output: __kache_root__/source.rs\n"),
@@ -4604,19 +4617,13 @@ source = "git+https://example.com/gitdep#abc"
                     }
                     _ => unreachable!(),
                 }
-                let current = checkout(dir.path(), "b");
                 assert_eq!(
                     seed(&current, VERSION, &[donor], no_runs().path(), later()).units,
-                    0,
-                    "{layout:?}: {malformed}"
+                    usize::from(dep_info),
+                    "{layout:?}: {malformed}: only the registry unit, when it is not the one"
                 );
                 assert!(
-                    !marker(
-                        &current.target_dir.join(PROFILE),
-                        layout,
-                        &unit("dep", HASH)
-                    )
-                    .exists(),
+                    !marker(&current.target_dir.join(PROFILE), layout, &refused).exists(),
                     "{layout:?}: {malformed}"
                 );
             }

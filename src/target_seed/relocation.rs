@@ -16,6 +16,22 @@ pub(super) struct Relocation<'a> {
     rebase: &'a kache_store::link::DepinfoRebase,
     depinfo_dirs: Vec<PathBuf>,
     script: Option<Script>,
+    /// Whether the unit's compiler dep-info is copied ([`Self::leaves_out`]).
+    dep_info: DepInfo,
+}
+
+/// Whether a seeding copies a unit's compiler dep-info (`deps/*.d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DepInfo {
+    /// Rebased to the new target: a workspace unit's, which a later seeding
+    /// from this target into another checkout reads for the variables the
+    /// compiler read ([`super::workspace::CrossCheckout::reads_checkout_from_env`]).
+    Copied,
+    /// Left out: a registry unit's. Cargo reads the compiler's dep-info only
+    /// just after the compiler wrote it, to translate it into the unit's
+    /// fingerprint, and judges a unit by that fingerprint alone; kache reads
+    /// it only for workspace units.
+    LeftOut,
 }
 
 struct Script {
@@ -86,6 +102,7 @@ impl<'a> Relocation<'a> {
             rebase,
             depinfo_dirs,
             script,
+            dep_info: DepInfo::Copied,
         })
     }
 
@@ -105,7 +122,20 @@ impl<'a> Relocation<'a> {
             rebase,
             depinfo_dirs: depinfo_dirs(from, Layout::Shared, unit, false),
             script: None,
+            dep_info: DepInfo::Copied,
         }
+    }
+
+    /// This relocation, copying the unit's compiler dep-info or leaving it
+    /// out as `dep_info` says.
+    pub(super) fn with_dep_info(self, dep_info: DepInfo) -> Self {
+        Self { dep_info, ..self }
+    }
+
+    /// Whether the donor file `path` is compiler dep-info the copy leaves
+    /// out ([`DepInfo::LeftOut`]). Told by the path alone.
+    pub(super) fn leaves_out(&self, path: &Path) -> bool {
+        self.dep_info == DepInfo::LeftOut && self.is_depinfo(path)
     }
 
     #[cfg_attr(not(unix), allow(dead_code))]
