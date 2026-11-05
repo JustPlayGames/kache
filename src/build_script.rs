@@ -1496,8 +1496,10 @@ impl Environment {
 /// Whether `contents` names `root`. On Windows a tool may spell a root
 /// otherwise than Cargo did: `cl.exe` records an `OUT_DIR` Cargo spelled
 /// `C:\w\target/x\debug\build\ring-1\out` with backslashes only, a
-/// tool may change the drive letter's case, and a PE file or a PDB holds
-/// paths in UTF-16. Any of them names the root as surely, so each counts.
+/// tool may change the drive letter's case, a PE file or a PDB holds
+/// paths in UTF-16, and a path written with `{:?}`, as a string literal or
+/// in JSON has each backslash doubled. Any of them names the root as
+/// surely, so each counts.
 fn spells_root(contents: &[u8], root: &Path) -> bool {
     spells_root_with(contents, root.as_os_str().as_encoded_bytes(), cfg!(windows))
 }
@@ -1524,6 +1526,13 @@ fn spells_root_with(contents: &[u8], root: &[u8], windows: bool) -> bool {
     {
         return true;
     }
+    // Escaped: a separator of the root written as two backslashes. A build
+    // script that generates `pub const DIR: &str = {:?};` from its manifest
+    // directory spells it so, and the run, taken for one that names no
+    // root, was restored in other checkouts with the first one's path.
+    if find_bytes(contents, br"\\").is_some() && spells_escaped(contents, root, same) {
+        return true;
+    }
     // UTF-16LE: each byte of the root (ASCII or not) followed by a zero
     // byte. A root with non-ASCII characters is matched narrow only.
     if !root.is_ascii() || contents.len() < root.len() * 2 {
@@ -1537,6 +1546,35 @@ fn spells_root_with(contents: &[u8], root: &[u8], windows: bool) -> bool {
             .zip(root)
             .all(|(unit, &b)| unit[1] == 0 && same(unit[0], b))
     })
+}
+
+/// Whether `contents` holds `root` with each separator written as one
+/// separator or as two backslashes, its other bytes compared by `same`.
+fn spells_escaped(contents: &[u8], root: &[u8], same: impl Fn(u8, u8) -> bool) -> bool {
+    let separator = |c: u8| c == b'/' || c == b'\\';
+    let matches_at = |mut at: usize| {
+        for &expected in root {
+            let Some(&found) = contents.get(at) else {
+                return false;
+            };
+            if separator(expected) {
+                if !separator(found) {
+                    return false;
+                }
+                at += if found == b'\\' && contents.get(at + 1) == Some(&b'\\') {
+                    2
+                } else {
+                    1
+                };
+            } else if same(found, expected) {
+                at += 1;
+            } else {
+                return false;
+            }
+        }
+        true
+    };
+    (0..contents.len()).any(matches_at)
 }
 
 const OUT_DIR_PLACEHOLDER: &str = "${KACHE_OUT_DIR}";
@@ -1978,6 +2016,13 @@ impl Run {
         );
         fold(&mut hasher, "binary", self.binary_hash.as_bytes());
         fold(&mut hasher, "os", std::env::consts::OS.as_bytes());
+        if cfg!(windows) {
+            // A Windows run stored before a root written with doubled
+            // backslashes was found ([`spells_root`]) may be bound to no
+            // root although it names one: Windows keys changed once, so no
+            // such run is found again. Other systems' keys stay.
+            fold(&mut hasher, "roots", b"escaped");
+        }
         fold(&mut hasher, "arch", std::env::consts::ARCH.as_bytes());
         let file_hasher = self.store.file_hasher();
         let mut budget = MAX_INPUT_FILES;
@@ -4114,6 +4159,19 @@ mod tests {
         assert!(!spells_root_with(&wide, root, false));
         assert!(!spells_root_with(
             br"C:\w\target\x\debug\build\ring-2\out",
+            root,
+            true
+        ));
+        // With each backslash doubled, as `{:?}`, a string literal or JSON
+        // writes it.
+        let literal: &[u8] =
+            br#"pub const DIR: &str = "C:\\w\\target/x\\debug\\build\\ring-1\\out";"#;
+        assert!(spells_root_with(literal, root, true));
+        assert!(!spells_root_with(literal, root, false));
+        let json: &[u8] = br#"{"dir":"c:\\w\\target\\x\\debug\\build\\ring-1\\out\\a"}"#;
+        assert!(spells_root_with(json, root, true));
+        assert!(!spells_root_with(
+            br#""C:\\w\\target\\x\\debug\\build\\ring-2\\out""#,
             root,
             true
         ));
