@@ -5564,6 +5564,100 @@ fn the_target_info_probe_seeds_a_new_checkout() {
     assert!(!off.join("target").exists());
 }
 
+/// `KACHE_SEED_WORKSPACE_UNITS` is the build's: a daemon that runs the
+/// target-info probe for the build seeds by the build's value, not by its
+/// own environment, which the build never reaches. Here the daemon has none
+/// (every donor gives path units) and the build asks for none.
+#[test]
+fn a_build_that_asks_for_no_workspace_units_gets_none_from_a_running_daemon() {
+    let e = env();
+    e.cmd()
+        .env_remove("KACHE_SEED_WORKSPACE_UNITS")
+        .args(["daemon", "start"])
+        .assert()
+        .success();
+    let root = TempDir::new().unwrap();
+    let checkout = root.path().join("checkout");
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    std::fs::write(
+        checkout.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(checkout.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let built = e.wrapper_build(&checkout, &checkout.join("target"));
+    assert!(built.status.success(), "{built:?}");
+    // A registry unit beside the checkout's own `app`, as the toolchain lays
+    // them out.
+    let per_unit = !checkout.join("target/debug/.fingerprint").is_dir();
+    let units = |target: &Path, package: &str| -> Vec<String> {
+        let (dir, prefix) = if per_unit {
+            (target.join("debug/build").join(package), String::new())
+        } else {
+            (target.join("debug/.fingerprint"), format!("{package}-"))
+        };
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        names.sort();
+        names
+    };
+    let dep = if per_unit {
+        checkout.join("target/debug/build/dep/0123456789abcdef")
+    } else {
+        checkout.join("target/debug/.fingerprint/dep-0123456789abcdef")
+    };
+    std::fs::create_dir_all(dep.join("fingerprint")).unwrap();
+    std::fs::write(dep.join("fingerprint/lib"), "fp").unwrap();
+    let mut lock = std::fs::read_to_string(checkout.join("Cargo.lock")).unwrap();
+    lock.push_str(
+        "\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    );
+    std::fs::write(checkout.join("Cargo.lock"), lock).unwrap();
+    let app = units(&checkout.join("target"), "app");
+    assert!(!app.is_empty(), "the build left no unit of app");
+
+    // A new target of the same checkout, whose path units a donor of the
+    // same checkout gives unless the build says otherwise.
+    let probe = |target: &str, workspace_units: Option<&str>| {
+        let mut command = e.cmd();
+        command
+            .current_dir(&checkout)
+            .env("KACHE_SEED_NEW_TARGETS", "1")
+            .env("CARGO_TARGET_DIR", target)
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .env_remove("KACHE_SEED_WORKSPACE_UNITS");
+        if let Some(value) = workspace_units {
+            command.env("KACHE_SEED_WORKSPACE_UNITS", value);
+        }
+        command
+            .args(["rustc", "-", "--crate-name", "___", "--print=file-names"])
+            .args(["--crate-type", "lib"])
+            .write_stdin("")
+            .assert()
+            .success();
+        checkout.join(target)
+    };
+    let on = probe("target-on", None);
+    assert_eq!(units(&on, "app"), app, "the daemon's choice gives them");
+    let off = probe("target-off", Some("0"));
+    assert_eq!(
+        units(&off, "dep"),
+        units(&checkout.join("target"), "dep"),
+        "the registry unit is seeded"
+    );
+    assert_eq!(
+        units(&off, "app"),
+        Vec::<String>::new(),
+        "the build asked for no workspace units"
+    );
+}
+
 #[test]
 fn daemon_readiness_channel_precedes_a_fresh_running_status() {
     use kunobi_daemon::launch::DaemonCommand;

@@ -279,10 +279,12 @@ pub(crate) fn path_packages(lockfile: &str) -> BTreeSet<String> {
     &path - &registry
 }
 
-/// Which donors give workspace (path) units, from
-/// `KACHE_SEED_WORKSPACE_UNITS`.
+/// The build's choice of which donors give workspace (path) units.
+pub(crate) const WORKSPACE_UNITS_ENV: &str = "KACHE_SEED_WORKSPACE_UNITS";
+
+/// Which donors give workspace (path) units, from [`WORKSPACE_UNITS_ENV`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkspaceUnits {
+pub(crate) enum WorkspaceUnits {
     /// `0`, `false`, `no` or `off`: none.
     Off,
     /// `same`: targets of the same checkout only.
@@ -291,7 +293,14 @@ enum WorkspaceUnits {
     Checked,
 }
 
-fn workspace_units_wanted(value: Option<&OsStr>) -> WorkspaceUnits {
+/// The build's [`WORKSPACE_UNITS_ENV`], from the invocation's own
+/// environment: a daemon that runs the probe for a client must not take its
+/// own, which a build that set the variable never reaches.
+pub(crate) fn workspace_units_for(env: &crate::invocation::InvocationEnv) -> WorkspaceUnits {
+    workspace_units_wanted(env.var_os(WORKSPACE_UNITS_ENV).as_deref())
+}
+
+pub(crate) fn workspace_units_wanted(value: Option<&OsStr>) -> WorkspaceUnits {
     match value.and_then(OsStr::to_str).map(str::trim) {
         Some(value)
             if ["0", "false", "no", "off"]
@@ -2096,6 +2105,7 @@ pub(crate) fn seed(
         &no_recorded_hashes,
         SeedDeadline::fixed(deadline),
         false,
+        WorkspaceUnits::Checked,
     )
 }
 
@@ -2103,6 +2113,7 @@ pub(crate) fn seed(
 /// a check of the donor's workspace used ([`check_demand`]). Without such a
 /// record in the donor, every unit, as [`seed`]. `recorded` reads the
 /// store's memo rows for the donor's artifacts ([`artifacts_stored`]).
+/// `workspace_units` is the build's choice ([`workspace_units_for`]).
 pub(crate) fn seed_for_lane(
     target: &NewTarget,
     rustc_version: &str,
@@ -2111,12 +2122,13 @@ pub(crate) fn seed_for_lane(
     recorded: RecordedLookup,
     deadline: SeedDeadline,
     check_lane: bool,
+    workspace_units: WorkspaceUnits,
 ) -> Seeded {
     let Ok(lockfile) = std::fs::read_to_string(target.workspace_root.join("Cargo.lock")) else {
         return Seeded::default();
     };
     let registry = registry_packages(&lockfile);
-    let mode = workspace_units_wanted(std::env::var_os("KACHE_SEED_WORKSPACE_UNITS").as_deref());
+    let mode = workspace_units;
     let workspace = if mode == WorkspaceUnits::Off {
         BTreeSet::new()
     } else {
@@ -3022,10 +3034,15 @@ pub(crate) fn before_probe_for(
     let Some(version) = rustc_version_for(args.first().map(String::as_str), env) else {
         return;
     };
-    let note = env.var_os("KACHE_LOG_FILE").is_none();
-    if let Err(error) =
-        crate::daemon::seed_new_target(config, &target, &version, probe_is_check_lane(env), note)
-    {
+    let note = env.var_os("KACHE_LOG_FILE").is_none().then_some(env);
+    if let Err(error) = crate::daemon::seed_new_target(
+        config,
+        &target,
+        &version,
+        probe_is_check_lane(env),
+        workspace_units_for(env),
+        note,
+    ) {
         tracing::debug!("not seeding {}: {error:#}", target.target_dir.display());
     }
 }
@@ -3034,14 +3051,12 @@ pub(crate) fn before_probe_for(
 /// event. A wrapper has no file layer unless `KACHE_LOG_FILE` asks for one
 /// (Cargo runs hundreds of wrappers a build), but a seeding happens once per
 /// new target directory and leaves no other trace of what it copied.
-pub(crate) fn note_in_log(line: &str) {
-    note_in_log_for(&crate::invocation::InvocationEnv::capture(), line);
-}
-
-/// [`note_in_log`] into the file the log's file layer would write for `env`:
-/// `KACHE_LOG_FILE_PATH` when set, not the default log beside the default
-/// cache folder.
-fn note_in_log_for(env: &crate::invocation::InvocationEnv, line: &str) {
+///
+/// The file is the one the log's file layer would write for `env`, the
+/// build's: `KACHE_LOG_FILE_PATH` when set, not the default log beside the
+/// default cache folder. A daemon that runs the probe for a client passes
+/// the client's environment, not its own.
+pub(crate) fn note_in_log_for(env: &crate::invocation::InvocationEnv, line: &str) {
     use std::io::Write;
     let Some(path) = crate::log_file_path_for(env) else {
         return;
@@ -6329,6 +6344,7 @@ source = "git+https://example.com/gitdep#abc"
             &no_recorded_hashes,
             SeedDeadline::fixed(later()),
             true,
+            WorkspaceUnits::Checked,
         );
         assert_eq!(seeded.units, 4);
         let to = same.target_dir.join(PROFILE);
@@ -6381,6 +6397,7 @@ source = "git+https://example.com/gitdep#abc"
                 &no_recorded_hashes,
                 deadline,
                 false,
+                WorkspaceUnits::Checked,
             )
         };
         let passed = Instant::now();
@@ -6447,7 +6464,8 @@ source = "git+https://example.com/gitdep#abc"
                 &stored,
                 &no_recorded_hashes,
                 SeedDeadline::fixed(later()),
-                true
+                true,
+                WorkspaceUnits::Checked,
             ),
             Seeded {
                 units: 2,
@@ -6465,7 +6483,8 @@ source = "git+https://example.com/gitdep#abc"
                 &stored,
                 &no_recorded_hashes,
                 SeedDeadline::fixed(later()),
-                false
+                false,
+                WorkspaceUnits::Checked,
             ),
             Seeded {
                 units: 3,
@@ -6501,6 +6520,7 @@ source = "git+https://example.com/gitdep#abc"
                 &no_recorded_hashes,
                 deadline,
                 true,
+                WorkspaceUnits::Checked,
             )
         };
         let in_time = seed_by("in-time", SeedDeadline::fixed(later()));

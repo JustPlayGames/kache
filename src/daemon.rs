@@ -10455,12 +10455,24 @@ fn send_build_started_with(
 /// Seed a new target directory from the most recently used tracked targets
 /// (see [`crate::target_seed`]), within [`crate::target_seed::SeedDeadline`].
 /// Only a wrapper from before seeding moved into the wrapper sends this.
+/// Such a request carries no environment, so its build's
+/// `KACHE_SEED_WORKSPACE_UNITS` is this daemon's.
 fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
     let target = crate::target_seed::NewTarget {
         target_dir: PathBuf::from(&req.target_dir),
         workspace_root: PathBuf::from(&req.workspace_root),
     };
-    match seed_new_target(config, &target, &req.rustc_version, req.check_lane, false) {
+    let workspace_units = crate::target_seed::workspace_units_wanted(
+        std::env::var_os(crate::target_seed::WORKSPACE_UNITS_ENV).as_deref(),
+    );
+    match seed_new_target(
+        config,
+        &target,
+        &req.rustc_version,
+        req.check_lane,
+        workspace_units,
+        None,
+    ) {
         Ok(_) => Response::ok(),
         Err(error) => Response::err(format!("{error:#}")),
     }
@@ -10476,14 +10488,20 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
 /// time instead (62-110 CPU-s against 13-15 for a seeded first clippy of a
 /// 1,300-unit workspace). Cargo waits for the probe either way.
 ///
-/// `note` also appends the outcome to the diagnostic log when no log layer
-/// writes it there: a wrapper's file log is off unless asked for.
+/// `workspace_units` is the build's choice of donors for path units
+/// ([`crate::target_seed::workspace_units_for`]): a daemon running the probe
+/// for a client reads it from the client's environment, never its own.
+///
+/// `note`, the build's environment, also has the outcome appended to the
+/// diagnostic log when no log layer writes it there: a wrapper's file log is
+/// off unless asked for.
 pub(crate) fn seed_new_target(
     config: &Config,
     target: &crate::target_seed::NewTarget,
     rustc_version: &str,
     check_lane: bool,
-    note: bool,
+    workspace_units: crate::target_seed::WorkspaceUnits,
+    note: Option<&crate::invocation::InvocationEnv>,
 ) -> Result<crate::target_seed::Seeded> {
     let started = std::time::Instant::now();
     let since_ns = kache_store::file_hash::stamp_clock_ns();
@@ -10519,6 +10537,7 @@ pub(crate) fn seed_new_target(
         &|paths| store.recorded_file_hashes(paths),
         deadline,
         check_lane,
+        workspace_units,
     );
     memoise_seeded_files(&store, &seeded.placed, since_ns);
     if let Some(donor) = &seeded.donor {
@@ -10534,8 +10553,8 @@ pub(crate) fn seed_new_target(
             line.push_str(&format!(", {} left at the deadline", seeded.left));
         }
         tracing::info!("{line}");
-        if note {
-            crate::target_seed::note_in_log(&line);
+        if let Some(env) = note {
+            crate::target_seed::note_in_log_for(env, &line);
         }
     }
     Ok(seeded)
