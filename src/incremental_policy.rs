@@ -229,15 +229,16 @@ impl AdaptiveUnit {
     /// and path dependencies) in profiles with incremental on, whether or not
     /// the command selects them. That argument, not `CARGO_PRIMARY_PACKAGE`,
     /// marks a unit someone may be editing.
-    /// Eligible invocations must have a stable Cargo unit id and exactly:
-    /// `<profile>/deps` (or the unit's own `out` in Cargo's per-unit layout)
-    /// plus `<profile>/incremental`, both absolute. A build script is not:
-    /// Cargo gives it no extra filename, so it has no unit id.
+    /// Eligible invocations must have a stable Cargo unit id
+    /// ([`cargo_unit_id`]) and exactly: `<profile>/deps` (or the unit's own
+    /// `out` in Cargo's per-unit layout) plus `<profile>/incremental`, both
+    /// absolute. A build script is not: Cargo gives it no extra filename, so
+    /// it has no unit id.
     pub(crate) fn eligible(args: &RustcArgs, policy_guard: &[u8]) -> Option<Self> {
         if !args.is_primary {
             return None;
         }
-        let unit_id = args.unit_id()?;
+        let unit_id = cargo_unit_id(args)?;
         if !(8..=64).contains(&unit_id.len())
             || !unit_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -963,6 +964,16 @@ pub(crate) fn key_fingerprint(
     let mut stable_count = 0usize;
     let mut dynamic_count = 0usize;
     for (name, value) in fields {
+        // The inputs a build script declared are files and variables of the
+        // package, folded into the key as one digest. Neither group fits: a
+        // build script that watches its package's own sources (an asset
+        // scanner) moves the digest on every edit, which in the stable group
+        // kept such a unit from ever qualifying, and on their own they say
+        // nothing of someone editing the unit's Rust code. A compile on an
+        // incremental lane rereads them all the same.
+        if name == "build_script_inputs" {
+            continue;
+        }
         let target = if matches!(name.as_str(), "sources" | "externs") {
             dynamic_count += 1;
             &mut dynamic
@@ -981,6 +992,34 @@ pub(crate) fn key_fingerprint(
         stable: stable.finalize().to_hex().to_string(),
         sources_externs: dynamic.finalize().to_hex().to_string(),
     })
+}
+
+/// The Cargo unit id eligibility asks for: the `-C extra-filename` hash, or,
+/// for a `cdylib` or `dylib` with no `-C extra-filename` at all, its
+/// `-C metadata` hash. Cargo leaves the hash out of a path package's dynamic
+/// library so the file keeps the name its loader asks for (a web app's
+/// `.wasm`, a plugin's `.so`), but still passes `-C metadata`, which differs
+/// for every unit. Without this, such a crate never compiled incrementally:
+/// each edit was a full compile and a stored entry no build asked for again.
+/// A build script or other executable keeps needing the extra filename.
+fn cargo_unit_id(args: &RustcArgs) -> Option<String> {
+    if args.extra_filename.is_some() {
+        return args.unit_id();
+    }
+    let dynamic = args
+        .crate_types
+        .iter()
+        .any(|kind| matches!(kind.as_str(), "cdylib" | "dylib"));
+    let libraries_only = args.crate_types.iter().all(|kind| {
+        matches!(
+            kind.as_str(),
+            "cdylib" | "dylib" | "rlib" | "lib" | "staticlib"
+        )
+    });
+    if !(dynamic && libraries_only) {
+        return None;
+    }
+    args.get_codegen_opt("metadata").map(str::to_owned)
 }
 
 /// Two misses of one unit that differ only in its sources or dependencies:
@@ -2015,6 +2054,69 @@ mod tests {
     }
 
     #[test]
+    fn a_dynamic_library_without_extra_filename_is_identified_by_its_metadata() {
+        let (temp, _args, _unit) = fixture();
+        let profile = temp.path().join("target/debug");
+        let argv = |extra: &[&str]| {
+            let mut argv: Vec<String> = vec![
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                "sample".into(),
+                "src/lib.rs".into(),
+                "--out-dir".into(),
+                profile.join("deps").to_string_lossy().into_owned(),
+                "-C".into(),
+                format!("incremental={}", profile.join("incremental").display()),
+            ];
+            argv.extend(extra.iter().map(|arg| arg.to_string()));
+            RustcArgs::parse(&argv).unwrap()
+        };
+        let web_app = [
+            "--crate-type",
+            "cdylib",
+            "--crate-type",
+            "rlib",
+            "-Cmetadata=0eec5fa7167476a4",
+        ];
+        let first = AdaptiveUnit::eligible(&argv(&web_app), b"").unwrap();
+        let mut other_features = web_app.to_vec();
+        other_features.push("--cfg=feature=\"extra\"");
+        other_features[4] = "-Cmetadata=91c3f5e0a2b4d6e8";
+        let second = AdaptiveUnit::eligible(&argv(&other_features), b"").unwrap();
+        assert_ne!(
+            first.unit_dir, second.unit_dir,
+            "another unit, another state"
+        );
+
+        assert!(
+            AdaptiveUnit::eligible(&argv(&["--crate-type", "cdylib"]), b"").is_none(),
+            "without -C metadata there is no unit id"
+        );
+        assert!(
+            AdaptiveUnit::eligible(
+                &argv(&["--crate-type", "bin", "-Cmetadata=0eec5fa7167476a4"]),
+                b""
+            )
+            .is_none(),
+            "an executable (a build script) still needs its extra filename"
+        );
+        assert!(
+            AdaptiveUnit::eligible(
+                &argv(&["--crate-type", "rlib", "-Cmetadata=0eec5fa7167476a4"]),
+                b""
+            )
+            .is_none(),
+            "Cargo names every other library with an extra filename"
+        );
+        let mut empty_extra = web_app.to_vec();
+        empty_extra.push("-Cextra-filename=");
+        assert!(
+            AdaptiveUnit::eligible(&argv(&empty_extra), b"").is_none(),
+            "an extra filename that names no unit fails closed"
+        );
+    }
+
+    #[test]
     fn eligibility_is_narrow() {
         let (_temp, mut args, unit) = fixture();
         assert!(unit.unit_dir.ends_with(&unit.unit_key));
@@ -2672,6 +2774,34 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn build_script_inputs_neither_block_nor_prove_an_edit() {
+        let with_inputs = |sources: &str, inputs: &str| {
+            let mut fields = fields("stable", sources, "extern-a");
+            fields.insert("build_script_inputs".into(), inputs.into());
+            fields
+        };
+        let (_temp, _args, unit) = fixture();
+        assert!(unit.observe_build_at(
+            &cache_key("first"),
+            &with_inputs("source-a", "scan-a"),
+            100
+        ));
+        assert!(
+            unit.try_seed_at(
+                &cache_key("inputs-only"),
+                &with_inputs("source-a", "scan-b"),
+                101
+            )
+            .is_none(),
+            "a moved declared input alone is no edit of the unit"
+        );
+        let lease = unit
+            .try_seed_at(&cache_key("edit"), &with_inputs("source-b", "scan-b"), 102)
+            .expect("an edit its build script also watches still seeds");
+        assert_eq!(lease.kind(), LeaseKind::Seed);
     }
 
     #[test]
