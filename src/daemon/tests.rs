@@ -18537,6 +18537,7 @@ fn a_seeding_hands_its_memo_rows_over_rather_than_waiting_for_the_index() {
         from: donor.clone(),
         before,
         at: placed.clone(),
+        hash: None,
     };
 
     memoise_seeded_files(&store, std::slice::from_ref(&file), since_ns);
@@ -18567,7 +18568,18 @@ fn a_seeding_hands_its_memo_rows_over_rather_than_waiting_for_the_index() {
     .unwrap();
     memoise_seeded_files(&alone, std::slice::from_ref(&file), since_ns);
     let again = crate::cache_key::FileFingerprint::from_path(&placed).unwrap();
-    assert_eq!(alone.file_hash_at(&again), Some(hash));
+    assert_eq!(alone.file_hash_at(&again), Some(hash.clone()));
+
+    // A donor the index has no row for takes the hash the seeding read.
+    let fresh = Store::open(&test_config(&dir.path().join("other"))).unwrap();
+    let learned = crate::target_seed::PlacedFile {
+        hash: Some(hash.clone()),
+        ..file
+    };
+    memoise_seeded_files(&fresh, std::slice::from_ref(&learned), since_ns);
+    assert_eq!(fresh.file_hash_at(&again), Some(hash.clone()));
+    let donor_now = crate::cache_key::FileFingerprint::from_path(&donor).unwrap();
+    assert_eq!(fresh.file_hash_at(&donor_now), Some(hash));
 }
 
 /// A daemon that has just started defers a hinted size sweep to the end of
