@@ -451,6 +451,67 @@ fn a_donor_file_written_out_in_full_is_compared_and_renamed_in_the_copy() {
     assert!(!bad.join("dep-lib-p").exists());
 }
 
+/// Clippy lists `clippy.toml` by its canonical path: `\\?\C:\w\clippy.toml`
+/// on Windows, the real path through a symbolic link on Unix. Spelled so,
+/// the donor's file is still the donor's: compared by bytes and renamed in
+/// the copy, never taken for one file outside both checkouts.
+#[test]
+fn a_donor_file_listed_by_another_spelling_of_its_checkout_is_compared() {
+    let fixture = Fixture::new(&[]);
+    #[cfg(unix)]
+    let (donor_root, theirs) = {
+        let alias = fixture.donor.with_file_name("alias");
+        std::os::unix::fs::symlink(&fixture.donor, &alias).unwrap();
+        (alias, fixture.donor.join("Cargo.toml"))
+    };
+    #[cfg(windows)]
+    let (donor_root, theirs) = (
+        fixture.donor.clone(),
+        std::fs::canonicalize(fixture.donor.join("Cargo.toml")).unwrap(),
+    );
+    assert!(
+        theirs.strip_prefix(&donor_root).is_err(),
+        "another spelling"
+    );
+    let dep_info = fixture.fingerprint.join("dep-lib-p");
+    let listed = [(0, "src/lib.rs"), (1, theirs.to_str().unwrap())];
+    write(&dep_info, &encoded(&listed, &[]));
+    at(&dep_info, BUILT);
+    let check = || {
+        CrossCheckout::new(
+            &donor_root,
+            &donor_root.join("target"),
+            &fixture.ours,
+            &BTreeSet::from(["p".to_owned()]),
+            true,
+            later(),
+        )
+        .unwrap()
+    };
+    let record = record_of(&fixture.fingerprint);
+    let verified = check()
+        .verify("p", &fixture.fingerprint, &record)
+        .expect("same manifest");
+    let copy = fixture.donor.join("copy");
+    write(&copy.join("dep-lib-p"), &std::fs::read(&dep_info).unwrap());
+    check().date(&copy, verified.stamp).unwrap();
+    let ours = fixture.ours.join("Cargo.toml");
+    let rebased = [(0, "src/lib.rs"), (1, ours.to_str().unwrap())];
+    assert_eq!(
+        std::fs::read(copy.join("dep-lib-p")).unwrap(),
+        encoded(&rebased, &[])
+    );
+    write(
+        &fixture.ours.join("Cargo.toml"),
+        b"[workspace]\nmembers = []\n",
+    );
+    assert_eq!(
+        check().verify("p", &fixture.fingerprint, &record),
+        None,
+        "another manifest"
+    );
+}
+
 /// Where the unit at `fingerprint` (`<target>/debug/.fingerprint/<unit>`) has
 /// its run's output recorded, if it is a run.
 fn record_of(fingerprint: &Path) -> PathBuf {

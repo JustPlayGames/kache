@@ -76,7 +76,22 @@ pub(super) struct CrossCheckout {
     /// A copy thread that needs a package another is comparing waits for
     /// that comparison rather than making its own.
     packages: Mutex<HashMap<String, Arc<OnceLock<Option<PackageCheck>>>>>,
+    /// Both checkouts' canonical paths, resolved the first time a dep-info
+    /// lists a path spelled otherwise than either root ([`Self::place`]).
+    canonical_roots: OnceLock<[Option<PathBuf>; 2]>,
     deadline: Instant,
+}
+
+/// Where an absolute path a donor's dep-info lists lies
+/// ([`CrossCheckout::place`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Place {
+    /// In the donor's checkout, at this path below its root.
+    Donor(PathBuf),
+    /// In this checkout.
+    Ours,
+    /// Outside both: the same file for either.
+    Outside,
 }
 
 /// A package directory found the same in both checkouts.
@@ -262,6 +277,7 @@ impl CrossCheckout {
             adopt,
             roots,
             packages: Mutex::new(HashMap::new()),
+            canonical_roots: OnceLock::new(),
             deadline,
         })
     }
@@ -615,7 +631,45 @@ impl CrossCheckout {
     /// Date and rebase the copied unit's dep-infos at `fingerprint`
     /// ([`date_and_rebase`]).
     pub(super) fn date(&self, fingerprint: &Path, stamp: SystemTime) -> std::io::Result<()> {
-        date_and_rebase(fingerprint, &self.donor_root, &self.our_root, stamp)
+        let below_donor = |path: &Path| match self.place(path)? {
+            Place::Donor(within) => Some(within),
+            Place::Ours | Place::Outside => None,
+        };
+        date_and_rebase(fingerprint, below_donor, &self.our_root, stamp)
+    }
+
+    /// Where the absolute `path` lies. A path spelled otherwise than either
+    /// checkout's root is placed by its canonical path, as are the roots:
+    /// Clippy lists `clippy.toml` canonicalized, `\\?\C:\w\clippy.toml` on
+    /// Windows and the real path through a symbolic link on Unix, and a
+    /// letter's case or an 8.3 name spells a Windows directory too. Taken
+    /// for a file outside both checkouts, the donor's would be judged by its
+    /// age alone, and a copy kept another checkout's Clippy settings. `None`
+    /// when such a path cannot be resolved (it is gone).
+    fn place(&self, path: &Path) -> Option<Place> {
+        if let Ok(within) = path.strip_prefix(&self.donor_root) {
+            return Some(Place::Donor(within.to_path_buf()));
+        }
+        if path.starts_with(&self.our_root) {
+            return Some(Place::Ours);
+        }
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let [donor, ours] = self.canonical_roots.get_or_init(|| {
+            [&self.donor_root, &self.our_root].map(|root| std::fs::canonicalize(root).ok())
+        });
+        if let Some(within) = donor
+            .as_deref()
+            .and_then(|donor| canonical.strip_prefix(donor).ok())
+        {
+            return Some(Place::Donor(within.to_path_buf()));
+        }
+        if ours
+            .as_deref()
+            .is_some_and(|ours| canonical.starts_with(ours))
+        {
+            return Some(Place::Ours);
+        }
+        Some(Place::Outside)
     }
 
     /// Whether a file a dep-info lists, `path` from the package root, is
@@ -629,18 +683,19 @@ impl CrossCheckout {
         reference: SystemTime,
     ) -> bool {
         if path.is_absolute() {
-            if path.starts_with(&self.our_root) && !path.starts_with(&self.donor_root) {
-                return false;
-            }
-            let Ok(within) = path.strip_prefix(&self.donor_root) else {
+            let within = match self.place(path) {
+                Some(Place::Donor(within)) => within,
+                Some(Place::Ours) | None => return false,
                 // The same file for both checkouts.
-                return modified(path).is_some_and(|time| time <= reference);
+                Some(Place::Outside) => {
+                    return modified(path).is_some_and(|time| time <= reference);
+                }
             };
             // `src/../../assets/x` (an `include_bytes!` that climbs out of
             // its package) stays below the checkout; each side's path is
             // compared as the compiler opened it there.
-            let our_file = self.our_root.join(within);
-            return normal(within)
+            let our_file = self.our_root.join(&within);
+            return normal(&within)
                 .is_some_and(|below| !self.donor_root.join(below).starts_with(&self.donor_target))
                 && modified(path).is_some_and(|time| time <= reference)
                 && same_bytes(path, &our_file, self.deadline);
@@ -1089,12 +1144,14 @@ impl<'a> Reader<'a> {
 }
 
 /// Make each dep-info of the copied unit at `fingerprint` name this
-/// checkout's files where it named the donor's, in full, and give it the
+/// checkout's files where it named the donor's in full (`below_donor` gives
+/// the part of such a path below the donor's checkout, in any spelling
+/// [`CrossCheckout::place`] knows), and give it the
 /// time `stamp`. A dep-info that cannot be read or written is removed: the
 /// unit is then built, as without seeding.
 pub(super) fn date_and_rebase(
     fingerprint: &Path,
-    donor_root: &Path,
+    below_donor: impl Fn(&Path) -> Option<PathBuf>,
     our_root: &Path,
     stamp: SystemTime,
 ) -> std::io::Result<()> {
@@ -1106,7 +1163,11 @@ pub(super) fn date_and_rebase(
         let rebased = std::fs::read(&file).ok().and_then(|bytes| {
             let mut info = EncodedDepInfo::parse(&bytes)?;
             for entry in &mut info.files {
-                if let Ok(within) = Path::new(&entry.path).strip_prefix(donor_root) {
+                let path = Path::new(&entry.path);
+                if !path.is_absolute() {
+                    continue;
+                }
+                if let Some(within) = below_donor(path) {
                     entry.path = our_root.join(within).to_str()?.to_owned();
                 }
             }
