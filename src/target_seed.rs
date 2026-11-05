@@ -2142,9 +2142,17 @@ pub(crate) fn seed_for_lane(
         return Seeded::default();
     }
     let checked = mode == WorkspaceUnits::Checked;
-    for (tried, (donor, layout, read)) in
-        ranked_donors(target, rustc_version, donors, &registry, &both, checked, check_lane)
-            .enumerate()
+    for (tried, (donor, layout, read)) in ranked_donors(
+        target,
+        rustc_version,
+        donors,
+        &registry,
+        &both,
+        checked,
+        check_lane,
+        deadline.soft,
+    )
+    .enumerate()
     {
         // The first donor goes on past `soft` while it copies; another, tried
         // when the one before copied nothing, only before it.
@@ -2191,7 +2199,7 @@ pub(crate) fn seed_for_lane(
             (Layout::Shared, None) => {
                 let deps = outputs_by_hash(&from);
                 let demand = check_lane
-                    .then(|| check_demand(&from, &registry, &deps))
+                    .then(|| check_demand(&from, &registry, &deps, copy_threads(), deadline.limit))
                     .flatten();
                 (deps, units(&from, layout, packages), demand)
             }
@@ -2456,6 +2464,7 @@ fn ranked_donors<'a>(
     both: &BTreeSet<String>,
     checked: bool,
     check_lane: bool,
+    until: Instant,
 ) -> impl Iterator<Item = (&'a Donor, Layout, Option<CheckRead>)> + 'a {
     let mut usable = donors.iter().filter_map(move |donor| {
         if donor.target_dir == target.target_dir
@@ -2467,6 +2476,7 @@ fn ranked_donors<'a>(
         layout(&donor.target_dir.join(PROFILE)).map(|layout| (donor, layout))
     });
     let candidates: Vec<_> = usable.by_ref().take(RANKED_DONORS).collect();
+    let threads = reading_threads(candidates.len());
     // Each donor's fingerprints are read in a thread of its own: a check
     // reads every unit's, tens of milliseconds a donor.
     let mut ranked: Vec<_> = std::thread::scope(|scope| {
@@ -2481,7 +2491,7 @@ fn ranked_donors<'a>(
                         registry
                     };
                     if check_lane && layout == Layout::Shared {
-                        let read = CheckRead::of(&profile, registry, packages);
+                        let read = CheckRead::of(&profile, registry, packages, threads, until);
                         (read.units(), Some(read))
                     } else {
                         (units_by_name(&profile, layout, packages).len(), None)
@@ -2523,7 +2533,7 @@ fn check_units(
     registry: &BTreeSet<String>,
     packages: &BTreeSet<String>,
 ) -> usize {
-    CheckRead::of(profile, registry, packages).units()
+    CheckRead::of(profile, registry, packages, 1, Instant::now() + SEED_LIMIT).units()
 }
 
 /// What ranking reads of a shared-layout donor for a check: its outputs by
@@ -2541,10 +2551,19 @@ struct CheckRead {
 }
 
 impl CheckRead {
-    fn of(profile: &Path, registry: &BTreeSet<String>, packages: &BTreeSet<String>) -> Self {
+    /// Its fingerprints read by `threads` until `until` ([`check_demand`]):
+    /// a read cut short ranks the donor by its checked units and gives it
+    /// every unit, as a donor without a workspace check.
+    fn of(
+        profile: &Path,
+        registry: &BTreeSet<String>,
+        packages: &BTreeSet<String>,
+        threads: usize,
+        until: Instant,
+    ) -> Self {
         let deps = outputs_by_hash(profile);
         let held = units_by_name(profile, Layout::Shared, packages);
-        let demand = check_demand(profile, registry, &deps);
+        let demand = check_demand(profile, registry, &deps, threads, until);
         Self { deps, held, demand }
     }
 
@@ -2727,40 +2746,43 @@ fn file_name(path: &Path) -> String {
 /// unit's fingerprint. A dependency is named there by its fingerprint hash,
 /// the one the dependency's own hash file holds.
 ///
-/// `None` when the donor holds no checked workspace unit or a fingerprint
-/// cannot be read: then nothing says what a check needs. Only ever a filter
-/// on what is copied: a unit left out is restored by the wrapper when Cargo
-/// asks for it, as without seeding.
+/// `None` when the donor holds no checked workspace unit, a fingerprint
+/// cannot be read, or not every fingerprint was read by `until`: then
+/// nothing says what a check needs. Only ever a filter on what is copied: a
+/// unit left out is restored by the wrapper when Cargo asks for it, as
+/// without seeding.
+///
+/// Each unit's fingerprints are a listing and two small reads, which a
+/// loaded machine serves from disk one at a time: read in order, the 2,193
+/// units of a workspace clippy's donor took 35-82 s at load 180-200, and
+/// three targets of one checkout ranked past the seeding's limit copied
+/// nothing. `threads` read them side by side ([`reading_threads`]).
 fn check_demand(
     profile: &Path,
     registry: &BTreeSet<String>,
     deps: &HashMap<String, Vec<PathBuf>>,
+    threads: usize,
+    until: Instant,
 ) -> Option<std::collections::HashSet<String>> {
+    let units: Vec<(PathBuf, String, String)> = subdirectories(&profile.join(".fingerprint"))
+        .into_iter()
+        .filter_map(|unit| {
+            let name = file_name(&unit);
+            let (package, hash) = name.rsplit_once('-')?;
+            let (package, hash) = (package.to_owned(), hash.to_owned());
+            Some((unit, package, hash))
+        })
+        .collect();
+    let read = read_in_parallel(&units, threads, until, |(unit, _, _)| {
+        read_fingerprints(unit)
+    })?;
     let mut by_fingerprint: HashMap<String, String> = HashMap::new();
     let mut edges: HashMap<String, Vec<String>> = HashMap::new();
     let mut roots = Vec::new();
-    for unit in subdirectories(&profile.join(".fingerprint")) {
-        let name = file_name(&unit);
-        let Some((package, hash)) = name.rsplit_once('-') else {
-            continue;
-        };
-        let mut wants = Vec::new();
-        for file in entries(&unit) {
-            let file_name = file_name(&file);
-            if file_name.ends_with(".json") {
-                let text = std::fs::read_to_string(&file).ok()?;
-                let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-                for dep in json.get("deps")?.as_array()? {
-                    let fingerprint = dep.as_array()?.get(3)?.as_u64()?;
-                    wants.push(hex_le(fingerprint));
-                }
-            } else if file_name != INVOCATION_STAMP
-                && !file_name.starts_with("dep-")
-                && !file_name.contains('.')
-            {
-                let fingerprint = std::fs::read_to_string(&file).ok()?;
-                by_fingerprint.insert(fingerprint.trim().to_owned(), name.clone());
-            }
+    for ((unit, package, hash), (wants, hashes)) in units.iter().zip(read) {
+        let name = file_name(unit);
+        for fingerprint in hashes {
+            by_fingerprint.insert(fingerprint, name.clone());
         }
         if !registry.contains(package) && metadata_only(deps, hash) {
             roots.push(name.clone());
@@ -2782,6 +2804,82 @@ fn check_demand(
         }
     }
     Some(reached)
+}
+
+/// Threads that read a donor's fingerprints while donors are ranked, shared
+/// by the donors read at once ([`ranked_donors`]): twice the copy threads,
+/// each donor at least two. A thread spends nearly all its time waiting for
+/// the disk, so on a loaded machine more of them in flight shorten the
+/// wait; on a quiet one the reads take milliseconds either way.
+fn reading_threads(donors: usize) -> usize {
+    (copy_threads() * 2 / donors.max(1)).max(2)
+}
+
+/// `read` of each of `items`, in their order, made by up to `threads` threads
+/// at once; `None` when one gives `None` or `until` passes first.
+fn read_in_parallel<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    until: Instant,
+    read: impl Fn(&T) -> Option<R> + Sync,
+) -> Option<Vec<R>> {
+    let next = AtomicUsize::new(0);
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let mut read_by: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads.clamp(1, items.len().max(1)))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    while !failed.load(Ordering::Relaxed) {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(at) else {
+                            break;
+                        };
+                        match (Instant::now() < until).then(|| read(item)).flatten() {
+                            Some(value) => done.push((at, value)),
+                            None => failed.store(true, Ordering::Relaxed),
+                        }
+                    }
+                    done
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap_or_default())
+            .collect()
+    });
+    if failed.into_inner() || read_by.len() != items.len() {
+        return None;
+    }
+    read_by.sort_unstable_by_key(|(at, _)| *at);
+    Some(read_by.into_iter().map(|(_, value)| value).collect())
+}
+
+/// What a unit's fingerprint directory says for [`check_demand`]: the
+/// fingerprints of the dependencies its `.json` names, and the fingerprints
+/// its hash files hold. `None` when one cannot be read.
+fn read_fingerprints(unit: &Path) -> Option<(Vec<String>, Vec<String>)> {
+    let mut wants = Vec::new();
+    let mut hashes = Vec::new();
+    for file in entries(unit) {
+        let file_name = file_name(&file);
+        if file_name.ends_with(".json") {
+            let text = std::fs::read_to_string(&file).ok()?;
+            let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+            for dep in json.get("deps")?.as_array()? {
+                let fingerprint = dep.as_array()?.get(3)?.as_u64()?;
+                wants.push(hex_le(fingerprint));
+            }
+        } else if file_name != INVOCATION_STAMP
+            && !file_name.starts_with("dep-")
+            && !file_name.contains('.')
+        {
+            let fingerprint = std::fs::read_to_string(&file).ok()?;
+            hashes.push(fingerprint.trim().to_owned());
+        }
+    }
+    Some((wants, hashes))
 }
 
 /// A fingerprint as Cargo's hash files spell it: the little-endian bytes of
@@ -6163,7 +6261,7 @@ source = "git+https://example.com/gitdep#abc"
             .map(String::from)
             .into();
         let deps = deps_by_hash(&profile.join("deps"));
-        let demand = check_demand(&profile, &registry, &deps).unwrap();
+        let demand = check_demand(&profile, &registry, &deps, 4, later()).unwrap();
         for wanted in [
             format!("dep-{}", h(1)),
             format!("mac-{}", h(4)),
@@ -6200,14 +6298,23 @@ source = "git+https://example.com/gitdep#abc"
         );
         write(&examples.join("demo"), "uplifted");
         let registry: BTreeSet<String> = ["dep"].map(String::from).into();
-        let demand = check_demand(&profile, &registry, &outputs_by_hash(&profile)).unwrap();
+        let demand =
+            check_demand(&profile, &registry, &outputs_by_hash(&profile), 4, later()).unwrap();
         for wanted in [h(1), h(2), h(3), h(4)] {
             assert!(demand.iter().any(|unit| unit.ends_with(&wanted)), "{wanted}");
         }
-        assert!(check_demand(&profile, &registry, &deps_by_hash(&profile.join("deps")))
+        assert!(
+            check_demand(
+                &profile,
+                &registry,
+                &deps_by_hash(&profile.join("deps")),
+                4,
+                later()
+            )
             .unwrap()
             .iter()
-            .all(|unit| !unit.ends_with(&h(2)) && !unit.ends_with(&h(4))));
+            .all(|unit| !unit.ends_with(&h(2)) && !unit.ends_with(&h(4)))
+        );
 
         let same = NewTarget {
             target_dir: donor.workspace_root.join("target").join("integrate-clippy"),
@@ -6368,6 +6475,89 @@ source = "git+https://example.com/gitdep#abc"
         );
     }
 
+    /// A check build whose donors could not all be read in time (a loaded
+    /// machine reading fingerprints from disk) still copies, from the donor
+    /// read so far gives the most, every unit it holds: ranked past the
+    /// seeding's limit, three targets of one checkout copied nothing.
+    #[test]
+    fn a_check_ranked_past_its_time_still_copies_every_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        // The workspace's check used `dep` and `gitdep` checked; `dep` was
+        // also built, which a check does not read.
+        let checks = empty_donor(dir.path(), "checks");
+        let profile = checks.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "dep", &h(1), 11, &[], &["rlib", "rmeta"]);
+        fingerprinted_unit(&profile, "dep", &h(3), 13, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "gitdep", &h(6), 16, &[], &["rmeta"]);
+        fingerprinted_unit(&profile, "app", &h(7), 17, &[13, 16], &["rmeta"]);
+        let stored = cache_storing(&dir.path().join("cache"), &["x"]);
+        let seed_by = |name: &str, deadline: SeedDeadline| {
+            seed_for_lane(
+                &checkout(dir.path(), name),
+                VERSION,
+                std::slice::from_ref(&checks),
+                &stored,
+                &no_recorded_hashes,
+                deadline,
+                true,
+            )
+        };
+        let in_time = seed_by("in-time", SeedDeadline::fixed(later()));
+        assert_eq!(
+            (in_time.units, in_time.donor.as_deref()),
+            (2, Some(checks.workspace_root.as_path()))
+        );
+        let late = seed_by(
+            "late",
+            SeedDeadline {
+                soft: Instant::now(),
+                limit: later(),
+            },
+        );
+        assert_eq!(
+            (late.units, late.donor.as_deref()),
+            (3, Some(checks.workspace_root.as_path()))
+        );
+    }
+
+    /// The fingerprints of a check are read side by side, all of them by
+    /// the deadline or none: a part says nothing of what the check needs.
+    #[test]
+    fn a_check_demand_is_read_whole_by_its_deadline_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let h = |n: u8| format!("{n:016x}");
+        for n in 1..=40 {
+            fingerprinted_unit(&profile, "dep", &h(n), u64::from(n), &[], &["rmeta"]);
+        }
+        let needs: Vec<u64> = (1..=40).collect();
+        fingerprinted_unit(&profile, "app", &h(99), 99, &needs, &["rmeta"]);
+        let registry: BTreeSet<String> = ["dep"].map(String::from).into();
+        let deps = outputs_by_hash(&profile);
+        for threads in [0, 1, 3, 64] {
+            let demand = check_demand(&profile, &registry, &deps, threads, later()).unwrap();
+            assert_eq!(demand.len(), 41, "{threads} threads read every unit");
+        }
+        assert!(check_demand(&profile, &registry, &deps, 4, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn reads_in_parallel_keep_their_order_and_fail_whole() {
+        let items: Vec<u32> = (0..200).collect();
+        let doubled = read_in_parallel(&items, 7, later(), |n| Some(n * 2)).unwrap();
+        assert_eq!(doubled, items.iter().map(|n| n * 2).collect::<Vec<_>>());
+        assert!(read_in_parallel(&items, 7, later(), |n| (*n != 150).then_some(*n)).is_none());
+        assert!(read_in_parallel(&items, 7, Instant::now(), |n| Some(*n)).is_none());
+        assert_eq!(
+            read_in_parallel(&[] as &[u32], 7, later(), |n| Some(*n)),
+            Some(Vec::new())
+        );
+        // Donors read at once share the threads, each keeping two.
+        assert_eq!(reading_threads(1), copy_threads() * 2);
+        assert_eq!(reading_threads(RANKED_DONORS * 8), 2);
+    }
+
     /// A check donor with no checked workspace unit gives every unit, but
     /// counts only those a check compiled: its metadata-only ones.
     #[test]
@@ -6407,7 +6597,7 @@ source = "git+https://example.com/gitdep#abc"
         );
         let registry: BTreeSet<String> = ["dep"].map(String::from).into();
         let deps = deps_by_hash(&profile.join("deps"));
-        assert!(check_demand(&profile, &registry, &deps).is_none());
+        assert!(check_demand(&profile, &registry, &deps, 4, later()).is_none());
     }
 
     #[test]
