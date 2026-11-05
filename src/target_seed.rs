@@ -1081,7 +1081,7 @@ fn copy_unit(
             Layout::PerUnit => out.join(crate::build_script::LAUNCH_RECORD),
             Layout::Shared => out.with_file_name(crate::build_script::LAUNCH_RECORD),
         };
-        pin_launcher(from, to, &record, deadline)?;
+        pin_launcher(from, to, &record, deadline, &counts.pins)?;
     }
     match layout {
         Layout::PerUnit => {
@@ -1853,6 +1853,9 @@ struct FileCounts {
     placed: std::sync::Mutex<Vec<PlacedFile>>,
     /// The hashes of donor artifacts the seeding's checks learned.
     learned: Learned,
+    /// The launcher pins the seeding copies ([`pin_launcher`]).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pins: Pins,
     /// The new profile's directories this seeding made or found.
     made: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     /// A lock for each directory the copy threads place names into
@@ -2359,10 +2362,25 @@ pub(crate) fn seed_for_lane(
     Seeded::default()
 }
 
+/// The launcher pins of one seeding, a lock a pinned path ([`pin_launcher`]).
+///
+/// The build scripts of a workspace share a few pins (4 in a 6,000-unit
+/// workspace, 31 MB each), and the copy threads reach their units at once:
+/// each copied a pin for itself until one renamed its copy into place, 20-26
+/// copies a seeding where 4 were needed.
+type Pins = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>>;
+
 /// Copy the executable this unit's launcher needs before publishing the unit.
 /// Each profile owns its inode, including pins inherited from older donors.
+/// One thread of a seeding copies a pin while the others needing it wait.
 #[cfg(unix)]
-fn pin_launcher(from: &Path, to: &Path, record: &Path, deadline: Instant) -> std::io::Result<()> {
+fn pin_launcher(
+    from: &Path,
+    to: &Path,
+    record: &Path,
+    deadline: Instant,
+    pins: &Pins,
+) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
     use std::path::Component;
@@ -2390,6 +2408,13 @@ fn pin_launcher(from: &Path, to: &Path, record: &Path, deadline: Instant) -> std
         _ => return Err(invalid()),
     }
     let pinned = to.join(relative);
+    let pin = std::sync::Arc::clone(
+        pins.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(pinned.clone())
+            .or_default(),
+    );
+    let _copying = pin.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if std::fs::symlink_metadata(&pinned)
         .is_ok_and(|metadata| metadata.is_file() && metadata.nlink() == 1)
     {
@@ -3592,7 +3617,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&to.join(shims).join("pin/kache"), "ours");
         let record = launcher_record(&from, Layout::Shared, &format!("{shims}/pin/kache"));
         let original = kache_fs::file_identity(&to.join(shims).join("pin/kache")).unwrap();
-        pin_launcher(&from, &to, &record, later()).unwrap();
+        pin_launcher(&from, &to, &record, later(), &Pins::default()).unwrap();
         assert_eq!(
             std::fs::read_to_string(to.join(shims).join("pin/kache")).unwrap(),
             "ours"
@@ -3616,7 +3641,7 @@ source = "git+https://example.com/gitdep#abc"
         std::fs::create_dir_all(copied.parent().unwrap()).unwrap();
         std::fs::hard_link(&source, &copied).unwrap();
         let record = launcher_record(&from, Layout::Shared, &relative);
-        pin_launcher(&from, &to, &record, later()).unwrap();
+        pin_launcher(&from, &to, &record, later(), &Pins::default()).unwrap();
         assert_ne!(
             kache_fs::file_identity(&source).unwrap(),
             kache_fs::file_identity(&copied).unwrap()
@@ -3626,7 +3651,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&source.with_file_name("real"), "symlink executable");
         std::os::unix::fs::symlink("real", &source).unwrap();
         std::fs::remove_file(&copied).unwrap();
-        pin_launcher(&from, &to, &record, later()).unwrap();
+        pin_launcher(&from, &to, &record, later(), &Pins::default()).unwrap();
         assert!(std::fs::symlink_metadata(&copied).unwrap().is_file());
         assert_eq!(std::fs::read(copied).unwrap(), b"symlink executable");
     }
@@ -3641,7 +3666,7 @@ source = "git+https://example.com/gitdep#abc"
         write(&from.join(&relative), "kache");
         let record = launcher_record(&from, Layout::Shared, &relative);
         assert_eq!(
-            pin_launcher(&from, &to, &record, Instant::now())
+            pin_launcher(&from, &to, &record, Instant::now(), &Pins::default())
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::TimedOut
@@ -3657,7 +3682,7 @@ source = "git+https://example.com/gitdep#abc"
         ] {
             let record = launcher_record(&from, Layout::Shared, relative);
             assert_eq!(
-                pin_launcher(&from, &to, &record, later())
+                pin_launcher(&from, &to, &record, later(), &Pins::default())
                     .unwrap_err()
                     .kind(),
                 std::io::ErrorKind::InvalidData,
@@ -3667,16 +3692,16 @@ source = "git+https://example.com/gitdep#abc"
         }
         std::fs::write(&record, "no fields").unwrap();
         assert_eq!(
-            pin_launcher(&from, &to, &record, later())
+            pin_launcher(&from, &to, &record, later(), &Pins::default())
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::InvalidData
         );
         std::fs::remove_file(&record).unwrap();
-        pin_launcher(&from, &to, &record, later()).unwrap();
+        pin_launcher(&from, &to, &record, later(), &Pins::default()).unwrap();
         assert!(!to.exists());
         std::fs::create_dir(&record).unwrap();
-        assert!(pin_launcher(&from, &to, &record, later()).is_err());
+        assert!(pin_launcher(&from, &to, &record, later(), &Pins::default()).is_err());
     }
 
     #[test]
