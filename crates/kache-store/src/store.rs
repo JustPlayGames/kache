@@ -6699,6 +6699,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             );
         }
         let predictions_pruned = predictions.rows;
+        if self.config.compress_predictions {
+            self.compress_input_predictions();
+        }
         let file_hashes_pruned =
             self.file_hash_cache()
                 .prune_file_hashes()
@@ -6739,6 +6742,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             file_hashes_gone_pruned: gone.rows,
             file_hashes_gone_cut_short: gone.cut_short,
             ..HousekeepingStats::default()
+        }
+    }
+
+    /// Rewrite plain input prediction rows as zstd frames for at most
+    /// [`crate::file_hash::PREDICTION_CONVERSION_BUDGET`], after the prune so
+    /// that rows about to go are not rewritten first.
+    fn compress_input_predictions(&self) {
+        match self
+            .file_hash_cache()
+            .compress_input_predictions_within(crate::file_hash::PREDICTION_CONVERSION_BUDGET)
+        {
+            Ok(done) if done.rows > 0 || done.cut_short => tracing::info!(
+                rows = done.rows,
+                kept_plain = done.kept_plain,
+                batches = done.batches,
+                longest_batch_ms = done.longest_batch.as_millis() as u64,
+                cut_short = done.cut_short,
+                "gc: compressed input prediction rows"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!("gc: input prediction compression failed: {error}"),
         }
     }
 
