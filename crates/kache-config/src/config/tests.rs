@@ -1089,6 +1089,36 @@ fn unused_unit_cleanup_defaults_to_thirty_days() {
 }
 
 #[test]
+fn input_prediction_retention_defaults_to_thirty_days_and_zero_counts_as_unset() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_INPUT_PREDICTION_RETENTION_DAYS");
+    let days = || Config::load().unwrap().input_prediction_retention_days;
+    assert_eq!(days(), 30);
+    std::fs::write(
+        &config_path,
+        "[cache]\ninput_prediction_retention_days = 7\n",
+    )
+    .unwrap();
+    assert_eq!(days(), 7);
+    let _env = NamedEnvGuard::set("KACHE_INPUT_PREDICTION_RETENTION_DAYS", "3");
+    assert_eq!(days(), 3);
+    drop(_env);
+    for unset in ["0", "soon"] {
+        let _env = NamedEnvGuard::set("KACHE_INPUT_PREDICTION_RETENTION_DAYS", unset);
+        assert_eq!(days(), 7, "{unset} counts as unset: the file's value");
+    }
+    std::fs::write(
+        &config_path,
+        "[cache]\ninput_prediction_retention_days = 0\n",
+    )
+    .unwrap();
+    assert_eq!(days(), 30);
+}
+
+#[test]
 fn memory_pressure_admission_is_on_by_default_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -3252,6 +3282,7 @@ fn test_file_config_roundtrip() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            input_prediction_retention_days: None,
             auto_clean_adaptive_idle_hours: None,
             seed_new_targets: None,
             build_script_hermetic: None,
@@ -3921,6 +3952,7 @@ fn test_config_store_dir() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
@@ -4018,6 +4050,7 @@ fn test_config_index_db_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
@@ -4111,6 +4144,7 @@ fn test_config_event_log_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
@@ -4223,6 +4257,7 @@ fn test_config_socket_path() {
         auto_recover_targets: false,
         scheduler_memory_pressure: true,
         auto_clean_unused_units_days: 0,
+        input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
@@ -4971,6 +5006,7 @@ fn test_save_and_load_file_config() {
             auto_recover_targets: None,
             scheduler_memory_pressure: None,
             auto_clean_unused_units_days: None,
+            input_prediction_retention_days: None,
             auto_clean_adaptive_idle_hours: None,
             seed_new_targets: None,
             build_script_hermetic: None,

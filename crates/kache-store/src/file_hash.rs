@@ -608,14 +608,22 @@ impl<'db> FileHashCache<'db> {
     /// long as it took: the retention window moves on by a sweep's interval
     /// at a time, so that is little while the GC runs often, but a sweep
     /// after a pause, or a shorter window, meets millions of rows.
+    ///
+    /// A build script's rows ([`BUILD_SCRIPT_ROW_PREFIXES`]) keep at least
+    /// [`INPUT_PREDICTION_RETENTION_SECS`] whatever `retention` says: such a
+    /// row names the inputs a run read, and without it the script runs
+    /// again, which costs more than a rustc pre-pass, for rows that take
+    /// next to no room.
     pub fn prune_input_predictions_within(
         &self,
         now: i64,
         retention: i64,
         budget: Duration,
     ) -> rusqlite::Result<PredictionPrune> {
+        let cutoff = now.saturating_sub(retention);
         self.prune_input_predictions_batched(
-            now.saturating_sub(retention),
+            cutoff,
+            cutoff.min(prediction_prune_cutoff(now)),
             budget,
             PREDICTION_PRUNE_BATCH,
         )
@@ -678,15 +686,18 @@ impl<'db> FileHashCache<'db> {
     fn prune_input_predictions_at(&self, now: i64) -> rusqlite::Result<usize> {
         self.prune_input_predictions_batched(
             prediction_prune_cutoff(now),
+            prediction_prune_cutoff(now),
             Duration::MAX,
             PREDICTION_PRUNE_BATCH,
         )
         .map(|pruned| pruned.rows)
     }
 
+    /// Rows unused since `cutoff` go, a build script's since `script_cutoff`.
     fn prune_input_predictions_batched(
         &self,
         cutoff: i64,
+        script_cutoff: i64,
         budget: Duration,
         batch: usize,
     ) -> rusqlite::Result<PredictionPrune> {
@@ -711,7 +722,7 @@ impl<'db> FileHashCache<'db> {
                 return Ok(done);
             }
             let held = Instant::now();
-            let deleted = match self.delete_expired_predictions(cutoff, batch) {
+            let deleted = match self.delete_expired_predictions(cutoff, script_cutoff, batch) {
                 Ok(deleted) => deleted,
                 Err(error) if crate::gone_dirs::is_busy(&error) => {
                     done.cut_short = true;
@@ -730,17 +741,40 @@ impl<'db> FileHashCache<'db> {
         }
     }
 
-    fn delete_expired_predictions(&self, cutoff: i64, batch: usize) -> rusqlite::Result<usize> {
+    fn delete_expired_predictions(
+        &self,
+        cutoff: i64,
+        script_cutoff: i64,
+        batch: usize,
+    ) -> rusqlite::Result<usize> {
+        let [first, second] = BUILD_SCRIPT_ROW_PREFIXES;
         let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        // `prefix` and every name that starts with it sort below `prefix` +
+        // U+10FFFF, as in `put_input_prediction_trimming`.
         let deleted = tx.execute(
             "DELETE FROM input_predictions WHERE rowid IN (
-                 SELECT rowid FROM input_predictions WHERE last_used < ?1 LIMIT ?2)",
-            params![cutoff, i64::try_from(batch).unwrap_or(i64::MAX)],
+                 SELECT rowid FROM input_predictions
+                 WHERE last_used < ?1
+                   AND (last_used < ?2
+                        OR NOT (identity >= ?3 AND identity < ?3 || char(1114111))
+                           AND NOT (identity >= ?4 AND identity < ?4 || char(1114111)))
+                 LIMIT ?5)",
+            params![
+                cutoff,
+                script_cutoff,
+                first,
+                second,
+                i64::try_from(batch).unwrap_or(i64::MAX)
+            ],
         )?;
         tx.commit()?;
         Ok(deleted)
     }
 }
+
+/// What the rows of build scripts' input predictions are named first
+/// (`build_script.rs` in the kache crate checks that it names them so).
+pub const BUILD_SCRIPT_ROW_PREFIXES: [&str; 2] = ["build-script:", "unsettled:"];
 
 /// Rows one write transaction of the prediction prune deletes. A row holds
 /// the closure of one unit, about 4 KB on a shared build host's index and up
@@ -2450,11 +2484,11 @@ mod tests {
         set_prediction_last_used(&cache, "recent", now - 6 * 86_400);
         let week = now - 7 * 86_400;
         let none = cache
-            .prune_input_predictions_batched(week, Duration::ZERO, 2)
+            .prune_input_predictions_batched(week, week, Duration::ZERO, 2)
             .unwrap();
         assert_eq!((none.rows, none.batches, none.cut_short), (0, 0, true));
         let all = cache
-            .prune_input_predictions_batched(week, Duration::from_secs(60), 2)
+            .prune_input_predictions_batched(week, week, Duration::from_secs(60), 2)
             .unwrap();
         assert_eq!((all.rows, all.batches, all.cut_short), (5, 3, false));
         let left: Vec<String> = cache
@@ -2466,6 +2500,41 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(left, ["recent"]);
+    }
+
+    #[test]
+    fn a_shorter_window_leaves_build_script_rows_their_thirty_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let now = 1_900_000_000;
+        for (identity, idle_days) in [
+            ("rustc-unit", 8),
+            ("build-script:abc", 8),
+            ("unsettled:build-script:abc", 8),
+            ("build-script:old", 31),
+        ] {
+            cache
+                .put_input_prediction(identity, 2, None, "payload")
+                .unwrap();
+            set_prediction_last_used(&cache, identity, now - idle_days * 86_400);
+        }
+        let done = cache
+            .prune_input_predictions_within(now, 7 * 86_400, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(
+            done.rows, 2,
+            "the rustc row and the script row past 30 days"
+        );
+        let mut left: Vec<String> = cache
+            .db()
+            .prepare("SELECT identity FROM input_predictions")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["build-script:abc", "unsettled:build-script:abc"]);
     }
 
     #[test]

@@ -2185,6 +2185,7 @@ mod tests {
                 auto_recover_targets: None,
                 scheduler_memory_pressure: None,
                 auto_clean_unused_units_days: None,
+                input_prediction_retention_days: None,
                 auto_clean_adaptive_idle_hours: None,
                 target_liveness: None,
                 seed_new_targets: None,

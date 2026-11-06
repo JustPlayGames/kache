@@ -102,6 +102,7 @@ mod tests {
             auto_recover_targets: false,
             scheduler_memory_pressure: true,
             auto_clean_unused_units_days: 0,
+            input_prediction_retention_days: 30,
             auto_clean_adaptive_idle_hours: 0,
             target_liveness: false,
             seed_new_targets: false,
