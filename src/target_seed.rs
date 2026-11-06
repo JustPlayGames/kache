@@ -2456,7 +2456,8 @@ fn pin_launcher(
 const RANKED_DONORS: usize = 8;
 
 /// The donors that can give `target` units, in the order seeding tries them:
-/// of the [`RANKED_DONORS`] most recently used, the one that can give the
+/// of the [`RANKED_DONORS`] most recently used, those of `target`'s own
+/// checkout first, then the others, each group the one that can give the
 /// most first (the more recent of two that give as many), then every other
 /// in order of use. A build gets every unit of `packages` a donor holds; a
 /// check (`check_lane`) only those [`check_units`] counts.
@@ -2466,14 +2467,20 @@ const RANKED_DONORS: usize = 8;
 /// a 1,900-unit workspace. Seeding stops at the first donor it copies from,
 /// so taking the most recent one alone left a new checkout with those 361.
 ///
+/// The other checkouts' donors are read only once the iterator reaches
+/// them, when their own checkout's gave nothing: read up front, integrate's
+/// three clippy targets, seeded at once from their checkout's `target/`,
+/// each read the eight recent donors' fingerprints first, 0.45-0.5 s of a
+/// 0.85-0.95 s seeding, against 0.11 s for one seeding alone.
+///
 /// A check's ranked donor of the shared layout comes with what ranking read
 /// of it ([`CheckRead`]), which seeding it uses again.
 fn ranked_donors<'a>(
     target: &'a NewTarget,
     rustc_version: &'a str,
     donors: &'a [Donor],
-    registry: &BTreeSet<String>,
-    both: &BTreeSet<String>,
+    registry: &'a BTreeSet<String>,
+    both: &'a BTreeSet<String>,
     checked: bool,
     check_lane: bool,
     until: Instant,
@@ -2487,7 +2494,35 @@ fn ranked_donors<'a>(
         }
         layout(&donor.target_dir.join(PROFILE)).map(|layout| (donor, layout))
     });
-    let candidates: Vec<_> = usable.by_ref().take(RANKED_DONORS).collect();
+    let (own, others): (Vec<_>, Vec<_>) = usable
+        .by_ref()
+        .take(RANKED_DONORS)
+        .partition(|(donor, _)| same_checkout(donor, target));
+    let rank = move |candidates: Vec<(&'a Donor, Layout)>| {
+        rank_by_units(
+            target, candidates, registry, both, checked, check_lane, until,
+        )
+    };
+    rank(own)
+        .into_iter()
+        .chain(std::iter::once(others).flat_map(rank))
+        .chain(usable.map(|(donor, layout)| (donor, layout, None)))
+}
+
+/// `candidates`, the one that can give the most first, stable: equals keep
+/// their order of use ([`ranked_donors`]).
+fn rank_by_units<'a>(
+    target: &NewTarget,
+    candidates: Vec<(&'a Donor, Layout)>,
+    registry: &BTreeSet<String>,
+    both: &BTreeSet<String>,
+    checked: bool,
+    check_lane: bool,
+    until: Instant,
+) -> Vec<(&'a Donor, Layout, Option<CheckRead>)> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
     let threads = reading_threads(candidates.len());
     // Each donor's fingerprints are read in a thread of its own: a check
     // reads every unit's, tens of milliseconds a donor.
@@ -2520,13 +2555,11 @@ fn ranked_donors<'a>(
             })
             .collect()
     });
-    // A target of the same checkout first: it gives every unit without
-    // touching the checkout. Stable: equals keep their order of use.
-    ranked.sort_by_key(|entry| (!same_checkout(entry.0, target), std::cmp::Reverse(entry.2)));
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     ranked
         .into_iter()
         .map(|(donor, layout, _, read)| (donor, layout, read))
-        .chain(usable.map(|(donor, layout)| (donor, layout, None)))
+        .collect()
 }
 
 /// The units of `packages` in a donor's shared-layout `profile` a check
@@ -6536,6 +6569,59 @@ source = "git+https://example.com/gitdep#abc"
                 ..Seeded::default()
             }
         );
+    }
+
+    /// Another checkout's donors are read only once this checkout's own gave
+    /// nothing: a donor of the same checkout is tried first whatever the
+    /// others hold. Read up front, integrate's three clippy targets each read
+    /// the eight recent donors' fingerprints before copying from their
+    /// checkout's `target/`, 0.45-0.5 s of a 0.85-0.95 s seeding when the
+    /// three ran at once.
+    #[test]
+    fn other_checkouts_donors_are_read_only_after_this_checkouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = |n: u8| format!("{n:016x}");
+        let own = empty_donor(dir.path(), "own");
+        fingerprinted_unit(
+            &own.target_dir.join(PROFILE),
+            "dep",
+            &h(1),
+            11,
+            &[],
+            &["rmeta"],
+        );
+        let new = NewTarget {
+            target_dir: own.target_dir.join("integrate-clippy"),
+            workspace_root: own.workspace_root.clone(),
+        };
+        // Used last and before: two other checkouts' donors, one unit each.
+        let last = empty_donor(dir.path(), "last");
+        let before = empty_donor(dir.path(), "before");
+        for (donor, n) in [(&last, 2), (&before, 3)] {
+            let profile = donor.target_dir.join(PROFILE);
+            fingerprinted_unit(&profile, "dep", &h(n), u64::from(n), &[], &["rmeta"]);
+        }
+        let registry: BTreeSet<String> = ["dep", "gitdep"].map(String::from).into();
+        let both: BTreeSet<String> = ["app", "dep", "gitdep"].map(String::from).into();
+        let donors = [own.clone(), last.clone(), before.clone()];
+        let mut ranked = ranked_donors(
+            &new,
+            VERSION,
+            &donors,
+            &registry,
+            &both,
+            true,
+            true,
+            later(),
+        );
+        assert_eq!(ranked.next().unwrap().0, &own);
+        // Grown since the seeding began: read now, `before` holds the most.
+        let profile = before.target_dir.join(PROFILE);
+        fingerprinted_unit(&profile, "gitdep", &h(4), 14, &[], &["rmeta"]);
+        let rest: Vec<_> = ranked
+            .map(|(donor, _, _)| donor.workspace_root.clone())
+            .collect();
+        assert_eq!(rest, [before.workspace_root, last.workspace_root]);
     }
 
     /// A check build whose donors could not all be read in time (a loaded
