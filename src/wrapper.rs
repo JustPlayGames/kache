@@ -9334,6 +9334,33 @@ fn register_target_root(
     );
 }
 
+/// Record a target a seeding placed units in ([`crate::target_seed`]) as
+/// a target root, built by the probe's `rustc -vV`. Only a compile records
+/// its target ([`register_target_root`]), and a build whose units seeding
+/// left fresh compiles none: its target was nobody's donor, so the next new
+/// target seeded from an older one or, once that was gone, from none.
+pub(crate) fn register_seeded_target(
+    config: &Config,
+    target: &Path,
+    workspace_root: &Path,
+    rustc_version: &str,
+    cargo_home: &Path,
+) {
+    if !owns_its_target(workspace_root, Some(cargo_home)) {
+        return;
+    }
+    let Ok(store) = Store::open(config) else {
+        return;
+    };
+    register_target_root(
+        config,
+        &store,
+        target,
+        workspace_root,
+        Some(rustc_version.trim()),
+    );
+}
+
 fn automatic_seeding_enabled(config: &Config, args: &RustcArgs) -> bool {
     config.seed_incremental
         && args.inner_rustc.is_none()
