@@ -7240,6 +7240,42 @@ fn event_result_for_store_put_maps_dup_vs_miss() {
 }
 
 #[test]
+fn a_linked_test_binary_at_the_bound_is_kept_out_of_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("t-0123456789abcdef");
+    std::fs::write(&binary, vec![0u8; 4096]).unwrap();
+    let artifacts = crate::compiler::ArtifactSet::new(vec![crate::compiler::Artifact {
+        path: binary,
+        store_name: "t-0123456789abcdef".into(),
+        kind: crate::compiler::ArtifactKind::Executable,
+        required: true,
+    }]);
+    let compile = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "--crate-name", "t", "--edition=2021", "src/lib.rs"];
+        argv.extend_from_slice(extra);
+        RustcArgs::parse(&argv.iter().map(|a| a.to_string()).collect::<Vec<_>>()).unwrap()
+    };
+    let test_link = compile(&["--test", "--emit=dep-info,link"]);
+    let test_check = compile(&["--test", "--emit=dep-info,metadata"]);
+    let bin_link = compile(&["--crate-type", "bin", "--emit=dep-info,link"]);
+    let mut config = test_config(PathBuf::from("cache"));
+    assert_eq!(
+        test_binary_over_store_bound(&config, &test_link, &artifacts),
+        None,
+        "no bound by default"
+    );
+    config.max_stored_test_binary_bytes = 4096;
+    assert_eq!(
+        test_binary_over_store_bound(&config, &test_link, &artifacts),
+        Some(4096)
+    );
+    assert_eq!(test_binary_over_store_bound(&config, &test_check, &artifacts), None);
+    assert_eq!(test_binary_over_store_bound(&config, &bin_link, &artifacts), None);
+    config.max_stored_test_binary_bytes = 4097;
+    assert_eq!(test_binary_over_store_bound(&config, &test_link, &artifacts), None);
+}
+
+#[test]
 fn store_admission_preserves_writable_remote_publication() {
     let mut config = test_config(PathBuf::from("cache"));
     config.min_store_compile_ms = 1_000;

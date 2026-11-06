@@ -227,6 +227,7 @@ fn size_key(key: &str) -> Option<bool> {
         "cache.local_max_size"
         | "cache.event_log_max_size"
         | "cache.prefetch_max_bytes"
+        | "cache.max_stored_test_binary_size"
         | "cache.auto_recover_min_free_bytes" => Some(true),
         "cache.restore_max_size" => Some(false),
         _ => None,
@@ -315,6 +316,7 @@ mod tests {
             "local_max_size",
             "event_log_max_size",
             "prefetch_max_bytes",
+            "max_stored_test_binary_size",
             "auto_recover_min_free_bytes",
             "restore_max_size",
         ] {

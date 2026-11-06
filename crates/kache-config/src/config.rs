@@ -271,6 +271,14 @@ pub struct Config {
     /// A publish-capable path with a writable remote overrides it so admission
     /// never suppresses publication; local-only paths still honor the threshold.
     pub min_store_compile_ms: u64,
+    /// Largest linked test binary (`rustc --test` emitting a link) the store
+    /// keeps, in bytes (default `0`, no bound). A test binary at or above it
+    /// is compiled and used as before but not stored: on a shared build host
+    /// the binaries above 256 MiB were 41% of the bytes stored over five days
+    /// and 3.7% of the compile time their hits saved. Set via
+    /// `KACHE_MAX_STORED_TEST_BINARY_SIZE` or
+    /// `[cache] max_stored_test_binary_size`.
+    pub max_stored_test_binary_bytes: u64,
     /// Age retention applied by unattended GC sweeps, in hours (default `0`,
     /// disabled). Set via `KACHE_GC_MAX_AGE_HOURS` or
     /// `[cache] gc_max_age_hours`.
@@ -1095,6 +1103,9 @@ pub struct CacheFileConfig {
     pub prefetch_deadline_secs: Option<u64>,
     /// Put-side admission threshold. See [`Config::min_store_compile_ms`].
     pub min_store_compile_ms: Option<u64>,
+    /// Largest stored test binary. See [`Config::max_stored_test_binary_bytes`].
+    #[serde(default, deserialize_with = "crate::size::optional_text")]
+    pub max_stored_test_binary_size: Option<String>,
     /// Automatic GC age retention. See [`Config::gc_max_age_hours`].
     pub gc_max_age_hours: Option<u64>,
     /// Young entries an automatic sweep spares. See [`Config::gc_spare_young_hours`].
@@ -1450,6 +1461,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_DEMAND_TIMEOUT_SECS",
     "KACHE_REMOTE_NEGATIVE_TTL_SECS",
     "KACHE_MIN_STORE_COMPILE_MS",
+    "KACHE_MAX_STORED_TEST_BINARY_SIZE",
     "KACHE_GC_MAX_AGE_HOURS",
     "KACHE_GC_SPARE_YOUNG_HOURS",
     "KACHE_DAEMON_IDLE_TIMEOUT",
@@ -1562,6 +1574,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
         "cache.remote_negative_ttl_secs",
     ),
     ("KACHE_MIN_STORE_COMPILE_MS", "cache.min_store_compile_ms"),
+    (
+        "KACHE_MAX_STORED_TEST_BINARY_SIZE",
+        "cache.max_stored_test_binary_size",
+    ),
     ("KACHE_GC_MAX_AGE_HOURS", "cache.gc_max_age_hours"),
     ("KACHE_GC_SPARE_YOUNG_HOURS", "cache.gc_spare_young_hours"),
     ("KACHE_GC_EVICT_SHARED", "cache.gc_evict_shared"),
@@ -2068,6 +2084,22 @@ impl Config {
                         .and_then(|c| c.min_store_compile_ms)
                 })
                 .unwrap_or(DEFAULT_MIN_STORE_COMPILE_MS);
+
+        let max_stored_test_binary_bytes =
+            env_or_ignored_for(invocation, "KACHE_MAX_STORED_TEST_BINARY_SIZE", ignore_env)
+                .ok()
+                .and_then(|s| parse_size_checked(&s, "KACHE_MAX_STORED_TEST_BINARY_SIZE"))
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()
+                        .and_then(|c| c.cache.as_ref())
+                        .and_then(|c| c.max_stored_test_binary_size.as_ref())
+                        .and_then(|s| {
+                            parse_size_checked(s, "[cache] max_stored_test_binary_size")
+                        })
+                })
+                .unwrap_or(0);
 
         let gc_max_age_hours = env_or_ignored_for(invocation, "KACHE_GC_MAX_AGE_HOURS", ignore_env)
             .ok()
@@ -2598,6 +2630,7 @@ impl Config {
             prefetch_max_bytes,
             prefetch_deadline_secs,
             min_store_compile_ms,
+            max_stored_test_binary_bytes,
             gc_max_age_hours,
             gc_spare_young_hours,
             daemon_idle_timeout_secs,
@@ -5455,11 +5488,12 @@ mod invocation_tests {
             ("\"1.5GiB\"", 1_610_612_736),
             ("\"1GB\"", 1_000_000_000),
         ] {
-            std::fs::write(&path, format!("[cache]\nlocal_max_size = {raw}\nevent_log_max_size = {raw}\nprefetch_max_bytes = {raw}\nauto_recover_min_free_bytes = {raw}\nrestore_max_size = {raw}\n[cache.remote]\nbucket = \"test\"\n")).unwrap();
+            std::fs::write(&path, format!("[cache]\nlocal_max_size = {raw}\nevent_log_max_size = {raw}\nprefetch_max_bytes = {raw}\nmax_stored_test_binary_size = {raw}\nauto_recover_min_free_bytes = {raw}\nrestore_max_size = {raw}\n[cache.remote]\nbucket = \"test\"\n")).unwrap();
             let config = Config::load_for(&env).unwrap();
             assert_eq!(config.max_size, expected);
             assert_eq!(config.event_log_max_size, expected);
             assert_eq!(config.prefetch_max_bytes, expected);
+            assert_eq!(config.max_stored_test_binary_bytes, expected);
             assert_eq!(config.auto_recover_min_free_bytes, expected);
             assert_eq!(config.restore_max_size, expected);
             assert_eq!(config.remote.unwrap().restore_max_size, expected);
@@ -5470,9 +5504,11 @@ mod invocation_tests {
                 ("KACHE_HOST_CONFIG", ""),
                 ("KACHE_RESTORE_MAX_SIZE", "12GiB"),
                 ("KACHE_AUTO_RECOVER_MIN_FREE_BYTES", "500MB"),
+                ("KACHE_MAX_STORED_TEST_BINARY_SIZE", "256MiB"),
             ],
         );
         let config = Config::load_for(&overridden).unwrap();
+        assert_eq!(config.max_stored_test_binary_bytes, 268_435_456);
         assert_eq!(config.restore_max_size, 12_884_901_888);
         assert_eq!(config.remote.unwrap().restore_max_size, 12_884_901_888);
         assert_eq!(config.auto_recover_min_free_bytes, 500_000_000);

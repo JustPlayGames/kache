@@ -3945,6 +3945,7 @@ fn save_manifest_config(
         prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
         prefetch_deadline_secs: crate::config::DEFAULT_PREFETCH_DEADLINE_SECS,
         min_store_compile_ms: crate::config::DEFAULT_MIN_STORE_COMPILE_MS,
+        max_stored_test_binary_bytes: 0,
         gc_max_age_hours: crate::config::DEFAULT_GC_MAX_AGE_HOURS,
         gc_spare_young_hours: 0,
         daemon_idle_timeout_secs: DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,

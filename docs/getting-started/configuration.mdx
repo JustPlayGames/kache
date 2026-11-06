@@ -149,6 +149,7 @@ local_max_size = "200GiB"
 | `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` | `cache.auto_clean_adaptive_idle_hours` | `0` | Let the daemon drop adaptive incremental state no compile used for this many hours; `0` disables it. See [Unused build units](#unused-build-units). |
 | `KACHE_SEED_NEW_TARGETS` | `cache.seed_new_targets` | `true` | Copy another checkout's registry build units into a target directory Cargo has not built yet. See [New checkouts](#new-checkouts). |
 | `KACHE_MIN_STORE_COMPILE_MS` | `cache.min_store_compile_ms` | `0` | Do not store results whose compile took less than this many milliseconds; `0` stores all eligible results. Ignored for a result that publishes to a writable remote, because the upload reads the local entry |
+| `KACHE_MAX_STORED_TEST_BINARY_SIZE` | `cache.max_stored_test_binary_size` | `0` | Do not store a linked test binary (`rustc --test` emitting a link) whose outputs reach this size, such as `256MiB`; the build uses it as compiled. `0` stores them all. A test's check (`--emit=metadata`) is stored as before. Such a skip is a `skipped` event with the reason `test-binary-size` |
 | `KACHE_COMPRESSION_LEVEL` | `cache.compression_level` | `3` | Zstd level, clamped to 1 through 22 |
 | none | `cache.event_log_max_size` | `64MiB` | Rotate the event log after this size. Rotation keeps the build in progress, up to half this size, and moves the dropped lines to `events.jsonl.archive/`, pruned at each rotation to 8 days and 512 MiB |
 | none | `cache.event_log_keep_lines` | `1000` | Minimum lines retained when the event log rotates |

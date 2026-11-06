@@ -939,6 +939,22 @@ fn store_admits_compile(config: &Config, compile_time_ms: u64, publishes_to_remo
         || compile_time_ms >= config.min_store_compile_ms
 }
 
+/// The size of a linked test binary's outputs when it reaches
+/// [`Config::max_stored_test_binary_bytes`], which keeps it out of the store.
+/// `None` for every other compile, and when no bound is set. A test's check
+/// (`--emit=metadata`) writes no binary and is stored as before.
+fn test_binary_over_store_bound(
+    config: &Config,
+    args: &RustcArgs,
+    artifacts: &crate::compiler::ArtifactSet,
+) -> Option<u64> {
+    if config.max_stored_test_binary_bytes == 0 || !args.is_test || !args.emits_link() {
+        return None;
+    }
+    let size = artifacts.total_size();
+    (size >= config.max_stored_test_binary_bytes).then_some(size)
+}
+
 /// GCC/Clang objects (and clang-cl without CodeView debug) use the rustc
 /// remote pipeline. clang-cl debug objects embed un-remapped paths.
 fn cc_publishes_to_remote(parsed: &crate::compiler::cc::CcArgs) -> bool {
@@ -5271,6 +5287,32 @@ fn run_parsed_rustc(
                 .key_record(key_record),
         );
         print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        drop(lock);
+        return Ok(result.exit_code);
+    }
+
+    // A test binary above the configured size: it is used as compiled, and
+    // its hits would rarely pay for the space (see the setting).
+    if let Some(size) = test_binary_over_store_bound(config, args, &result.artifacts) {
+        tracing::debug!(
+            crate_name = %crate_name,
+            size,
+            max_stored_test_binary_bytes = config.max_stored_test_binary_bytes,
+            "admission: test binary above the stored size"
+        );
+        let elapsed = start.elapsed().as_millis() as u64;
+        log_event(
+            config,
+            EventInputs::new(&event_root, crate_name, EventResult::Skipped, elapsed)
+                .rebuilt_observed(rebuilt.clone())
+                .skip_reason("test-binary-size")
+                .compile_time_ms(compile_time_ms)
+                .keyed(&cache_key, key_ms, key_hash_stats)
+                .lookup_ms(lookup_ms)
+                .key_record(key_record),
+        );
+        print_progress(crate_name, EventResult::Skipped, elapsed, 0);
+        clean_incremental_dir(config, args);
         drop(lock);
         return Ok(result.exit_code);
     }
