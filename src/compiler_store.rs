@@ -203,6 +203,7 @@ mod tests {
                 held_bytes_budget: Default::default(),
                 upload_spool_max_jobs: 128,
                 deferred_durability: false,
+                compress_predictions: false,
                 index_mode: Default::default(),
             })
             .unwrap();
@@ -257,6 +258,7 @@ mod tests {
             held_bytes_budget: Default::default(),
             upload_spool_max_jobs: 128,
             deferred_durability: false,
+            compress_predictions: false,
             index_mode: Default::default(),
         })
         .unwrap();

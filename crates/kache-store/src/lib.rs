@@ -14,6 +14,7 @@ mod index_compaction;
 pub mod link;
 pub mod markers;
 pub mod opcounts;
+pub mod prediction_codec;
 pub mod sharing;
 mod store;
 #[cfg(test)]

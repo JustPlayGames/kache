@@ -3,6 +3,7 @@
 pub use crate::cc_memo::{CcPreprocessMemo, CcPreprocessMemoInput};
 pub use crate::gone_dirs::{GONE_DIR_PRUNE_BATCH, GONE_DIR_PRUNE_BUDGET, GoneDirPrune};
 pub use crate::index_compaction::{IndexCompaction, IndexPageStats, index_page_stats};
+use crate::prediction_codec as codec;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
@@ -176,6 +177,10 @@ const FILE_HASH_LOOKUP_CHUNK: usize = 256;
 
 pub enum FileHashCache<'db> {
     Borrowed(&'db Connection),
+    /// [`Self::Borrowed`], writing new input prediction rows as zstd frames
+    /// ([`crate::prediction_codec`]): a store opened with
+    /// `compress_predictions` hands this out.
+    Compressing(&'db Connection),
     #[cfg(any(test, feature = "test-support"))]
     Owned(Connection),
 }
@@ -219,7 +224,7 @@ impl<'db> FileHashCache<'db> {
 
     pub fn db(&self) -> &Connection {
         match self {
-            Self::Borrowed(db) => db,
+            Self::Borrowed(db) | Self::Compressing(db) => db,
             #[cfg(any(test, feature = "test-support"))]
             Self::Owned(db) => db,
         }
@@ -451,16 +456,18 @@ impl<'db> FileHashCache<'db> {
         identity: &str,
         now: i64,
     ) -> rusqlite::Result<Option<(u32, String)>> {
-        let row: Option<(u32, String, i64)> = self
+        // Both forms a row can take (`prediction_codec`); one this release
+        // cannot read is absent, as a row of an unknown schema is.
+        let row: Option<(Option<(u32, String)>, i64)> = self
             .db()
             .query_row(
                 "SELECT schema, prediction_json, last_used FROM input_predictions
                  WHERE identity = ?1",
                 params![identity],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((codec::decode(row.get(0)?, row.get_ref(1)?), row.get(2)?)),
             )
             .optional()?;
-        let Some((schema, json, last_used)) = row else {
+        let Some((Some((schema, json)), last_used)) = row else {
             return Ok(None);
         };
         // Best-effort: a stamp that cannot be written costs an early prune
@@ -476,6 +483,9 @@ impl<'db> FileHashCache<'db> {
         Ok(Some((schema, json)))
     }
 
+    /// Record the closure `prediction_json` under `identity`, compressed
+    /// when this cache is [`Self::Compressing`] and the row is not a build
+    /// script's ([`codec::Codec::for_write`]).
     pub fn put_input_prediction(
         &self,
         identity: &str,
@@ -483,11 +493,30 @@ impl<'db> FileHashCache<'db> {
         crate_name: Option<&str>,
         prediction_json: &str,
     ) -> rusqlite::Result<()> {
+        self.put_input_prediction_as(
+            codec::Codec::for_write(matches!(self, Self::Compressing(_)), identity),
+            identity,
+            schema,
+            crate_name,
+            prediction_json,
+        )
+    }
+
+    /// [`Self::put_input_prediction`] in the form `codec` says.
+    pub fn put_input_prediction_as(
+        &self,
+        codec: codec::Codec,
+        identity: &str,
+        schema: u32,
+        crate_name: Option<&str>,
+        prediction_json: &str,
+    ) -> rusqlite::Result<()> {
+        let (stored_schema, payload) = codec::encode(codec, schema, prediction_json);
         self.db().execute(
             "INSERT OR REPLACE INTO input_predictions
              (identity, schema, crate_name, prediction_json, updated_at, last_used)
              VALUES (?1, ?2, ?3, ?4, datetime('now'), unixepoch())",
-            params![identity, schema, crate_name, prediction_json],
+            params![identity, stored_schema, crate_name, payload],
         )?;
         Ok(())
     }

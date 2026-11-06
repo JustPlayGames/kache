@@ -1119,6 +1119,38 @@ fn input_prediction_retention_defaults_to_thirty_days_and_zero_counts_as_unset()
 }
 
 #[test]
+fn input_prediction_compression_is_off_by_default_and_obeys_env_precedence() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let _missing = NamedEnvGuard::remove("KACHE_INPUT_PREDICTION_COMPRESSION");
+    let on = || Config::load().unwrap().input_prediction_compression;
+    let stored =
+        || kache_core::store_config::Config::from(&Config::load().unwrap()).compress_predictions;
+    assert!(!on());
+    assert!(!stored());
+    std::fs::write(
+        &config_path,
+        "[cache]\ninput_prediction_compression = true\n",
+    )
+    .unwrap();
+    assert!(on());
+    assert!(stored(), "the store is opened with the setting");
+    for (value, want) in [("0", false), ("yes", false), ("1", true), ("TRUE", true)] {
+        let _env = NamedEnvGuard::set("KACHE_INPUT_PREDICTION_COMPRESSION", value);
+        assert_eq!(on(), want, "{value}");
+    }
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\ninput_prediction_compression = true\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set("KACHE_INPUT_PREDICTION_COMPRESSION", "0");
+    assert!(on());
+}
+
+#[test]
 fn memory_pressure_admission_is_on_by_default_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -3266,6 +3298,7 @@ fn test_file_config_roundtrip() {
             out_dir_alias: None,
             out_dir_alias_root: None,
             deferred_durability: None,
+            input_prediction_compression: None,
             daemon_publish: None,
             daemon_publish_rustc: None,
             trust_daemon_execution: None,
@@ -3935,6 +3968,7 @@ fn test_config_store_dir() {
         out_dir_alias: true,
         out_dir_alias_root: None,
         deferred_durability: false,
+        input_prediction_compression: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
         trust_daemon_execution: false,
@@ -4033,6 +4067,7 @@ fn test_config_index_db_path() {
         out_dir_alias: true,
         out_dir_alias_root: None,
         deferred_durability: false,
+        input_prediction_compression: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
         trust_daemon_execution: false,
@@ -4127,6 +4162,7 @@ fn test_config_event_log_path() {
         out_dir_alias: true,
         out_dir_alias_root: None,
         deferred_durability: false,
+        input_prediction_compression: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
         trust_daemon_execution: false,
@@ -4240,6 +4276,7 @@ fn test_config_socket_path() {
         out_dir_alias: true,
         out_dir_alias_root: None,
         deferred_durability: false,
+        input_prediction_compression: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
         trust_daemon_execution: false,
@@ -4990,6 +5027,7 @@ fn test_save_and_load_file_config() {
             out_dir_alias: None,
             out_dir_alias_root: None,
             deferred_durability: None,
+            input_prediction_compression: None,
             daemon_publish: None,
             daemon_publish_rustc: None,
             trust_daemon_execution: None,
