@@ -2169,6 +2169,7 @@ mod tests {
                 out_dir_alias: None,
                 out_dir_alias_root: None,
                 deferred_durability: None,
+                input_prediction_compression: None,
                 daemon_publish: None,
                 daemon_publish_rustc: None,
                 trust_daemon_execution: None,

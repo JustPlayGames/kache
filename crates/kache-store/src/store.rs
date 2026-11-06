@@ -3682,7 +3682,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Borrow the persistent memo without exposing the index connection.
     pub fn file_hash_cache(&self) -> crate::file_hash::FileHashCache<'_> {
-        crate::file_hash::FileHashCache::Borrowed(&self.db)
+        if self.config.compress_predictions {
+            crate::file_hash::FileHashCache::Compressing(&self.db)
+        } else {
+            crate::file_hash::FileHashCache::Borrowed(&self.db)
+        }
     }
 
     /// Check if a committed entry exists for this cache key.
