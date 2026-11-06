@@ -99,6 +99,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         out_dir_alias: true,
         out_dir_alias_root: None,
         deferred_durability: false,
+        input_prediction_compression: false,
         daemon_publish: true,
         daemon_publish_rustc: true,
         trust_daemon_execution: false,

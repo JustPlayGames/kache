@@ -660,6 +660,15 @@ pub struct Config {
     /// `KACHE_INPUT_PREDICTION_RETENTION_DAYS` or `[cache]
     /// input_prediction_retention_days`.
     pub input_prediction_retention_days: u64,
+    /// Write new input predictions as zstd frames, about a seventh of the
+    /// JSON's size (default off). Every release from the one that added this
+    /// setting reads rows of both forms; an older one reads a compressed row
+    /// as absent and runs rustc's dep-info pre-pass for that unit once. A
+    /// build script's rows stay plain. Set via
+    /// `KACHE_INPUT_PREDICTION_COMPRESSION` or `[cache]
+    /// input_prediction_compression`; every process that writes the index
+    /// should see the same value, so set it in the config file.
+    pub input_prediction_compression: bool,
     /// Let the daemon drop adaptive incremental state no compile used for
     /// this many hours (`0`, the default, disables it). Set via
     /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` or `[cache]
@@ -1064,6 +1073,8 @@ pub struct CacheFileConfig {
     pub auto_clean_unused_units_days: Option<u64>,
     /// See [`Config::input_prediction_retention_days`].
     pub input_prediction_retention_days: Option<u64>,
+    /// See [`Config::input_prediction_compression`].
+    pub input_prediction_compression: Option<bool>,
     /// See [`Config::auto_clean_adaptive_idle_hours`].
     pub auto_clean_adaptive_idle_hours: Option<u64>,
     /// See [`Config::seed_new_targets`].
@@ -1517,6 +1528,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
     "KACHE_INPUT_PREDICTION_RETENTION_DAYS",
+    "KACHE_INPUT_PREDICTION_COMPRESSION",
     "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
@@ -1671,6 +1683,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_INPUT_PREDICTION_RETENTION_DAYS",
         "cache.input_prediction_retention_days",
+    ),
+    (
+        "KACHE_INPUT_PREDICTION_COMPRESSION",
+        "cache.input_prediction_compression",
     ),
     (
         "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
@@ -2452,6 +2468,8 @@ impl Config {
             Self::auto_clean_unused_units_days_for(invocation, &file_config);
         let input_prediction_retention_days =
             Self::input_prediction_retention_days_for(invocation, &file_config);
+        let input_prediction_compression =
+            Self::input_prediction_compression_enabled_for(invocation, &file_config);
         let auto_clean_adaptive_idle_hours =
             Self::auto_clean_adaptive_idle_hours_for(invocation, &file_config);
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
@@ -2601,6 +2619,7 @@ impl Config {
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
             input_prediction_retention_days,
+            input_prediction_compression,
             auto_clean_adaptive_idle_hours,
             seed_new_targets,
             build_script_hermetic,
@@ -3602,6 +3621,28 @@ impl Config {
                 .filter(|days| *days > 0)
         })
         .unwrap_or(DEFAULT_INPUT_PREDICTION_RETENTION_DAYS)
+    }
+
+    /// Compressed input prediction rows, off by default.
+    /// `KACHE_INPUT_PREDICTION_COMPRESSION=1`/`=true` turns them on and any
+    /// other value off (env wins), else `[cache]
+    /// input_prediction_compression`, else off.
+    fn input_prediction_compression_enabled_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> bool {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        if let Ok(v) =
+            env_or_ignored_for(invocation, "KACHE_INPUT_PREDICTION_COMPRESSION", ignore_env)
+        {
+            return v == "1" || v.eq_ignore_ascii_case("true");
+        }
+        file_config
+            .as_ref()
+            .ok()
+            .and_then(|c| c.cache.as_ref())
+            .and_then(|c| c.input_prediction_compression)
+            .unwrap_or(false)
     }
 
     /// Adaptive incremental idle window in hours, off (`0`) by default.
@@ -5500,6 +5541,7 @@ impl From<&Config> for kache_core::store_config::Config {
             held_bytes_budget: config.held_bytes_budget,
             upload_spool_max_jobs: UPLOAD_SPOOL_MAX_JOBS,
             deferred_durability: config.deferred_durability,
+            compress_predictions: config.input_prediction_compression,
             index_mode: config.index_mode,
         }
     }
