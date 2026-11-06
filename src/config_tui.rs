@@ -2232,6 +2232,7 @@ mod tests {
                 prefetch_max_bytes: None,
                 prefetch_deadline_secs: None,
                 min_store_compile_ms: Some(750),
+                max_stored_test_binary_size: None,
                 gc_max_age_hours: Some(72),
                 gc_spare_young_hours: None,
                 scheduler: Some(false),
