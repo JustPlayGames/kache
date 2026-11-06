@@ -6,6 +6,7 @@ pub use crate::index_compaction::{IndexCompaction, IndexPageStats, index_page_st
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub const MIN_PERSISTED_HASH_BYTES: i64 = 64 * 1024;
 
@@ -589,11 +590,35 @@ impl<'db> FileHashCache<'db> {
     }
 
     /// Delete predictions no build has read or recorded for
-    /// [`INPUT_PREDICTION_RETENTION_SECS`]. Run from the GC sweep and
-    /// `doctor --repair`. Freed pages go to the freelist; index compaction
-    /// returns them to disk.
+    /// [`INPUT_PREDICTION_RETENTION_SECS`], all of them: `doctor --repair`.
+    /// The GC sweep bounds its time with
+    /// [`Self::prune_input_predictions_within`]. Freed pages go to the
+    /// freelist; index compaction returns them to disk.
     pub fn prune_input_predictions(&self) -> rusqlite::Result<usize> {
         self.prune_input_predictions_at(unix_now())
+    }
+
+    /// Delete predictions no build has read or recorded for `retention`
+    /// seconds before `now`, for at most `budget`, in write transactions of
+    /// [`PREDICTION_PRUNE_BATCH`] rows with a pause as long as each between
+    /// them, so that waiting writers get the lock. A prune the budget or a
+    /// writer holding the lock cuts short goes on at the next sweep.
+    ///
+    /// One `DELETE` of every expired row held the index's write lock for as
+    /// long as it took: the retention window moves on by a sweep's interval
+    /// at a time, so that is little while the GC runs often, but a sweep
+    /// after a pause, or a shorter window, meets millions of rows.
+    pub fn prune_input_predictions_within(
+        &self,
+        now: i64,
+        retention: i64,
+        budget: Duration,
+    ) -> rusqlite::Result<PredictionPrune> {
+        self.prune_input_predictions_batched(
+            now.saturating_sub(retention),
+            budget,
+            PREDICTION_PRUNE_BATCH,
+        )
     }
 
     /// Delete file hash rows not written for [`FILE_HASH_RETENTION_SECS`].
@@ -651,17 +676,93 @@ impl<'db> FileHashCache<'db> {
     }
 
     fn prune_input_predictions_at(&self, now: i64) -> rusqlite::Result<usize> {
+        self.prune_input_predictions_batched(
+            prediction_prune_cutoff(now),
+            Duration::MAX,
+            PREDICTION_PRUNE_BATCH,
+        )
+        .map(|pruned| pruned.rows)
+    }
+
+    fn prune_input_predictions_batched(
+        &self,
+        cutoff: i64,
+        budget: Duration,
+        batch: usize,
+    ) -> rusqlite::Result<PredictionPrune> {
+        let mut done = PredictionPrune::default();
         // Built here, not when a wrapper upgrades the table: indexing a large
         // table takes the write lock for seconds, and this runs off the build.
-        self.db().execute_batch(
+        match self.db().execute_batch(
             "CREATE INDEX IF NOT EXISTS input_predictions_last_used
              ON input_predictions(last_used)",
-        )?;
-        self.db().execute(
-            "DELETE FROM input_predictions WHERE last_used < ?1",
-            params![prediction_prune_cutoff(now)],
-        )
+        ) {
+            Ok(()) => {}
+            Err(error) if crate::gone_dirs::is_busy(&error) => {
+                done.cut_short = true;
+                return Ok(done);
+            }
+            Err(error) => return Err(error),
+        }
+        let start = Instant::now();
+        loop {
+            if start.elapsed() >= budget {
+                done.cut_short = true;
+                return Ok(done);
+            }
+            let held = Instant::now();
+            let deleted = match self.delete_expired_predictions(cutoff, batch) {
+                Ok(deleted) => deleted,
+                Err(error) if crate::gone_dirs::is_busy(&error) => {
+                    done.cut_short = true;
+                    return Ok(done);
+                }
+                Err(error) => return Err(error),
+            };
+            let held = held.elapsed();
+            done.longest_batch = done.longest_batch.max(held);
+            done.batches += 1;
+            done.rows += deleted;
+            if deleted < batch {
+                return Ok(done);
+            }
+            std::thread::sleep(held.max(Duration::from_millis(5)));
+        }
     }
+
+    fn delete_expired_predictions(&self, cutoff: i64, batch: usize) -> rusqlite::Result<usize> {
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM input_predictions WHERE rowid IN (
+                 SELECT rowid FROM input_predictions WHERE last_used < ?1 LIMIT ?2)",
+            params![cutoff, i64::try_from(batch).unwrap_or(i64::MAX)],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+}
+
+/// Rows one write transaction of the prediction prune deletes. A row holds
+/// the closure of one unit, about 4 KB on a shared build host's index and up
+/// to 300 KB for a crate that embeds thousands of files, each its own
+/// overflow pages to free.
+pub const PREDICTION_PRUNE_BATCH: usize = 100;
+
+/// How long one GC sweep spends on the prediction prune.
+pub const PREDICTION_PRUNE_BUDGET: Duration = Duration::from_secs(60);
+
+/// What one [`FileHashCache::prune_input_predictions_within`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PredictionPrune {
+    /// Rows deleted.
+    pub rows: usize,
+    /// Write transactions the deletes took.
+    pub batches: usize,
+    /// The longest any batch held the write lock.
+    pub longest_batch: Duration,
+    /// Whether the budget, or a writer holding the lock, stopped the prune
+    /// before the last expired row.
+    pub cut_short: bool,
 }
 
 /// How long a file hash row is kept after it was last written. The memo is
@@ -679,7 +780,7 @@ pub const INPUT_PREDICTION_TOUCH_INTERVAL_SECS: i64 = 86_400;
 /// short enough that identities no build produces any more stop piling up.
 pub const INPUT_PREDICTION_RETENTION_SECS: i64 = 30 * 86_400;
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
@@ -2329,6 +2430,62 @@ mod tests {
             )
             .unwrap();
         assert!(indexed);
+    }
+
+    #[test]
+    fn the_bounded_prediction_prune_goes_in_batches_and_stops_at_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let now = 1_900_000_000;
+        for n in 0..5 {
+            let identity = format!("expired-{n}");
+            cache
+                .put_input_prediction(&identity, 2, None, "payload")
+                .unwrap();
+            set_prediction_last_used(&cache, &identity, now - 8 * 86_400);
+        }
+        cache
+            .put_input_prediction("recent", 2, None, "payload")
+            .unwrap();
+        set_prediction_last_used(&cache, "recent", now - 6 * 86_400);
+        let week = now - 7 * 86_400;
+        let none = cache
+            .prune_input_predictions_batched(week, Duration::ZERO, 2)
+            .unwrap();
+        assert_eq!((none.rows, none.batches, none.cut_short), (0, 0, true));
+        let all = cache
+            .prune_input_predictions_batched(week, Duration::from_secs(60), 2)
+            .unwrap();
+        assert_eq!((all.rows, all.batches, all.cut_short), (5, 3, false));
+        let left: Vec<String> = cache
+            .db()
+            .prepare("SELECT identity FROM input_predictions")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(left, ["recent"]);
+    }
+
+    #[test]
+    fn a_writer_holding_the_index_cuts_the_prediction_prune_short_without_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        cache
+            .put_input_prediction("old", 2, None, "payload")
+            .unwrap();
+        set_prediction_last_used(&cache, "old", 1);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        cache.db().busy_timeout(Duration::ZERO).unwrap();
+        let done = cache
+            .prune_input_predictions_within(1_900_000_000, 86_400, Duration::from_secs(60))
+            .unwrap();
+        assert_eq!((done.rows, done.cut_short), (0, true));
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert!(cache.get_input_prediction_at("old", 2).unwrap().is_some());
     }
 
     #[test]

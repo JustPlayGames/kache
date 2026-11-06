@@ -6671,13 +6671,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 tracing::warn!("gc: key lock sweep failed: {error:#}");
                 KeyLockSweepStats::default()
             });
-        let predictions_pruned = self
+        let predictions = self
             .file_hash_cache()
-            .prune_input_predictions()
+            .prune_input_predictions_within(
+                crate::file_hash::unix_now(),
+                crate::file_hash::INPUT_PREDICTION_RETENTION_SECS,
+                crate::file_hash::PREDICTION_PRUNE_BUDGET,
+            )
             .unwrap_or_else(|error| {
                 tracing::warn!("gc: input prediction pruning failed: {error}");
-                0
+                crate::file_hash::PredictionPrune::default()
             });
+        if predictions.cut_short {
+            tracing::info!(
+                rows = predictions.rows,
+                batches = predictions.batches,
+                longest_batch_ms = predictions.longest_batch.as_millis() as u64,
+                "gc: input prediction prune cut short; it goes on at the next sweep"
+            );
+        }
+        let predictions_pruned = predictions.rows;
         let file_hashes_pruned =
             self.file_hash_cache()
                 .prune_file_hashes()
