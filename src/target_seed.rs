@@ -2197,7 +2197,7 @@ pub(crate) fn seed_for_lane(
         // the donor's target still keeps it out.
         let target_needles = needles_for(donor, true);
         let from = donor.target_dir.join(PROFILE);
-        let Some(_theirs) = try_lock_shared(&from.join(".cargo-lock")) else {
+        let Some(_theirs) = lock_donor(&from) else {
             continue;
         };
         // A check's donor ranked first was read whole by the ranking: its
@@ -2682,14 +2682,34 @@ fn try_lock(path: &Path) -> Option<Held> {
 }
 
 /// Lock a donor's `path` for reading without waiting: Cargo building there
-/// holds it exclusively and keeps seeding out, while other seedings, which
-/// only read the donor, share it. An exclusive lock let one new checkout
-/// at a time read a donor: of three started together from one donor, two
-/// went unseeded and restored every unit one compiler call at a time.
+/// holds it exclusively ([`DONOR_LOCKS`]) and keeps seeding out, while
+/// other seedings, which only read the donor, share it. An exclusive lock
+/// let one new checkout at a time read a donor: of three started together
+/// from one donor, two went unseeded and restored every unit one compiler
+/// call at a time.
 fn try_lock_shared(path: &Path) -> Option<Held> {
     let file = open_lock(path)?;
     file.try_lock_shared().ok()?;
     Some(Held(file))
+}
+
+/// The locks a Cargo build of a donor's `profile` takes that seeding reads
+/// under: `.cargo-lock`, which older Cargo holds exclusively for a build,
+/// and `.cargo-build-lock`, which Cargo 1.99.1 holds exclusively over the
+/// build directory while it keeps `.cargo-lock` only shared. Locking
+/// `.cargo-lock` alone let a seeding copy from a donor Cargo 1.99.1 was
+/// writing into: integrate's clippy targets seeded from the checkout's own
+/// target while its tests built there.
+const DONOR_LOCKS: [&str; 2] = [".cargo-lock", ".cargo-build-lock"];
+
+/// Lock a donor's `profile` for reading ([`try_lock_shared`] on each of
+/// [`DONOR_LOCKS`]). `None` when a build holds any of them.
+fn lock_donor(profile: &Path) -> Option<[Held; 2]> {
+    let [old, build] = DONOR_LOCKS;
+    Some([
+        try_lock_shared(&profile.join(old))?,
+        try_lock_shared(&profile.join(build))?,
+    ])
 }
 
 fn open_lock(path: &Path) -> Option<std::fs::File> {
@@ -4436,6 +4456,20 @@ source = "git+https://example.com/gitdep#abc"
         );
         assert_eq!(seeded.donor, Some(free.workspace_root.clone()));
         drop(held);
+        // So does a build of Cargo 1.99.1, which holds the profile's
+        // `.cargo-lock` only shared and its build lock exclusively.
+        let profile = busy.target_dir.join(PROFILE);
+        let old_lock = try_lock_shared(&profile.join(".cargo-lock")).unwrap();
+        let build_lock = try_lock(&profile.join(".cargo-build-lock")).unwrap();
+        let seeded = seed(
+            &checkout(dir.path(), "modern"),
+            VERSION,
+            &[busy.clone(), free.clone()],
+            no_runs().path(),
+            later(),
+        );
+        assert_eq!(seeded.donor, Some(free.workspace_root.clone()));
+        drop((old_lock, build_lock));
         // Another seeding reading the donor does not keep this one out.
         let reading = try_lock_shared(&busy.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
         let beside = checkout(dir.path(), "beside");
