@@ -227,6 +227,7 @@ fn gc_runs_history_is_appended_only_with_record_sessions() {
             key_locks_remaining: 7,
             predictions_pruned: 8,
             file_hashes_pruned: 9,
+            file_hashes_gone_pruned: 10,
             ..Default::default()
         }),
         ..Default::default()
@@ -288,6 +289,7 @@ fn gc_runs_history_is_appended_only_with_record_sessions() {
             key_locks_remaining: Some(7),
             predictions_pruned: Some(8),
             file_hashes_pruned: Some(9),
+            file_hashes_gone_pruned: Some(10),
         }
     );
     assert_eq!(records[1].source, "manual");

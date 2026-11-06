@@ -63,6 +63,9 @@ pub struct GcStatsPersisted {
     /// File hash memo rows deleted as not written for a month.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_hashes_pruned: Option<usize>,
+    /// File hash memo rows deleted because their directory is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hashes_gone_pruned: Option<usize>,
 }
 
 pub(crate) const GC_STATS_FILE: &str = "gc_stats.json";
@@ -130,6 +133,8 @@ pub struct GcRunRecord {
     pub predictions_pruned: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_hashes_pruned: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_hashes_gone_pruned: Option<usize>,
 }
 
 impl GcRunRecord {
@@ -156,6 +161,7 @@ impl GcRunRecord {
             key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
             predictions_pruned: stats.housekeeping.map(|h| h.predictions_pruned),
             file_hashes_pruned: stats.housekeeping.map(|h| h.file_hashes_pruned),
+            file_hashes_gone_pruned: stats.housekeeping.map(|h| h.file_hashes_gone_pruned),
         }
     }
 }
@@ -223,6 +229,7 @@ pub(crate) fn write_last_gc_run(
         key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
         predictions_pruned: stats.housekeeping.map(|h| h.predictions_pruned),
         file_hashes_pruned: stats.housekeeping.map(|h| h.file_hashes_pruned),
+        file_hashes_gone_pruned: stats.housekeeping.map(|h| h.file_hashes_gone_pruned),
     };
     let json = serde_json::to_string_pretty(&persisted)?;
     kache_store::atomic::atomic_replace(&cache_dir.join(GC_STATS_FILE), json.as_bytes())

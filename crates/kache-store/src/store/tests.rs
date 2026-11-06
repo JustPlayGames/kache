@@ -13055,16 +13055,27 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
             [],
         )
         .unwrap();
+    // A worktree removed since its build hashed it, beside one still there.
+    let worktrees = dir.path().join("worktrees");
+    std::fs::create_dir_all(worktrees.join("live/src")).unwrap();
+    let (live, removed) = (
+        format!("{}/live/src/lib.rs", worktrees.display()),
+        format!("{}/removed/src/lib.rs", worktrees.display()),
+    );
     for (path, written) in [
-        ("/old", "2000-01-01 00:00:00"),
-        ("/new", "9999-01-01 00:00:00"),
+        ("/old", "datetime('2000-01-01 00:00:00')"),
+        ("/new", "datetime('9999-01-01 00:00:00')"),
+        (live.as_str(), "datetime('now', '-1 hour')"),
+        (removed.as_str(), "datetime('now', '-1 hour')"),
     ] {
         store
             .db
             .execute(
-                "INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
-                     VALUES (?1, 1, 1, 'h', ?2)",
-                rusqlite::params![path, written],
+                &format!(
+                    "INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
+                     VALUES (?1, 1, 1, 'h', {written})"
+                ),
+                rusqlite::params![path],
             )
             .unwrap();
     }
@@ -13076,6 +13087,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
             key_locks_remaining: 1,
             predictions_pruned: 1,
             file_hashes_pruned: 1,
+            file_hashes_gone_pruned: if cfg!(unix) { 1 } else { 0 },
             ..Default::default()
         }
     );

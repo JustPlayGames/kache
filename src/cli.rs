@@ -4328,7 +4328,7 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
     combined.housekeeping = Some(housekeeping);
     if verbose {
         println!(
-            "Housekeeping: removed {} ({} remain), {} ({} remain), {} ({} remain), {}, {}.",
+            "Housekeeping: removed {} ({} remain), {} ({} remain), {} ({} remain), {}, {}, {}.",
             term::counted(
                 housekeeping.key_locks_removed as u64,
                 "stale key lock",
@@ -4356,6 +4356,11 @@ pub fn run_gc_local(config: &Config, mode: GcMode) -> Result<crate::store::GcSta
                 housekeeping.file_hashes_pruned as u64,
                 "old file hash",
                 "old file hashes"
+            ),
+            term::counted(
+                housekeeping.file_hashes_gone_pruned as u64,
+                "file hash of a gone directory",
+                "file hashes of gone directories"
             ),
         );
     }
