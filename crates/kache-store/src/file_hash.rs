@@ -803,6 +803,175 @@ impl<'db> FileHashCache<'db> {
         tx.commit()?;
         Ok(deleted)
     }
+
+    /// Rewrite plain input prediction rows as zstd frames
+    /// ([`crate::prediction_codec`]), for at most `budget`, in write
+    /// transactions of [`PREDICTION_CONVERSION_BATCH`] rows with a pause as
+    /// long as each between them, as the prediction prune goes. A build
+    /// script's rows, and rows a frame would not shrink, stay plain. A row
+    /// keeps its name, `last_used` and `updated_at`, so trims and prunes
+    /// order it as before; it moves to the end of the table (a new rowid),
+    /// so that the pages it leaves are freed.
+    ///
+    /// Rows are walked in rowid order. Each batch's rows are found by a read
+    /// outside the write lock, then read again, compressed and written again
+    /// under it: a row a writer replaced meanwhile has another rowid, or is
+    /// no longer plain, and is left alone. A conversion the budget or a
+    /// writer holding the lock cuts short goes on at the next sweep, from
+    /// the first row again; the rows converted by then are passed over by
+    /// that read.
+    pub fn compress_input_predictions_within(
+        &self,
+        budget: Duration,
+    ) -> rusqlite::Result<PredictionConversion> {
+        self.compress_input_predictions_batched(budget, PREDICTION_CONVERSION_BATCH)
+    }
+
+    fn compress_input_predictions_batched(
+        &self,
+        budget: Duration,
+        batch: usize,
+    ) -> rusqlite::Result<PredictionConversion> {
+        let mut done = PredictionConversion::default();
+        let start = Instant::now();
+        let mut after = 0i64;
+        loop {
+            if start.elapsed() >= budget {
+                done.cut_short = true;
+                return Ok(done);
+            }
+            let rowids = match self.plain_prediction_rowids(after, batch) {
+                Ok(rowids) => rowids,
+                Err(error) if crate::gone_dirs::is_busy(&error) => {
+                    done.cut_short = true;
+                    return Ok(done);
+                }
+                Err(error) => return Err(error),
+            };
+            let Some(&last) = rowids.last() else {
+                return Ok(done);
+            };
+            after = last;
+            let held = Instant::now();
+            match self.compress_prediction_rows(&rowids) {
+                Ok((converted, kept_plain)) => {
+                    done.rows += converted;
+                    done.kept_plain += kept_plain;
+                }
+                Err(error) if crate::gone_dirs::is_busy(&error) => {
+                    done.cut_short = true;
+                    return Ok(done);
+                }
+                Err(error) => return Err(error),
+            }
+            let held = held.elapsed();
+            done.longest_batch = done.longest_batch.max(held);
+            done.batches += 1;
+            if rowids.len() < batch {
+                return Ok(done);
+            }
+            std::thread::sleep(held.max(Duration::from_millis(5)));
+        }
+    }
+
+    /// The rowids after `after` of up to `batch` plain rows that are not a
+    /// build script's, in order. `typeof` reads only the record's header.
+    fn plain_prediction_rowids(&self, after: i64, batch: usize) -> rusqlite::Result<Vec<i64>> {
+        let [first, second] = BUILD_SCRIPT_ROW_PREFIXES;
+        let mut statement = self.db().prepare_cached(
+            "SELECT rowid FROM input_predictions
+             WHERE rowid > ?1 AND typeof(prediction_json) = 'text'
+               AND NOT (identity >= ?2 AND identity < ?2 || char(1114111))
+               AND NOT (identity >= ?3 AND identity < ?3 || char(1114111))
+             ORDER BY rowid LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![
+                    after,
+                    first,
+                    second,
+                    i64::try_from(batch).unwrap_or(i64::MAX)
+                ],
+                |row| row.get(0),
+            )?
+            .collect()
+    }
+
+    /// Compress the rows `rowids` that are still plain, in one write
+    /// transaction. Returns how many were rewritten and how many stayed
+    /// plain because their frame would not be smaller.
+    fn compress_prediction_rows(&self, rowids: &[i64]) -> rusqlite::Result<(usize, usize)> {
+        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let (mut converted, mut kept_plain) = (0, 0);
+        {
+            let mut read = tx.prepare_cached(
+                "SELECT identity, schema, crate_name, prediction_json, updated_at, last_used
+                 FROM input_predictions
+                 WHERE rowid = ?1 AND typeof(prediction_json) = 'text'",
+            )?;
+            let mut delete = tx.prepare_cached("DELETE FROM input_predictions WHERE rowid = ?1")?;
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO input_predictions
+                 (identity, schema, crate_name, prediction_json, updated_at, last_used)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for &rowid in rowids {
+                let row: Option<PlainRow> = read
+                    .query_row(params![rowid], |row| {
+                        Ok(PlainRow {
+                            identity: row.get(0)?,
+                            schema: row.get(1)?,
+                            crate_name: row.get(2)?,
+                            json: row.get(3)?,
+                            updated_at: row.get(4)?,
+                            last_used: row.get(5)?,
+                        })
+                    })
+                    .optional()?;
+                let Some(row) = row else {
+                    continue;
+                };
+                if codec::Codec::for_write(true, &row.identity) == codec::Codec::Plain {
+                    continue;
+                }
+                let (stored_schema, payload) =
+                    codec::encode(codec::Codec::Zstd, row.schema, &row.json);
+                if stored_schema == row.schema {
+                    kept_plain += 1;
+                    continue;
+                }
+                // Deleted and inserted again, not updated: a cell that shrinks
+                // in place leaves its page as full as SQLite counts it, so
+                // the table would keep a page per row of about 4 KB. A delete
+                // lets the emptied pages go to the freelist, and the inserts
+                // fill new pages at the end of the table.
+                delete.execute(params![rowid])?;
+                insert.execute(params![
+                    row.identity,
+                    stored_schema,
+                    row.crate_name,
+                    payload,
+                    row.updated_at,
+                    row.last_used
+                ])?;
+                converted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok((converted, kept_plain))
+    }
+}
+
+/// A plain row as [`FileHashCache::compress_input_predictions_within`]
+/// reads it before writing it again compressed.
+struct PlainRow {
+    identity: String,
+    schema: u32,
+    crate_name: Option<String>,
+    json: String,
+    updated_at: String,
+    last_used: i64,
 }
 
 /// What the rows of build scripts' input predictions are named first
@@ -817,6 +986,29 @@ pub const PREDICTION_PRUNE_BATCH: usize = 100;
 
 /// How long one GC sweep spends on the prediction prune.
 pub const PREDICTION_PRUNE_BUDGET: Duration = Duration::from_secs(60);
+
+/// Rows one write transaction of the prediction conversion rewrites
+/// ([`FileHashCache::compress_input_predictions_within`]).
+pub const PREDICTION_CONVERSION_BATCH: usize = 100;
+
+/// How long one GC sweep spends converting plain prediction rows.
+pub const PREDICTION_CONVERSION_BUDGET: Duration = Duration::from_secs(60);
+
+/// What one [`FileHashCache::compress_input_predictions_within`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PredictionConversion {
+    /// Rows rewritten as zstd frames.
+    pub rows: usize,
+    /// Rows left plain because their frame would not be smaller.
+    pub kept_plain: usize,
+    /// Write transactions the rewrites took.
+    pub batches: usize,
+    /// The longest any batch held the write lock.
+    pub longest_batch: Duration,
+    /// Whether the budget, or a writer holding the lock, stopped the
+    /// conversion before the last plain row.
+    pub cut_short: bool,
+}
 
 /// What one [`FileHashCache::prune_input_predictions_within`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2686,6 +2878,235 @@ mod tests {
         assert_eq!((done.rows, done.cut_short), (0, true));
         writer.execute_batch("ROLLBACK").unwrap();
         assert!(cache.get_input_prediction_at("old", 2).unwrap().is_some());
+    }
+
+    fn long_json(tag: usize) -> String {
+        format!(
+            "{{\"schema\":2,\"sources\":[{}]}}",
+            (0..30)
+                .map(|i| format!("\"/src/{tag}/module_{i}.rs\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    /// Each row's SQLite type, `last_used` and `updated_at`, by name.
+    fn prediction_rows(cache: &FileHashCache<'_>) -> Vec<(String, String, i64, String)> {
+        let mut statement = cache
+            .db()
+            .prepare(
+                "SELECT identity, typeof(prediction_json), last_used, updated_at
+                 FROM input_predictions ORDER BY identity",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn the_conversion_compresses_plain_rows_in_batches_and_keeps_their_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        for i in 0..250 {
+            let identity = format!("unit-{i:03}");
+            cache
+                .put_input_prediction(&identity, 2, Some("c"), &long_json(i))
+                .unwrap();
+            set_prediction_last_used(&cache, &identity, 1_000 + i as i64);
+        }
+        cache
+            .put_input_prediction("build-script:x", 2, None, &long_json(900))
+            .unwrap();
+        cache
+            .put_input_prediction("unsettled:x", 2, None, &long_json(901))
+            .unwrap();
+        cache.put_input_prediction("tiny", 2, None, "{}").unwrap();
+        let before = prediction_rows(&cache);
+
+        let done = cache
+            .compress_input_predictions_batched(Duration::MAX, 100)
+            .unwrap();
+        assert_eq!(
+            (done.rows, done.kept_plain, done.batches, done.cut_short),
+            (250, 1, 3, false),
+            "the tiny row is the third batch's last"
+        );
+        let after = prediction_rows(&cache);
+        assert_eq!(after.len(), before.len());
+        for ((identity, kind, last_used, updated_at), old) in after.iter().zip(&before) {
+            assert_eq!((identity, last_used, updated_at), (&old.0, &old.2, &old.3));
+            let compressed = identity.starts_with("unit-");
+            assert_eq!(kind, if compressed { "blob" } else { "text" }, "{identity}");
+        }
+        for i in [0, 99, 100, 249] {
+            assert_eq!(
+                cache
+                    .get_input_prediction_at(&format!("unit-{i:03}"), 1_000 + i as i64)
+                    .unwrap(),
+                Some((2, long_json(i)))
+            );
+        }
+        assert_eq!(
+            cache.get_input_prediction("build-script:x").unwrap(),
+            Some((2, long_json(900)))
+        );
+
+        let again = cache
+            .compress_input_predictions_batched(Duration::MAX, 100)
+            .unwrap();
+        assert_eq!((again.rows, again.kept_plain, again.batches), (0, 1, 1));
+    }
+
+    #[test]
+    fn the_conversion_stops_at_its_budget_and_goes_on_at_the_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        for i in 0..5 {
+            cache
+                .put_input_prediction(&format!("unit-{i}"), 2, None, &long_json(i))
+                .unwrap();
+        }
+        let none = cache
+            .compress_input_predictions_batched(Duration::ZERO, 2)
+            .unwrap();
+        assert_eq!((none.rows, none.batches, none.cut_short), (0, 0, true));
+        // A batch of 2 holds the lock for well under the pause it then takes
+        // (at least 5 ms), so a 1 ms budget lets exactly one batch through.
+        let one = cache
+            .compress_input_predictions_batched(Duration::from_millis(1), 2)
+            .unwrap();
+        assert_eq!((one.rows, one.batches, one.cut_short), (2, 1, true));
+        let rest = cache
+            .compress_input_predictions_within(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!((rest.rows, rest.batches, rest.cut_short), (3, 1, false));
+    }
+
+    #[test]
+    fn a_writer_holding_the_index_cuts_the_conversion_short_without_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = FileHashCache::open(&path).unwrap();
+        cache
+            .put_input_prediction("unit", 2, None, &long_json(1))
+            .unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        cache.db().busy_timeout(Duration::ZERO).unwrap();
+        let done = cache
+            .compress_input_predictions_within(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!((done.rows, done.cut_short), (0, true));
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(prediction_rows(&cache)[0].1, "text");
+    }
+
+    /// Between the read that finds a batch and its write transaction, a
+    /// writer may replace a row (under a new rowid, or under the old one
+    /// after a delete, plain or compressed): each row then holds what was
+    /// written last, never the closure the read found, and a compressed row
+    /// under a found rowid is passed over, not read as text.
+    #[test]
+    fn a_row_written_after_the_conversion_found_it_keeps_what_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        for i in 0..3 {
+            cache
+                .put_input_prediction(&format!("unit-{i}"), 2, None, &long_json(i))
+                .unwrap();
+        }
+        let rowids = cache.plain_prediction_rowids(0, 10).unwrap();
+        assert_eq!(rowids.len(), 3);
+        let rewrite = |identity: &str, codec, json: &str, rowid: Option<i64>| {
+            cache
+                .put_input_prediction_as(codec, identity, 2, None, json)
+                .unwrap();
+            if let Some(rowid) = rowid {
+                // SQLite gives a deleted row's rowid to the next insert when
+                // it was the largest; the test puts it there directly.
+                cache
+                    .db()
+                    .execute(
+                        "UPDATE input_predictions SET rowid = ?1 WHERE identity = ?2",
+                        params![rowid, identity],
+                    )
+                    .unwrap();
+            }
+        };
+        rewrite("unit-0", codec::Codec::Plain, &long_json(50), None);
+        rewrite(
+            "unit-1",
+            codec::Codec::Plain,
+            &long_json(51),
+            Some(rowids[1]),
+        );
+        rewrite(
+            "unit-2",
+            codec::Codec::Zstd,
+            &long_json(52),
+            Some(rowids[2]),
+        );
+        let (converted, kept_plain) = cache.compress_prediction_rows(&rowids).unwrap();
+        assert_eq!(
+            (converted, kept_plain),
+            (1, 0),
+            "only the plain row under a found rowid"
+        );
+        for (i, json) in [(0, 50), (1, 51), (2, 52)] {
+            assert_eq!(
+                cache.get_input_prediction(&format!("unit-{i}")).unwrap(),
+                Some((2, long_json(json)))
+            );
+        }
+        let kinds: Vec<String> = prediction_rows(&cache)
+            .into_iter()
+            .map(|row| row.1)
+            .collect();
+        assert_eq!(kinds, ["text", "blob", "blob"]);
+    }
+
+    /// A row of about 3.5 KB has a page to itself (rows up to about 4 KB
+    /// need no overflow page). Shrunk in place, it would keep that page;
+    /// moved, it frees it.
+    #[test]
+    fn the_conversion_frees_the_pages_its_rows_leave() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileHashCache::open(&dir.path().join("index.db")).unwrap();
+        let json = format!(
+            "{{\"sources\":[{}]}}",
+            "\"/src/a/b/c/module.rs\",".repeat(150)
+        );
+        for i in 0..400 {
+            cache
+                .put_input_prediction(&format!("unit-{i:03}"), 2, None, &json)
+                .unwrap();
+        }
+        let pages = |cache: &FileHashCache<'_>| -> (i64, i64) {
+            let page = |name: &str| -> i64 {
+                cache
+                    .db()
+                    .pragma_query_value(None, name, |row| row.get(0))
+                    .unwrap()
+            };
+            (page("page_count"), page("freelist_count"))
+        };
+        let (before, _) = pages(&cache);
+        let done = cache
+            .compress_input_predictions_within(Duration::from_secs(60))
+            .unwrap();
+        assert_eq!(done.rows, 400);
+        let (after, free) = pages(&cache);
+        assert_eq!(after, before, "nothing truncates the file");
+        assert!(
+            (after - free) * 4 < before,
+            "{} pages in use of {before}",
+            after - free
+        );
     }
 
     #[test]
