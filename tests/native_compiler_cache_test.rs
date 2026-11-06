@@ -106,6 +106,20 @@ fn entries(root: &Path) -> Vec<(String, i64)> {
         .unwrap()
 }
 
+/// The committed entries once their hit counts are `expected`. A warm
+/// daemon takes a hit's access stamp and writes it in its next batch (every
+/// 250 ms), not on the hit path, so the count follows the hit.
+fn entries_counted(root: &Path, expected: &[(String, i64)]) -> Vec<(String, i64)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let now = entries(root);
+        if now == expected || std::time::Instant::now() >= deadline {
+            return now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn age_entry(root: &Path, key: &str) {
     // Store::get throttles hit stamps; age the row instead of sleeping for it.
     let db = rusqlite::Connection::open(root.join("cache/index.db")).unwrap();
@@ -204,7 +218,8 @@ fn native_clang_cl_restores_objects_and_runs_through_a_warm_daemon() {
         }
         success(&mut compile(program));
         assert_eq!(std::fs::read(&object).unwrap(), expected);
-        assert_eq!(entries(&root), [(key.clone(), hits)]);
+        let counted = [(key.clone(), hits)];
+        assert_eq!(entries_counted(&root, &counted), counted);
     }
     // A new miss must also execute through the frontend with no engine beside it.
     std::fs::write(&source, "int native_cache_answer(void) { return 43; }\n").unwrap();
