@@ -8149,6 +8149,93 @@ fn remove_targets_keeps_a_target_while_cargo_is_running() {
     assert!(!target.exists());
 }
 
+/// A Kache from before process starts were recorded leaves `<pid>-<nanos>`
+/// records while it builds. Sharing a store with it, clean keeps its target,
+/// keeps its record and names it; once its process is gone, both go.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_older_kaches_lease_keeps_clean_out_and_its_record_named() {
+    struct Running(std::process::Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("project/target");
+    std::fs::create_dir_all(&target).unwrap();
+    let to_remove = [RemovalTarget {
+        path: target.clone(),
+        scanned_identity: directory_identity(&target),
+        estimated_reclaimable: 10,
+        apparent_gap: 0,
+    }];
+    // The older Kache: a process of its own, holding the shared lock and the
+    // record it writes, which names no start.
+    let mut older = Running(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("sleep stands in for an older Kache's build"),
+    );
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.path().join("target-use.lock"))
+        .unwrap();
+    lock.lock_shared().unwrap();
+    let records = root.path().join("target-use.holders");
+    std::fs::create_dir_all(&records).unwrap();
+    let record = records.join(format!("{}-1", older.0.id()));
+    let since = kache_store::markers::now_epoch_secs();
+    std::fs::write(&record, format!("{since}\tcargo build --older")).unwrap();
+
+    let remove = |skipped: &mut Vec<CleanSkipped>, waiting: &mut Vec<_>| {
+        remove_targets(
+            &to_remove,
+            root.path(),
+            root.path(),
+            true,
+            skipped,
+            waiting,
+            &mut Vec::new(),
+        )
+        .0
+    };
+    let (mut skipped, mut waiting) = (Vec::new(), Vec::new());
+    assert_eq!(remove(&mut skipped, &mut waiting), 0);
+    assert!(target.exists(), "clean took a target an older Kache holds");
+    assert!(record.exists(), "a live older Kache lost its record");
+    assert_eq!(
+        waiting
+            .iter()
+            .map(|holder| (holder.process.pid(), holder.what.as_str()))
+            .collect::<Vec<_>>(),
+        [(older.0.id(), "cargo build --older")],
+        "clean must name the older Kache it waits for"
+    );
+    assert!(
+        skipped[0]
+            .reason
+            .starts_with("waiting for `cargo build --older`"),
+        "{}",
+        skipped[0].reason
+    );
+
+    // Once its process has exited and its lock is released, its record is
+    // stale and goes, and so does the target.
+    older.0.kill().unwrap();
+    older.0.wait().unwrap();
+    drop(lock);
+    assert_eq!(remove(&mut Vec::new(), &mut Vec::new()), 1);
+    assert!(!target.exists());
+    assert!(crate::target_use::holders(root.path()).is_empty());
+    assert!(!record.exists(), "the record of an exited Kache stayed");
+}
+
 /// A link inside a target goes as a link: what it points to stays.
 #[cfg(unix)]
 #[test]
