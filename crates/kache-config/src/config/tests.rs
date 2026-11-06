@@ -1119,7 +1119,7 @@ fn input_prediction_retention_defaults_to_thirty_days_and_zero_counts_as_unset()
 }
 
 #[test]
-fn input_prediction_compression_is_off_by_default_and_obeys_env_precedence() {
+fn input_prediction_compression_is_on_by_default_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
@@ -1128,26 +1128,26 @@ fn input_prediction_compression_is_off_by_default_and_obeys_env_precedence() {
     let on = || Config::load().unwrap().input_prediction_compression;
     let stored =
         || kache_core::store_config::Config::from(&Config::load().unwrap()).compress_predictions;
-    assert!(!on());
-    assert!(!stored());
-    std::fs::write(
-        &config_path,
-        "[cache]\ninput_prediction_compression = true\n",
-    )
-    .unwrap();
     assert!(on());
     assert!(stored(), "the store is opened with the setting");
-    for (value, want) in [("0", false), ("yes", false), ("1", true), ("TRUE", true)] {
+    std::fs::write(
+        &config_path,
+        "[cache]\ninput_prediction_compression = false\n",
+    )
+    .unwrap();
+    assert!(!on());
+    assert!(!stored());
+    for (value, want) in [("0", false), ("FALSE", false), ("1", true), ("yes", true)] {
         let _env = NamedEnvGuard::set("KACHE_INPUT_PREDICTION_COMPRESSION", value);
         assert_eq!(on(), want, "{value}");
     }
     std::fs::write(
         &config_path,
-        "[cache]\nignore_env = true\ninput_prediction_compression = true\n",
+        "[cache]\nignore_env = true\ninput_prediction_compression = false\n",
     )
     .unwrap();
-    let _ignored = NamedEnvGuard::set("KACHE_INPUT_PREDICTION_COMPRESSION", "0");
-    assert!(on());
+    let _ignored = NamedEnvGuard::set("KACHE_INPUT_PREDICTION_COMPRESSION", "1");
+    assert!(!on());
 }
 
 #[test]

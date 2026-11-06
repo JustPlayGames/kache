@@ -661,10 +661,11 @@ pub struct Config {
     /// input_prediction_retention_days`.
     pub input_prediction_retention_days: u64,
     /// Write new input predictions as zstd frames, about a seventh of the
-    /// JSON's size (default off). Every release from the one that added this
-    /// setting reads rows of both forms; an older one reads a compressed row
-    /// as absent and runs rustc's dep-info pre-pass for that unit once. A
-    /// build script's rows stay plain. Set via
+    /// JSON's size, and let the GC rewrite plain rows the same way (default
+    /// on). Every release from the one that added this setting reads rows of
+    /// both forms; an older one reads a compressed row as absent and runs
+    /// rustc's dep-info pre-pass for that unit once. A build script's rows
+    /// stay plain. Set via
     /// `KACHE_INPUT_PREDICTION_COMPRESSION` or `[cache]
     /// input_prediction_compression`; every process that writes the index
     /// should see the same value, so set it in the config file.
@@ -3623,10 +3624,10 @@ impl Config {
         .unwrap_or(DEFAULT_INPUT_PREDICTION_RETENTION_DAYS)
     }
 
-    /// Compressed input prediction rows, off by default.
-    /// `KACHE_INPUT_PREDICTION_COMPRESSION=1`/`=true` turns them on and any
-    /// other value off (env wins), else `[cache]
-    /// input_prediction_compression`, else off.
+    /// Compressed input prediction rows, on by default.
+    /// `KACHE_INPUT_PREDICTION_COMPRESSION=0`/`=false` turns them off and any
+    /// other value on (env wins), else `[cache]
+    /// input_prediction_compression`, else on.
     fn input_prediction_compression_enabled_for(
         invocation: &InvocationEnv,
         file_config: &Result<FileConfig>,
@@ -3635,14 +3636,14 @@ impl Config {
         if let Ok(v) =
             env_or_ignored_for(invocation, "KACHE_INPUT_PREDICTION_COMPRESSION", ignore_env)
         {
-            return v == "1" || v.eq_ignore_ascii_case("true");
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
         }
         file_config
             .as_ref()
             .ok()
             .and_then(|c| c.cache.as_ref())
             .and_then(|c| c.input_prediction_compression)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Adaptive incremental idle window in hours, off (`0`) by default.

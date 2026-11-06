@@ -17833,3 +17833,34 @@ fn a_store_compresses_new_prediction_rows_only_when_its_config_says_so() {
         );
     }
 }
+
+#[test]
+fn housekeeping_compresses_plain_prediction_rows_only_when_the_config_says_so() {
+    for compress in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.compress_predictions = compress;
+        let store = Store::open(config).unwrap();
+        let json = format!("{{\"sources\":[{}]}}", "\"/src/lib.rs\",".repeat(50));
+        crate::file_hash::FileHashCache::Borrowed(&store.db)
+            .put_input_prediction("unit", 2, None, &json)
+            .unwrap();
+        store.sweep_housekeeping(30);
+        let kind: String = store
+            .db
+            .query_row(
+                "SELECT typeof(prediction_json) FROM input_predictions WHERE identity = 'unit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, if compress { "blob" } else { "text" });
+        assert_eq!(
+            store
+                .file_hash_cache()
+                .get_input_prediction("unit")
+                .unwrap(),
+            Some((2, json))
+        );
+    }
+}
