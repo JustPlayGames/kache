@@ -1373,6 +1373,12 @@ pub struct HousekeepingStats {
     pub predictions_pruned: usize,
     /// File hash memo rows deleted as not written for a month (#1206).
     pub file_hashes_pruned: usize,
+    /// File hash memo rows deleted because their directory is gone.
+    #[serde(default)]
+    pub file_hashes_gone_pruned: usize,
+    /// Whether that prune stopped at its budget, to go on at the next sweep.
+    #[serde(default)]
+    pub file_hashes_gone_cut_short: bool,
     /// Scheduler flight files (compile and discovery flights) unlinked as
     /// stale. Filled by the caller that sweeps the scheduler's directory.
     #[serde(default)]
@@ -6679,6 +6685,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     tracing::warn!("gc: file hash pruning failed: {error}");
                     0
                 });
+        // Rows of worktrees and target directories deleted since: nearly all
+        // of the table where agents make a worktree per task.
+        let gone = self
+            .file_hash_cache()
+            .prune_file_hashes_under_gone_dirs(crate::file_hash::GONE_DIR_PRUNE_BUDGET)
+            .unwrap_or_else(|error| {
+                tracing::warn!("gc: pruning file hashes of gone directories failed: {error}");
+                crate::file_hash::GoneDirPrune::default()
+            });
+        if gone.rows > 0 || gone.cut_short {
+            tracing::info!(
+                rows = gone.rows,
+                dirs = gone.dirs,
+                batches = gone.batches,
+                longest_batch_ms = gone.longest_batch.as_millis() as u64,
+                cut_short = gone.cut_short,
+                "gc: pruned file hashes of gone directories"
+            );
+        }
         // After the prune, so the one-time copy is as small as it gets.
         match self.file_hash_cache().rebuild_file_hashes_without_rowid() {
             Ok(true) => tracing::info!("gc: rebuilt file_hashes without rowid"),
@@ -6690,6 +6715,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             key_locks_remaining: locks.remaining(),
             predictions_pruned,
             file_hashes_pruned,
+            file_hashes_gone_pruned: gone.rows,
+            file_hashes_gone_cut_short: gone.cut_short,
             ..HousekeepingStats::default()
         }
     }

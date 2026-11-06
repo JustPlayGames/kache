@@ -1,6 +1,7 @@
 //! Persistent file fingerprints and opaque compiler memo records.
 
 pub use crate::cc_memo::{CcPreprocessMemo, CcPreprocessMemoInput};
+pub use crate::gone_dirs::{GONE_DIR_PRUNE_BATCH, GONE_DIR_PRUNE_BUDGET, GoneDirPrune};
 pub use crate::index_compaction::{IndexCompaction, IndexPageStats, index_page_stats};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};

@@ -7452,6 +7452,7 @@ impl Daemon {
             memos_remaining = housekeeping.memos_remaining,
             predictions_pruned = housekeeping.predictions_pruned,
             file_hashes_pruned = housekeeping.file_hashes_pruned,
+            file_hashes_gone_pruned = housekeeping.file_hashes_gone_pruned,
             prestage_pruned,
             "gc: housekeeping"
         );

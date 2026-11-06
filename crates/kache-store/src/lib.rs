@@ -9,6 +9,7 @@ pub mod eviction;
 mod eviction_evidence;
 pub mod file_hash;
 pub mod filesystem;
+mod gone_dirs;
 mod index_compaction;
 pub mod link;
 pub mod markers;
