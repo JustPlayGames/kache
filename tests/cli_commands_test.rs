@@ -5658,6 +5658,66 @@ fn a_build_that_asks_for_no_workspace_units_gets_none_from_a_running_daemon() {
     );
 }
 
+/// A target that seeding filled is a donor too. Cargo then finds every unit
+/// fresh and compiles nothing, so no compile records the target; once its
+/// own donor was gone, the next new target found none (a clippy of 125 s
+/// against 21 s, 2026-11-05).
+#[test]
+fn a_target_seeding_filled_seeds_the_next_new_target() {
+    let e = env();
+    let root = TempDir::new().unwrap();
+    let checkout = root.path().join("checkout");
+    std::fs::create_dir_all(checkout.join("src")).unwrap();
+    std::fs::write(
+        checkout.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(checkout.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    let built = e.wrapper_build(&checkout, &checkout.join("target"));
+    assert!(built.status.success(), "{built:?}");
+    let per_unit = !checkout.join("target/debug/.fingerprint").is_dir();
+    let units = |target: &Path| -> Vec<String> {
+        let (dir, prefix) = if per_unit {
+            (target.join("debug/build/app"), "")
+        } else {
+            (target.join("debug/.fingerprint"), "app-")
+        };
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with(prefix))
+            .collect();
+        names.sort();
+        names
+    };
+    let app = units(&checkout.join("target"));
+    assert!(!app.is_empty(), "the build left no unit of app");
+    let probe = |target: &str| {
+        e.cmd()
+            .current_dir(&checkout)
+            .env("KACHE_SEED_NEW_TARGETS", "1")
+            .env("CARGO_TARGET_DIR", target)
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .env_remove("KACHE_SEED_WORKSPACE_UNITS")
+            .args(["rustc", "-", "--crate-name", "___", "--print=file-names"])
+            .args(["--crate-type", "lib"])
+            .write_stdin("")
+            .assert()
+            .success();
+        checkout.join(target)
+    };
+    assert_eq!(units(&probe("target-seeded")), app, "seeded from the build");
+    std::fs::remove_dir_all(checkout.join("target")).unwrap();
+    assert_eq!(
+        units(&probe("target-next")),
+        app,
+        "the seeded target is the donor left"
+    );
+}
+
 #[test]
 fn daemon_readiness_channel_precedes_a_fresh_running_status() {
     use kunobi_daemon::launch::DaemonCommand;

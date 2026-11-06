@@ -3035,7 +3035,7 @@ pub(crate) fn before_probe_for(
         return;
     };
     let note = env.var_os("KACHE_LOG_FILE").is_none().then_some(env);
-    if let Err(error) = crate::daemon::seed_new_target(
+    match crate::daemon::seed_new_target(
         config,
         &target,
         &version,
@@ -3043,7 +3043,17 @@ pub(crate) fn before_probe_for(
         workspace_units_for(env),
         note,
     ) {
-        tracing::debug!("not seeding {}: {error:#}", target.target_dir.display());
+        Ok(seeded) if seeded.units > 0 => crate::wrapper::register_seeded_target(
+            config,
+            &target.target_dir,
+            &target.workspace_root,
+            &version,
+            &cargo_home,
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!("not seeding {}: {error:#}", target.target_dir.display());
+        }
     }
 }
 
