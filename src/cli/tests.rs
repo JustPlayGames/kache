@@ -3891,6 +3891,7 @@ fn save_manifest_config(
         out_dir_alias: true,
         out_dir_alias_root: None,
         deferred_durability: false,
+        input_prediction_compression: false,
         daemon_publish: false,
         daemon_publish_rustc: false,
         trust_daemon_execution: false,

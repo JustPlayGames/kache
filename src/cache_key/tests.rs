@@ -4010,8 +4010,15 @@ fn prediction_verification_reads_the_snapshot() {
         )
         .unwrap();
     let hasher = FileHasher::persistent(&db).with_input_predictions(true);
+    // Enough files that the row compresses (below).
+    let mut source_files = vec![source.clone()];
+    for i in 0..12 {
+        let module = dir.path().join(format!("module_{i}.rs"));
+        std::fs::write(&module, "// a module\n").unwrap();
+        source_files.push(module);
+    }
     let closure = DepInfo {
-        source_files: vec![source.clone()],
+        source_files,
         env_deps: Vec::new(),
     };
     let identity = rustc_prediction_identity(&args).unwrap();
@@ -4022,6 +4029,25 @@ fn prediction_verification_reads_the_snapshot() {
         (inputs, out.used_prediction)
     };
 
+    assert_eq!(resolve(&KeyEnv::default()), (Some(closure.clone()), true));
+    // The same row as a store opened with `compress_predictions` writes it:
+    // a zstd frame, read back as the same closure and the same key inputs.
+    let other = rusqlite::Connection::open(&db).unwrap();
+    let (schema, json) = FileHashCache::Borrowed(&other)
+        .get_input_prediction(&identity)
+        .unwrap()
+        .unwrap();
+    FileHashCache::Compressing(&other)
+        .put_input_prediction(&identity, schema, Some("x"), &json)
+        .unwrap();
+    let kind: String = other
+        .query_row(
+            "SELECT typeof(prediction_json) FROM input_predictions WHERE identity = ?1",
+            [&identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind, "blob");
     assert_eq!(resolve(&KeyEnv::default()), (Some(closure), true));
     let (verified, predicted) = resolve(&env_with("KACHE_VERIFY_INPUT_PREDICTIONS", "always"));
     assert!(!predicted, "the pre-pass answered, not the record");

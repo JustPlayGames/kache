@@ -114,6 +114,10 @@ pub struct Config {
     /// later; a hit on an entry still pending verifies its bytes first.
     pub deferred_durability: bool,
     pub index_mode: IndexMode,
+    /// Write new input prediction rows as zstd frames (`[cache]
+    /// input_prediction_compression`). Rows of either form are read either
+    /// way.
+    pub compress_predictions: bool,
 }
 
 impl From<&Config> for Config {
@@ -220,6 +224,7 @@ mod tests {
             held_bytes_budget: HeldBytesBudget::default(),
             upload_spool_max_jobs: 2,
             deferred_durability: false,
+            compress_predictions: false,
             index_mode: IndexMode::default(),
         };
         let second = Config {
