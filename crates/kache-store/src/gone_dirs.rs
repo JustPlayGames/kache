@@ -5,9 +5,9 @@
 //! is the only thing that removes them. On a machine where agents make and
 //! delete a worktree per task, nearly every row belongs to a directory that
 //! is already gone: 27.6 of 28.0 million rows on a shared build host
-//! (2026-11-06), most of a 29 GB index. Such a row can never be served again,
-//! since its file is gone, so the GC sweep deletes them, a directory at a
-//! time, in short write transactions.
+//! (2026-11-06), about 12.8 GB of a 29 GB index. Such a row can never be
+//! served again, since its file is gone, so the GC sweep deletes them, a
+//! directory at a time, in short write transactions.
 
 use crate::file_hash::FileHashCache;
 use rusqlite::{ErrorCode, OptionalExtension, Transaction, TransactionBehavior, params};
