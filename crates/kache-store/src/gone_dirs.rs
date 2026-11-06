@@ -125,7 +125,7 @@ fn row_dir(
     RowDir::Present
 }
 
-fn is_busy(error: &rusqlite::Error) -> bool {
+pub(crate) fn is_busy(error: &rusqlite::Error) -> bool {
     matches!(
         error.sqlite_error_code(),
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
