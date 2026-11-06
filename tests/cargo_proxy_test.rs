@@ -100,10 +100,24 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
     );
     assert!(target.join("debug/output").exists());
 
+    let records = cache.join("target-use.holders");
+    assert_eq!(
+        std::fs::read_dir(&records).unwrap().count(),
+        1,
+        "the running shim names itself to cleanup"
+    );
+
     std::fs::write(&go, "").unwrap();
     assert!(child.wait().unwrap().success());
     lease.lock().unwrap();
     lease.unlock().unwrap();
+    // The shim exits with Cargo's status; its record goes with its lease, or
+    // records pile up for cleanup to probe (246 on a shared host, 20 days old).
+    let left: Vec<_> = std::fs::read_dir(&records)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "the exited shim left {left:?}");
 }
 
 #[test]

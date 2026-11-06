@@ -318,7 +318,7 @@ const CARGO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 fn run_cargo_guarded(
     mut command: Command,
     cargo: &Path,
-    _lease: crate::target_use::Lease,
+    lease: crate::target_use::Lease,
     config: &crate::config::Config,
 ) -> Result<()> {
     let mut capture = crate::target_liveness::Capture::prepare(&command, cargo, config);
@@ -368,6 +368,9 @@ fn run_cargo_guarded(
     {
         tracing::warn!(%error, "target liveness receipt not recorded");
     }
+    // `exit` runs no destructors: release the lease and remove its record
+    // here, once Cargo and what it ran have exited.
+    drop(lease);
     std::process::exit(crate::test_runner::finish(
         crate::test_runner::exit_disposition(
             status.code(),
