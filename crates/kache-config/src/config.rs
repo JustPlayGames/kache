@@ -146,6 +146,9 @@ pub const DEFAULT_RESTORE_MAX_SIZE: u64 = 8 * 1024 * 1024 * 1024;
 /// Default for [`Config::auto_clean_unused_units_days`].
 pub const DEFAULT_UNUSED_UNITS_DAYS: u64 = 30;
 
+/// Default for [`Config::input_prediction_retention_days`].
+pub const DEFAULT_INPUT_PREDICTION_RETENTION_DAYS: u64 = 30;
+
 /// The free-space floor below which builds evict cache entries, unless
 /// `cache.auto_recover_min_free_bytes` says otherwise.
 pub const DEFAULT_RECOVERY_FLOOR: u64 = 10 << 30;
@@ -650,6 +653,13 @@ pub struct Config {
     /// disables it). Set via `KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS` or
     /// `[cache] auto_clean_unused_units_days`.
     pub auto_clean_unused_units_days: u64,
+    /// The GC deletes an input prediction no build has read or recorded for
+    /// this many days (default `30`; `0` counts as unset). A shorter
+    /// window keeps the index small where worktrees come and go; a unit
+    /// whose row went runs rustc's dep-info pre-pass once more. Set via
+    /// `KACHE_INPUT_PREDICTION_RETENTION_DAYS` or `[cache]
+    /// input_prediction_retention_days`.
+    pub input_prediction_retention_days: u64,
     /// Let the daemon drop adaptive incremental state no compile used for
     /// this many hours (`0`, the default, disables it). Set via
     /// `KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS` or `[cache]
@@ -1052,6 +1062,8 @@ pub struct CacheFileConfig {
     pub scheduler_memory_pressure: Option<bool>,
     /// See [`Config::auto_clean_unused_units_days`].
     pub auto_clean_unused_units_days: Option<u64>,
+    /// See [`Config::input_prediction_retention_days`].
+    pub input_prediction_retention_days: Option<u64>,
     /// See [`Config::auto_clean_adaptive_idle_hours`].
     pub auto_clean_adaptive_idle_hours: Option<u64>,
     /// See [`Config::seed_new_targets`].
@@ -1504,6 +1516,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_AUTO_RECOVER_TARGETS",
     "KACHE_SCHEDULER_MEMORY_PRESSURE",
     "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
+    "KACHE_INPUT_PREDICTION_RETENTION_DAYS",
     "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
     "KACHE_SEED_NEW_TARGETS",
     "KACHE_BUILD_SCRIPT_HERMETIC",
@@ -1654,6 +1667,10 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     (
         "KACHE_AUTO_CLEAN_UNUSED_UNITS_DAYS",
         "cache.auto_clean_unused_units_days",
+    ),
+    (
+        "KACHE_INPUT_PREDICTION_RETENTION_DAYS",
+        "cache.input_prediction_retention_days",
     ),
     (
         "KACHE_AUTO_CLEAN_ADAPTIVE_IDLE_HOURS",
@@ -2433,6 +2450,8 @@ impl Config {
             Self::scheduler_memory_pressure_enabled_for(invocation, &file_config);
         let auto_clean_unused_units_days =
             Self::auto_clean_unused_units_days_for(invocation, &file_config);
+        let input_prediction_retention_days =
+            Self::input_prediction_retention_days_for(invocation, &file_config);
         let auto_clean_adaptive_idle_hours =
             Self::auto_clean_adaptive_idle_hours_for(invocation, &file_config);
         let seed_new_targets = Self::seed_new_targets_enabled_for(invocation, &file_config);
@@ -2581,6 +2600,7 @@ impl Config {
             auto_recover_targets,
             scheduler_memory_pressure,
             auto_clean_unused_units_days,
+            input_prediction_retention_days,
             auto_clean_adaptive_idle_hours,
             seed_new_targets,
             build_script_hermetic,
@@ -3554,6 +3574,34 @@ impl Config {
                     .and_then(|c| c.auto_clean_unused_units_days)
             })
             .unwrap_or(DEFAULT_UNUSED_UNITS_DAYS)
+    }
+
+    /// Input prediction retention in days, `30` by default; `0` or a value
+    /// that does not parse counts as unset.
+    /// `KACHE_INPUT_PREDICTION_RETENTION_DAYS` (env wins), else `[cache]
+    /// input_prediction_retention_days`.
+    fn input_prediction_retention_days_for(
+        invocation: &InvocationEnv,
+        file_config: &Result<FileConfig>,
+    ) -> u64 {
+        let ignore_env = Self::ignore_env_enabled(file_config);
+        env_or_ignored_for(
+            invocation,
+            "KACHE_INPUT_PREDICTION_RETENTION_DAYS",
+            ignore_env,
+        )
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|days| *days > 0)
+        .or_else(|| {
+            file_config
+                .as_ref()
+                .ok()
+                .and_then(|c| c.cache.as_ref())
+                .and_then(|c| c.input_prediction_retention_days)
+                .filter(|days| *days > 0)
+        })
+        .unwrap_or(DEFAULT_INPUT_PREDICTION_RETENTION_DAYS)
     }
 
     /// Adaptive incremental idle window in hours, off (`0`) by default.

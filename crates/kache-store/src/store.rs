@@ -6661,7 +6661,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// The per-key structures nothing else bounds: stale key lock files,
     /// unused input predictions and old file hash rows. The caller holds `gc.lock`. A pass that fails
     /// is logged and counts as zero; the next sweep tries again.
-    pub fn sweep_housekeeping(&self) -> HousekeepingStats {
+    /// `prediction_retention_days` is how long an unused input prediction
+    /// stays (`[cache] input_prediction_retention_days`).
+    pub fn sweep_housekeeping(&self, prediction_retention_days: u64) -> HousekeepingStats {
         if self.read_only {
             return HousekeepingStats::default();
         }
@@ -6675,7 +6677,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .file_hash_cache()
             .prune_input_predictions_within(
                 crate::file_hash::unix_now(),
-                crate::file_hash::INPUT_PREDICTION_RETENTION_SECS,
+                i64::try_from(prediction_retention_days.max(1))
+                    .unwrap_or(i64::MAX / 86_400)
+                    .saturating_mul(86_400),
                 crate::file_hash::PREDICTION_PRUNE_BUDGET,
             )
             .unwrap_or_else(|error| {

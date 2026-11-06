@@ -7427,7 +7427,7 @@ impl Daemon {
 
         // Key lock files and input predictions grow with every distinct key
         // and eviction removes neither (#1126). Still under gc.lock.
-        let mut housekeeping = gc_store.sweep_housekeeping();
+        let mut housekeeping = gc_store.sweep_housekeeping(config.input_prediction_retention_days);
         // Flight files grow the same way, one per missed key (scheduler/).
         if !gc_store.is_read_only() {
             let flights = crate::scheduler::sweep_stale_flights(&config.cache_dir);

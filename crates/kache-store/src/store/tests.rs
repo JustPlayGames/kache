@@ -13037,7 +13037,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     // Nothing to do, as on a fresh store with predictions off.
-    assert_eq!(store.sweep_housekeeping(), HousekeepingStats::default());
+    assert_eq!(store.sweep_housekeeping(30), HousekeepingStats::default());
 
     let stale = aged_key_lock(&config, &key(1), TWO_HOURS);
     aged_key_lock(&config, &key(2), TWO_HOURS);
@@ -13081,7 +13081,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
     }
 
     assert_eq!(
-        store.sweep_housekeeping(),
+        store.sweep_housekeeping(30),
         HousekeepingStats {
             key_locks_removed: 2,
             key_locks_remaining: 1,
@@ -13129,7 +13129,7 @@ fn housekeeping_rebuilds_an_older_file_hashes_table_without_rowid() {
     };
     assert!(!table_sql().contains("WITHOUT ROWID"));
 
-    assert_eq!(store.sweep_housekeeping().file_hashes_pruned, 1);
+    assert_eq!(store.sweep_housekeeping(30).file_hashes_pruned, 1);
     assert!(table_sql().contains("WITHOUT ROWID"), "{}", table_sql());
     let paths: Vec<String> = store
         .db
@@ -16296,7 +16296,7 @@ fn read_only_maintenance_preserves_files_and_registered_incremental_directories(
         (sweep.scanned, sweep.removed, sweep.bytes_reclaimed),
         (0, 0, 0)
     );
-    assert_eq!(ro.sweep_housekeeping(), HousekeepingStats::default());
+    assert_eq!(ro.sweep_housekeeping(30), HousekeepingStats::default());
     assert!(stale_lock.exists());
     assert!(fs::metadata(&staging).unwrap().permissions().readonly());
     assert_eq!(ro_tree_snapshot(dir.path()), before);

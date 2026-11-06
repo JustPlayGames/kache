@@ -4703,6 +4703,11 @@ mod tests {
         let identity = a.identity();
         assert!(identity.starts_with(PREDICTION_PREFIX), "{identity}");
         assert!(identity.len() > PREDICTION_PREFIX.len() + 32);
+        assert_eq!(
+            kache_store::file_hash::BUILD_SCRIPT_ROW_PREFIXES,
+            [PREDICTION_PREFIX, UNSETTLED_PREFIX],
+            "the GC keeps rows named so their full 30 days"
+        );
         assert_eq!(identity, a.identity(), "stable across calls");
         assert_ne!(identity, run("bbbb").identity());
         // One binary, two configurations: a row each.
