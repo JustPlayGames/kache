@@ -208,6 +208,26 @@ pub(crate) fn fetch_stats_snapshot(
         };
     }
 
+    // A daemon holds its run lock but gave no answer in time: it is busy (a
+    // stats request waits behind the builds' index work), not gone. Starting
+    // one would only wait out the start budget against it and ask again, so
+    // say what happened and read the store directly.
+    if daemon::existing_daemon_run_lock_is_held(&config.socket_path()).unwrap_or(false) {
+        if announce_auto_start {
+            eprintln!(
+                "kache: the daemon at {} did not answer in time (busy); reading the store directly",
+                config.socket_path().display()
+            );
+        }
+        return snapshot_from_direct_reads(
+            config,
+            include_entries,
+            sort_by,
+            window,
+            include_summaries,
+        );
+    }
+
     // Daemon unreachable or stale socket: best-effort auto-start for monitor/stats UX.
     // This path is not used by compile-time hot operations.
     if announce_auto_start {
