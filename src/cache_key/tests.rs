@@ -2079,7 +2079,7 @@ fn weak_windows_inputs_read_fresh_without_hash_or_stamp_memos() {
         assert!(!input.stamp_settled());
         assert!(
             hasher
-                .memo_input_is_unchanged(&input, &None, &|_| vec![path.clone()], &|_| None,)
+                .memo_input_is_unchanged(&input, &|_| vec![path.clone()], &|_| None)
                 .is_none()
         );
         assert!(hasher.hash_static_lib(&path).is_ok());
@@ -15513,6 +15513,23 @@ fn mapped_hashes_are_memoised_by_content_and_map_set() {
     assert_eq!(reads.get(), 6);
 }
 
+/// A process's shared header scans with the scan's JSON as its parsed form:
+/// a new one models a new process, which has only the index.
+fn header_scans() -> SharedHeaderScans<String> {
+    SharedHeaderScans::new(1 << 20)
+}
+
+fn scans_of(
+    shared: &SharedHeaderScans<String>,
+    hasher: &FileHasher<'_>,
+    paths: &[PathBuf],
+    version: i64,
+    scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
+) -> anyhow::Result<Vec<String>> {
+    let parsed = shared.scans(hasher, paths, version, scan, &|json| Ok(json.to_owned()))?;
+    Ok(parsed.iter().map(|scan| scan.to_string()).collect())
+}
+
 #[test]
 fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
     let dir = tempfile::tempdir().unwrap();
@@ -15532,13 +15549,13 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
     };
     let first = FileHasher::persistent(&db);
     assert_eq!(
-        first.cc_header_scans(&paths, 1, &scan).unwrap(),
+        scans_of(&header_scans(), &first, &paths, 1, &scan).unwrap(),
         ["probe", "probe"]
     );
     assert_eq!(scans.get(), 1, "identical files share a scan");
     let without_memo = FileHasher::persistent(&db);
     assert_eq!(
-        without_memo.cc_header_scans(&paths, 1, &scan).unwrap(),
+        scans_of(&header_scans(), &without_memo, &paths, 1, &scan).unwrap(),
         ["probe", "probe"]
     );
     assert_eq!(
@@ -15568,8 +15585,9 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
         .cc_preprocess_memo_lookup("memo", no_remap, &no_mapping)
         .unwrap();
     assert_eq!(warm.stats().bytes_hashed, 0);
+    let process = header_scans();
     assert_eq!(
-        warm.cc_header_scans(&satisfied, 1, &scan).unwrap(),
+        scans_of(&process, &warm, &satisfied, 1, &scan).unwrap(),
         ["probe", "probe"]
     );
     assert_eq!(scans.get(), 1, "the scan survives a fresh FileHasher");
@@ -15578,7 +15596,7 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
         0,
         "memo-validated small headers must not be hashed again"
     );
-    warm.cc_header_scans(&satisfied, 2, &scan).unwrap();
+    scans_of(&process, &warm, &satisfied, 2, &scan).unwrap();
     assert_eq!(
         scans.get(),
         2,
@@ -15588,13 +15606,91 @@ fn header_scans_share_content_and_warm_memos_do_not_reread_small_headers() {
         std::fs::write(path, "different bytes")?;
         Ok(("0".repeat(64), "wrong".into()))
     };
-    assert!(warm.cc_header_scans(&paths[..1], 3, &changed).is_err());
+    assert!(scans_of(&process, &warm, &paths[..1], 3, &changed).is_err());
     let cache = warm.cache.as_ref().unwrap();
     assert!(
         cache
             .get_cc_header_scans(3, &[&inputs[0].content])
             .unwrap()
             .is_empty()
+    );
+}
+
+/// The daemon runs every unit of a C crate at once: each header is read
+/// from the index and parsed once, by one unit, while the units that want
+/// it at the same time wait for that copy, and scans past the budget are
+/// let go, oldest first.
+#[test]
+fn units_at_once_share_one_parse_of_each_header_within_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let headers: Vec<_> = ["big.h", "other.h"]
+        .iter()
+        .map(|name| dir.path().join(name))
+        .collect();
+    for (header, text) in headers.iter().zip(["#define BIG 1\n", "#define OTHER 1\n"]) {
+        std::fs::write(header, text).unwrap();
+    }
+    let scan = |path: &Path| -> anyhow::Result<(String, String)> {
+        let bytes = std::fs::read(path)?;
+        Ok((blake3::hash(&bytes).to_hex().to_string(), "x".repeat(600)))
+    };
+    // Stored by an earlier process; this one has parsed nothing yet.
+    scans_of(
+        &header_scans(),
+        &FileHasher::persistent(&db),
+        &headers,
+        1,
+        &scan,
+    )
+    .unwrap();
+    let parses = std::sync::atomic::AtomicUsize::new(0);
+    let parse = |json: &str| -> anyhow::Result<String> {
+        parses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        Ok(json.to_owned())
+    };
+    let unscanned = |path: &Path| -> anyhow::Result<(String, String)> {
+        anyhow::bail!("{} is stored and must not be scanned", path.display())
+    };
+    let shared = SharedHeaderScans::new(1000);
+    let big = &headers[..1];
+    std::thread::scope(|scope| {
+        let units: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    let unit = FileHasher::persistent(&db);
+                    shared.scans(&unit, big, 1, &unscanned, &parse).unwrap()
+                })
+            })
+            .collect();
+        let copies: Vec<_> = units.into_iter().map(|unit| unit.join().unwrap()).collect();
+        assert!(
+            copies
+                .iter()
+                .all(|copy| std::sync::Arc::ptr_eq(&copy[0], &copies[0][0])),
+            "every unit holds the one copy"
+        );
+    });
+    assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let unit = FileHasher::persistent(&db);
+    shared
+        .scans(&unit, &headers[1..], 1, &unscanned, &parse)
+        .unwrap();
+    assert_eq!(parses.load(std::sync::atomic::Ordering::SeqCst), 2);
+    shared
+        .scans(&unit, &headers[1..], 1, &unscanned, &parse)
+        .unwrap();
+    assert_eq!(
+        parses.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a held scan is reused"
+    );
+    shared.scans(&unit, big, 1, &unscanned, &parse).unwrap();
+    assert_eq!(
+        parses.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "1,200 bytes of scans over a budget of 1,000: the oldest went"
     );
 }
 
@@ -15615,14 +15711,20 @@ fn header_scans_keep_the_key_snapshot_and_the_write_guard_detects_a_later_save()
     };
     let paths = std::slice::from_ref(&header);
     let first = FileHasher::persistent(&db);
-    assert_eq!(first.cc_header_scans(paths, 1, &scan).unwrap(), ["old\n"]);
+    assert_eq!(
+        scans_of(&header_scans(), &first, paths, 1, &scan).unwrap(),
+        ["old\n"]
+    );
     let mut keyed = FileHasher::persistent(&db);
     crate::test_support::settle_writes(&[&header]);
     keyed.arm_too_new_guard(stamp_clock_ns(), 0);
     keyed.hash(&header).unwrap();
     assert!(!keyed.inputs_changed_since_keyed());
     std::fs::write(&header, "new bytes\n").unwrap();
-    assert_eq!(keyed.cc_header_scans(paths, 1, &scan).unwrap(), ["old\n"]);
+    assert_eq!(
+        scans_of(&header_scans(), &keyed, paths, 1, &scan).unwrap(),
+        ["old\n"]
+    );
     assert_eq!(
         scans.get(),
         1,
@@ -15634,7 +15736,7 @@ fn header_scans_keep_the_key_snapshot_and_the_write_guard_detects_a_later_save()
     );
     let next = FileHasher::persistent(&db);
     assert_eq!(
-        next.cc_header_scans(paths, 1, &scan).unwrap(),
+        scans_of(&header_scans(), &next, paths, 1, &scan).unwrap(),
         ["new bytes\n"]
     );
     assert_eq!(scans.get(), 2, "a new invocation observes the new content");
