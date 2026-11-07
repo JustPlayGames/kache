@@ -11,6 +11,7 @@ pub mod file_hash;
 pub mod filesystem;
 mod gone_dirs;
 mod index_compaction;
+mod index_pool;
 pub mod link;
 pub mod markers;
 pub mod opcounts;
@@ -23,6 +24,10 @@ pub mod workspace;
 
 pub use blob_drift::{BlobRefcountDrift, blob_refcount_drift};
 pub use eviction_evidence::{EvictionEvidenceCohort, EvictionHorizonEvidence};
+pub use index_pool::{
+    IndexGuard, IndexPoolStats, close_idle_index_connections, index_pool_stats, index_pool_used,
+    pool_index_connections,
+};
 pub use store::*;
 
 /// Compiler-owned rules applied when publishing an entry. Implementations must

@@ -9,7 +9,7 @@ fn legacy(store: &Store, key: &str, cost: u64) -> EntryMeta {
     )
     .unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries(cache_key, crate_name, size, committed)
              VALUES (?1, 'fixture', 25, 1)",
@@ -21,7 +21,7 @@ fn legacy(store: &Store, key: &str, cost: u64) -> EntryMeta {
 
 fn state(store: &Store, key: &str) -> (i64, i64, i64, i64) {
     store
-        .db
+        .db()
         .query_row(
             "SELECT compile_time_ms, compile_time_backfilled,
                     compile_time_retry_at, compile_time_retry_count
@@ -150,14 +150,14 @@ fn existing_positive_costs_and_uncommitted_rows_are_not_backfilled() {
     legacy(&store, "positive", 7777);
     legacy(&store, "uncommitted", 7777);
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET compile_time_ms = 50 WHERE cache_key = 'positive'",
             [],
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET committed = 0 WHERE cache_key = 'uncommitted'",
             [],
@@ -249,7 +249,7 @@ fn writes_commit_in_small_groups_between_metadata_reads() {
         store
             .backfill_compile_times_batch(129, 1000, || {
                 let processed: i64 = store
-                    .db
+                    .db()
                     .query_row(
                         "SELECT count(*) FROM entries WHERE compile_time_backfilled = 1",
                         [],
@@ -292,9 +292,10 @@ fn stale_results_cannot_update_deleted_replaced_or_revised_rows() {
                 .pop()
                 .unwrap();
             let outcome = store.compile_time_outcome(candidate);
-            store.db.execute_batch(change).unwrap();
+            store.db().execute_batch(change).unwrap();
             let snapshot = || -> Vec<String> {
-                let mut stmt = store.db.prepare(
+                let store_db = store.db();
+                let mut stmt = store_db.prepare(
                     "SELECT printf('%d|%s|%d|%d|%d|%d|%d|%s', rowid, cache_key,
                      committed, compile_time_ms, compile_time_backfilled,
                      compile_time_retry_at, compile_time_retry_count, coalesce(content_hash, 'NULL'))
@@ -363,7 +364,7 @@ fn an_update_failure_rolls_back_cost_and_state_together() {
         .map(|candidate| store.compile_time_outcome(candidate))
         .collect();
     store
-        .db
+        .db()
         .execute_batch(
             "CREATE TRIGGER reject_backfill BEFORE UPDATE ON entries
          WHEN NEW.cache_key = 'b' BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
@@ -381,7 +382,7 @@ fn legacy_schema_upgrades_and_reopens_without_resetting_progress() {
     let store = Store::open(&config).unwrap();
     legacy(&store, "legacy", 0);
     store
-        .db
+        .db()
         .execute_batch(
             "DROP INDEX idx_entries_compile_time_pending;
          ALTER TABLE entries DROP COLUMN compile_time_backfilled;
@@ -395,7 +396,7 @@ fn legacy_schema_upgrades_and_reopens_without_resetting_progress() {
     assert_eq!(state(&store, "legacy"), (0, 0, 0, 0));
     assert_eq!(store.backfill_compile_times_limited(1).unwrap(), 0);
     assert_eq!(state(&store, "legacy"), (0, 1, 0, 0));
-    super::super::compile_time_backfill::ensure_schema(&store.db).unwrap();
+    super::super::compile_time_backfill::ensure_schema(&store.db()).unwrap();
     assert_eq!(state(&store, "legacy"), (0, 1, 0, 0));
     drop(store);
     let store = Store::open(&config).unwrap();
@@ -409,7 +410,7 @@ fn concurrent_schema_upgrades_serialize_column_creation() {
     let store = Store::open(&config).unwrap();
     legacy(&store, "legacy", 0);
     store
-        .db
+        .db()
         .execute_batch(
             "DROP INDEX idx_entries_compile_time_pending;
          ALTER TABLE entries DROP COLUMN compile_time_backfilled;
@@ -445,7 +446,8 @@ fn due_work_uses_the_partial_index_without_a_temporary_sort() {
         "EXPLAIN QUERY PLAN {}",
         super::super::compile_time_backfill::SELECT_DUE
     );
-    let mut stmt = store.db.prepare(&sql).unwrap();
+    let store_db = store.db();
+    let mut stmt = store_db.prepare(&sql).unwrap();
     let details = stmt
         .query_map(params![1000, 3], |row| row.get::<_, String>(3))
         .unwrap()

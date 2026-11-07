@@ -175,12 +175,39 @@ impl ObservedFingerprint {
 /// Paths per lookup statement, well under SQLite's bound-parameter limit.
 const FILE_HASH_LOOKUP_CHUNK: usize = 256;
 
+/// Where a [`FileHashCache::Store`] borrows its connection from.
+pub trait IndexSource {
+    /// The connection, for one statement or transaction.
+    fn index(&self) -> crate::index_pool::IndexGuard<'_>;
+}
+
+/// A [`FileHashCache`]'s connection, for as long as one statement needs it.
+pub enum IndexRef<'a> {
+    Plain(&'a Connection),
+    Lent(crate::index_pool::IndexGuard<'a>),
+}
+
+impl std::ops::Deref for IndexRef<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Plain(db) => db,
+            Self::Lent(db) => db,
+        }
+    }
+}
+
 pub enum FileHashCache<'db> {
     Borrowed(&'db Connection),
     /// [`Self::Borrowed`], writing new input prediction rows as zstd frames
     /// ([`crate::prediction_codec`]): a store opened with
     /// `compress_predictions` hands this out.
     Compressing(&'db Connection),
+    /// A store's connection, lent for each statement, so a pooled store can
+    /// give it back while the cache lives ([`crate::index_pool`]); `true`
+    /// writes as [`Self::Compressing`] does.
+    Store(&'db dyn IndexSource, bool),
     #[cfg(any(test, feature = "test-support"))]
     Owned(Connection),
 }
@@ -222,11 +249,12 @@ impl<'db> FileHashCache<'db> {
         Ok(Self::Owned(db))
     }
 
-    pub fn db(&self) -> &Connection {
+    pub fn db(&self) -> IndexRef<'_> {
         match self {
-            Self::Borrowed(db) | Self::Compressing(db) => db,
+            Self::Borrowed(db) | Self::Compressing(db) => IndexRef::Plain(db),
+            Self::Store(store, _) => IndexRef::Lent(store.index()),
             #[cfg(any(test, feature = "test-support"))]
-            Self::Owned(db) => db,
+            Self::Owned(db) => IndexRef::Plain(db),
         }
     }
 
@@ -319,7 +347,8 @@ impl<'db> FileHashCache<'db> {
         let since = memo_rows_valid_since();
         for chunk in paths.chunks(FILE_HASH_LOOKUP_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let mut stmt = self.db().prepare_cached(&format!(
+            let db = self.db();
+            let mut stmt = db.prepare_cached(&format!(
                 "SELECT path, size, mtime_ns, ctime_ns, inode, hash FROM file_hashes
                  WHERE path IN ({placeholders}) AND rule >= {FILE_HASH_RULE}
                    AND updated_at >= datetime({since}, 'unixepoch')"
@@ -498,7 +527,10 @@ impl<'db> FileHashCache<'db> {
         prediction_json: &str,
     ) -> rusqlite::Result<()> {
         self.put_input_prediction_as(
-            codec::Codec::for_write(matches!(self, Self::Compressing(_)), identity),
+            codec::Codec::for_write(
+                matches!(self, Self::Compressing(_) | Self::Store(_, true)),
+                identity,
+            ),
             identity,
             schema,
             crate_name,
@@ -541,10 +573,9 @@ impl<'db> FileHashCache<'db> {
     ) -> rusqlite::Result<()> {
         // One write transaction for the row and the trim, not two: each
         // takes the index's write lock, which a burst of stores queues on.
-        let tx = rusqlite::Transaction::new_unchecked(
-            self.db(),
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         self.put_input_prediction_trimming(
             prefix,
             identity,
@@ -598,7 +629,8 @@ impl<'db> FileHashCache<'db> {
         limit: usize,
     ) -> rusqlite::Result<Vec<String>> {
         let upper = format!("{prefix}\u{10FFFF}");
-        let mut statement = self.db().prepare(
+        let db = self.db();
+        let mut statement = db.prepare(
             "SELECT identity FROM input_predictions
              WHERE identity > ?1 AND identity < ?2
              ORDER BY last_used DESC, updated_at DESC
@@ -680,7 +712,8 @@ impl<'db> FileHashCache<'db> {
     /// table without a `rule` column copies its rows at rule 0, which no
     /// lookup serves.
     pub fn rebuild_file_hashes_without_rowid(&self) -> rusqlite::Result<bool> {
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         if !file_hashes_has_rowid(&tx)? {
             return Ok(false);
         }
@@ -781,7 +814,8 @@ impl<'db> FileHashCache<'db> {
         batch: usize,
     ) -> rusqlite::Result<usize> {
         let [first, second] = BUILD_SCRIPT_ROW_PREFIXES;
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         // `prefix` and every name that starts with it sort below `prefix` +
         // U+10FFFF, as in `put_input_prediction_trimming`.
         let deleted = tx.execute(
@@ -878,7 +912,8 @@ impl<'db> FileHashCache<'db> {
     /// build script's, in order. `typeof` reads only the record's header.
     fn plain_prediction_rowids(&self, after: i64, batch: usize) -> rusqlite::Result<Vec<i64>> {
         let [first, second] = BUILD_SCRIPT_ROW_PREFIXES;
-        let mut statement = self.db().prepare_cached(
+        let db = self.db();
+        let mut statement = db.prepare_cached(
             "SELECT rowid FROM input_predictions
              WHERE rowid > ?1 AND typeof(prediction_json) = 'text'
                AND NOT (identity >= ?2 AND identity < ?2 || char(1114111))
@@ -902,7 +937,8 @@ impl<'db> FileHashCache<'db> {
     /// transaction. Returns how many were rewritten and how many stayed
     /// plain because their frame would not be smaller.
     fn compress_prediction_rows(&self, rowids: &[i64]) -> rusqlite::Result<(usize, usize)> {
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         let (mut converted, mut kept_plain) = (0, 0);
         {
             let mut read = tx.prepare_cached(
@@ -2892,8 +2928,8 @@ mod tests {
 
     /// Each row's SQLite type, `last_used` and `updated_at`, by name.
     fn prediction_rows(cache: &FileHashCache<'_>) -> Vec<(String, String, i64, String)> {
-        let mut statement = cache
-            .db()
+        let db = cache.db();
+        let mut statement = db
             .prepare(
                 "SELECT identity, typeof(prediction_json), last_used, updated_at
                  FROM input_predictions ORDER BY identity",

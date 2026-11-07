@@ -255,7 +255,8 @@ impl FileHashCache<'_> {
         let mut found = std::collections::HashMap::new();
         for chunk in contents.chunks(MEMO_LOOKUP_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let mut stmt = self.db().prepare_cached(&format!(
+            let db = self.db();
+            let mut stmt = db.prepare_cached(&format!(
                 "SELECT content, scan FROM cc_header_scans
                  WHERE version = ?1 AND content IN ({placeholders})"
             ))?;
@@ -283,7 +284,8 @@ impl FileHashCache<'_> {
         if pairs.is_empty() {
             return Ok(());
         }
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         {
             let mut put = tx.prepare_cached(
                 "INSERT INTO cc_header_scans(content, scan, version) VALUES (?1, ?2, ?3)
@@ -310,7 +312,8 @@ impl FileHashCache<'_> {
         // of this lookup.
         for chunk in contents.chunks(MEMO_LOOKUP_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let mut stmt = self.db().prepare_cached(&format!(
+            let db = self.db();
+            let mut stmt = db.prepare_cached(&format!(
                 "SELECT content, mapped FROM cc_mapped_hashes
                  WHERE maps = ?1 AND content IN ({placeholders}) AND rule >= {CC_MEMO_RULE}"
             ))?;
@@ -336,7 +339,8 @@ impl FileHashCache<'_> {
         let mut found = std::collections::HashMap::new();
         for chunk in contents.chunks(MEMO_LOOKUP_CHUNK) {
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let mut stmt = self.db().prepare_cached(&format!(
+            let db = self.db();
+            let mut stmt = db.prepare_cached(&format!(
                 "SELECT content, construct FROM cc_asm_scans
                  WHERE content IN ({placeholders}) AND rule >= {CC_MEMO_RULE}"
             ))?;
@@ -358,7 +362,8 @@ impl FileHashCache<'_> {
         if pairs.is_empty() {
             return Ok(());
         }
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         {
             let mut put = tx.prepare_cached(&format!(
                 "INSERT INTO cc_asm_scans(content, construct, rule) VALUES (?1, ?2, {CC_MEMO_RULE})
@@ -383,7 +388,8 @@ impl FileHashCache<'_> {
         if pairs.is_empty() {
             return Ok(());
         }
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         {
             let mut put = tx.prepare_cached(&format!(
                 "INSERT INTO cc_mapped_hashes(content, maps, mapped, rule)
@@ -410,7 +416,8 @@ impl FileHashCache<'_> {
         // file's memo held 0.9 to 5.5 MB of them (aws-lc-sys, zstd-sys), read
         // by every unit of a build at once. The compiler takes each from
         // [`Self::get_cc_header_scans`] once per process.
-        let mut stmt = self.db().prepare_cached(
+        let db = self.db();
+        let mut stmt = db.prepare_cached(
             "SELECT m.preprocessed_hash, m.input_count, m.last_used <= unixepoch() - 86400,
                     i.id, i.name, i.content, i.mapped, i.local_path,
                     i.size, i.mtime_ns, i.ctime_ns, i.inode, i.proof
@@ -468,7 +475,8 @@ impl FileHashCache<'_> {
         preprocessed_hash: &str,
         inputs: &[CcPreprocessMemoInput],
     ) -> rusqlite::Result<()> {
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         let id: i64 = tx.query_row(
             "INSERT INTO cc_preprocess_memos(memo_key, preprocessed_hash, input_count)
              VALUES (?1, ?2, 0) ON CONFLICT(memo_key) DO UPDATE SET
@@ -566,7 +574,8 @@ impl FileHashCache<'_> {
     /// lock as an entry's registration does rather than failing after one
     /// busy timeout.
     pub fn prune_cc_preprocess_memos(&self) -> rusqlite::Result<(usize, usize)> {
-        let tx = crate::store::begin_write_waiting(self.db(), "pruning C/C++ memos")?;
+        let db = self.db();
+        let tx = crate::store::begin_write_waiting(&db, "pruning C/C++ memos")?;
         tx.execute(
             "DELETE FROM cc_memo_input_refs WHERE memo_id IN
              (SELECT id FROM cc_preprocess_memos WHERE last_used < unixepoch() - 2592000)",
@@ -713,18 +722,18 @@ mod tests {
                  ALTER TABLE cc_asm_scans DROP COLUMN rule;",
             )
             .unwrap();
-        assert!(!has_rule_columns(cache.db()).unwrap());
+        assert!(!has_rule_columns(&cache.db()).unwrap());
 
         // The first opener to take the lock adds the columns and purges.
-        ensure_rule(cache.db()).unwrap();
-        assert!(has_rule_columns(cache.db()).unwrap());
+        ensure_rule(&cache.db()).unwrap();
+        assert!(has_rule_columns(&cache.db()).unwrap());
         assert_eq!(rows(&cache), [0; 6]);
 
         // A second opener found a column missing before that, and takes the
         // lock only now, after rows were recorded under the columns.
         record(&cache);
         assert_eq!(rows(&cache), [1; 6]);
-        add_rule_columns(cache.db()).unwrap();
+        add_rule_columns(&cache.db()).unwrap();
         assert_eq!(rows(&cache), [1; 6], "the purge runs once");
     }
 
@@ -1291,7 +1300,7 @@ mod tests {
         cache
             .put_cc_preprocess_memo_inputs("new", "hash", &[input("a.h", "a")])
             .unwrap();
-        ensure_schema(cache.db()).unwrap();
+        ensure_schema(&cache.db()).unwrap();
         assert!(cache.get_cc_preprocess_memo("new").unwrap().is_some());
         assert_eq!(cache.db().query_row("SELECT count(*) FROM pragma_table_info('cc_preprocess_memos') WHERE name = 'inputs_json'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
