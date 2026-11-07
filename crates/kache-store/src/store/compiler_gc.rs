@@ -21,7 +21,8 @@ impl<P: crate::ArtifactPolicy> ArtifactStore<P> {
     fn rustc_entries(&self, version: &str) -> Result<Vec<(String, u64, String)>> {
         // A release selects all its builds; a complete identity selects only
         // that build. Use a word boundary, so 1.9.0 cannot select 1.99.0.
-        let mut stmt = self.db.prepare(
+        let db = self.db();
+        let mut stmt = db.prepare(
             "SELECT cache_key, size, rustc_version FROM entries
              WHERE committed = 1 AND (rustc_version = ?1 OR
                 substr(rustc_version, 1, instr(rustc_version || ' ', ' ') - 1) = ?1)
@@ -48,7 +49,7 @@ impl<P: crate::ArtifactPolicy> ArtifactStore<P> {
             entries: selected.len(),
             bytes,
             versions: versions.into_iter().collect(),
-            unknown_entries: self.db.query_row(
+            unknown_entries: self.db().query_row(
                 "SELECT COUNT(*) FROM entries WHERE committed = 1 AND rustc_version IS NULL",
                 [],
                 |row| row.get::<_, i64>(0),

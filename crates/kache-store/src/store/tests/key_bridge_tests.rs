@@ -7,7 +7,7 @@ use super::*;
 fn legacy_entry(store: &Store, dir: &Path, key: &str, version: u32) -> EntryMeta {
     put_test_entry(store, dir, key, 4096);
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET key_schema = ?2 WHERE cache_key = ?1",
             params![key, version],
@@ -25,7 +25,7 @@ fn legacy_entry(store: &Store, dir: &Path, key: &str, version: u32) -> EntryMeta
 
 fn refcount(store: &Store, hash: &str) -> i64 {
     store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -118,7 +118,7 @@ fn a_hit_on_an_earlier_key_versions_row_stops_it_ranking_stale_at_once() {
     ] {
         legacy_entry(&store, dir.path(), key, version);
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET crate_name = ?2, crate_type = ?3 WHERE cache_key = ?1",
                 params![key, crate_name, crate_type],
@@ -150,7 +150,7 @@ fn a_hit_on_an_earlier_key_versions_row_stops_it_ranking_stale_at_once() {
     store.get("earlier").unwrap().expect("a hit");
 
     let schema: u32 = store
-        .db
+        .db()
         .query_row(
             "SELECT key_schema FROM entries WHERE cache_key = 'earlier'",
             [],
@@ -280,7 +280,7 @@ fn a_stale_rows_old_hits_do_not_outrank_a_live_entry() {
     legacy_entry(&store, dir.path(), "live", current);
     for (key, hits, idle) in [("earlier", 10_000_000, "-1 minute"), ("live", 0, "-2 days")] {
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET hit_count = ?2, last_accessed = datetime('now', ?3)
                  WHERE cache_key = ?1",
