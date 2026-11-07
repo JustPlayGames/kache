@@ -751,6 +751,35 @@ fn stats_and_report_label_the_requested_window() {
         .stderr(predicates::str::contains("invalid --since"));
 }
 
+/// A daemon that holds its run lock but answers too late (stopped here, busy
+/// on a build machine) is not "unreachable": `stats` says it is busy, reads
+/// the store directly and starts nothing, rather than announcing a start.
+#[cfg(unix)]
+#[test]
+fn stats_names_a_busy_daemon_instead_of_starting_one() {
+    let e = env();
+    e.cmd().arg("stats").assert().success();
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(e.cache.join("daemon.state.json")).unwrap())
+            .unwrap();
+    let pid = libc::pid_t::try_from(state["pid"].as_u64().unwrap()).unwrap();
+    // SAFETY: kill(2) on the PID this test's own daemon recorded; it only
+    // pauses that process, and SIGCONT below resumes it before the env drops.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "pausing the daemon");
+    let output = e
+        .cmd()
+        .arg("stats")
+        .timeout(std::time::Duration::from_secs(60))
+        .output();
+    // SAFETY: as above, the same PID.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0, "resuming the daemon");
+    let output = output.unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stats still reports: {stderr}");
+    assert!(stderr.contains("did not answer in time (busy)"), "{stderr}");
+    assert!(!stderr.contains("starting one"), "{stderr}");
+}
+
 /// #689 end-to-end: `stats` announces a daemon auto-start on stderr, and a
 /// later invocation pointing `KACHE_CONFIG` at a different file still renders
 /// the daemon's values — now with a warning naming both values and both
