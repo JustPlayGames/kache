@@ -6902,8 +6902,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         Ok(())
     }
 
-    /// Whether an entry's blobs and metadata have reached disk. Unknown rows
-    /// read as durable: the size check and the verification policy still apply.
+    /// Whether an entry's blobs and metadata have reached disk. A row that is
+    /// gone (a concurrent lookup evicted the entry after this one found it) or
+    /// an index error reads as pending, so the lookup verifies the bytes: read
+    /// as durable, only the size check stood between a bad blob and a hit.
     fn entry_is_durable(&self, cache_key: &str) -> bool {
         self.db()
             .query_row(
@@ -6911,7 +6913,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 params![cache_key],
                 |row| row.get::<_, bool>(0),
             )
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Entries stored without an fsync that no flush has reached yet.
