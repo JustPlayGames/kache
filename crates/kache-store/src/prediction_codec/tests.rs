@@ -135,7 +135,7 @@ fn only_a_compressing_cache_compresses_and_never_a_build_scripts_row() {
     let dir = tempfile::tempdir().unwrap();
     let owned = open_cache(&dir);
     let json = closure_json(40);
-    let compressing = FileHashCache::Compressing(owned.db());
+    let compressing = FileHashCache::Compressing(&owned.db());
     compressing
         .put_input_prediction("unit", 2, None, &json)
         .unwrap();
@@ -145,7 +145,7 @@ fn only_a_compressing_cache_compresses_and_never_a_build_scripts_row() {
     compressing
         .put_input_prediction_trimming("tree:", "tree:a", 102, None, &json, 2)
         .unwrap();
-    FileHashCache::Borrowed(owned.db())
+    FileHashCache::Borrowed(&owned.db())
         .put_input_prediction("plain", 2, None, &json)
         .unwrap();
     assert_eq!(stored(&owned, "unit").1, "blob");

@@ -1152,6 +1152,21 @@ pub fn blob_path_in_store_dir(store_dir: &Path, hash: &str) -> PathBuf {
 /// pragma churn — `query_only` hard-refuses any accidental write, and the
 /// short busy timeout lets a caller skip a figure the index is too busy to
 /// answer instead of waiting for it.
+/// How long a read-only store's connection waits for a lock.
+const READ_ONLY_BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// A read-only store's connection: [`open_index_db_readonly`] with its busy
+/// timeout, checked to read. An index that cannot be read fails here, once,
+/// not as a miss per unit.
+fn open_read_only_connection(db_path: &Path, busy_wait: Duration) -> Result<Connection> {
+    let db = open_index_db_readonly(db_path)?;
+    db.busy_timeout(busy_wait)?;
+    db.query_row("SELECT 1 FROM entries LIMIT 1", [], |_| Ok(()))
+        .optional()
+        .with_context(|| format!("read-only store: querying {}", db_path.display()))?;
+    Ok(db)
+}
+
 pub fn open_index_db_readonly(db_path: &Path) -> Result<Connection> {
     let db = Connection::open_with_flags(
         db_path,
@@ -1624,7 +1639,9 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     policy: std::marker::PhantomData<P>,
     config: Config,
     options: StoreOptions,
-    db: Connection,
+    /// Through [`Self::db`]: its own connection, or one it shares with the
+    /// process's other stores, statement by statement ([`crate::index_pool`]).
+    db: crate::index_pool::IndexConn,
     /// Write slice and pause for eviction sweeps: [`EVICTION_WRITE_SLICE`]
     /// and [`EVICTION_WRITE_PAUSE`] outside tests.
     eviction_pacing: (Duration, Duration),
@@ -3231,6 +3248,12 @@ fn positive_or_none(value: i64) -> Option<u64> {
     (value > 0).then_some(value as u64)
 }
 
+impl<P: ArtifactPolicy> crate::file_hash::IndexSource for ArtifactStore<P> {
+    fn index(&self) -> crate::index_pool::IndexGuard<'_> {
+        self.db()
+    }
+}
+
 impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn open(config: impl Into<Config>) -> Result<Self> {
         Self::open_with_options(
@@ -3248,14 +3271,34 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             .with_context(|| format!("creating store directory {}", store_dir.display()))?;
 
         let db_path = config.index_db_path();
-        let (db, recovered) = open_index_db_reporting_recovery(&db_path, config.index_mode)
-            .with_context(|| format!("opening index database {}", db_path.display()))?;
+        let pool = crate::index_pool::Pool::of(
+            &db_path,
+            false,
+            config.index_mode.resolve().pragma_value(),
+        );
+        let (db, recovered) = match pool.as_ref().and_then(crate::index_pool::Pool::take) {
+            Some(pooled) => {
+                pooled.db.busy_timeout(INDEX_BUSY_WAIT)?;
+                (pooled, false)
+            }
+            None => {
+                let (db, recovered) = open_index_db_reporting_recovery(&db_path, config.index_mode)
+                    .with_context(|| format!("opening index database {}", db_path.display()))?;
+                if recovered && let Some(pool) = &pool {
+                    pool.forget();
+                }
+                (
+                    crate::index_pool::Pooled::opened(db, &db_path, pool.is_some()),
+                    recovered,
+                )
+            }
+        };
 
         let store = Self {
             policy: std::marker::PhantomData,
             config: config.clone(),
             options,
-            db,
+            db: crate::index_pool::IndexConn::new(db, pool),
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
             ranking_fresh_for: RANKING_FRESH_FOR,
             size_sweep_walk_budget: SIZE_SWEEP_WALK_BUDGET,
@@ -3348,18 +3391,23 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 }
             }
         }
-        let db = open_index_db_readonly(&db_path)?;
-        let busy_wait = Duration::from_secs(2);
-        db.busy_timeout(busy_wait)?;
-        // An index that cannot be read fails here, once, not as a miss per unit.
-        db.query_row("SELECT 1 FROM entries LIMIT 1", [], |_| Ok(()))
-            .optional()
-            .with_context(|| format!("read-only store: querying {}", db_path.display()))?;
+        let busy_wait = READ_ONLY_BUSY_WAIT;
+        let pool = crate::index_pool::Pool::of(&db_path, true, "");
+        let db = match pool.as_ref().and_then(crate::index_pool::Pool::take) {
+            Some(pooled) => {
+                pooled.db.busy_timeout(busy_wait)?;
+                pooled
+            }
+            None => {
+                let db = open_read_only_connection(&db_path, busy_wait)?;
+                crate::index_pool::Pooled::opened(db, &db_path, pool.is_some())
+            }
+        };
         Ok(Self {
             policy: std::marker::PhantomData,
             config,
             options,
-            db,
+            db: crate::index_pool::IndexConn::new(db, pool),
             eviction_pacing: (EVICTION_WRITE_SLICE, EVICTION_WRITE_PAUSE),
             ranking_fresh_for: RANKING_FRESH_FOR,
             size_sweep_walk_budget: SIZE_SWEEP_WALK_BUDGET,
@@ -3368,6 +3416,31 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             pending_pins: None,
             busy_memo_rows: None,
             busy_wait: std::cell::Cell::new(busy_wait),
+        })
+    }
+
+    /// The index connection, for one statement or transaction. A pooled
+    /// store ([`crate::index_pool`]) takes one here when it holds none: an
+    /// idle one, else a new one. A new one that cannot be opened is an empty
+    /// in-memory database, on which every statement fails as on an
+    /// unreadable index, and is never pooled.
+    fn db(&self) -> crate::index_pool::IndexGuard<'_> {
+        self.db.get(self.busy_wait.get(), |key| {
+            let opened = if key.read_only {
+                open_read_only_connection(&key.path, READ_ONLY_BUSY_WAIT)
+            } else {
+                try_open_index_db(&key.path, self.config.index_mode).map_err(anyhow::Error::from)
+            };
+            match opened {
+                Ok(db) => crate::index_pool::Pooled::opened(db, &key.path, true),
+                Err(error) => {
+                    tracing::warn!(
+                        "reopening the index {} after a park failed: {error:#}",
+                        key.path.display()
+                    );
+                    crate::index_pool::Pooled::unusable()
+                }
+            }
         })
     }
 
@@ -3616,14 +3689,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Give the connection back its own busy timeout after a call that
     /// waited with another.
     fn give_back_busy_timeout(&self) {
-        let _ = self.db.busy_timeout(self.busy_wait.get());
+        let _ = self.db().busy_timeout(self.busy_wait.get());
     }
 
     /// One transaction for `rows`, waiting at most `wait` for the write lock.
     fn write_memo_rows(&self, rows: &[MemoRow], wait: Duration) -> rusqlite::Result<()> {
-        let _ = self.db.busy_timeout(wait);
+        let _ = self.db().busy_timeout(wait);
         let written = (|| -> rusqlite::Result<()> {
-            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            self.db().execute_batch("BEGIN IMMEDIATE")?;
             let cache = self.file_hash_cache();
             for row in rows {
                 // A row of any size holds for exactly its stamp. A restore
@@ -3636,11 +3709,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     cache.put(&row.fingerprint, &row.hash)?;
                 }
             }
-            self.db.execute_batch("COMMIT")
+            self.db().execute_batch("COMMIT")
         })();
         self.give_back_busy_timeout();
-        if written.is_err() && !self.db.is_autocommit() {
-            let _ = self.db.execute_batch("ROLLBACK");
+        if written.is_err() && !self.db().is_autocommit() {
+            let _ = self.db().execute_batch("ROLLBACK");
         }
         written
     }
@@ -3682,11 +3755,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Borrow the persistent memo without exposing the index connection.
     pub fn file_hash_cache(&self) -> crate::file_hash::FileHashCache<'_> {
-        if self.config.compress_predictions {
-            crate::file_hash::FileHashCache::Compressing(&self.db)
-        } else {
-            crate::file_hash::FileHashCache::Borrowed(&self.db)
-        }
+        crate::file_hash::FileHashCache::Store(self, self.config.compress_predictions)
     }
 
     /// Check if a committed entry exists for this cache key.
@@ -3699,7 +3768,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
 
         // Check if it's committed in the database
-        self.db
+        self.db()
             .query_row(
                 "SELECT committed FROM entries WHERE cache_key = ?1",
                 params![cache_key],
@@ -3827,7 +3896,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // ([`kache_format::KeyComponent`]): a C compile or build-script run
         // whose recipe the bump left alone is not stale (lane KACHE-W22).
         let (age_seconds, earlier_key_version): (Option<i64>, bool) = self
-            .db
+            .db()
             .query_row(&HIT_AGE_AND_STALE_SQL, params![cache_key], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
             })
@@ -3848,11 +3917,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             || age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64))
             && !self.hit_stamps.as_ref().is_some_and(|sink| sink(cache_key))
         {
-            let _ = self.db.busy_timeout(HIT_STAMP_BUSY_WAIT);
+            let _ = self.db().busy_timeout(HIT_STAMP_BUSY_WAIT);
             // A hit proves the entry is one this release's keys reach: it is
             // no longer an earlier key version's, whatever version stored it
             // (a component whose key version did not move hits as before).
-            let stamped = self.db.execute(
+            let stamped = self.db().execute(
                 "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + 1, \
                  key_schema = MAX(key_schema, ?2) WHERE cache_key = ?1",
                 params![cache_key, kache_format::CACHE_KEY_VERSION],
@@ -4057,7 +4126,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if prepared.is_empty() {
             return Ok(results);
         }
-        let mut tx = self.begin_entry_registration()?;
+        let db = self.db();
+        let mut tx = self.begin_entry_registration(&db)?;
         for (index, meta, meta_json) in prepared {
             let request = &requests[index];
             let sp = tx.savepoint()?;
@@ -4168,10 +4238,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if hits.is_empty() {
             return Ok(());
         }
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         {
             let mut stamp = tx.prepare_cached(
                 "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + ?2, \
@@ -4715,9 +4784,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if changed.is_empty() && !batch.iter().any(CheckedHandoff::is_ready) {
             return refuse_all(batch, &"refused");
         }
+        let db = self.db();
         let started = match wait {
-            RegistrationWait::Patient => self.begin_entry_registration(),
-            RegistrationWait::AtMost(wait) => self.try_begin_entry_registration(wait),
+            RegistrationWait::Patient => self.begin_entry_registration(&db),
+            RegistrationWait::AtMost(wait) => self.try_begin_entry_registration(&db, wait),
         };
         let mut tx = match started {
             Ok(tx) => tx,
@@ -5184,9 +5254,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         wait: RegistrationWait,
     ) -> Result<Option<StorePutResult>> {
         self.refuse_write("store an entry")?;
+        let db = self.db();
         let tx = match wait {
-            RegistrationWait::Patient => self.begin_entry_registration()?,
-            RegistrationWait::AtMost(wait) => match self.try_begin_entry_registration(wait) {
+            RegistrationWait::Patient => self.begin_entry_registration(&db)?,
+            RegistrationWait::AtMost(wait) => match self.try_begin_entry_registration(&db, wait) {
                 Ok(tx) => tx,
                 Err(error) if is_sqlite_busy(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
@@ -5298,27 +5369,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// burst of stores on a disk whose journal stalls can keep the lock
     /// queued past one timeout, and the entry is worth more than the wait
     /// (its next build would compile it again).
-    fn begin_entry_registration(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        self.begin_write_waiting("registering an entry")
-    }
-
-    /// [`begin_write_waiting`] on this store's connection.
-    fn begin_write_waiting(&self, doing: &str) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        begin_write_waiting(&self.db, doing)
+    /// `db` is this store's connection ([`Self::db`]), which the caller
+    /// holds for as long as the transaction lives.
+    fn begin_entry_registration<'db>(
+        &self,
+        db: &'db Connection,
+    ) -> rusqlite::Result<rusqlite::Transaction<'db>> {
+        begin_write_waiting(db, "registering an entry")
     }
 
     /// [`Self::begin_entry_registration`] in one attempt that waits at most
     /// `wait` for the write lock, the connection's own busy timeout given
     /// back afterwards.
-    fn try_begin_entry_registration(
+    fn try_begin_entry_registration<'db>(
         &self,
+        db: &'db Connection,
         wait: Duration,
-    ) -> rusqlite::Result<rusqlite::Transaction<'_>> {
-        let _ = self.db.busy_timeout(wait);
-        let started = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        );
+    ) -> rusqlite::Result<rusqlite::Transaction<'db>> {
+        let _ = db.busy_timeout(wait);
+        let started =
+            rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate);
         self.give_back_busy_timeout();
         started
     }
@@ -5413,10 +5483,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Content verification above and the strict flush below stay outside it.
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         // A second download of a committed key (two daemons, a retried
         // prefetch) replaces a generation that already holds references.
         release_entry_blob_refs(&tx, cache_key)?;
@@ -5499,10 +5568,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // without weakening the production lock or relying on scheduler
         // sleeps.
         before_write_lock();
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         after_write_lock();
         let committed: i64 = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1 AND committed = 1)",
@@ -5617,10 +5685,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
         // Install missing blobs and register the batch under one writer lock.
         // Preflight and the strict durability flush remain outside the lock.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         let mut imported = 0usize;
         for entry in entries {
             let meta = &entry.meta;
@@ -5852,19 +5919,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Verify that `entry_blobs` and `blobs` exactly match committed entry
     /// metadata. The write lock makes the filesystem/SQLite comparison stable.
     pub fn blob_index_drift(&self) -> Result<BlobIndexDrift> {
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        self.db().execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
-            let (expected, _) = self.authoritative_blob_index(&self.db, false)?;
-            let actual = self.indexed_blob_graph(&self.db)?;
+            let (expected, _) = self.authoritative_blob_index(&self.db(), false)?;
+            let actual = self.indexed_blob_graph(&self.db())?;
             Ok(Self::compare_blob_indexes(&expected, &actual))
         })();
         match result {
             Ok(drift) => {
-                self.db.execute_batch("COMMIT")?;
+                self.db().execute_batch("COMMIT")?;
                 Ok(drift)
             }
             Err(error) => {
-                let _ = self.db.execute_batch("ROLLBACK");
+                let _ = self.db().execute_batch("ROLLBACK");
                 Err(error)
             }
         }
@@ -5874,7 +5941,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// reads, no `meta.json` and no write lock. See
     /// [`crate::BlobRefcountDrift`] for what it can and cannot see.
     pub fn blob_refcount_drift(&self) -> Result<crate::BlobRefcountDrift> {
-        Ok(crate::blob_refcount_drift(&self.db)?)
+        Ok(crate::blob_refcount_drift(&self.db())?)
     }
 
     /// Rebuild only the derived blob graph from committed entry metadata.
@@ -5902,11 +5969,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         drop_unverifiable: bool,
     ) -> Result<(BlobIndexDrift, Vec<String>)> {
         self.refuse_write("reconcile the blob index")?;
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        self.db().execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<(BlobIndexDrift, Vec<String>)> {
-            let (expected, dropped) = self.authoritative_blob_index(&self.db, drop_unverifiable)?;
+            let (expected, dropped) =
+                self.authoritative_blob_index(&self.db(), drop_unverifiable)?;
             for key in &dropped {
-                self.db
+                self.db()
                     .execute("DELETE FROM entries WHERE cache_key = ?1", params![key])?;
                 let entry_dir = self.entry_dir(key);
                 if let Err(error) = fs::remove_dir_all(&entry_dir)
@@ -5917,22 +5985,22 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     });
                 }
             }
-            let actual = self.indexed_blob_graph(&self.db)?;
+            let actual = self.indexed_blob_graph(&self.db())?;
             let drift = Self::compare_blob_indexes(&expected, &actual);
             if drift.total() == 0 {
                 return Ok((drift, dropped));
             }
 
-            self.db.execute("DELETE FROM entry_blobs", [])?;
-            self.db.execute("DELETE FROM blobs", [])?;
+            self.db().execute("DELETE FROM entry_blobs", [])?;
+            self.db().execute("DELETE FROM blobs", [])?;
             for ((cache_key, hash), refs) in &expected.entry_mappings {
-                self.db.execute(
+                self.db().execute(
                     "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, ?3)",
                     params![cache_key, hash, refs],
                 )?;
             }
             for (hash, (size, refcount)) in &expected.blobs {
-                self.db.execute(
+                self.db().execute(
                     "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, ?3)",
                     params![hash, size, refcount],
                 )?;
@@ -5941,11 +6009,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         })();
         match result {
             Ok(outcome) => {
-                self.db.execute_batch("COMMIT")?;
+                self.db().execute_batch("COMMIT")?;
                 Ok(outcome)
             }
             Err(error) => {
-                let _ = self.db.execute_batch("ROLLBACK");
+                let _ = self.db().execute_batch("ROLLBACK");
                 Err(error)
             }
         }
@@ -6068,7 +6136,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let crate_type_str = meta.crate_types.join(",");
         let num_features = meta.features.len() as i64;
 
-        let tx = self.db.unchecked_transaction()?;
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
         // Claim the entry row first. If it is already there, a concurrent or
         // earlier rebuild owns this entry's refcounts and we must not add more.
         let inserted = tx.execute(
@@ -6124,7 +6193,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             "SELECT cache_key, crate_name, compile_time_ms, size FROM entries WHERE committed = 1 AND crate_name IN ({}) ORDER BY last_accessed DESC",
             placeholders.join(",")
         );
-        let mut stmt = self.db.prepare(&sql)?;
+        let db = self.db();
+        let mut stmt = db.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> = crate_names
             .iter()
             .map(|n| n as &dyn rusqlite::ToSql)
@@ -6676,7 +6746,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return Ok(stats);
         };
         let live: std::collections::HashSet<String> = self
-            .db
+            .db()
             .prepare("SELECT cache_key FROM entries")?
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -6818,7 +6888,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     fn finish_strict_durability(&self, cache_key: &str) -> Result<()> {
         if self.durable_writes() {
             self.flush_entry_durability(cache_key)?;
-            let durable: bool = self.db.query_row(
+            let durable: bool = self.db().query_row(
                 "SELECT EXISTS(SELECT 1 FROM entries
                  WHERE cache_key = ?1 AND committed = 1 AND durable = 1)",
                 params![cache_key],
@@ -6837,7 +6907,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// an index error reads as pending, so the lookup verifies the bytes: read
     /// as durable, only the size check stood between a bad blob and a hit.
     fn entry_is_durable(&self, cache_key: &str) -> bool {
-        self.db
+        self.db()
             .query_row(
                 "SELECT durable FROM entries WHERE cache_key = ?1",
                 params![cache_key],
@@ -6848,7 +6918,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Entries stored without an fsync that no flush has reached yet.
     pub fn pending_durability(&self) -> Result<u64> {
-        Ok(self.db.query_row(
+        Ok(self.db().query_row(
             "SELECT count(*) FROM entries WHERE committed = 1 AND durable = 0",
             [],
             |row| row.get::<_, i64>(0),
@@ -6860,7 +6930,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// connection a process opens afterwards: its commits checkpoint only
     /// once the log reaches [`DEFERRED_AUTOCHECKPOINT_PAGES`].
     pub fn defer_wal_checkpoints_here(&self) -> Result<()> {
-        self.db
+        self.db()
             .pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
         Ok(())
     }
@@ -6869,7 +6939,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// checkpoint the WAL (`PRAGMA wal_autocheckpoint`).
     pub fn wal_autocheckpoint_pages(&self) -> Result<i64> {
         Ok(self
-            .db
+            .db()
             .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
     }
 
@@ -6879,9 +6949,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// log's frames and how many of them are now in the index.
     pub fn checkpoint_wal(&self) -> Result<(i64, i64)> {
         self.refuse_write("checkpoint the index")?;
-        Ok(self.db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            Ok((row.get(1)?, row.get(2)?))
-        })?)
+        Ok(self
+            .db()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(1)?, row.get(2)?))
+            })?)
     }
 
     /// Flush up to `limit` entries stored without an fsync: every blob and
@@ -6891,7 +6963,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn flush_durability(&self, limit: usize) -> Result<usize> {
         self.refuse_write("flush durability")?;
         let keys: Vec<String> = {
-            let mut stmt = self.db.prepare_cached(
+            let db = self.db();
+            let mut stmt = db.prepare_cached(
                 "SELECT cache_key FROM entries WHERE committed = 1 AND durable = 0
                  ORDER BY created_at LIMIT ?1",
             )?;
@@ -6921,7 +6994,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ) -> Result<bool> {
         self.refuse_write("flush entry durability")?;
         let pending_hash: Option<String> = self
-            .db
+            .db()
             .query_row(
                 "SELECT content_hash FROM entries
                  WHERE cache_key = ?1 AND committed = 1 AND durable = 0",
@@ -6989,10 +7062,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         sync_file(&metadata_file).context("flushing entry metadata")?;
         crate::atomic::fsync_dir(&entry_dir).context("flushing entry directory")?;
         before_promotion();
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         let current_hash: Option<String> = tx
             .query_row(
                 "SELECT content_hash FROM entries
@@ -7075,9 +7147,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // publishers; hashing and fsync still run after this guard drops.
         // Large-entry promotion already holds the writer transaction.
         #[cfg(windows)]
+        let db = self.db();
+        #[cfg(windows)]
         let _writer = if writer_guard.is_none() {
             Some(rusqlite::Transaction::new_unchecked(
-                &self.db,
+                &db,
                 rusqlite::TransactionBehavior::Immediate,
             )?)
         } else {
@@ -7095,7 +7169,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Calculate the total size of the store.
     pub fn total_size(&self) -> Result<u64> {
         let size: i64 =
-            self.db
+            self.db()
                 .query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |row| {
                     row.get(0)
                 })?;
@@ -7112,7 +7186,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// was deferred sit outside this sum.
     pub fn physical_size(&self) -> Result<u64> {
         let size: i64 =
-            self.db
+            self.db()
                 .query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
                     row.get(0)
                 })?;
@@ -7122,9 +7196,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Every indexed blob of at least `min_size` bytes, as `(hash, size)`.
     /// One query, where listing the blob directories would stat every file.
     pub fn blobs_at_least(&self, min_size: u64) -> Result<Vec<(String, u64)>> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT hash, size FROM blobs WHERE size >= ?1")?;
+        let db = self.db();
+        let mut stmt = db.prepare("SELECT hash, size FROM blobs WHERE size >= ?1")?;
         let rows = stmt.query_map([i64::try_from(min_size).unwrap_or(i64::MAX)], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -7139,7 +7212,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Get the number of entries in the store.
     pub fn entry_count(&self) -> Result<usize> {
         let count: i64 = self
-            .db
+            .db()
             .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))?;
         Ok(count as usize)
     }
@@ -7153,7 +7226,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if unit.is_empty() {
             return Ok(());
         }
-        self.db.execute(
+        self.db().execute(
             "UPDATE entries SET unit_id = ?2 WHERE cache_key = ?1",
             params![cache_key, unit],
         )?;
@@ -7171,7 +7244,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // [`INCREMENTAL_DIR_REFRESH`] is left as it is: read first. A sweep
         // that removed the row (and the directory) makes the next unit
         // register it again.
-        let fresh: bool = self.db.query_row(
+        let fresh: bool = self.db().query_row(
             "SELECT EXISTS(SELECT 1 FROM incremental_dirs WHERE path = ?1 \
              AND last_seen > datetime('now', ?2))",
             params![
@@ -7183,7 +7256,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if fresh {
             return Ok(());
         }
-        self.db.execute(
+        self.db().execute(
             "INSERT OR REPLACE INTO incremental_dirs (path, last_seen) VALUES (?1, datetime('now'))",
             params![path],
         )?;
@@ -7197,9 +7270,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// writes the rows wrappers handed it under one take of the write lock.
     pub fn with_write_transaction<T>(&self, write: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
         self.refuse_write("write handed rows")?;
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        self.db().execute_batch("BEGIN IMMEDIATE")?;
         let written = write(self);
-        finish_transaction(&self.db, written.is_ok())?;
+        finish_transaction(&self.db(), written.is_ok())?;
         written
     }
 
@@ -7259,7 +7332,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // warm target directory costs one query per invocation, not a wait
         // behind whichever miss is storing.
         let fresh: Option<bool> = self
-            .db
+            .db()
             .query_row(
                 "SELECT discovered = 0 AND last_seen > unixepoch() - 300
                     AND workspace_root = ?2 AND device = ?3 AND inode = ?4
@@ -7280,12 +7353,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         // The row and the removal of its aliases commit together, so another
         // registration cannot slip between them and lose its row to ours.
-        let in_transaction = !self.db.is_autocommit();
+        let in_transaction = !self.db().is_autocommit();
         if !in_transaction {
             if let Some(wait) = wait {
-                let _ = self.db.busy_timeout(wait);
+                let _ = self.db().busy_timeout(wait);
             }
-            let begun = self.db.execute_batch("BEGIN IMMEDIATE");
+            let begun = self.db().execute_batch("BEGIN IMMEDIATE");
             if wait.is_some() {
                 self.give_back_busy_timeout();
             }
@@ -7293,7 +7366,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let written = self.record_target_root(&target, &workspace_root, identity, rustc);
         if !in_transaction {
-            finish_transaction(&self.db, written.is_ok())?;
+            finish_transaction(&self.db(), written.is_ok())?;
         }
         written
     }
@@ -7311,7 +7384,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if crate::filesystem::directory_identity(target) != Some(identity) {
             return Ok(());
         }
-        self.db.execute(
+        self.db().execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
              VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, ?5, 0)
@@ -7340,7 +7413,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // while Cargo used a /var or /tmp spelling, and rows recorded before
         // paths were normalized may spell it through `..`. The build row is
         // authoritative; discard every alias by inode.
-        self.db.execute(
+        self.db().execute(
             "DELETE FROM target_roots
              WHERE path != ?1 AND device = ?2 AND inode = ?3",
             params![
@@ -7350,11 +7423,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             ],
         )?;
         // A registration that got here wrote its row; prune the registry.
-        self.db.execute(
+        self.db().execute(
             "DELETE FROM target_roots WHERE last_seen < unixepoch() - 15552000",
             [],
         )?;
-        self.db.execute(
+        self.db().execute(
             "DELETE FROM target_roots WHERE path IN (
                 SELECT path FROM target_roots
                 ORDER BY discovered ASC, last_seen DESC, path ASC
@@ -7381,7 +7454,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let Some(identity) = crate::filesystem::directory_identity(&target) else {
             return Ok(false);
         };
-        let inserted = self.db.execute(
+        let inserted = self.db().execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode, discovered)
              VALUES (?1, ?2, unixepoch(), unixepoch(), ?3, ?4, 1)
@@ -7406,7 +7479,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let inserted = inserted != 0;
         // A Git repository can expose many worktrees, but it must not crowd
         // targets whose builds kache actually observed out of the registry.
-        self.db.execute(
+        self.db().execute(
             "DELETE FROM target_roots WHERE path IN (
                 SELECT path FROM target_roots
                 ORDER BY discovered ASC, last_seen DESC, path ASC
@@ -7419,7 +7492,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     pub fn tracked_target_roots(&self, stale_hours: u64) -> Result<Vec<TrackedTargetRoot>> {
         let stale_seconds = stale_hours.saturating_mul(3600).min(i64::MAX as u64) as i64;
-        let mut stmt = self.db.prepare(
+        let db = self.db();
+        let mut stmt = db.prepare(
             "SELECT path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered
              FROM target_roots
              WHERE last_seen <= unixepoch() - ?1
@@ -7480,7 +7554,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return recorded;
         }
         if !self.read_only
-            && let Err(error) = self.db.execute(
+            && let Err(error) = self.db().execute(
                 "UPDATE target_roots SET device = ?1
                  WHERE path = ?2 AND device = ?3 AND inode = ?4",
                 params![
@@ -7502,7 +7576,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// When a build or Git discovery last recorded `path`, if it is tracked.
     pub fn target_root_last_seen(&self, path: &Path) -> Result<Option<i64>> {
         Ok(self
-            .db
+            .db()
             .query_row(
                 "SELECT last_seen FROM target_roots WHERE path = ?1",
                 params![path.to_string_lossy()],
@@ -7513,7 +7587,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     pub fn forget_target_root(&self, path: &Path) -> Result<()> {
         self.refuse_write("forget a target root")?;
-        self.db.execute(
+        self.db().execute(
             "DELETE FROM target_roots WHERE path = ?1",
             params![path.to_string_lossy()],
         )?;
@@ -7532,13 +7606,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Check and delete in one write transaction: a build that recreates
         // the path either registered first, so the path exists and its row
         // stays, or waits and records a fresh row after this one is gone.
-        let in_transaction = !self.db.is_autocommit();
+        let in_transaction = !self.db().is_autocommit();
         if !in_transaction {
-            self.db.execute_batch("BEGIN IMMEDIATE")?;
+            self.db().execute_batch("BEGIN IMMEDIATE")?;
         }
         let forgotten = self.forget_gone_rows_with_identity(identity);
         if !in_transaction {
-            finish_transaction(&self.db, forgotten.is_ok())?;
+            finish_transaction(&self.db(), forgotten.is_ok())?;
         }
         forgotten
     }
@@ -7548,9 +7622,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         identity: crate::filesystem::PathIdentity,
     ) -> Result<()> {
         let paths: Vec<String> = {
-            let mut stmt = self
-                .db
-                .prepare("SELECT path FROM target_roots WHERE device = ?1 AND inode = ?2")?;
+            let db = self.db();
+            let mut stmt =
+                db.prepare("SELECT path FROM target_roots WHERE device = ?1 AND inode = ?2")?;
             stmt.query_map(
                 params![identity.device.to_string(), identity.inode.to_string()],
                 |row| row.get(0),
@@ -7576,7 +7650,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         identity: crate::filesystem::PathIdentity,
     ) -> Result<()> {
         self.refuse_write("forget a target root")?;
-        self.db.execute(
+        self.db().execute(
             "DELETE FROM target_roots WHERE path = ?1 AND device = ?2 AND inode = ?3",
             params![
                 path.to_string_lossy(),
@@ -7591,9 +7665,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn clean_registered_incremental_dirs(&self) -> Result<usize> {
         self.refuse_write("clean incremental directories")?;
         let paths: Vec<String> = {
-            let mut stmt = self
-                .db
-                .prepare("SELECT path FROM incremental_dirs ORDER BY last_seen ASC")?;
+            let db = self.db();
+            let mut stmt =
+                db.prepare("SELECT path FROM incremental_dirs ORDER BY last_seen ASC")?;
             stmt.query_map([], |row| row.get(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -7602,7 +7676,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         for path_str in paths {
             let path = PathBuf::from(&path_str);
             if !path.exists() {
-                self.db.execute(
+                self.db().execute(
                     "DELETE FROM incremental_dirs WHERE path = ?1",
                     params![path_str],
                 )?;
@@ -7614,7 +7688,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     "registered incremental path is not a directory, pruning: {}",
                     path.display()
                 );
-                self.db.execute(
+                self.db().execute(
                     "DELETE FROM incremental_dirs WHERE path = ?1",
                     params![path_str],
                 )?;
@@ -7623,7 +7697,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
             match fs::remove_dir_all(&path) {
                 Ok(()) => {
-                    self.db.execute(
+                    self.db().execute(
                         "DELETE FROM incremental_dirs WHERE path = ?1",
                         params![path_str],
                     )?;
@@ -7660,7 +7734,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ) -> Result<Vec<crate::eviction::EntryFeatures>> {
         #[cfg(any(test, feature = "test-support"))]
         slow_eviction_scan_for_test(&self.config.cache_dir);
-        let mut stmt = self.db.prepare(&format!(
+        let db = self.db();
+        let mut stmt = db.prepare(&format!(
             "SELECT cache_key, size, CASE WHEN {stale} THEN 0 ELSE hit_count END,
                     content_hash, committed,
                     (julianday('now') - julianday(last_accessed)) * 24.0
@@ -7813,7 +7888,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // The shadow's victims are stamped with the sweep's start, so the
         // sweep's own tombstones are never older than them.
         let swept_at: Option<String> = shadow.and_then(|_| {
-            self.db
+            self.db()
                 .query_row("SELECT datetime('now')", [], |row| row.get(0))
                 .ok()
         });
@@ -8120,7 +8195,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Read every row first: the probes below touch the filesystem, and a
         // read statement left open across them would pin the WAL snapshot.
         let last_refs = {
-            let mut stmt = self.db.prepare(
+            let db = self.db();
+            let mut stmt = db.prepare(
                 // The filter is holds_last_reference's: most rows fail it,
                 // and each one read costs two 64-character strings.
                 "SELECT eb.cache_key, b.hash, b.size, b.refcount, eb.refs
@@ -8164,7 +8240,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // Read every row first, as in held_by_live_files: no read statement
         // stays open across the filesystem probes.
         let last_refs = {
-            let mut stmt = self.db.prepare_cached(
+            let db = self.db();
+            let mut stmt = db.prepare_cached(
                 "SELECT b.hash, b.size, b.refcount, eb.refs
                  FROM entry_blobs eb JOIN blobs b ON b.hash = eb.hash
                  WHERE eb.cache_key = ?1",
@@ -8410,7 +8487,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                  AND last_accessed >= datetime('now', ?1))"
             )
         };
-        let mut stmt = self.db.prepare(&format!(
+        let db = self.db();
+        let mut stmt = db.prepare(&format!(
             "SELECT cache_key FROM entries
              WHERE committed = 1
                AND (key_schema = 0 OR key_schema > {rustc} OR key_schema < {component})
@@ -8535,10 +8613,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // `blobs` table and unlink the unreferenced ones. `BEGIN IMMEDIATE`
         // takes the write lock up front so the unlinks serialize with any
         // `put`/`remove_entry` mutating the same blob.
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        self.db().execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
             let referenced: std::collections::HashSet<String> = {
-                let mut stmt = self.db.prepare("SELECT hash FROM blobs")?;
+                let db = self.db();
+                let mut stmt = db.prepare("SELECT hash FROM blobs")?;
                 stmt.query_map([], |row| row.get::<_, String>(0))?
                     .filter_map(|r| r.ok())
                     .collect()
@@ -8555,11 +8634,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         })();
         match result {
             Ok(()) => {
-                self.db.execute_batch("COMMIT")?;
+                self.db().execute_batch("COMMIT")?;
                 Ok(stats)
             }
             Err(e) => {
-                let _ = self.db.execute_batch("ROLLBACK");
+                let _ = self.db().execute_batch("ROLLBACK");
                 Err(e)
             }
         }
@@ -8571,7 +8650,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn backfill_content_hashes(&self) -> Result<usize> {
         self.refuse_write("backfill content hashes")?;
         let keys: Vec<String> = {
-            let mut stmt = self.db.prepare(
+            let db = self.db();
+            let mut stmt = db.prepare(
                 "SELECT cache_key FROM entries WHERE content_hash IS NULL AND committed = 1",
             )?;
             stmt.query_map([], |row| row.get(0))?
@@ -8585,7 +8665,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
             {
                 let content_hash = compute_content_hash(&meta.files);
-                self.db.execute(
+                self.db().execute(
                     "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
                     params![content_hash, key],
                 )?;
@@ -8632,7 +8712,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     fn backfill_entry_blobs_limited(&self, limit: i64) -> Result<usize> {
         self.refuse_write("backfill blob references")?;
         let keys: Vec<String> = {
-            let mut stmt = self.db.prepare(
+            let db = self.db();
+            let mut stmt = db.prepare(
                 "SELECT cache_key FROM entries
                  WHERE committed = 1
                    AND cache_key NOT IN (SELECT cache_key FROM entry_blobs)
@@ -8650,7 +8731,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 && let Ok(meta) = serde_json::from_str::<EntryMeta>(&content)
                 && !meta.files.is_empty()
             {
-                let tx = self.db.unchecked_transaction()?;
+                let db = self.db();
+                let tx = db.unchecked_transaction()?;
                 // Re-check under the write lock: a concurrent put/import may
                 // have registered this entry's rows since the SELECT above —
                 // and the entry row must still exist, or a concurrent removal
@@ -8689,7 +8771,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         policy: &str,
         shadow: Option<(&str, bool)>,
     ) {
-        let result = self.db.execute(
+        let result = self.db().execute(
             "INSERT OR REPLACE INTO eviction_tombstones
                 (cache_key, evicted_at, policy, size, hit_count, idle_hours, compile_time_ms,
                  demanded_at, shadow_policy, shadow_would_evict)
@@ -8724,7 +8806,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             return;
         }
         let result = (|| -> rusqlite::Result<()> {
-            let tx = self.db.unchecked_transaction()?;
+            let db = self.db();
+            let tx = db.unchecked_transaction()?;
             {
                 let mut insert = tx.prepare(
                     "INSERT OR IGNORE INTO shadow_victims
@@ -8760,7 +8843,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// on its later tombstone, or when its tombstone saw a request. Rows of
     /// unknown cost are left out, as in [`Self::shadow_demand_split`].
     pub fn shadow_counterfactual(&self) -> Result<ShadowCounterfactual> {
-        let row = self.db.query_row(
+        let row = self.db().query_row(
             "WITH since AS (SELECT MIN(swept_at) AS t FROM shadow_victims),
              live AS (
                 SELECT * FROM eviction_tombstones
@@ -8821,7 +8904,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         as_of_unix_secs: i64,
         horizon_secs: u64,
     ) -> Result<crate::EvictionHorizonEvidence> {
-        crate::eviction_evidence::read(&self.db, as_of_unix_secs, horizon_secs)
+        crate::eviction_evidence::read(&self.db(), as_of_unix_secs, horizon_secs)
     }
 
     /// Note that a key was requested after being evicted — the observation the
@@ -8834,7 +8917,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Only the *first* demand is recorded — that is the interval the reuse
     /// question is about.
     fn note_tombstone_demand(&self, cache_key: &str) {
-        let pending: Result<i64, _> = self.db.query_row(
+        let pending: Result<i64, _> = self.db().query_row(
             "SELECT EXISTS(SELECT 1 FROM eviction_tombstones
                            WHERE cache_key = ?1 AND demanded_at IS NULL)",
             params![cache_key],
@@ -8843,7 +8926,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if !matches!(pending, Ok(1)) {
             return;
         }
-        let updated = self.db.execute(
+        let updated = self.db().execute(
             "UPDATE eviction_tombstones SET demanded_at = datetime('now')
              WHERE cache_key = ?1 AND demanded_at IS NULL",
             params![cache_key],
@@ -8864,11 +8947,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn prune_tombstones(&self, keep_days: u64) -> Result<usize> {
         self.refuse_write("prune tombstones")?;
         let cutoff = format!("-{keep_days} days");
-        let removed = self.db.execute(
+        let removed = self.db().execute(
             "DELETE FROM eviction_tombstones WHERE evicted_at < datetime('now', ?1)",
             params![cutoff],
         )?;
-        self.db.execute(
+        self.db().execute(
             "DELETE FROM shadow_victims WHERE swept_at < datetime('now', ?1)",
             params![cutoff],
         )?;
@@ -8881,7 +8964,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// The ratio is the headline number for #594: a high rate means eviction is
     /// discarding entries the build still wants.
     pub fn tombstone_stats(&self) -> Result<(usize, usize)> {
-        let row = self.db.query_row(
+        let row = self.db().query_row(
             "SELECT COUNT(*), COUNT(demanded_at) FROM eviction_tombstones",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -8908,7 +8991,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// counting them would bias the kept cohort with young, high-demand
     /// keys.
     pub fn shadow_demand_split(&self) -> Result<ShadowDemandSplit> {
-        let row = self.db.query_row(
+        let row = self.db().query_row(
             "SELECT
                 COUNT(CASE WHEN shadow_would_evict = 1 THEN 1 END),
                 COUNT(CASE WHEN shadow_would_evict = 1 AND demanded_at IS NOT NULL THEN 1 END),
@@ -9057,9 +9140,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// hash per reference, as `meta.files` would list them. Empty for an
     /// entry never mapped (a legacy entry not yet backfilled).
     fn mapped_blob_references(&self, cache_key: &str) -> Result<Vec<String>> {
-        let mut stmt = self
-            .db
-            .prepare_cached("SELECT hash, refs FROM entry_blobs WHERE cache_key = ?1")?;
+        let db = self.db();
+        let mut stmt =
+            db.prepare_cached("SELECT hash, refs FROM entry_blobs WHERE cache_key = ?1")?;
         let rows = stmt
             .query_map(params![cache_key], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -9143,7 +9226,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 // healthy removers. Both shapes mean the same thing — someone
                 // else is mid-operation — so both settle on the write lock
                 // rather than on a sleep.
-                let tx = self.db.unchecked_transaction()?;
+                let db = self.db();
+                let tx = db.unchecked_transaction()?;
                 tx.execute("UPDATE entries SET cache_key = cache_key WHERE 1 = 0", [])?;
                 let row_exists: i64 = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1)",
@@ -9247,10 +9331,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // SQLITE_BUSY_SNAPSHOT) without calling the busy handler. A build
         // writing to the index at that moment then made the sweep skip the
         // entry instead of waiting a few milliseconds for it.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
 
         // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
         // the write lock, before any decrement or unlink — if the entry was
@@ -9392,8 +9475,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // of giving up after one busy timeout: a sweep on a busy index used
         // to log "skipping eviction ... database is locked" here and leave
         // both on disk.
-        let cleanup_tx = self
-            .begin_write_waiting("removing an evicted entry's files")
+        let db = self.db();
+        let cleanup_tx = begin_write_waiting(&db, "removing an evicted entry's files")
             .with_context(|| {
                 format!(
                     "entry {cache_key}: removed from the index, but its directory and \
@@ -9510,7 +9593,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn insert_entry_row_for_test(&self, cache_key: &str) {
-        self.db
+        self.db()
             .execute(
                 "INSERT OR REPLACE INTO entries (cache_key, crate_name, size, committed) \
                  VALUES (?1, 'test', 1, 1)",
@@ -9523,7 +9606,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn set_busy_timeout_for_test(&self, wait: Duration) {
-        self.db.busy_timeout(wait).unwrap();
+        self.db().busy_timeout(wait).unwrap();
         self.busy_wait.set(wait);
     }
 
@@ -9535,7 +9618,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn set_key_schema_for_test(&self, cache_key: &str, version: u32) {
-        self.db
+        self.db()
             .execute(
                 "UPDATE entries SET key_schema = ?2 WHERE cache_key = ?1",
                 params![cache_key, version],
@@ -9553,7 +9636,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn set_last_accessed_for_test(&self, cache_key: &str, sql_modifier: &str) {
-        self.db
+        self.db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', ?2) WHERE cache_key = ?1",
                 params![cache_key, sql_modifier],
@@ -9608,7 +9691,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn clear(&self) -> Result<()> {
         self.refuse_write("clear the store")?;
         let drop_index_rows = || -> Result<()> {
-            let tx = self.db.unchecked_transaction()?;
+            let db = self.db();
+            let tx = db.unchecked_transaction()?;
             tx.execute("DELETE FROM entries", [])?;
             tx.execute("DELETE FROM entry_blobs", [])?;
             tx.execute("DELETE FROM blobs", [])?;
@@ -9657,7 +9741,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             _ => "crate_name ASC",
         };
 
-        let mut stmt = self.db.prepare(&format!(
+        let db = self.db();
+        let mut stmt = db.prepare(&format!(
             "SELECT cache_key, crate_name, crate_type, profile, size, created_at, last_accessed, hit_count, content_hash FROM entries WHERE committed = 1 ORDER BY {order_clause}"
         ))?;
 
@@ -9701,10 +9786,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         meta: &EntryMeta,
         after_preflight: impl FnOnce(),
     ) -> Result<bool> {
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        let db = self.db();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         let committed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM entries WHERE cache_key = ?1 AND committed = 1)",
             params![meta.cache_key],
@@ -9849,15 +9933,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Return content-dedup statistics: unique blobs, physical vs logical size.
     pub fn blob_stats(&self) -> Result<BlobStats> {
         let total_blobs: i64 = self
-            .db
+            .db()
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))?;
         let total_blob_size: i64 =
-            self.db
+            self.db()
                 .query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |row| {
                     row.get(0)
                 })?;
         let total_logical_size: i64 =
-            self.db
+            self.db()
                 .query_row("SELECT COALESCE(SUM(size), 0) FROM entries", [], |row| {
                     row.get(0)
                 })?;

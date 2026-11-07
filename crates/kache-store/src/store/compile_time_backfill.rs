@@ -85,7 +85,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     pub(super) fn compile_time_candidates(&self, limit: i64, now: i64) -> Result<Vec<Candidate>> {
-        let mut stmt = self.db.prepare(SELECT_DUE)?;
+        let db = self.db();
+        let mut stmt = db.prepare(SELECT_DUE)?;
         Ok(stmt
             .query_map(params![now, limit], |row| {
                 Ok(Candidate {
@@ -121,7 +122,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         outcomes: &[Outcome],
         now: i64,
     ) -> Result<usize> {
-        let tx = self.db.unchecked_transaction()?;
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
         let mut recovered = 0;
         {
             let mut success = tx.prepare(

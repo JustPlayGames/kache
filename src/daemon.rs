@@ -7706,6 +7706,15 @@ pub fn run_server(
     // Every connection this process opens (GC, publishes, the durability
     // tick's) leaves routine checkpoints to that tick's explicit passive one.
     kache_store::defer_wal_checkpoints();
+    // The units it runs share index connections statement by statement: each
+    // held one of its own from its store's open to its end, through its waits
+    // and its compile (400-800 at once on a 192-thread machine, 156-193 MB of
+    // page cache). The statements in use come and go in bursts, so only an
+    // eighth of the permits stay idle, each with its page cache, until the
+    // builds stop and the heap trim closes them.
+    kache_store::pool_index_connections(
+        INDEX_CONNECTIONS_IDLE.max(crate::scheduler::default_pool_size() as usize / 8),
+    );
     // Before the runtime starts its threads, each of which would otherwise
     // take an arena of its own.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -8144,6 +8153,10 @@ async fn server_main(
                     return;
                 };
                 let started = Instant::now();
+                // Their page caches are free heap once they close.
+                if matches!(trim, crate::platform::HeapTrim::Quiet { .. }) {
+                    kache_store::close_idle_index_connections();
+                }
                 crate::platform::below_normal(crate::platform::release_free_heap);
                 let after = crate::platform::resident_bytes().unwrap_or(before);
                 gate.trimmed(trim, after);
@@ -8154,6 +8167,7 @@ async fn server_main(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "gave free heap back"
                 );
+                log_index_pool();
             })
             .await;
         }
@@ -8471,6 +8485,7 @@ async fn server_main(
 
     control.finish().await;
     // Socket file is cleaned up by `_socket_guard` (Drop).
+    log_index_pool();
     tracing::info!("daemon stopped");
     Ok(())
 }
@@ -8816,6 +8831,33 @@ impl Drop for DownloadingGuard {
         }
     }
 }
+
+/// The shared index connections' counters (`kache_store::index_pool_stats`),
+/// once the pool has been used.
+fn log_index_pool() {
+    if !kache_store::index_pool_used() {
+        return;
+    }
+    let pool = kache_store::index_pool_stats();
+    tracing::info!(
+        opened = pool.opened,
+        reused = pool.reused,
+        given_back = pool.given_back,
+        closed_over_cap = pool.closed_over_cap,
+        stale = pool.stale,
+        closed_idle = pool.closed_idle,
+        lock_waits = pool.lock_waits,
+        lock_wait_us = pool.lock_wait_us,
+        lock_wait_us_max = pool.lock_wait_us_max,
+        in_use = pool.in_use,
+        in_use_max = pool.in_use_max,
+        idle = pool.idle,
+        "index connections"
+    );
+}
+
+/// The fewest idle index connections the daemon keeps for its units.
+const INDEX_CONNECTIONS_IDLE: usize = 4;
 
 /// How often the daemon sweeps the store (age, housekeeping, size).
 const PERIODIC_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);

@@ -146,14 +146,14 @@ fn attempt(db: &Connection) -> anyhow::Result<Attempt> {
 
 impl FileHashCache<'_> {
     pub fn index_page_stats(&self) -> rusqlite::Result<IndexPageStats> {
-        index_page_stats(self.db())
+        index_page_stats(&self.db())
     }
 
     /// VACUUM the index when its freelist is large. Index reads continue
     /// while it runs but writes wait, so callers pick a quiet moment; a
     /// contended index reports `Busy` instead of failing.
     pub fn compact_index(&self) -> anyhow::Result<IndexCompaction> {
-        Ok(match attempt(self.db())? {
+        Ok(match attempt(&self.db())? {
             Attempt::Done(outcome) => outcome,
             Attempt::BusyBeforeVacuum | Attempt::BusyAfterVacuum => IndexCompaction::Busy,
         })
@@ -162,7 +162,7 @@ impl FileHashCache<'_> {
     /// `compact_index` for explicit repair: anything short of a compaction
     /// that was needed is an error the user can read.
     pub fn compact_sparse_index(&self) -> anyhow::Result<Option<(u64, u64)>> {
-        match attempt(self.db())? {
+        match attempt(&self.db())? {
             Attempt::Done(IndexCompaction::NotNeeded) => Ok(None),
             Attempt::Done(IndexCompaction::Compacted { before, after }) => {
                 Ok(Some((before, after)))
@@ -287,7 +287,7 @@ mod tests {
         assert!(sparse.free_bytes() >= 80 << 20);
         assert!(sparse.live_bytes() < 1 << 20);
         assert!(sparse.should_compact());
-        assert_eq!(index_page_stats(cache.db()).unwrap(), sparse);
+        assert_eq!(index_page_stats(&cache.db()).unwrap(), sparse);
 
         let IndexCompaction::Compacted { before, after } = cache.compact_index().unwrap() else {
             panic!("large freelist must compact");

@@ -55,7 +55,7 @@ fn compiler_selection_is_exact_and_keeps_unknown_and_shared_outputs() {
         "an active restore keeps its entry"
     );
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = '2000-01-01 00:00:00'",
             [],
