@@ -167,12 +167,11 @@ impl FileHashCache<'_> {
         let mut known = HashMap::new();
         let mut from_dir: Option<String> = None;
         let mut after_row = String::new();
-        let mut at_or_after = self
-            .db()
-            .prepare("SELECT path FROM file_hashes WHERE path >= ?1 ORDER BY path LIMIT 1")?;
-        let mut past = self
-            .db()
-            .prepare("SELECT path FROM file_hashes WHERE path > ?1 ORDER BY path LIMIT 1")?;
+        let db = self.db();
+        let mut at_or_after =
+            db.prepare("SELECT path FROM file_hashes WHERE path >= ?1 ORDER BY path LIMIT 1")?;
+        let mut past =
+            db.prepare("SELECT path FROM file_hashes WHERE path > ?1 ORDER BY path LIMIT 1")?;
         loop {
             if start.elapsed() >= budget {
                 done.cut_short = true;
@@ -235,7 +234,8 @@ impl FileHashCache<'_> {
         seen_gone_at: i64,
         batch: usize,
     ) -> rusqlite::Result<usize> {
-        let tx = Transaction::new_unchecked(self.db(), TransactionBehavior::Immediate)?;
+        let db = self.db();
+        let tx = Transaction::new_unchecked(&db, TransactionBehavior::Immediate)?;
         let deleted = tx.execute(
             "DELETE FROM file_hashes WHERE path IN (
                  SELECT path FROM file_hashes

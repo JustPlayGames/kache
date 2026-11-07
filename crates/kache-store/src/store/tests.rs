@@ -1,5 +1,6 @@
 mod compiler_gc_tests;
 mod cost_backfill_tests;
+mod index_pool_tests;
 mod key_bridge_tests;
 
 fn connection_synchronous(db: &Connection) -> i64 {
@@ -44,7 +45,7 @@ fn store_open_applies_the_configured_synchronous_mode() {
             ..test_config(dir.path())
         };
         let store = Store::open(config).unwrap();
-        assert_eq!(connection_synchronous(store.file_hash_cache().db()), pragma);
+        assert_eq!(connection_synchronous(&store.file_hash_cache().db()), pragma);
     }
 }
 
@@ -127,6 +128,7 @@ fn incompatible_predictions_are_relearned_without_removing_compiled_entries() {
                 .unwrap(),
                 ("compiled".into(), 123)
             );
+            drop(cache);
             drop(db);
 
             let db = open_index_db(&path).unwrap();
@@ -176,7 +178,7 @@ fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
         };
         let store = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
         store
-            .db
+            .db()
             .execute_batch(
                 "WITH RECURSIVE rows(n) AS (
                      SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 1000
@@ -189,10 +191,10 @@ fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
             .unwrap();
         if upgrade {
             store
-                .db
+                .db()
                 .execute_batch("DROP INDEX IF EXISTS idx_entries_durability_pending")
                 .unwrap();
-            store.db.pragma_update(None, "user_version", 13).unwrap();
+            store.db().pragma_update(None, "user_version", 13).unwrap();
         }
         drop(store);
         let store = Store::open_with_options(&config, StoreOptions::from_env(|_| None)).unwrap();
@@ -203,8 +205,8 @@ fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
             "SELECT cache_key FROM entries WHERE committed = 1 AND durable = 0
              ORDER BY created_at LIMIT 10",
         ] {
-            let mut stmt = store
-                .db
+            let store_db = store.db();
+            let mut stmt = store_db
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
                 .unwrap();
             let plan: Vec<String> = stmt
@@ -221,7 +223,8 @@ fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
                 plan.iter().all(|step| !step.contains("TEMP B-TREE")),
                 "{plan:?}"
             );
-            let mut stmt = store.db.prepare(sql).unwrap();
+            let store_db = store.db();
+            let mut stmt = store_db.prepare(sql).unwrap();
             let mut rows = stmt.query([]).unwrap();
             while rows.next().unwrap().is_some() {}
             drop(rows);
@@ -254,7 +257,7 @@ fn durability_poll_and_batch_use_pending_index_after_open_and_upgrade() {
                 )
                 .unwrap();
             store
-                .db
+                .db()
                 .execute(
                     "UPDATE entries SET created_at = ?1 WHERE cache_key = ?2",
                     params![created_at, key],
@@ -453,6 +456,7 @@ fn the_cc_memo_rule_columns_arrive_once_and_older_rows_are_never_served() {
         .unwrap();
     db.pragma_update(None, "user_version", 8_i64).unwrap();
     record_as_older_release(&db, "older-memo", 1);
+    drop(cache);
     drop(db);
 
     let db = open_index_db(&path).unwrap();
@@ -735,6 +739,7 @@ fn file_hashes_rebuilt_by_an_older_gc_after_the_upgrade_get_their_rule_back() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+    drop(cache);
     drop(db);
 
     let db = open_index_db(&path).unwrap();
@@ -794,13 +799,13 @@ fn record_entry_unit_updates_only_that_entry() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();
     store
-        .db
+        .db()
         .execute_batch("INSERT INTO entries (cache_key, crate_name) VALUES ('a', 'x'), ('b', 'x');")
         .unwrap();
     store.record_entry_unit("a", "unit-a").unwrap();
     store.record_entry_unit("b", "").unwrap();
     let units: Vec<(String, String)> = store
-        .db
+        .db()
         .prepare("SELECT cache_key, unit_id FROM entries ORDER BY cache_key")
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -2322,11 +2327,10 @@ fn cas_publication_never_replaces_a_published_blob_and_takes_no_index_lock() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     let peer = Store::open(&config).unwrap();
-    let held = rusqlite::Transaction::new_unchecked(
-        &peer.db,
-        rusqlite::TransactionBehavior::Immediate,
-    )
-    .unwrap();
+    let store_db = peer.db();
+    let held =
+        rusqlite::Transaction::new_unchecked(&store_db, rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
     let source = write_temp_file(dir.path(), "locked-publish.rlib", b"published bytes");
     let (staged, _) = store.stage_blob_from_source(&source, false).unwrap();
     let hash = crate::file_hash::hash_file(&staged).unwrap();
@@ -2686,9 +2690,11 @@ fn strict_flush_serializes_the_windows_readonly_open_window() {
     let permissions = fs::metadata(&blob).unwrap().permissions();
     assert!(permissions.readonly());
 
-    let writer =
-        rusqlite::Transaction::new_unchecked(&holder.db, rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
+    let writer = rusqlite::Transaction::new_unchecked(
+        &holder.db(),
+        rusqlite::TransactionBehavior::Immediate,
+    )
+    .unwrap();
     // Reproduce another opener/publisher's temporary writable window. It
     // restores read-only while holding the writer guard, before our opener
     // may inspect permissions. Without that guard our opener snapshots false
@@ -3243,7 +3249,7 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
         config.deferred_durability = true;
         let store = Store::open(&config).unwrap();
         let peer = Store::open(&config).unwrap();
-        peer.db.busy_timeout(Duration::ZERO).unwrap();
+        peer.db().busy_timeout(Duration::ZERO).unwrap();
         let outputs: Vec<_> = (0..count)
             .map(|index| {
                 let name = format!("part-{index}.rlib");
@@ -3281,8 +3287,9 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                         let metadata_sync = kache_fs::file_identity(&meta_path).ok()
                             == kache_fs::handle_identity(file).ok();
                         let must_hold_writer = count == 65 && !metadata_sync;
+                        let store_db = peer.db();
                         let competing = rusqlite::Transaction::new_unchecked(
-                            &peer.db,
+                            &store_db,
                             rusqlite::TransactionBehavior::Immediate,
                         );
                         match competing {
@@ -3387,7 +3394,7 @@ fn durability_deduplicates_shared_hashes_but_rejects_contradictory_sizes() {
     meta.files[1].size += 1;
     fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET content_hash = ?1 WHERE cache_key = 'duplicate-blob'",
             params![compute_content_hash(&meta.files)],
@@ -3425,7 +3432,7 @@ fn durability_flush_rejects_untrusted_pending_metadata_without_promotion() {
                 fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
             }
             "aggregate" => {
-                store.db.execute(
+                store.db().execute(
                     "UPDATE entries SET content_hash = 'different' WHERE cache_key = 'metadata-boundary'", [],
                 ).unwrap();
             }
@@ -3436,7 +3443,7 @@ fn durability_flush_rejects_untrusted_pending_metadata_without_promotion() {
                     meta.files[0].size += 1;
                 }
                 fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
-                store.db.execute(
+                store.db().execute(
                     "UPDATE entries SET content_hash = ?1 WHERE cache_key = 'metadata-boundary'",
                     params![compute_content_hash(&meta.files)],
                 ).unwrap();
@@ -3514,7 +3521,7 @@ fn durability_flush_verifies_reopened_imports_and_continues_after_corruption() {
         fs::write(&blob, &bytes).unwrap();
         let intact = put_entry(&store, dir.path(), 92, "intact", b"intact pending artifact");
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET created_at = CASE WHEN cache_key = ?1
              THEN '2000-01-01' ELSE '2001-01-01' END",
@@ -3591,8 +3598,9 @@ fn durability_flush_checks_metadata_even_when_blob_content_is_unchanged() {
     assert!(
         !store
             .flush_entry_durability_with("metadata-generation", fs::File::sync_all, || {
+                let store_db = peer.db();
                 let tx = rusqlite::Transaction::new_unchecked(
-                    &peer.db,
+                    &store_db,
                     rusqlite::TransactionBehavior::Immediate,
                 )
                 .unwrap();
@@ -3708,7 +3716,7 @@ fn get_counts_hits_and_evicts_damaged_blobs() {
 
         let hit_count = || {
             store
-                .db
+                .db()
                 .query_row(
                     "SELECT hit_count FROM entries WHERE cache_key = 'probe_key'",
                     [],
@@ -4106,21 +4114,21 @@ fn reconcile_blob_index_repairs_refcounts_and_stale_rows_idempotently() {
     fs::write(&stale_path, b"stale indexed blob").unwrap();
 
     store
-        .db
+        .db()
         .execute(
             "UPDATE blobs SET refcount = 41 WHERE hash = ?1",
             params![hash],
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE entry_blobs SET refs = 7 WHERE cache_key = 'repair_a'",
             [],
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 9)",
             params![stale_hash, b"stale indexed blob".len() as i64],
@@ -4148,7 +4156,7 @@ fn reconcile_blob_index_repairs_refcounts_and_stale_rows_idempotently() {
     );
 
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -4158,7 +4166,7 @@ fn reconcile_blob_index_repairs_refcounts_and_stale_rows_idempotently() {
     assert_eq!(refcount, 2);
     assert_eq!(
         store
-            .db
+            .db()
             .query_row(
                 "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
                 params![stale_hash],
@@ -4196,7 +4204,7 @@ fn reconcile_blob_index_fails_closed_on_unreadable_metadata() {
         .hash
         .clone();
     store
-        .db
+        .db()
         .execute(
             "UPDATE blobs SET refcount = 9 WHERE hash = ?1",
             params![hash],
@@ -4211,7 +4219,7 @@ fn reconcile_blob_index_fails_closed_on_unreadable_metadata() {
     let error = store.reconcile_blob_index().unwrap_err().to_string();
     assert!(error.contains("parsing authoritative meta.json"), "{error}");
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -4386,7 +4394,7 @@ fn rebuild_index_from_store_adopts_build_script_names_and_refuses_escaping_ones(
         )
         .unwrap();
 
-    store.db.execute("DELETE FROM entries", []).unwrap();
+    store.db().execute("DELETE FROM entries", []).unwrap();
     let stats = store.rebuild_index_from_store().unwrap();
     assert_eq!(stats.entries_rebuilt, 1, "{stats:?}");
     assert_eq!(stats.entries_skipped, 0, "{stats:?}");
@@ -4401,7 +4409,7 @@ fn rebuild_index_from_store_adopts_build_script_names_and_refuses_escaping_ones(
     meta.files[0].name = "../escape.s".to_string();
     fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
 
-    store.db.execute("DELETE FROM entries", []).unwrap();
+    store.db().execute("DELETE FROM entries", []).unwrap();
     let stats = store.rebuild_index_from_store().unwrap();
     assert_eq!(stats.entries_rebuilt, 0, "{stats:?}");
     assert_eq!(stats.entries_skipped, 1, "{stats:?}");
@@ -4642,11 +4650,11 @@ fn rebuild_index_is_idempotent_and_does_not_inflate_refcounts() {
     let k = put_entry(&store, dir.path(), 3, "gamma", b"gamma rlib content");
 
     let hash: String = store
-        .db
+        .db()
         .query_row("SELECT hash FROM blobs", [], |r| r.get(0))
         .unwrap();
     let refcount_before: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -4665,7 +4673,7 @@ fn rebuild_index_is_idempotent_and_does_not_inflate_refcounts() {
     }
 
     let refcount_after: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -4680,7 +4688,7 @@ fn rebuild_index_is_idempotent_and_does_not_inflate_refcounts() {
     // And removal still reclaims the blob, proving the refcount is truthful.
     store.remove_entry(&k).unwrap();
     let remaining: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
             params![hash],
@@ -4987,7 +4995,7 @@ fn test_store_eviction() {
     // claim it (a just-put entry is "recently accessed" and is now pinned
     // against eviction for EVICTION_IDLE_GRACE — kunobi-ninja/kache#326).
     store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'key1'",
                 [],
@@ -5022,7 +5030,7 @@ fn store_with_one_evictable_entry(dir: &Path, key: &str) -> (Store, Config) {
         .unwrap();
     store.remove_clone_for_test(&output_file);
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = ?1",
             params![key],
@@ -5037,7 +5045,7 @@ fn evict_counts_an_entry_it_fails_to_remove() {
     let (store, _config) = store_with_one_evictable_entry(dir.path(), "broken");
     // Unparseable meta with no blob mapping: its references are unknown.
     store
-        .db
+        .db()
         .execute("DELETE FROM entry_blobs WHERE cache_key = 'broken'", [])
         .unwrap();
     std::fs::write(store.entry_dir("broken").join("meta.json"), b"{not json").unwrap();
@@ -5096,7 +5104,7 @@ fn evict_counts_lock_contention_apart_from_bad_data() {
     // A second writer holding the database for the whole sweep; the
     // removal waits out the busy timeout and fails. The timeout is cut
     // from 5 s so the test does not sit through it.
-    store.db.busy_timeout(Duration::from_millis(50)).unwrap();
+    store.db().busy_timeout(Duration::from_millis(50)).unwrap();
     let blocker = Connection::open(config.index_db_path()).unwrap();
     blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
@@ -5131,7 +5139,7 @@ fn evict_waits_for_a_competing_writer_and_still_evicts() {
 
     let dir = tempfile::tempdir().unwrap();
     let (store, config) = store_with_one_evictable_entry(dir.path(), "contended");
-    store.db.busy_handler(Some(wait_for_lock)).unwrap();
+    store.db().busy_handler(Some(wait_for_lock)).unwrap();
     // The wrapper that spawned the auto-GC worker is still writing its
     // own durability flag when the worker starts evicting.
     let competitor = Connection::open(config.index_db_path()).unwrap();
@@ -5232,7 +5240,7 @@ fn evict_leaves_an_entry_whose_blob_is_still_hardlinked_outside() {
     std::fs::hard_link(&blob, &retainer).unwrap();
 
     store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'kept'",
                 [],
@@ -5283,7 +5291,7 @@ fn disk_pressure_skips_a_hardlinked_entry_without_the_write_lock() {
     let retainer = dir.path().join("target-copy.rlib");
     std::fs::hard_link(store.blob_path(&meta.files[0].hash), &retainer).unwrap();
     store.set_last_accessed_for_test("held", "-1 hour");
-    store.db.busy_handler(Some(give_up)).unwrap();
+    store.db().busy_handler(Some(give_up)).unwrap();
     let build = Connection::open(config.index_db_path()).unwrap();
     build.execute_batch("BEGIN IMMEDIATE").unwrap();
 
@@ -5474,7 +5482,7 @@ fn an_automatic_sweep_values_young_entries_slow_to_compile_ten_times() {
             put_idle_entry(&store, dir.path(), key, size);
             store.set_last_accessed_for_test(key, idle);
             store
-                .db
+                .db()
                 .execute(
                     "UPDATE entries SET compile_time_ms = ?2, hit_count = ?3 WHERE cache_key = ?1",
                     params![key, compile_secs * 1000, hits],
@@ -5600,7 +5608,7 @@ fn evict_leaves_an_entry_whose_blob_is_still_reflinked_outside() {
         return;
     }
     store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'kept-reflink'",
                 [],
@@ -5646,7 +5654,7 @@ fn durable_upload_intent_pins_payload_across_every_eviction_policy_until_retired
         .unwrap();
     store.set_last_accessed_for_test(&pending_key, "-48 hours");
     let duplicate_group = store
-        .db
+        .db()
         .query_row(
             "SELECT content_hash FROM entries WHERE cache_key = ?1",
             params![pending_key.as_str()],
@@ -5672,7 +5680,7 @@ fn durable_upload_intent_pins_payload_across_every_eviction_policy_until_retired
     // Healthy identical entries have zero marginal reclaim and are
     // correctly excluded before the durable-upload pin is consulted.
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
             params![duplicate_group, newer_twin_key.as_str()],
@@ -5784,7 +5792,7 @@ fn eviction_records_a_tombstone_and_a_later_lookup_marks_demand() {
     store.remove_clone_for_test(&out);
     // Age it past the active-pin grace so it is actually evictable.
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-2 hours')",
             [],
@@ -5797,7 +5805,7 @@ fn eviction_records_a_tombstone_and_a_later_lookup_marks_demand() {
     );
 
     let (key, policy, cost, demanded): (String, String, i64, Option<String>) = store
-        .db
+        .db()
         .query_row(
             "SELECT cache_key, policy, compile_time_ms, demanded_at FROM eviction_tombstones",
             [],
@@ -5827,7 +5835,7 @@ fn tombstone_demand_records_only_the_first_request() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO eviction_tombstones (cache_key, evicted_at, demanded_at)
                  VALUES ('k', datetime('now','-1 hour'), NULL)",
@@ -5837,7 +5845,7 @@ fn tombstone_demand_records_only_the_first_request() {
 
     store.note_tombstone_demand("k");
     let first: String = store
-        .db
+        .db()
         .query_row(
             "SELECT demanded_at FROM eviction_tombstones WHERE cache_key='k'",
             [],
@@ -5846,7 +5854,7 @@ fn tombstone_demand_records_only_the_first_request() {
         .unwrap();
     store.note_tombstone_demand("k");
     let second: String = store
-        .db
+        .db()
         .query_row(
             "SELECT demanded_at FROM eviction_tombstones WHERE cache_key='k'",
             [],
@@ -5864,7 +5872,7 @@ fn tombstones_are_pruned_by_age_and_re_eviction_resets_the_record() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO eviction_tombstones (cache_key, evicted_at) VALUES
                    ('old', datetime('now','-30 days')),
@@ -5879,7 +5887,7 @@ fn tombstones_are_pruned_by_age_and_re_eviction_resets_the_record() {
     // Re-evicting a key already demanded must clear the demand so the new
     // observation window starts clean.
     store
-        .db
+        .db()
         .execute(
             "UPDATE eviction_tombstones SET demanded_at = datetime('now') WHERE cache_key='recent'",
             [],
@@ -5933,7 +5941,7 @@ fn put_records_compile_time_and_eviction_can_see_it() {
         .unwrap();
 
     let indexed: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT compile_time_ms FROM entries WHERE cache_key = 'costly'",
             [],
@@ -5978,7 +5986,7 @@ fn backfill_compile_times_recovers_pre_index_entries() {
     // Simulate a row written before the column existed. meta.json still
     // has the real value — that is what makes recovery possible.
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET compile_time_ms = 0, compile_time_backfilled = 0",
             [],
@@ -5987,7 +5995,7 @@ fn backfill_compile_times_recovers_pre_index_entries() {
 
     assert_eq!(store.backfill_compile_times().unwrap(), 1);
     let restored: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT compile_time_ms FROM entries WHERE cache_key = 'legacy'",
             [],
@@ -6032,7 +6040,7 @@ fn backfill_compile_times_is_bounded_per_sweep_and_converges() {
             .unwrap();
     }
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET compile_time_ms = 0, compile_time_backfilled = 0",
             [],
@@ -6075,15 +6083,19 @@ fn recover_legacy_compile_cost(blocking_rows: usize) -> (Vec<usize>, i64, i64) {
     let mut template = serde_json::to_value(store.stored_meta("template").unwrap()).unwrap();
     let hash = template["files"][0]["hash"].as_str().unwrap().to_owned();
     store
-        .db
+        .db()
         .execute("DELETE FROM entries WHERE cache_key='template'", [])
         .unwrap();
     store
-        .db
+        .db()
         .execute("DELETE FROM entry_blobs WHERE cache_key='template'", [])
         .unwrap();
-    store.db.execute("UPDATE blobs SET refcount=0", []).unwrap();
-    let tx = store.db.unchecked_transaction().unwrap();
+    store
+        .db()
+        .execute("UPDATE blobs SET refcount=0", [])
+        .unwrap();
+    let store_db = store.db();
+    let tx = store_db.unchecked_transaction().unwrap();
     for i in 0..=blocking_rows {
         let expensive = i == blocking_rows;
         let key = format!("{i:064x}");
@@ -6113,7 +6125,7 @@ fn recover_legacy_compile_cost(blocking_rows: usize) -> (Vec<usize>, i64, i64) {
         .map(|_| store.backfill_compile_times_limited(3).unwrap())
         .collect();
     let cost = store
-        .db
+        .db()
         .query_row(
             "SELECT compile_time_ms FROM entries WHERE cache_key=?1",
             params![format!("{blocking_rows:064x}")],
@@ -6121,7 +6133,7 @@ fn recover_legacy_compile_cost(blocking_rows: usize) -> (Vec<usize>, i64, i64) {
         )
         .unwrap();
     let unknown = store
-        .db
+        .db()
         .query_row(
             "SELECT COUNT(*) FROM entries WHERE compile_time_ms = 0",
             [],
@@ -6178,7 +6190,7 @@ fn size_pressure_policy_matches_the_sql_ordering_it_replaced() {
     ];
     for (key, size, hits, idle) in seed {
         store
-                .db
+                .db()
                 .execute(
                     "INSERT INTO entries (cache_key, crate_name, size, hit_count, committed, last_accessed)
                      VALUES (?1, 'c', ?2, ?3, 1, datetime('now', ?4))",
@@ -6189,8 +6201,8 @@ fn size_pressure_policy_matches_the_sql_ordering_it_replaced() {
 
     // The exact query this refactor removed from `evict()`.
     let sql_order: Vec<String> = {
-        let mut stmt = store
-            .db
+        let store_db = store.db();
+        let mut stmt = store_db
             .prepare(
                 "SELECT cache_key FROM entries
                      ORDER BY
@@ -6242,7 +6254,7 @@ fn older_than_matches_former_sql_while_duplicate_fails_closed() {
         ("lonely", 200.0, Some("h2")),
     ] {
         store
-                .db
+                .db()
                 .execute(
                     "INSERT INTO entries (cache_key, crate_name, size, committed, content_hash, last_accessed)
                      VALUES (?1, 'c', 100, 1, ?2, datetime('now', ?3))",
@@ -6254,8 +6266,8 @@ fn older_than_matches_former_sql_while_duplicate_fails_closed() {
     let candidates = store.eviction_candidates().unwrap();
 
     let sql_old: Vec<String> = {
-        let mut stmt = store
-            .db
+        let store_db = store.db();
+        let mut stmt = store_db
             .prepare(
                 "SELECT cache_key FROM entries WHERE last_accessed < datetime('now', '-24 hours')",
             )
@@ -6285,8 +6297,8 @@ fn older_than_matches_former_sql_while_duplicate_fails_closed() {
     );
 
     let sql_dup: Vec<String> = {
-        let mut stmt = store
-            .db
+        let store_db = store.db();
+        let mut stmt = store_db
             .prepare(
                 "SELECT e.cache_key FROM entries e
                      JOIN (SELECT content_hash, MAX(last_accessed) AS newest
@@ -6361,7 +6373,7 @@ fn evict_skips_recently_accessed_entry() {
 
     // Age it past the grace window → no longer pinned → evictable.
     store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'live_key'",
                 [],
@@ -6428,7 +6440,7 @@ fn put_test_entry(store: &Store, dir: &Path, key: &str, bytes: usize) {
 
 fn set_idle_past_grace(store: &Store) {
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -6482,7 +6494,7 @@ fn an_import_is_kept_only_within_the_import_pin() {
     let pin = IMPORT_PIN.as_secs() as i64;
     let age = |key: &str, secs: i64| {
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET imported_at = unixepoch() - ?1 WHERE cache_key = ?2",
                 params![secs, key],
@@ -6522,7 +6534,7 @@ fn only_imports_are_stamped_and_only_automatic_sweeps_keep_them() {
     put_test_entry(&store, dir.path(), "built_key", 10);
     let stamped = |key: &str| -> bool {
         store
-            .db
+            .db()
             .query_row(
                 "SELECT imported_at IS NOT NULL FROM entries WHERE cache_key = ?1",
                 params![key],
@@ -6611,7 +6623,9 @@ fn a_freshly_registered_incremental_dir_is_not_written_again() {
 
     let writer = Connection::open(config.index_db_path()).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let _ = store.db.busy_timeout(std::time::Duration::from_millis(10));
+    let _ = store
+        .db()
+        .busy_timeout(std::time::Duration::from_millis(10));
     store
         .remember_incremental_dir(&incremental_dir)
         .expect("a fresh row needs no write");
@@ -6619,7 +6633,7 @@ fn a_freshly_registered_incremental_dir_is_not_written_again() {
 
     // A stale row is written again.
     store
-        .db
+        .db()
         .execute(
             "UPDATE incremental_dirs SET last_seen = datetime('now', '-1 hour')",
             [],
@@ -6627,7 +6641,7 @@ fn a_freshly_registered_incremental_dir_is_not_written_again() {
         .unwrap();
     store.remember_incremental_dir(&incremental_dir).unwrap();
     let fresh: bool = store
-        .db
+        .db()
         .query_row(
             "SELECT last_seen > datetime('now', '-60 seconds') FROM incremental_dirs",
             [],
@@ -6654,7 +6668,7 @@ fn test_incremental_dir_registry_deduplicates_and_cleans() {
         .unwrap();
 
     let count_before: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
             row.get(0)
         })
@@ -6666,7 +6680,7 @@ fn test_incremental_dir_registry_deduplicates_and_cleans() {
     assert!(!incremental_dir.exists());
 
     let count_after: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
             row.get(0)
         })
@@ -6823,7 +6837,7 @@ fn a_target_root_keeps_its_row_when_its_volume_is_renumbered() {
     let path = std::path::absolute(&target).unwrap();
     let set_device = |device: u64| {
         store
-            .db
+            .db()
             .execute(
                 "UPDATE target_roots SET device = ?1 WHERE path = ?2",
                 rusqlite::params![device.to_string(), path.to_string_lossy()],
@@ -6832,7 +6846,7 @@ fn a_target_root_keeps_its_row_when_its_volume_is_renumbered() {
     };
     let stored_device = || -> String {
         store
-            .db
+            .db()
             .query_row(
                 "SELECT device FROM target_roots WHERE path = ?1",
                 rusqlite::params![path.to_string_lossy()],
@@ -6849,7 +6863,7 @@ fn a_target_root_keeps_its_row_when_its_volume_is_renumbered() {
 
     // A replaced directory has a new inode and still reads as replaced.
     store
-        .db
+        .db()
         .execute(
             "UPDATE target_roots SET device = ?1, inode = ?2 WHERE path = ?3",
             rusqlite::params![
@@ -6939,7 +6953,7 @@ fn target_root_registry_filters_by_last_seen() {
 
     assert!(store.tracked_target_roots(24).unwrap().is_empty());
     store
-        .db
+        .db()
         .execute(
             "UPDATE target_roots SET last_seen = unixepoch() - 90000",
             [],
@@ -6967,7 +6981,7 @@ fn target_root_last_seen_reads_one_row() {
 
     store.remember_target_root(&target, &workspace).unwrap();
     store
-        .db
+        .db()
         .execute("UPDATE target_roots SET last_seen = 1234", [])
         .unwrap();
     assert_eq!(store.target_root_last_seen(&target).unwrap(), Some(1234));
@@ -6996,7 +7010,7 @@ fn target_registry_prunes_only_after_a_real_upsert() {
 
     let insert_stale = |path: &str| {
         store
-            .db
+            .db()
             .execute(
                 "INSERT INTO target_roots
                      (path, workspace_root, first_seen, last_seen, device, inode)
@@ -7007,7 +7021,7 @@ fn target_registry_prunes_only_after_a_real_upsert() {
     };
     let contains = |path: &str| -> bool {
         store
-            .db
+            .db()
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM target_roots WHERE path = ?1)",
                 params![path],
@@ -7044,7 +7058,7 @@ fn clean_registered_incremental_dirs_prunes_a_non_directory_path() {
     // The file is left in place (we only remove directories), but its row is gone.
     assert!(bogus.exists(), "the non-directory file is not deleted");
     let remaining: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
             row.get(0)
         })
@@ -7075,7 +7089,7 @@ fn clean_registered_incremental_dirs_keeps_row_when_remove_fails() {
     assert_eq!(cleaned, 0, "failed removals are not counted as cleaned");
     assert!(incremental_dir.exists(), "failed removal leaves the dir");
     let remaining: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
             row.get(0)
         })
@@ -7407,7 +7421,7 @@ fn claim_build_evicts_empty_committed_entry() {
     )
     .unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES (?1, ?2, 0, 1)",
             params![cache_key, "empty"],
@@ -7713,7 +7727,7 @@ fn a_build_replaces_an_older_spelling_of_the_same_target() {
     store.remember_target_root(&shared, &worktree).unwrap();
     let old = worktree.join("../shared");
     store
-        .db
+        .db()
         .execute(
             "UPDATE target_roots SET path = ?1, last_seen = last_seen - 86400",
             [old.to_string_lossy()],
@@ -7735,23 +7749,23 @@ fn a_registration_joins_the_callers_transaction() {
     let workspace = dir.path().join("workspace");
     let target = workspace.join("target");
     tagged_target(&target);
-    store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.db().execute_batch("BEGIN IMMEDIATE").unwrap();
     store.remember_target_root(&target, &workspace).unwrap();
-    store.db.execute_batch("ROLLBACK").unwrap();
+    store.db().execute_batch("ROLLBACK").unwrap();
     assert!(store.tracked_target_roots(0).unwrap().is_empty());
     store.remember_target_root(&target, &workspace).unwrap();
-    assert!(store.db.is_autocommit(), "no transaction left open");
+    assert!(store.db().is_autocommit(), "no transaction left open");
     assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
 
     // Forgetting a removed directory joins a caller's transaction the same way.
     let identity = crate::filesystem::directory_identity(&target).unwrap();
     std::fs::remove_dir_all(&target).unwrap();
-    store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.db().execute_batch("BEGIN IMMEDIATE").unwrap();
     store.forget_target_roots_with_identity(identity).unwrap();
-    store.db.execute_batch("ROLLBACK").unwrap();
+    store.db().execute_batch("ROLLBACK").unwrap();
     assert_eq!(store.tracked_target_roots(0).unwrap().len(), 1);
     store.forget_target_roots_with_identity(identity).unwrap();
-    assert!(store.db.is_autocommit(), "no transaction left open");
+    assert!(store.db().is_autocommit(), "no transaction left open");
     assert!(store.tracked_target_roots(0).unwrap().is_empty());
 }
 
@@ -7796,7 +7810,7 @@ fn forgetting_by_identity_keeps_rows_whose_path_still_exists() {
     let identity = crate::filesystem::directory_identity(&target).unwrap();
     let gone = std::path::absolute(dir.path()).unwrap().join("gone/target");
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO target_roots
                 (path, workspace_root, first_seen, last_seen, device, inode, rustc, discovered)
@@ -7822,7 +7836,7 @@ fn forgetting_a_removed_target_matches_its_identity_not_its_path() {
     store.remember_target_root(&target, &workspace).unwrap();
     let removed = crate::filesystem::directory_identity(&target).unwrap();
     store
-        .db
+        .db()
         .execute("UPDATE target_roots SET path = 'another spelling'", [])
         .unwrap();
     // A build recorded a new directory at the removed path since.
@@ -7974,7 +7988,7 @@ fn put_one_blob_entry(store: &Store, dir: &Path, key: &str) {
 
 fn blob_refcount_sum(store: &Store) -> i64 {
     store
-        .db
+        .db()
         .query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
             r.get(0)
         })
@@ -8128,7 +8142,7 @@ fn remove_entry_refuses_on_corrupt_meta_without_a_blob_mapping() {
     let store = Store::open(&config).unwrap();
     put_one_blob_entry(&store, dir.path(), "corrupt1");
     store
-        .db
+        .db()
         .execute("DELETE FROM entry_blobs WHERE cache_key = 'corrupt1'", [])
         .unwrap();
     let meta_path = store.entry_dir("corrupt1").join("meta.json");
@@ -8184,7 +8198,7 @@ fn remove_entry_refuses_when_meta_missing_but_row_present() {
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute("DELETE FROM entry_blobs WHERE cache_key = 'm1'", [])
         .unwrap();
     std::fs::remove_file(store.entry_dir("m1").join("meta.json")).unwrap();
@@ -8198,7 +8212,7 @@ fn remove_entry_refuses_when_meta_missing_but_row_present() {
         "wrong refusal shape: {err:#}"
     );
     let still_there: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT COUNT(*) FROM entries WHERE cache_key = 'm1'",
             [],
@@ -8221,10 +8235,11 @@ fn reput_over_refused_removal_releases_stale_refcounts() {
     let store = Store::open(&config).unwrap();
 
     let refcount_sum = |s: &Store| -> i64 {
-        s.db.query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
-            r.get(0)
-        })
-        .unwrap()
+        s.db()
+            .query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
     };
     // Each generation compiles to a fresh source path: put ingests by
     // hardlink where reflinks are unavailable (ext4), sharing the
@@ -8263,7 +8278,7 @@ fn reput_over_refused_removal_releases_stale_refcounts() {
         "re-put must release the stranded generation's references"
     );
     let mapped: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT COUNT(*) FROM entry_blobs WHERE cache_key = 'strand1'",
             [],
@@ -8289,8 +8304,8 @@ fn reput_over_refused_removal_releases_stale_refcounts() {
 /// has no row. Pure SQL, so it also holds a store whose meta.json
 /// files are unreadable to account.
 fn assert_blob_refs_match_mappings(store: &Store) {
-    let mut stmt = store
-        .db
+    let store_db = store.db();
+    let mut stmt = store_db
         .prepare(
             "SELECT b.hash, b.refcount,
                         COALESCE((SELECT SUM(refs) FROM entry_blobs e WHERE e.hash = b.hash), 0)
@@ -8541,7 +8556,7 @@ fn migration_skips_an_uncommitted_entry() {
     let store = Store::open(test_config(dir.path())).unwrap();
     let meta = extract_download(&store, "uncommitted", &[("a.rlib", b"blob A")]);
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed)
                  VALUES ('uncommitted', 'c1', 6, 0)",
@@ -8560,7 +8575,7 @@ fn migration_skips_an_uncommitted_entry() {
 fn legacy_entry(store: &Store, key: &str, outputs: &[(&str, &[u8])]) -> EntryMeta {
     let meta = extract_download(store, key, outputs);
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed)
                  VALUES (?1, 'c1', 1, 1)",
@@ -8587,7 +8602,7 @@ fn backfill_skips_an_entry_with_unmigrated_artifacts() {
 
     assert_eq!(store.backfill_entry_blobs().unwrap(), 0);
     let mapped: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM entry_blobs", [], |r| r.get(0))
         .unwrap();
     assert_eq!(mapped, 0);
@@ -8638,7 +8653,7 @@ fn republish_over_a_mapping_without_a_blob_row_keeps_the_new_reference() {
     let store = Store::open(test_config(dir.path())).unwrap();
     let map = |key: &str, content: &[u8]| {
         store
-            .db
+            .db()
             .execute(
                 "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, 1)",
                 params![key, content_hash(content)],
@@ -8676,14 +8691,14 @@ fn claiming_an_unowned_key_releases_its_leftover_mapping() {
     let store = Store::open(test_config(dir.path())).unwrap();
     let leftover = |key: &str| {
         store
-            .db
+            .db()
             .execute(
                 "INSERT INTO blobs (hash, size, refcount) VALUES (?1, 1, 1)",
                 params![format!("old-{key}")],
             )
             .unwrap();
         store
-            .db
+            .db()
             .execute(
                 "INSERT INTO entry_blobs (cache_key, hash, refs) VALUES (?1, ?2, 1)",
                 params![key, format!("old-{key}")],
@@ -8735,14 +8750,14 @@ fn owner_and_uncounted_mapping(store: &Store, dir: &Path) -> String {
     )
     .unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed)
                  VALUES ('uncounted', 'c1', 1, 1)",
             [],
         )
         .unwrap();
-    record_entry_blobs(&store.db, "uncounted", &meta.files).unwrap();
+    record_entry_blobs(&store.db(), "uncounted", &meta.files).unwrap();
     let hash = content_hash(b"shared blob");
     assert_eq!(blob_refcount(store, &hash), Some(1));
     hash
@@ -8750,7 +8765,7 @@ fn owner_and_uncounted_mapping(store: &Store, dir: &Path) -> String {
 
 fn mapped_refs(store: &Store, key: &str, hash: &str) -> Option<i64> {
     store
-        .db
+        .db()
         .query_row(
             "SELECT refs FROM entry_blobs WHERE cache_key = ?1 AND hash = ?2",
             params![key, hash],
@@ -8827,7 +8842,7 @@ fn floor_raises_only_blobs_the_release_could_empty_up_to_the_other_owners() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();
     store
-        .db
+        .db()
         .execute_batch(
             "INSERT INTO blobs (hash, size, refcount) VALUES
                      ('low', 1, 1), ('exact', 1, 5), ('high', 1, 9), ('under', 1, 2),
@@ -8854,7 +8869,7 @@ fn floor_raises_only_blobs_the_release_could_empty_up_to_the_other_owners() {
     ];
 
     assert_eq!(
-        floor_blob_refs_before_release(&store.db, "k", releases).unwrap(),
+        floor_blob_refs_before_release(&store.db(), "k", releases).unwrap(),
         2
     );
 
@@ -8901,7 +8916,7 @@ fn removing_from_a_heavily_shared_blob_floors_it_only_when_it_could_reach_zero()
     // Twenty thousand other entries map the blob; its count has drifted
     // below their sum.
     store
-        .db
+        .db()
         .execute(
             "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
              INSERT INTO entry_blobs (cache_key, hash, refs) SELECT 'sharer' || i, ?1, 1 FROM n",
@@ -8909,7 +8924,7 @@ fn removing_from_a_heavily_shared_blob_floors_it_only_when_it_could_reach_zero()
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE blobs SET refcount = 1000 WHERE hash = ?1",
             params![hash],
@@ -8927,7 +8942,7 @@ fn removing_from_a_heavily_shared_blob_floors_it_only_when_it_could_reach_zero()
     // Drifted down to this removal's one reference: now it could reach
     // zero, so it is floored to the sharers' references first.
     store
-        .db
+        .db()
         .execute(
             "UPDATE blobs SET refcount = 1 WHERE hash = ?1",
             params![hash],
@@ -8943,7 +8958,7 @@ fn release_entry_blob_refs_subtracts_this_keys_mapping_only() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(test_config(dir.path())).unwrap();
     store
-        .db
+        .db()
         .execute_batch(
             "INSERT INTO blobs (hash, size, refcount) VALUES
                      ('shared', 1, 5), ('last', 1, 2), ('drifted', 1, 1), ('idle', 1, 0),
@@ -8955,7 +8970,7 @@ fn release_entry_blob_refs_subtracts_this_keys_mapping_only() {
         )
         .unwrap();
 
-    release_entry_blob_refs(&store.db, "k").unwrap();
+    release_entry_blob_refs(&store.db(), "k").unwrap();
 
     assert_eq!(blob_refcount(&store, "shared"), Some(3));
     assert_eq!(blob_refcount(&store, "last"), None, "released to zero");
@@ -8976,7 +8991,7 @@ fn release_entry_blob_refs_subtracts_this_keys_mapping_only() {
         "rows this key never mapped are not its to delete"
     );
     let mapped: Vec<String> = store
-        .db
+        .db()
         .prepare("SELECT cache_key FROM entry_blobs")
         .unwrap()
         .query_map([], |r| r.get(0))
@@ -9123,7 +9138,7 @@ fn list_entries_errors_on_non_integer_size_row() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries \
                  (cache_key, crate_name, crate_type, profile, size, committed) \
@@ -9165,7 +9180,7 @@ fn test_store_evict_older_than() {
 
     // Backdate the entry so eviction is deterministic (not timing-dependent)
     store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-48 hours') WHERE cache_key = 'k1'",
                 [],
@@ -9256,7 +9271,7 @@ fn evict_stale_key_schemas_keeps_only_the_running_schema() {
             .unwrap();
         store.remove_clone_for_test(&output);
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET key_schema = ?2, last_accessed = datetime('now', '-1 day')
                  WHERE cache_key = ?1",
@@ -9268,7 +9283,7 @@ fn evict_stale_key_schemas_keeps_only_the_running_schema() {
 
     // A capped run takes the longest unused first (lane KACHE-W24).
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-3 days')
              WHERE cache_key = 'legacy'",
@@ -9310,7 +9325,7 @@ fn evict_stale_key_schemas_keeps_only_the_running_schema() {
         .unwrap();
     store.remove_clone_for_test(&output);
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET key_schema = ?1, last_accessed = datetime('now', '-1 day')
              WHERE cache_key = 'bridged'",
@@ -9403,7 +9418,7 @@ fn test_store_import_downloaded_entry() {
     assert!(store.contains("downloaded_key"));
     assert_eq!(store.entry_count().unwrap(), 1);
     let indexed_schema: u32 = store
-        .db
+        .db()
         .query_row(
             "SELECT key_schema FROM entries WHERE cache_key = 'downloaded_key'",
             [],
@@ -9493,7 +9508,8 @@ fn failed_restore_cleanup_preserves_a_concurrent_committed_generation() {
     let publisher_entry_dir = entry_dir.clone();
     let publisher_meta = meta_json.clone();
     let publisher = std::thread::spawn(move || {
-        let tx = publisher_store.db.unchecked_transaction().unwrap();
+        let store_db = publisher_store.db();
+        let tx = store_db.unchecked_transaction().unwrap();
         tx.execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed) \
                  VALUES (?1, 'published', 0, 1)",
@@ -9568,9 +9584,9 @@ fn failed_restore_cleanup_holds_the_writer_lock_through_removal() {
     locked_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("cleanup must acquire its writer lock");
-    contender_store.db.busy_timeout(Duration::ZERO).unwrap();
+    contender_store.db().busy_timeout(Duration::ZERO).unwrap();
     let lock_error = match rusqlite::Transaction::new_unchecked(
-        &contender_store.db,
+        &contender_store.db(),
         rusqlite::TransactionBehavior::Immediate,
     ) {
         Ok(transaction) => {
@@ -9715,7 +9731,7 @@ fn test_import_downloaded_entry_creates_blobs() {
 
     // Refcount should be 1 in the blobs table
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![&hash],
@@ -10231,7 +10247,7 @@ fn keys_for_crates_errors_on_non_text_cache_key_row() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed) \
                  VALUES (x'80', 'badcrate', 1, 1)",
@@ -10493,7 +10509,7 @@ fn test_blobs_table_created() {
 
     // Table should exist — query it
     let count: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
@@ -10607,7 +10623,7 @@ fn test_put_deduplicates_identical_content() {
 
     // Refcount should be 2
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![m1.files[0].hash],
@@ -10763,7 +10779,7 @@ fn test_remove_entry_decrements_refcount() {
     assert!(blob.exists(), "blob should survive when refcount > 0");
 
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![&hash],
@@ -10777,7 +10793,7 @@ fn test_remove_entry_decrements_refcount() {
     assert!(!blob.exists(), "blob should be deleted when refcount = 0");
 
     let count: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT COUNT(*) FROM blobs WHERE hash = ?1",
             params![&hash],
@@ -10809,7 +10825,7 @@ fn test_concurrent_puts_sharing_blob_are_consistent() {
     let stores: Vec<_> = (0..N)
         .map(|_| {
             let store = Store::open(&config).unwrap();
-            store.db.busy_timeout(Duration::from_secs(30)).unwrap();
+            store.db().busy_timeout(Duration::from_secs(30)).unwrap();
             store
         })
         .collect();
@@ -10844,7 +10860,7 @@ fn test_concurrent_puts_sharing_blob_are_consistent() {
     // Exactly one blob, referenced by every entry.
     assert_eq!(store.blob_stats().unwrap().total_blobs, 1);
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![&hash],
@@ -10911,7 +10927,7 @@ fn test_concurrent_put_remove_never_dangles() {
     let stores: Vec<_> = (0..THREADS)
         .map(|_| {
             let store = Store::open(&config).unwrap();
-            store.db.busy_timeout(Duration::from_secs(60)).unwrap();
+            store.db().busy_timeout(Duration::from_secs(60)).unwrap();
             store
         })
         .collect();
@@ -11062,11 +11078,11 @@ fn losing_remover_leaves_a_publishers_directory_alone() {
     // Simulate the publisher's window: meta.json is on disk, the entry
     // row is not committed yet.
     store
-        .db
+        .db()
         .execute("DELETE FROM entries WHERE cache_key = 'pub'", [])
         .unwrap();
     store
-        .db
+        .db()
         .execute("DELETE FROM entry_blobs WHERE cache_key = 'pub'", [])
         .unwrap();
 
@@ -11142,7 +11158,7 @@ fn removal_rolls_back_when_the_entry_was_republished_mid_flight() {
         "generation B's blob must remain on disk"
     );
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -11226,7 +11242,7 @@ fn republication_during_removal_cleanup_is_never_stranded() {
         let published = std::sync::Arc::clone(&published);
         std::thread::spawn(move || {
             let store = Store::open(&config).unwrap();
-            store.db.busy_timeout(Duration::from_secs(30)).unwrap();
+            store.db().busy_timeout(Duration::from_secs(30)).unwrap();
             let src_b = dir_path.join("b.rlib");
             std::fs::write(&src_b, b"generation B, republished").unwrap();
             // Bounded: if the removal never reaches the seam (a broken
@@ -11299,7 +11315,7 @@ fn republication_during_removal_cleanup_is_never_stranded() {
         "generation B's blob must be on disk"
     );
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -11351,10 +11367,10 @@ fn a_busy_index_delays_an_evicted_entry_s_file_cleanup_without_skipping_it() {
             let held_tx = held_tx.clone();
             holder = Some(std::thread::spawn(move || {
                 let other = Store::open(&config).unwrap();
-                other.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                other.db().execute_batch("BEGIN IMMEDIATE").unwrap();
                 held_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(1500));
-                other.db.execute_batch("COMMIT").unwrap();
+                other.db().execute_batch("COMMIT").unwrap();
             }));
             held_rx.recv().unwrap();
         },
@@ -11515,7 +11531,7 @@ fn two_removers_on_one_entry_never_double_decrement_shared_blob() {
         );
 
         let refcount: i64 = store
-            .db
+            .db()
             .query_row(
                 "SELECT refcount FROM blobs WHERE hash = ?1",
                 params![&hash],
@@ -11573,7 +11589,7 @@ fn evict_does_not_fire_while_physical_size_is_within_budget() {
     assert_eq!(store.physical_size().unwrap(), 200, "disk holds one copy");
 
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -11638,7 +11654,7 @@ fn evict_prefers_and_stops_on_actually_freed_bytes() {
 
     assert_eq!(store.physical_size().unwrap(), 600 * 1024);
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -11692,7 +11708,7 @@ fn evict_noop_within_the_hysteresis_band() {
     }
     assert_eq!(store.physical_size().unwrap(), 950);
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -11737,7 +11753,7 @@ fn evict_fires_at_the_trigger_and_stops_at_the_target() {
     }
     assert_eq!(store.physical_size().unwrap(), 1140);
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -11789,7 +11805,7 @@ fn size_sweep_records_shadow_verdicts_and_demand_splits() {
         store.remove_clone_for_test(&src);
     }
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -11808,7 +11824,7 @@ fn size_sweep_records_shadow_verdicts_and_demand_splits() {
     // budget the value-density ranking would have taken small_cheap
     // (density ~10 ms/MB) and kept huge_expensive (~150,000 ms/MB).
     let (shadow_policy, shadow_would_evict): (String, i64) = store
-        .db
+        .db()
         .query_row(
             "SELECT shadow_policy, shadow_would_evict FROM eviction_tombstones
                  WHERE cache_key = 'huge_expensive'",
@@ -11838,7 +11854,7 @@ fn size_sweep_records_shadow_verdicts_and_demand_splits() {
     // the density shadow ranks unknown cost as worthless by
     // construction, so counting it would bias the comparison.
     store
-            .db
+            .db()
             .execute_batch(
                 "INSERT INTO eviction_tombstones
                     (cache_key, policy, compile_time_ms, shadow_policy, shadow_would_evict, demanded_at)
@@ -11896,7 +11912,7 @@ fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
     }
     let age = |store: &Store| {
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
                 [],
@@ -11909,8 +11925,8 @@ fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
     assert!(!store.contains("huge_expensive"));
     assert!(store.contains("small_cheap"), "the live policy kept it");
     let recorded = |store: &Store| -> Vec<(String, i64, i64)> {
-        let mut stmt = store
-            .db
+        let store_db = store.db();
+        let mut stmt = store_db
             .prepare("SELECT cache_key, size, compile_time_ms FROM shadow_victims")
             .unwrap();
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -11954,14 +11970,14 @@ fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
     // A later sweep that wants the same victim again keeps its first record,
     // since that is when the shadow would have removed it.
     store
-        .db
+        .db()
         .execute(
             "UPDATE shadow_victims SET swept_at = datetime('now', '-1 day')",
             [],
         )
         .unwrap();
     let first: String = store
-        .db
+        .db()
         .query_row("SELECT swept_at FROM shadow_victims", [], |row| row.get(0))
         .unwrap();
     let victim = store
@@ -11972,7 +11988,7 @@ fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
         .unwrap();
     store.record_shadow_victims("value-density", "2026-01-01 00:00:00", &[&victim]);
     let again: String = store
-        .db
+        .db()
         .query_row("SELECT swept_at FROM shadow_victims", [], |row| row.get(0))
         .unwrap();
     assert_eq!(again, first);
@@ -12048,7 +12064,7 @@ fn evict_reports_physical_bytes_freed_not_logical() {
         store.remove_clone_for_test(&src);
     }
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -12094,7 +12110,7 @@ fn backfill_entry_blobs_reconstructs_marginal_bytes() {
             .unwrap();
     }
     // Simulate a store written before the table existed.
-    store.db.execute("DELETE FROM entry_blobs", []).unwrap();
+    store.db().execute("DELETE FROM entry_blobs", []).unwrap();
 
     let unknowns = store.eviction_candidates().unwrap();
     assert!(
@@ -12148,7 +12164,7 @@ fn a_size_sweep_frees_a_cold_blob_its_entries_share() {
     }
     for (key, hours) in [("twin_a", 100), ("twin_b", 100), ("warm", 1)] {
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', ?1) WHERE cache_key = ?2",
                 rusqlite::params![format!("-{hours} hours"), key],
@@ -12206,7 +12222,7 @@ fn test_clear_removes_blobs_too() {
 
     // Blobs table should be empty
     let count: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
@@ -12251,7 +12267,7 @@ fn test_get_lazily_migrates_legacy_entry() {
     )
     .unwrap();
     store
-            .db
+            .db()
             .execute(
                 "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('old_key', 'old_crate', ?1, 1)",
                 params![content.len() as i64],
@@ -12311,7 +12327,7 @@ fn get_preserves_a_retryable_legacy_entry_when_migration_fails() {
     )
     .unwrap();
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed) \
                  VALUES ('old_bad_key', 'old_bad_crate', ?1, 1)",
@@ -12385,7 +12401,7 @@ fn test_migrate_to_blobs_bulk() {
         )
         .unwrap();
         store
-                .db
+                .db()
                 .execute(
                     &format!(
                         "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('{key}', 'shared_crate', {}, 1)",
@@ -12403,7 +12419,7 @@ fn test_migrate_to_blobs_bulk() {
 
     // Refcount should be 2
     let refcount: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -12491,7 +12507,7 @@ fn read_meta(store: &Store, cache_key: &str) -> EntryMeta {
 /// Helper: query refcount for a blob hash, returns None if blob doesn't exist in DB.
 fn blob_refcount(store: &Store, hash: &str) -> Option<i64> {
     store
-        .db
+        .db()
         .query_row(
             "SELECT refcount FROM blobs WHERE hash = ?1",
             params![hash],
@@ -12503,7 +12519,7 @@ fn blob_refcount(store: &Store, hash: &str) -> Option<i64> {
 /// Helper: count rows in blobs table.
 fn blob_table_count(store: &Store) -> i64 {
     store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
         .unwrap()
 }
@@ -13050,7 +13066,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
             .unwrap();
     }
     store
-        .db
+        .db()
         .execute(
             "UPDATE input_predictions SET last_used = 1 WHERE identity = 'unused'",
             [],
@@ -13070,7 +13086,7 @@ fn housekeeping_sweeps_key_locks_and_prunes_predictions() {
         (removed.as_str(), "datetime('now', '-1 hour')"),
     ] {
         store
-            .db
+            .db()
             .execute(
                 &format!(
                     "INSERT INTO file_hashes (path, size, mtime_ns, hash, updated_at)
@@ -13106,7 +13122,7 @@ fn housekeeping_rebuilds_an_older_file_hashes_table_without_rowid() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     store
-        .db
+        .db()
         .execute_batch(
             "DROP TABLE file_hashes;
                  CREATE TABLE file_hashes (
@@ -13120,7 +13136,7 @@ fn housekeeping_rebuilds_an_older_file_hashes_table_without_rowid() {
         .unwrap();
     let table_sql = || -> String {
         store
-            .db
+            .db()
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'file_hashes'",
                 [],
@@ -13133,7 +13149,7 @@ fn housekeeping_rebuilds_an_older_file_hashes_table_without_rowid() {
     assert_eq!(store.sweep_housekeeping(30).file_hashes_pruned, 1);
     assert!(table_sql().contains("WITHOUT ROWID"), "{}", table_sql());
     let paths: Vec<String> = store
-        .db
+        .db()
         .prepare("SELECT path FROM file_hashes")
         .unwrap()
         .query_map([], |row| row.get(0))
@@ -13682,7 +13698,7 @@ fn test_migration_of_legacy_entry() {
 
     // Register in DB as committed
     store
-            .db
+            .db()
             .execute(
                 "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES ('legacy_key', 'legacy_crate', ?1, 1)",
                 params![(content_a.len() + content_b.len()) as i64],
@@ -13741,7 +13757,7 @@ fn legacy_migration_preserves_an_unindexed_cas_winner() {
     fs::copy(&artifact, &blob).unwrap();
     set_blob_readonly(&blob);
     let winner = kache_fs::file_identity(&blob).unwrap();
-    store.db.execute(
+    store.db().execute(
         "INSERT INTO entries (cache_key, crate_name, size, committed) VALUES (?1, 'fixture', ?2, 1)",
         params![key, file.size as i64],
     ).unwrap();
@@ -13888,7 +13904,7 @@ fn migrate_entry_to_blobs_bumps_refcount_when_insert_loses_race() {
     .unwrap();
 
     store
-        .db
+        .db()
         .execute(
             &format!(
                 "CREATE TEMP TRIGGER seed_blob_before_insert \
@@ -13904,7 +13920,7 @@ fn migrate_entry_to_blobs_bumps_refcount_when_insert_loses_race() {
         .unwrap();
 
     store
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name, size, committed)
                  VALUES ('legacy_race', 'legacy_crate', ?1, 1)",
@@ -14204,7 +14220,7 @@ fn test_put_stores_content_hash() {
         .unwrap();
 
     let ch: String = store
-        .db
+        .db()
         .query_row(
             "SELECT content_hash FROM entries WHERE cache_key = 'key_ch_1'",
             [],
@@ -14261,7 +14277,7 @@ fn test_import_downloaded_entry_stores_content_hash() {
     store.import_downloaded_entry("dl_ch_test").unwrap();
 
     let ch: String = store
-        .db
+        .db()
         .query_row(
             "SELECT content_hash FROM entries WHERE cache_key = 'dl_ch_test'",
             [],
@@ -14323,14 +14339,14 @@ fn verified_batch_import_is_atomic_and_registers_every_entry() {
     verified[1].meta.files[0].size += 1;
     assert!(store.import_verified_restored_entries(&verified).is_err());
     let rows: i64 = store
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0, "a failed preflight must register no batch rows");
 
     verified[1].meta.files[0].size = original_size;
     store
-            .db
+            .db()
             .execute(
                 "INSERT INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed) VALUES (?1, 'stale', 'lib', 'dev', 0, 0, 'stale', 0, ?2, 0)",
                 params![keys[0], kache_format::CACHE_KEY_VERSION],
@@ -14339,7 +14355,7 @@ fn verified_batch_import_is_atomic_and_registers_every_entry() {
     let imported = store.import_verified_restored_entries(&verified).unwrap();
     assert_eq!(imported, 2);
     let rows: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT COUNT(*) FROM entries WHERE committed = 1",
             [],
@@ -14348,7 +14364,7 @@ fn verified_batch_import_is_atomic_and_registers_every_entry() {
         .unwrap();
     assert_eq!(rows, 2);
     let stamped: i64 = store
-        .db
+        .db()
         .query_row(
             "SELECT COUNT(*) FROM entries WHERE imported_at IS NOT NULL",
             [],
@@ -14360,7 +14376,7 @@ fn verified_batch_import_is_atomic_and_registers_every_entry() {
         assert!(store.get(&key).unwrap().is_some());
     }
     let refcounts: Vec<i64> = store
-        .db
+        .db()
         .prepare("SELECT refcount FROM blobs ORDER BY hash")
         .unwrap()
         .query_map([], |row| row.get(0))
@@ -14563,7 +14579,7 @@ fn evict_duplicate_entries_spares_a_pair_sharing_one_blob() {
 
     // Artificially age the first entry's access time (LRU policy)
     store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'dup_key_1'",
                 [],
@@ -14616,7 +14632,7 @@ fn evict_duplicate_entries_skips_the_scan_under_budget() {
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
                  WHERE cache_key = 'under_budget_1'",
@@ -14668,7 +14684,7 @@ fn evict_duplicate_entries_fails_closed_for_unmapped_legacy_victim() {
             .unwrap();
     }
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
                  WHERE cache_key = 'legacy_old'",
@@ -14676,7 +14692,7 @@ fn evict_duplicate_entries_fails_closed_for_unmapped_legacy_victim() {
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute("DELETE FROM entry_blobs WHERE cache_key = 'legacy_old'", [])
         .unwrap();
 
@@ -14716,7 +14732,7 @@ fn evict_duplicate_entries_stops_at_the_physical_target() {
             .unwrap();
         store.remove_clone_for_test(&old_file);
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', ?1) \
                      WHERE cache_key = ?2",
@@ -14724,7 +14740,7 @@ fn evict_duplicate_entries_stops_at_the_physical_target() {
             )
             .unwrap();
         let group_hash: String = store
-            .db
+            .db()
             .query_row(
                 "SELECT content_hash FROM entries WHERE cache_key = ?1",
                 params![old_key],
@@ -14746,7 +14762,7 @@ fn evict_duplicate_entries_stops_at_the_physical_target() {
             .unwrap();
         store.remove_clone_for_test(&new_file);
         store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET content_hash = ?1 WHERE cache_key = ?2",
                 params![group_hash, new_key],
@@ -14794,7 +14810,7 @@ fn evict_duplicate_entries_releases_victim_with_corrupt_meta_through_its_mapping
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour') \
                  WHERE cache_key = 'dup_corrupt_old'",
@@ -14803,7 +14819,7 @@ fn evict_duplicate_entries_releases_victim_with_corrupt_meta_through_its_mapping
         .unwrap();
 
     let old_content_hash: String = store
-        .db
+        .db()
         .query_row(
             "SELECT content_hash FROM entries WHERE cache_key = 'dup_corrupt_old'",
             [],
@@ -14830,7 +14846,7 @@ fn evict_duplicate_entries_releases_victim_with_corrupt_meta_through_its_mapping
         )
         .unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET content_hash = ?1 WHERE cache_key = 'dup_corrupt_new'",
             params![old_content_hash],
@@ -14877,7 +14893,7 @@ fn test_backfill_content_hashes() {
 
     // Simulate a legacy entry by clearing the content_hash
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET content_hash = NULL WHERE cache_key = 'bf_key_1'",
             [],
@@ -14888,7 +14904,7 @@ fn test_backfill_content_hashes() {
     assert_eq!(backfilled, 1);
 
     let ch: String = store
-        .db
+        .db()
         .query_row(
             "SELECT content_hash FROM entries WHERE cache_key = 'bf_key_1'",
             [],
@@ -14905,7 +14921,7 @@ fn test_content_hash_column_exists() {
     let store = Store::open(&config).unwrap();
     let result: Result<Option<String>, _> =
         store
-            .db
+            .db()
             .query_row("SELECT content_hash FROM entries LIMIT 1", [], |row| {
                 row.get(0)
             });
@@ -14945,7 +14961,7 @@ fn test_content_hash_full_dedup_lifecycle() {
 
     // Age the first entry's access time (LRU policy)
     store
-            .db
+            .db()
             .execute(
                 "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'ch_lc_1'",
                 [],
@@ -15357,7 +15373,7 @@ fn put_evictable_entries(store: &Store, dir: &Path, n: usize) {
         store.remove_clone_for_test(&src);
     }
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
             [],
@@ -15377,18 +15393,18 @@ fn eviction_stands_off_after_losing_the_write_lock() {
     put_evictable_entries(&store, dir.path(), 3);
 
     let build = Store::open(&config).unwrap();
-    build.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    build.db().execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let mut gc_config = config.clone();
     gc_config.max_size = 1;
     let gc = Store::open(&gc_config).unwrap();
     // Each removal waits out the busy timeout before it gives up. Cut it
     // from 5 s so three lost locks do not take fifteen seconds.
-    gc.db.busy_timeout(Duration::from_millis(50)).unwrap();
+    gc.db().busy_timeout(Duration::from_millis(50)).unwrap();
     let started = std::time::Instant::now();
     let stats = gc.evict().unwrap();
     let elapsed = started.elapsed();
-    build.db.execute_batch("ROLLBACK").unwrap();
+    build.db().execute_batch("ROLLBACK").unwrap();
 
     assert_eq!(stats.entries_locked, 3, "{stats:?}");
     assert!(
@@ -15448,7 +15464,7 @@ fn eviction_skips_entries_it_found_held_without_taking_the_lock() {
     put_evictable_entries(&store, dir.path(), 3);
     // Every blob is still hardlinked into a build's target directory.
     let hashes: Vec<String> = store
-        .db
+        .db()
         .prepare("SELECT hash FROM blobs")
         .unwrap()
         .query_map([], |row| row.get(0))
@@ -15525,7 +15541,7 @@ fn put_idle_entry(store: &Store, dir: &Path, key: &str, size: usize) -> PathBuf 
     // Read before aging the entry: a get counts as a use.
     let meta = store.get(key).unwrap().unwrap();
     store
-        .db
+        .db()
         .execute(
             "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = ?1",
             params![key],
@@ -15706,7 +15722,7 @@ fn blob_refcount_drift_reads_the_store_without_the_write_lock() {
     );
 
     store
-        .db
+        .db()
         .execute_batch(
             "UPDATE blobs SET refcount = refcount + 1;
                  INSERT INTO blobs (hash, size, refcount) VALUES ('unowned', 4096, 2);",
@@ -15796,11 +15812,11 @@ mod size_sweep_properties {
                 }
             }
             // One reference instant, so every entry's idle time moves together.
-            let now: String = store.db.query_row("SELECT datetime('now')", [], |row| row.get(0)).unwrap();
+            let now: String = store.db().query_row("SELECT datetime('now')", [], |row| row.get(0)).unwrap();
             for (key, spec) in keys.iter().zip(&specs) {
                 let hours = if spec.recent { 0 } else { spec.idle_hours };
                 store
-                    .db
+                    .db()
                     .execute(
                         "UPDATE entries SET last_accessed = datetime(?1, ?2), hit_count = ?3 WHERE cache_key = ?4",
                         params![now, format!("-{hours} hours"), spec.hits, key],
@@ -15857,7 +15873,7 @@ fn lists_indexed_blobs_from_a_size_up() {
     let store = Store::open(test_config(dir.path())).unwrap();
     for (hash, size) in [("small", 99_i64), ("edge", 100), ("large", 101)] {
         store
-            .db
+            .db()
             .execute(
                 "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
                 params![hash, size],
@@ -16286,7 +16302,7 @@ fn read_only_maintenance_preserves_files_and_registered_incremental_directories(
     assert!(ro.clean_registered_incremental_dirs().is_err());
     assert_eq!(fs::read(&state).unwrap(), b"incremental state");
     let registry_count: i64 = owner
-        .db
+        .db()
         .query_row("SELECT COUNT(*) FROM incremental_dirs", [], |row| {
             row.get(0)
         })
@@ -16355,7 +16371,7 @@ fn read_only_hash_memo_writers_leave_the_index_and_timeout_untouched() {
         crate::file_hash::FileHashLookup::NeedsHash(_)
     ));
     let timeout: i64 = ro
-        .db
+        .db()
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
         .unwrap();
     assert_eq!(timeout, 2000);
@@ -16374,7 +16390,7 @@ fn duplicate_eviction_does_not_probe_unselected_held_entries() {
     for (blob, target) in [(held, "held-target.rlib"), (unrelated, "other-target.rlib")] {
         fs::hard_link(blob, dir.path().join(target)).unwrap();
     }
-    store.db.execute_batch(
+    store.db().execute_batch(
         "UPDATE entries SET content_hash = 'duplicate-group' WHERE cache_key IN ('held_duplicate', 'new_duplicate');
          UPDATE entries SET last_accessed = datetime('now', '-2 hours') WHERE cache_key = 'held_duplicate';"
     ).unwrap();
@@ -16434,7 +16450,7 @@ fn full_clear_removes_quarantined_files_and_preserves_live_index_and_other_paths
     fs::write(&wal, b"wal copy").unwrap();
     fs::write(&shm, b"shm").unwrap();
     let preserved = [
-        "other.db.corrupt-123-456",
+        "other.db().corrupt-123-456",
         "index.db.corrupt-not-a-quarantine",
         "index.db.corrupt-123-456-journal",
         "index.db.recovery-lock",
@@ -16545,9 +16561,9 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let owner = Store::open(&config).unwrap();
-    owner.db.execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime(100,'unixepoch'),'lru',1073741824,0,0,900,datetime(150,'unixepoch'),'value-density',1)",[]).unwrap();
+    owner.db().execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime(100,'unixepoch'),'lru',1073741824,0,0,900,datetime(150,'unixepoch'),'value-density',1)",[]).unwrap();
     let reader = Store::open_read_only(&config).unwrap();
-    let changes = reader.db.total_changes();
+    let changes = reader.db().total_changes();
     let report = reader.eviction_horizon_evidence(200, 100).unwrap();
     assert_eq!(report.as_of_unix_secs, 200);
     assert_eq!(report.horizon_secs, 100);
@@ -16558,11 +16574,11 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
             .demanded_gross_compile_cost_ms_lower,
         900
     );
-    assert_eq!(reader.db.total_changes(), changes);
+    assert_eq!(reader.db().total_changes(), changes);
     assert!(reader.eviction_horizon_evidence(200, 0).is_err());
     assert_eq!(
         owner
-            .db
+            .db()
             .query_row("SELECT count(*) FROM eviction_tombstones", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
@@ -16605,7 +16621,7 @@ fn deferred_checkpoints_raise_the_threshold_and_the_daemon_checkpoints() {
     let config = test_config(dir.path());
     let before = Store::open(&config).unwrap();
     let default: i64 = before
-        .db
+        .db()
         .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
         .unwrap();
     assert_eq!(default, 1000);
@@ -16613,13 +16629,13 @@ fn deferred_checkpoints_raise_the_threshold_and_the_daemon_checkpoints() {
     crate::defer_wal_checkpoints();
     let wrapper = Store::open(&config).unwrap();
     let deferred: i64 = wrapper
-        .db
+        .db()
         .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
         .unwrap();
     assert_eq!(deferred, crate::DEFERRED_AUTOCHECKPOINT_PAGES);
 
     wrapper
-        .db
+        .db()
         .execute(
             "INSERT INTO entries (cache_key, crate_name) VALUES ('ck', 'c')",
             [],
@@ -16633,7 +16649,7 @@ fn deferred_checkpoints_raise_the_threshold_and_the_daemon_checkpoints() {
 /// The stamp of an hour-old entry, read back.
 fn access_of(store: &Store, key: &str) -> (i64, i64) {
     store
-        .db
+        .db()
         .query_row(
             "SELECT strftime('%s', 'now') - strftime('%s', last_accessed), hit_count \
              FROM entries WHERE cache_key = ?1",
@@ -16993,13 +17009,14 @@ fn entry_registration_asks_again_for_a_lock_held_past_one_busy_timeout() {
     };
 
     let holder = hold(Duration::from_millis(150));
-    let tx = store.begin_entry_registration();
+    let db = store.db();
+    let tx = store.begin_entry_registration(&db);
     assert!(tx.is_ok(), "held for 2.5 timeouts: {:?}", tx.err());
     tx.unwrap().commit().unwrap();
     holder.join().unwrap();
 
     let holder = hold(Duration::from_millis(60 * u64::from(STORE_LOCK_ATTEMPTS) + 400));
-    let refused = store.begin_entry_registration();
+    let refused = store.begin_entry_registration(&db);
     assert!(refused.as_ref().is_err_and(is_sqlite_busy), "{:?}", refused.err());
     drop(refused);
     holder.join().unwrap();
@@ -17036,6 +17053,7 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
         .unwrap();
     db.execute_batch("DROP TABLE cc_header_scans").unwrap();
     db.pragma_update(None, "user_version", 10_i64).unwrap();
+    drop(cache);
     drop(db);
 
     let db = open_index_db(&path).unwrap();
@@ -17061,6 +17079,7 @@ fn an_index_from_before_the_header_scan_memo_gains_its_table() {
         .put_cc_header_scans(7, &[("header-content".into(), "[]".into())])
         .unwrap();
     assert_eq!(cache.prune_cc_preprocess_memos().unwrap(), (0, 0));
+    drop(cache);
     drop(db);
 
     let db = open_index_db(&path).unwrap();
@@ -17783,7 +17802,7 @@ fn store_calls_give_back_the_connections_own_busy_timeout() {
     store.set_busy_timeout_for_test(Duration::from_secs(60));
     let busy_ms = |store: &Store| -> i64 {
         store
-            .db
+            .db()
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap()
     };
@@ -17824,7 +17843,7 @@ fn a_store_compresses_new_prediction_rows_only_when_its_config_says_so() {
             .put_input_prediction("unit", 2, None, &json)
             .unwrap();
         let kind: String = store
-            .db
+            .db()
             .query_row(
                 "SELECT typeof(prediction_json) FROM input_predictions WHERE identity = 'unit'",
                 [],
@@ -17850,12 +17869,12 @@ fn housekeeping_compresses_plain_prediction_rows_only_when_the_config_says_so() 
         config.compress_predictions = compress;
         let store = Store::open(config).unwrap();
         let json = format!("{{\"sources\":[{}]}}", "\"/src/lib.rs\",".repeat(50));
-        crate::file_hash::FileHashCache::Borrowed(&store.db)
+        crate::file_hash::FileHashCache::Borrowed(&store.db())
             .put_input_prediction("unit", 2, None, &json)
             .unwrap();
         store.sweep_housekeeping(30);
         let kind: String = store
-            .db
+            .db()
             .query_row(
                 "SELECT typeof(prediction_json) FROM input_predictions WHERE identity = 'unit'",
                 [],
