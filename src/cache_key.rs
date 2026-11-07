@@ -9308,11 +9308,141 @@ fn native_runtime_fingerprints_can_warm(files: &[FileFingerprint], observed_at: 
         .all(|file| file.inode != 0 && stamp_is_settled(file, observed_at))
 }
 
+/// Header probe scans, parsed once per process and shared by every C/C++
+/// compile it runs at once.
+///
+/// A scan is a pure function of a header's bytes at one scanner version, so
+/// `(version, content hash)` names it for good, and a copy read once serves
+/// every unit. Each unit used to read and parse its own: a C file's headers
+/// carry 0.9 to 5.5 MB of scans (aws-lc-sys, zstd-sys, libwebp-sys), and the
+/// daemon runs every unit of a build's C crates at once, which took it to
+/// 2.3-3.2 GB on a copy of the build machine's index, 2.8 GB of it in use.
+///
+/// One unit loads a missing scan while the others that want it wait for it,
+/// so a burst parses each header once. A unit holds one scan's slot at a
+/// time and never the map's lock while it loads, so units waiting on each
+/// other's headers cannot deadlock. Scans past `budget` bytes of JSON,
+/// oldest loaded first, are let go: the units holding one keep it.
+pub(crate) struct SharedHeaderScans<T> {
+    slots: std::sync::Mutex<HeaderScanSlots<T>>,
+    budget: usize,
+}
+
+struct HeaderScanSlots<T> {
+    by_key: HashMap<(i64, String), std::sync::Arc<HeaderScanSlot<T>>>,
+    loaded: std::collections::VecDeque<HeaderScanLoad<T>>,
+    bytes: usize,
+}
+
+struct HeaderScanLoad<T> {
+    key: (i64, String),
+    slot: std::sync::Arc<HeaderScanSlot<T>>,
+    bytes: usize,
+}
+
+struct HeaderScanSlot<T>(std::sync::Mutex<Option<std::sync::Arc<T>>>);
+
+impl<T> SharedHeaderScans<T> {
+    pub(crate) fn new(budget: usize) -> Self {
+        Self {
+            slots: std::sync::Mutex::new(HeaderScanSlots {
+                by_key: HashMap::new(),
+                loaded: std::collections::VecDeque::new(),
+                bytes: 0,
+            }),
+            budget,
+        }
+    }
+
+    /// The scan of each of `paths` at `version`, parsed by `parse`: shared,
+    /// else stored in the index, else made by `scan`, which must report the
+    /// hash of the bytes it read so a racing save cannot poison the
+    /// content-addressed result. Scans made here are stored for every later
+    /// process.
+    pub(crate) fn scans(
+        &self,
+        hasher: &FileHasher<'_>,
+        paths: &[PathBuf],
+        version: i64,
+        scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
+        parse: &impl Fn(&str) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Vec<std::sync::Arc<T>>> {
+        let contents = hasher.cc_header_scan_contents(paths)?;
+        let mut learned = Vec::new();
+        let mut results = Vec::with_capacity(paths.len());
+        for (path, content) in paths.iter().zip(contents) {
+            let key = (version, content);
+            let slot = self.slot(&key);
+            let mut held = slot
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(parsed) = held.as_ref() {
+                results.push(std::sync::Arc::clone(parsed));
+                continue;
+            }
+            let json = match hasher.cc_stored_header_scan(version, &key.1) {
+                Some(json) => json,
+                None => {
+                    let (raw, json) = scan(path)?;
+                    anyhow::ensure!(
+                        raw == key.1,
+                        "cc: input changed while scanning header probes: {}",
+                        path.display()
+                    );
+                    learned.push((key.1.clone(), json.clone()));
+                    json
+                }
+            };
+            let parsed = std::sync::Arc::new(parse(&json)?);
+            *held = Some(std::sync::Arc::clone(&parsed));
+            drop(held);
+            self.loaded(key, slot, json.len());
+            results.push(parsed);
+        }
+        hasher.cc_store_header_scans(version, &learned);
+        Ok(results)
+    }
+
+    fn slot(&self, key: &(i64, String)) -> std::sync::Arc<HeaderScanSlot<T>> {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::sync::Arc::clone(
+            slots.by_key.entry(key.clone()).or_insert_with(|| {
+                std::sync::Arc::new(HeaderScanSlot(std::sync::Mutex::new(None)))
+            }),
+        )
+    }
+
+    fn loaded(&self, key: (i64, String), slot: std::sync::Arc<HeaderScanSlot<T>>, bytes: usize) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.bytes += bytes;
+        slots.loaded.push_back(HeaderScanLoad { key, slot, bytes });
+        while slots.bytes > self.budget && slots.loaded.len() > 1 {
+            let Some(oldest) = slots.loaded.pop_front() else {
+                break;
+            };
+            slots.bytes -= oldest.bytes;
+            if slots
+                .by_key
+                .get(&oldest.key)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &oldest.slot))
+            {
+                slots.by_key.remove(&oldest.key);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RecentHash {
     hash: String,
     fingerprint: Option<FileFingerprint>,
-    header_scan: Option<(i64, String)>,
 }
 
 /// [`hash_file`], for a read that follows a stat of the same file.
@@ -10198,13 +10328,8 @@ impl<'db> FileHasher<'db> {
         // would have discovered by preprocessing, and the caller needs them to
         // resolve include shadowing without a fresh dependency capture.
         let mut satisfied = Vec::with_capacity(inputs.len());
-        for (expected, scan) in inputs.iter().zip(&record.header_scans) {
-            satisfied.push(self.memo_input_is_unchanged(
-                expected,
-                scan,
-                &resolve,
-                mapped_content,
-            )?);
+        for expected in &inputs {
+            satisfied.push(self.memo_input_is_unchanged(expected, &resolve, mapped_content)?);
         }
         if record.needs_touch
             && let Err(error) = cache.touch_cc_preprocess_memo(memo_key)
@@ -10223,7 +10348,6 @@ impl<'db> FileHasher<'db> {
     fn memo_input_is_unchanged(
         &self,
         expected: &CcPreprocessMemoInput,
-        header_scan: &Option<(i64, String)>,
         resolve: &impl Fn(&str) -> Vec<PathBuf>,
         mapped_content: &impl Fn(&Path) -> Option<CcContentHashes>,
     ) -> Option<PathBuf> {
@@ -10259,7 +10383,6 @@ impl<'db> FileHasher<'db> {
                     RecentHash {
                         hash: expected.content.clone(),
                         fingerprint: Some(current.fingerprint),
-                        header_scan: header_scan.clone(),
                     },
                 );
                 return Some(path.clone());
@@ -10401,78 +10524,47 @@ impl<'db> FileHasher<'db> {
         Some(inputs)
     }
 
-    /// Scan the input content already selected for this key, reusing results
-    /// across wrapper processes. Memo validation and hashing register the
-    /// snapshot for the write guard; do not stat every input a second time.
-    /// A new scan must report the hash of its bytes so a racing save cannot
-    /// poison the content-addressed result.
-    pub(crate) fn cc_header_scans(
-        &self,
-        paths: &[PathBuf],
-        version: i64,
-        scan: &impl Fn(&Path) -> anyhow::Result<(String, String)>,
-    ) -> anyhow::Result<Vec<String>> {
+    /// The content hash each of `paths` is scanned as: the one this key
+    /// selected for it (memo validation and hashing register that snapshot
+    /// for the write guard, so no input is stat'ed a second time), else a
+    /// hash of it now.
+    pub(crate) fn cc_header_scan_contents(&self, paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
         let mut contents = Vec::with_capacity(paths.len());
-        let mut known = std::collections::HashMap::new();
         for path in paths {
             let selected = {
                 let resolved = self.resolve_path(path)?;
                 let recent = self.recent_hashes.borrow();
-                recent.get(&resolved).and_then(|recent| {
-                    recent
-                        .fingerprint
-                        .as_ref()
-                        .map(|_| (recent.hash.clone(), recent.header_scan.clone()))
-                })
+                recent
+                    .get(&resolved)
+                    .and_then(|recent| recent.fingerprint.as_ref().map(|_| recent.hash.clone()))
             };
-            let content = match selected {
-                Some((content, analysis)) => {
-                    if let Some((scan_version, scan)) = analysis
-                        && scan_version == version
-                    {
-                        known.insert(content.clone(), scan);
-                    }
-                    content
-                }
+            contents.push(match selected {
+                Some(content) => content,
                 None => self.hash(path)?,
-            };
-            contents.push(content);
+            });
         }
-        let missing: Vec<_> = contents
-            .iter()
-            .filter(|content| !known.contains_key(*content))
-            .map(String::as_str)
-            .collect();
-        if let Some(cache) = &self.cache {
-            match cache.get_cc_header_scans(version, &missing) {
-                Ok(found) => known.extend(found),
-                Err(error) => tracing::debug!("cc header scan lookup failed: {error}"),
+        Ok(contents)
+    }
+
+    /// The scan stored for `content` at `version`, if any.
+    pub(crate) fn cc_stored_header_scan(&self, version: i64, content: &str) -> Option<String> {
+        let cache = self.cache.as_ref()?;
+        match cache.get_cc_header_scans(version, &[content]) {
+            Ok(mut found) => found.remove(content),
+            Err(error) => {
+                tracing::debug!("cc header scan lookup failed: {error}");
+                None
             }
         }
-        let mut learned = Vec::new();
-        let mut results = Vec::with_capacity(paths.len());
-        for (path, content) in paths.iter().zip(contents) {
-            let result = if let Some(result) = known.get(&content) {
-                result.clone()
-            } else {
-                let (raw, result) = scan(path)?;
-                anyhow::ensure!(
-                    raw == content,
-                    "cc: input changed while scanning header probes: {}",
-                    path.display()
-                );
-                known.insert(content.clone(), result.clone());
-                learned.push((content, result.clone()));
-                result
-            };
-            results.push(result);
-        }
+    }
+
+    /// Store scans made in this invocation, for every later one.
+    pub(crate) fn cc_store_header_scans(&self, version: i64, learned: &[(String, String)]) {
         if let Some(cache) = &self.cache
-            && let Err(error) = cache.put_cc_header_scans(version, &learned)
+            && let Err(error) = cache.put_cc_header_scans(version, learned)
         {
             tracing::debug!("cc header scan update failed: {error}");
         }
-        Ok(results)
     }
 
     /// The first input whose raw text hides a file the assembler would read,
@@ -10566,7 +10658,6 @@ impl<'db> FileHasher<'db> {
             if self
                 .memo_input_is_unchanged(
                     expected,
-                    &None,
                     &|_: &str| vec![recorded_path.clone()],
                     mapped_content,
                 )
@@ -10793,7 +10884,6 @@ impl<'db> FileHasher<'db> {
         let recent = RecentHash {
             hash,
             fingerprint: observed.map(|observed| observed.fingerprint),
-            header_scan: None,
         };
         self.recent_hashes
             .borrow_mut()
@@ -10839,7 +10929,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -10872,7 +10961,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -10904,7 +10992,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(observed.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
@@ -11461,7 +11548,6 @@ impl<'db> FileHasher<'db> {
             RecentHash {
                 hash: hash.clone(),
                 fingerprint: Some(reported.fingerprint),
-                header_scan: None,
             },
         );
         Ok(hash)
