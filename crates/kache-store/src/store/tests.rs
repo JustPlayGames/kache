@@ -1700,6 +1700,19 @@ fn put_of_bytes_already_in_the_store_stages_nothing() {
     );
 }
 
+/// A lookup reads an entry's row twice: once to find it committed, once for
+/// its durable flag. When the second read finds no row (a concurrent lookup
+/// evicted the entry in between) or fails, the entry's bytes are verified as
+/// a pending entry's are, never trusted: in the next39 rig a build that
+/// evicted a bad pending entry between another build's two reads let that
+/// build restore a one-byte object unchecked.
+#[test]
+fn a_lookup_that_cannot_read_the_durable_flag_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    assert!(!store.entry_is_durable("an_entry_evicted_meanwhile"));
+}
+
 /// A file at an output's content address that does not hold the output's
 /// bytes (a store copy with stand-in blobs, a crash before a deferred flush,
 /// a writer that ignored the read-only bit) is never adopted: the entry
