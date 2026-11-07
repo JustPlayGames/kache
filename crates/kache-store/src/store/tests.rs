@@ -1700,6 +1700,53 @@ fn put_of_bytes_already_in_the_store_stages_nothing() {
     );
 }
 
+/// A file at an output's content address that does not hold the output's
+/// bytes (a store copy with stand-in blobs, a crash before a deferred flush,
+/// a writer that ignored the read-only bit) is never adopted: the entry
+/// records the output's own size, and its blob holds the output's bytes. The
+/// put used to take the file's size for the entry's, so the size check of
+/// every later hit passed and a one-byte object reached the linker.
+#[test]
+fn a_put_never_adopts_a_blob_that_does_not_hold_its_bytes() {
+    for deferred in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.deferred_durability = deferred;
+        let store = Store::open(&config).unwrap();
+        let bytes = b"an object file's real bytes".as_slice();
+        let output = dir.path().join("noise.o");
+        fs::write(&output, bytes).unwrap();
+        let hash = crate::file_hash::hash_file(&output).unwrap();
+        let blob = store.blob_path(&hash);
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::write(&blob, b"x").unwrap();
+
+        store
+            .put_with_compile_time_independent(
+                "c_key",
+                "noise.c",
+                &[],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[(output.clone(), "noise.o".to_string())],
+                "",
+                "",
+                1,
+            )
+            .unwrap();
+        let _ = store.flush_entry_durability("c_key");
+
+        let meta = store
+            .get("c_key")
+            .unwrap()
+            .unwrap_or_else(|| panic!("deferred={deferred}: the entry is a hit"));
+        assert_eq!(meta.files[0].hash, hash, "deferred={deferred}");
+        assert_eq!(meta.files[0].size, bytes.len() as u64, "deferred={deferred}");
+        assert_eq!(fs::read(&blob).unwrap(), bytes, "deferred={deferred}");
+    }
+}
+
 /// An output that changes between the digest read up front and its
 /// snapshot is staged in the wrong shard. The snapshot's own digest still
 /// decides where it is published, and the wrong shard keeps nothing.
