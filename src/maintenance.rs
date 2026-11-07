@@ -65,6 +65,12 @@ impl RequestClock {
         Duration::from_millis(self.ms_at(now).saturating_sub(last))
     }
 
+    /// When the last request came, in milliseconds since the clock started.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    pub(crate) fn last_request_ms(&self) -> u64 {
+        self.last_ms.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn idle_for(&self) -> Duration {
         if self.active.load(Ordering::Acquire) != 0 {
             return Duration::ZERO;
