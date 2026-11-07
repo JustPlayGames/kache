@@ -5038,12 +5038,20 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
             // The output's digest, read before any snapshot. When a blob
             // already holds these bytes there is nothing to stage or publish:
-            // the entry references that blob, whose bytes are by its address
-            // exactly the ones just read (a snapshot would only be discarded
-            // as a lost race). Otherwise the digest names the shard the
-            // snapshot is staged in (`stage_blob_beside`), and the snapshot's
-            // own digest below is still the address. An unreadable output
-            // stages in `staging/` as before.
+            // the entry references that blob (a snapshot would only be
+            // discarded as a lost race). Otherwise the digest names the shard
+            // the snapshot is staged in (`stage_blob_beside`), and the
+            // snapshot's own digest below is still the address. An unreadable
+            // output stages in `staging/` as before.
+            //
+            // A file at the address is taken for the output's bytes only at
+            // the output's size, and the entry records the output's size, not
+            // the file's. A file of another size does not hold these bytes (a
+            // write cut short by a crash before a deferred flush, a writer
+            // that ignored the read-only bit, a store copied with stand-ins):
+            // adopting its size made every later hit's size check pass, and
+            // a one-byte object reached the linker. Such an output is staged,
+            // and the snapshot replaces the file below.
             // A handed-off snapshot's digest was read by the wrapper before
             // the compile returned: that, not whatever the file holds now,
             // is the address.
@@ -5054,8 +5062,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if let Some(hash) = &predicted
                 && let Ok(blob_meta) = fs::metadata(self.blob_path(hash))
                 && blob_meta.is_file()
+                && blob_meta.len() == source_meta.len()
             {
-                let size = blob_meta.len();
+                let size = source_meta.len();
                 if size == 0 && !zero_byte_is_valid_output::<P>(store_name, crate_types) {
                     anyhow::bail!("refusing to cache zero-byte artifact: {}", store_name);
                 }
@@ -5117,6 +5126,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                      the snapshot now hashes to {hash}); refusing to store it"
                 );
             }
+            // The snapshot's bytes are `hash`'s, so a file at that address
+            // of another size is not a blob of them: put the snapshot there
+            // instead. Unlinking it outside the write lock is the concurrent
+            // removal every put already survives (the locked phase puts a
+            // blob back), and an entry that adopted the file stops matching
+            // its size, so its next lookup misses instead of restoring it.
+            self.discard_foreign_blob(&hash, size);
             if seen_output_blobs.insert(hash.clone()) {
                 put_result.output_blobs += 1;
                 if self.blob_path(&hash).is_file() {
@@ -6537,6 +6553,25 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             set_blob_readonly(blob);
         }
         Ok(outcome)
+    }
+
+    /// Unlink the file at `hash`'s address when it is not `size` bytes long:
+    /// the bytes whose digest is `hash` are `size` long, so that file does not
+    /// hold them, and a put that found it in place would otherwise discard
+    /// its own snapshot as a lost race and leave the file to be restored.
+    fn discard_foreign_blob(&self, hash: &str, size: u64) {
+        let blob = self.blob_path(hash);
+        let Ok(meta) = fs::metadata(&blob) else {
+            return;
+        };
+        if meta.is_file() && meta.len() != size {
+            tracing::warn!(
+                "blob {} is {} bytes, not the {size} its bytes take; replacing it",
+                hash.get(..16).unwrap_or(hash),
+                meta.len()
+            );
+            unlink_blob(&blob);
+        }
     }
 
     /// Discard a staging snapshot (best effort; the staging sweep reclaims any
