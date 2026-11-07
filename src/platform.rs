@@ -358,34 +358,89 @@ pub fn resident_bytes() -> Option<u64> {
     u64::try_from(page).ok().map(|page| pages * page)
 }
 
-/// When the daemon gives its free heap back between sweeps: once its
-/// resident memory has grown [`HeapTrimGate::GROWTH`] past the lowest it
-/// has been since the last trim. Builds' requests leave freed memory in
-/// glibc's arenas, which only a trim returns, and sweeps (which trim) can be
-/// hours apart: the build machine's daemon went from 0.5 to 1.4 GB in the
-/// 15 minutes after one, and a trim took it from 2.2 GB to 0.5 GB. Memory
-/// that is in use stays, and the next trim waits for as much growth again,
-/// so a daemon that really holds more trims no more often.
+/// When the daemon gives its free heap back between sweeps, and why
+/// ([`HeapTrim`]).
+///
+/// Growth: once its resident memory has grown [`HeapTrimGate::GROWTH`] past
+/// the lowest it has been since the last trim. Builds' requests leave freed
+/// memory in glibc's arenas, which only a trim returns, and sweeps (which
+/// trim) can be hours apart: the build machine's daemon went from 0.5 to
+/// 1.4 GB in the 15 minutes after one, and a trim took it from 2.2 GB to
+/// 0.5 GB. Memory that is in use stays, and the next trim waits for as much
+/// growth again, so a daemon that really holds more trims no more often.
+///
+/// Quiet: once the builds have stopped, when it holds
+/// [`HeapTrimGate::QUIET_GROWTH`] more than it did at rest (after its last
+/// quiet trim, or the least since). A burst's last growth trim runs while
+/// the burst's memory is still in use, and what the burst frees after it
+/// stays resident until the daemon grows a whole [`HeapTrimGate::GROWTH`]
+/// again: four cold builds left a daemon at 0.88 GB for fifteen minutes,
+/// half a gigabyte above what a trim leaves. One trim at rest gives it
+/// back, and the next waits for another burst: the daemon's own sweeps and
+/// upkeep go on without builds, and trim themselves when they are done.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[derive(Debug, Default)]
 pub struct HeapTrimGate {
     floor: Option<u64>,
+    rest: Option<u64>,
+    quiet_trimmed: Option<u64>,
+}
+
+/// Why [`HeapTrimGate`] trims.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeapTrim {
+    /// The heap grew past its floor.
+    Growth,
+    /// No build is running, and the heap holds more than at rest. `since`
+    /// names the quiet spell: the time of the last build request.
+    Quiet { since: u64 },
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+impl HeapTrim {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeapTrim::Growth => "growth",
+            HeapTrim::Quiet { .. } => "quiet",
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 impl HeapTrimGate {
     pub const GROWTH: u64 = 256 << 20;
+    pub const QUIET_GROWTH: u64 = 64 << 20;
 
-    /// Whether to trim at `resident` bytes.
-    pub fn due(&mut self, resident: u64) -> bool {
+    /// Whether to trim at `resident` bytes, and why. `quiet` gives the time
+    /// of the last build request once the builds have stopped, and `None`
+    /// while they run; it is asked only when the heap holds
+    /// [`Self::QUIET_GROWTH`] more than at rest. A quiet spell trims once.
+    pub fn due(&mut self, resident: u64, quiet: impl FnOnce() -> Option<u64>) -> Option<HeapTrim> {
         let floor = self.floor.map_or(resident, |floor| floor.min(resident));
+        let rest = self.rest.map_or(resident, |rest| rest.min(resident));
         self.floor = Some(floor);
-        resident >= floor.saturating_add(Self::GROWTH)
+        self.rest = Some(rest);
+        let spell = (resident >= rest.saturating_add(Self::QUIET_GROWTH))
+            .then(quiet)
+            .flatten()
+            .filter(|&since| self.quiet_trimmed != Some(since));
+        if let Some(since) = spell {
+            Some(HeapTrim::Quiet { since })
+        } else if resident >= floor.saturating_add(Self::GROWTH) {
+            Some(HeapTrim::Growth)
+        } else {
+            None
+        }
     }
 
-    /// A trim left `resident` bytes.
-    pub fn trimmed(&mut self, resident: u64) {
+    /// A trim for `trim` left `resident` bytes.
+    pub fn trimmed(&mut self, trim: HeapTrim, resident: u64) {
         self.floor = Some(resident);
+        if let HeapTrim::Quiet { since } = trim {
+            self.rest = Some(resident);
+            self.quiet_trimmed = Some(since);
+        }
     }
 }
 
@@ -791,22 +846,37 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
-    fn the_heap_is_trimmed_after_growth_past_its_lowest_point() {
+    fn the_heap_is_trimmed_after_growth_and_once_when_the_builds_stop() {
+        use super::HeapTrim::{Growth, Quiet};
         const MIB: u64 = 1 << 20;
+        let busy = || None;
         let mut gate = super::HeapTrimGate::default();
-        assert!(
-            !gate.due(500 * MIB),
+        assert_eq!(
+            gate.due(500 * MIB, || Some(0)),
+            None,
             "the first reading only sets the floor"
         );
-        assert!(!gate.due(700 * MIB));
+        assert_eq!(gate.due(700 * MIB, busy), None);
         // A sweep's own trim lowered it: growth counts from there.
-        assert!(!gate.due(300 * MIB));
-        assert!(!gate.due(555 * MIB));
-        assert!(gate.due(556 * MIB));
+        assert_eq!(gate.due(300 * MIB, busy), None);
+        assert_eq!(gate.due(555 * MIB, busy), None);
+        assert_eq!(gate.due(556 * MIB, busy), Some(Growth));
         // Memory in use stays: the next trim waits for as much growth again.
-        gate.trimmed(550 * MIB);
-        assert!(!gate.due(805 * MIB));
-        assert!(gate.due(806 * MIB));
+        gate.trimmed(Growth, 550 * MIB);
+        assert_eq!(gate.due(805 * MIB, busy), None);
+        assert_eq!(gate.due(806 * MIB, busy), Some(Growth));
+        gate.trimmed(Growth, 790 * MIB);
+        // The builds stopped: what they freed after the last trim goes back,
+        // measured from rest (300 MiB), not from that trim (790 MiB).
+        assert_eq!(gate.due(870 * MIB, || Some(7)), Some(Quiet { since: 7 }));
+        gate.trimmed(Quiet { since: 7 }, 320 * MIB);
+        assert_eq!(
+            gate.due(383 * MIB, || panic!("asked below rest + QUIET_GROWTH")),
+            None
+        );
+        // Once per quiet spell: the daemon's own upkeep may grow meanwhile.
+        assert_eq!(gate.due(500 * MIB, || Some(7)), None);
+        assert_eq!(gate.due(500 * MIB, || Some(9)), Some(Quiet { since: 9 }));
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

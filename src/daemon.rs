@@ -3294,6 +3294,27 @@ impl Daemon {
         self.compiles_in_flight.load(Ordering::Acquire)
     }
 
+    /// When the last build request came, once the builds have stopped: no
+    /// build request for [`crate::maintenance::QUIET_AFTER`], no compile
+    /// handed over, no client's call open (a `kache gc` among them), no
+    /// hinted sweep running and no scheduler permit held. `None` while they
+    /// run. The cheap checks come first; the permits are a walk of their slot
+    /// files.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn builds_quiet_since(&self, lifecycle: &Lifecycle) -> Option<u64> {
+        let since = self.request_clock.last_request_ms();
+        let idle = self.request_clock.idle_for();
+        let quiet = idle >= crate::maintenance::QUIET_AFTER
+            && self.compiles_in_flight() == 0
+            && lifecycle.snapshot().active == 0
+            && !self.gc_hint_pending.load(Ordering::Acquire)
+            && crate::maintenance::is_quiet(
+                crate::scheduler::permits_in_use(&self.config.cache_dir),
+                idle,
+            );
+        quiet.then_some(since)
+    }
+
     fn handle_health(&self) -> Response {
         Response {
             health: Some(DaemonHealth {
@@ -8095,7 +8116,11 @@ async fn server_main(
     });
 
     // Free heap the builds' requests leave behind, between sweeps (which
-    // trim on their own): see `HeapTrimGate`.
+    // trim on their own), and once more when they stop: see `HeapTrimGate`.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let trim_daemon = daemon.clone();
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let trim_lifecycle = Arc::clone(&lifecycle);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     tokio::spawn(async move {
         let gate = Arc::new(std::sync::Mutex::new(
@@ -8106,6 +8131,8 @@ async fn server_main(
         loop {
             interval.tick().await;
             let gate = Arc::clone(&gate);
+            let daemon = trim_daemon.clone();
+            let lifecycle = Arc::clone(&trim_lifecycle);
             let _ = tokio::task::spawn_blocking(move || {
                 let Some(before) = crate::platform::resident_bytes() else {
                     return;
@@ -8113,14 +8140,15 @@ async fn server_main(
                 let Ok(mut gate) = gate.lock() else {
                     return;
                 };
-                if !gate.due(before) {
+                let Some(trim) = gate.due(before, || daemon.builds_quiet_since(&lifecycle)) else {
                     return;
-                }
+                };
                 let started = Instant::now();
                 crate::platform::below_normal(crate::platform::release_free_heap);
                 let after = crate::platform::resident_bytes().unwrap_or(before);
-                gate.trimmed(after);
+                gate.trimmed(trim, after);
                 tracing::info!(
+                    reason = trim.as_str(),
                     before_mib = before >> 20,
                     after_mib = after >> 20,
                     elapsed_ms = started.elapsed().as_millis() as u64,
