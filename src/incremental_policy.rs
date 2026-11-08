@@ -1013,9 +1013,10 @@ pub(crate) fn key_fingerprint(
 /// state stays keyed on the whole command line, so two units that shared a
 /// metadata hash would still keep apart.
 ///
-/// An executable counts only when Cargo set `CARGO_BIN_NAME`, which it sets
-/// for a bin or binary example and never for a build script, so a build
-/// script never counts by its metadata, whatever directory it compiles into.
+/// An executable counts only when `CARGO_BIN_NAME` names its crate: Cargo sets
+/// it for a bin or binary example and never for a build script, and a value
+/// exported from outside reaches every unit, so a build script never counts by
+/// its metadata, whatever directory it compiles into.
 /// A binary example still needs `<profile>/deps` or a unit `out` directory
 /// below, so in the classic layout it stays out as it does elsewhere.
 fn cargo_unit_id(args: &RustcArgs) -> Option<String> {
@@ -1026,8 +1027,18 @@ fn cargo_unit_id(args: &RustcArgs) -> Option<String> {
         args.has_crate_type(|kind| matches!(kind, "cdylib" | "dylib" | "staticlib"));
     let libraries_only = !args
         .has_crate_type(|kind| !matches!(kind, "cdylib" | "dylib" | "rlib" | "lib" | "staticlib"));
-    let cargo_program =
-        args.crate_types == ["bin"] && args.invocation_env().var_os("CARGO_BIN_NAME").is_some();
+    // A `[[bin]]` or binary example (Cargo 1.100 gives them no extra filename,
+    // as it does for a Windows MSVC program). Build scripts are bins without an
+    // extra filename too; Cargo sets `CARGO_BIN_NAME` only for binaries, but an
+    // exported value is inherited by every unit, so it must also name this
+    // crate (upstream #1865). rustc deduplicates repeated crate types.
+    let cargo_program = args.has_crate_type(|kind| kind == "bin")
+        && !args.has_crate_type(|kind| kind != "bin")
+        && args
+            .invocation_env()
+            .var_os("CARGO_BIN_NAME")
+            .and_then(|name| name.to_str().map(|name| name.replace('-', "_")))
+            .is_some_and(|name| args.crate_name.as_deref() == Some(name.as_str()));
     if !(unhashed_library && libraries_only) && !cargo_program {
         return None;
     }
@@ -2037,31 +2048,63 @@ mod tests {
         let incremental = profile.join("incremental");
         fs::create_dir_all(&out).unwrap();
         fs::create_dir(&incremental).unwrap();
-        let argv = |crate_name: &str, extra: &[&str]| {
+        let eligible = |crate_name: &str, extra: &[&str], bin_name: Option<&str>| {
             let mut argv: Vec<String> = vec![
                 "/toolchain/bin/rustc".into(),
                 "--crate-name".into(),
                 crate_name.into(),
-                "src/lib.rs".into(),
+                "src/main.rs".into(),
                 "--out-dir".into(),
                 out.to_string_lossy().into_owned(),
                 "-C".into(),
                 format!("incremental={}", incremental.display()),
             ];
             argv.extend(extra.iter().map(|arg| arg.to_string()));
-            RustcArgs::parse(&argv).unwrap()
+            let env = crate::invocation::InvocationEnv::from_parts(
+                bin_name.map(|name| ("CARGO_BIN_NAME", name)),
+                None,
+                None,
+                temp.path().to_path_buf(),
+            );
+            AdaptiveUnit::eligible(&RustcArgs::parse_for(&argv, &env).unwrap(), b"")
         };
-        let unit =
-            AdaptiveUnit::eligible(&argv("sample", &["-Cextra-filename=-1234abcd"]), b"").unwrap();
+        let unit = eligible("sample", &["-Cextra-filename=-1234abcd"], None).unwrap();
         assert!(
             unit.unit_dir
                 .starts_with(profile.join("incremental.kache-auto")),
             "{}",
             unit.unit_dir.display()
         );
+
+        // Cargo 1.100 compiles a `[[bin]]` and a build script with the same
+        // flags: `--crate-type bin`, `-C metadata`, no extra filename.
+        let bin = ["--crate-type", "bin", "-Cmetadata=732051ce89cf3fe3"];
         assert!(
-            AdaptiveUnit::eligible(&argv("build_script_build", &[]), b"").is_none(),
-            "Cargo 1.100 compiles a build script with no extra filename"
+            eligible("sample", &bin, Some("sample")).is_some(),
+            "a [[bin]] is identified by -C metadata"
+        );
+        assert!(
+            eligible(
+                "sample",
+                &["--crate-type", "bin,bin", bin[2]],
+                Some("sample")
+            )
+            .is_some(),
+            "rustc deduplicates repeated crate types"
+        );
+        assert!(
+            eligible("build_script_build", &bin, Some("build-script-build")).is_some(),
+            "a [[bin]] may share a build script's crate name"
+        );
+        for inherited in [None, Some("outer")] {
+            assert!(
+                eligible("build_script_build", &bin, inherited).is_none(),
+                "a build script, even under an exported CARGO_BIN_NAME={inherited:?}"
+            );
+        }
+        assert!(
+            eligible("sample", &["--crate-type", "bin"], Some("sample")).is_none(),
+            "a bin without -C metadata has no unit id"
         );
     }
 
