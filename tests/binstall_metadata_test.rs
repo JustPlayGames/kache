@@ -14,11 +14,13 @@
 //! (via `{ archive-suffix }`), and every Windows target in the release
 //! matrix must carry a `pkg-fmt = "zip"` override.
 
+#[allow(dead_code)]
+mod common;
+
 use std::fs;
-use std::path::Path;
 
 fn repo_file(rel: &str) -> String {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = common::manifest_dir();
     fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("reading {rel}: {e}"))
 }
 

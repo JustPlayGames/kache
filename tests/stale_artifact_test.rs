@@ -21,7 +21,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 /// Copies `test-projects/stale-check/` to a temp dir and returns it.
 fn copy_fixture() -> TempDir {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/stale-check");
+    let fixture = common::manifest_dir().join("test-projects/stale-check");
     let tmp = TempDir::new().unwrap();
     copy_dir(&fixture, tmp.path());
     tmp

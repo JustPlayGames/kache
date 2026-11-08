@@ -631,7 +631,7 @@ clean = "unused"
 
     #[test]
     fn all_shipped_fixture_schemas_load() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         let selectors = Selectors::parse_many(&["suite:e2e".to_string()]).unwrap();
         let fixtures = discover(
             &root,

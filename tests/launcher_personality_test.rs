@@ -1,5 +1,8 @@
 //! Link and run the launcher against the selected toolchain's real core.
 
+#[allow(dead_code)]
+mod common;
+
 #[cfg(unix)]
 use std::ffi::OsString;
 #[cfg(unix)]
@@ -148,7 +151,7 @@ fn build_launcher(out: &Path) {
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .unwrap();
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("launcher/build_script.rs");
+    let source = common::manifest_dir().join("launcher/build_script.rs");
     let mut flags: Vec<OsString> = Vec::new();
     if let Some(linker) = std::env::var_os("RUSTC_LINKER") {
         let mut flag = OsString::from("linker=");
@@ -192,7 +195,7 @@ fn doctor_repairs_an_owned_client_pin_without_its_engine_and_preserves_the_scrip
     let old_relative = ".kache-build-script-shims/11111111111111111111111111111111/kache";
     let old_pin = profile.join(old_relative);
     std::fs::create_dir_all(old_pin.parent().unwrap()).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_kache"), &old_pin).unwrap();
+    std::fs::copy(common::bin_exe("kache"), &old_pin).unwrap();
     let old_id = std::fs::metadata(&old_pin).unwrap().ino();
     let old_hash = kache_store::file_hash::hash_file(&old_pin).unwrap();
     assert!(!old_pin.with_file_name("kache-engine").exists());
@@ -231,14 +234,14 @@ fn doctor_repairs_an_owned_client_pin_without_its_engine_and_preserves_the_scrip
             "locating kache-engine; reinstall both Kache binaries together",
         ));
     let before = std::fs::read(&record).unwrap();
-    command(Path::new(env!("CARGO_BIN_EXE_kache")))
+    command(&common::bin_exe("kache"))
         .args(["doctor", "--json", "--repair-build-scripts"])
         .arg(&target)
         .assert()
         .failure()
         .stderr(predicates::str::contains("reports diagnostics only"));
     assert_eq!(std::fs::read(&record).unwrap(), before);
-    command(Path::new(env!("CARGO_BIN_EXE_kache")))
+    command(&common::bin_exe("kache"))
         .args(["doctor", "--repair-build-scripts"])
         .arg(&target)
         .assert()
@@ -252,7 +255,7 @@ fn doctor_repairs_an_owned_client_pin_without_its_engine_and_preserves_the_scrip
     assert_ne!(pin, old_pin);
     assert_eq!(
         kache_store::file_hash::hash_file(&pin).unwrap(),
-        kache_store::file_hash::hash_file(Path::new(env!("CARGO_BIN_EXE_kache-engine"))).unwrap()
+        kache_store::file_hash::hash_file(&common::bin_exe("kache-engine")).unwrap()
     );
     assert!(!pin.with_file_name("kache-engine").exists());
     command(&launcher)
@@ -267,7 +270,7 @@ fn doctor_repairs_an_owned_client_pin_without_its_engine_and_preserves_the_scrip
         kache_store::file_hash::hash_file(&old_pin).unwrap(),
         old_hash
     );
-    command(Path::new(env!("CARGO_BIN_EXE_kache")))
+    command(&common::bin_exe("kache"))
         .args(["doctor", "--repair-build-scripts"])
         .arg(&target)
         .assert()

@@ -1730,8 +1730,7 @@ printf 'host %s %s %s\n' "$CLIENT_VALUE" "$flavor" "$PWD"
         // This fixture is checked in, not written immediately before exec.
         // Runtime-created scripts can race another test's fork and fail with
         // ETXTBSY under coverage even after the writer itself is closed.
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/mock_cc_lc_all.sh");
+        let script = crate::test_support::manifest_dir().join("tests/fixtures/mock_cc_lc_all.sh");
         let compiler = script.to_str().unwrap();
 
         let req = ProbeRequest {

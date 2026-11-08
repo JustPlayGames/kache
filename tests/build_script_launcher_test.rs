@@ -84,7 +84,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let mut command = self.command(Path::new(env!("CARGO_BIN_EXE_kache")));
+        let mut command = self.command(&common::bin_exe("kache"));
         command.args(["daemon", "stop"]);
         stop_daemon(&mut command, &self.cache());
     }
@@ -97,12 +97,8 @@ fn a_relative_kache_symlink_installs_an_executable_pin() {
     let bin = fixture.path().join("bin");
     fs::create_dir_all(&cell).unwrap();
     fs::create_dir(&bin).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_kache"), cell.join("kache")).unwrap();
-    fs::copy(
-        env!("CARGO_BIN_EXE_kache-engine"),
-        cell.join("kache-engine"),
-    )
-    .unwrap();
+    fs::copy(common::bin_exe("kache"), cell.join("kache")).unwrap();
+    fs::copy(common::bin_exe("kache-engine"), cell.join("kache-engine")).unwrap();
     let symlink = bin.join("kache");
     std::os::unix::fs::symlink("../Cellar/kache/1/bin/kache", &symlink).unwrap();
     let output = fixture.compile(&symlink);
@@ -125,7 +121,7 @@ fn an_install_failure_records_why_the_script_will_run_uncached() {
         "blocked",
     )
     .unwrap();
-    let output = fixture.compile(Path::new(env!("CARGO_BIN_EXE_kache")));
+    let output = fixture.compile(&common::bin_exe("kache"));
     assert!(output.status.success(), "{output:?}");
     assert!(!fixture.unit().join(".kache-launch").exists());
     let script = fixture.unit().join("build_script_build-1");
