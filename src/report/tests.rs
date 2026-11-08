@@ -726,6 +726,9 @@ fn write_test_events(dir: &std::path::Path) -> Config {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -2231,6 +2234,9 @@ fn test_missing_transfer_data() {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -2350,6 +2356,9 @@ fn test_suggestion_high_miss_share() {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -2468,6 +2477,9 @@ fn test_suggestion_high_hit_overhead() {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -2587,6 +2599,9 @@ fn test_suggestion_network_download_failures_and_fanout() {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -2711,6 +2726,9 @@ fn test_suggestion_network_latency_thresholds() {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -3238,6 +3256,9 @@ fn test_empty_report() {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
@@ -3738,6 +3759,9 @@ fn report_counts_each_download_transfer_format() {
         daemon_idle_timeout_secs: crate::config::DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
         s3_pool_idle_secs: crate::config::DEFAULT_S3_POOL_IDLE_SECS,
         remote_restore_timeout_secs: crate::config::DEFAULT_REMOTE_RESTORE_TIMEOUT_SECS,
+        remote_upload_max_attempts: 5,
+        remote_upload_memory_bytes: 536_870_912,
+        remote_upload_timeout_secs: 300,
         demand_timeout_secs: crate::config::DEFAULT_DEMAND_TIMEOUT_SECS,
         remote_negative_ttl_secs: crate::config::DEFAULT_REMOTE_NEGATIVE_TTL_SECS,
     };
