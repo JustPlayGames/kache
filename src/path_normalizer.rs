@@ -1375,20 +1375,36 @@ pub(crate) fn canonical_form(canon: &Path) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// The directories of a Cargo home that a worktree pool member links into the
+/// shared home: its downloads and checkouts.
+pub(crate) const LINKED_CARGO_HOME_DIRS: [&str; 2] = ["registry", "git"];
+
+/// Where `home`'s directory `sub` resolves, canonical, when it links into
+/// another Cargo home's directory of that name; `None` when it is the home's
+/// own (or missing).
+pub(crate) fn linked_cargo_home_dir(home: &Path, sub: &str) -> Option<PathBuf> {
+    linked_cargo_home_dir_in(home, home.canonicalize().ok().as_deref(), sub)
+}
+
+/// [`linked_cargo_home_dir`] for a home whose canonical path is `own`.
+fn linked_cargo_home_dir_in(home: &Path, own: Option<&Path>, sub: &str) -> Option<PathBuf> {
+    let target = home.join(sub).canonicalize().ok()?;
+    (target.file_name() == Some(std::ffi::OsStr::new(sub))
+        && target.parent().is_some_and(|parent| Some(parent) != own))
+    .then_some(target)
+}
+
 /// Where a Cargo home's `registry` and `git` resolve when they link into
 /// another directory of that name: that directory's parent, canonical, once.
 /// Empty when they are the home's own.
 fn linked_cargo_home_roots(home: &Path) -> Vec<String> {
     let own = home.canonicalize().ok();
     let mut roots = Vec::new();
-    for sub in ["registry", "git"] {
-        let Ok(target) = home.join(sub).canonicalize() else {
+    for sub in LINKED_CARGO_HOME_DIRS {
+        let Some(target) = linked_cargo_home_dir_in(home, own.as_deref(), sub) else {
             continue;
         };
-        if target.file_name() != Some(std::ffi::OsStr::new(sub)) {
-            continue;
-        }
-        let Some(parent) = target.parent().filter(|parent| Some(*parent) != own.as_deref()) else {
+        let Some(parent) = target.parent() else {
             continue;
         };
         if let Some(root) = canonical_form(parent)
