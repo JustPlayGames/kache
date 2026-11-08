@@ -1292,6 +1292,25 @@ pub(crate) fn canonical_form(canon: &Path) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// The directories of a Cargo home that a worktree pool member links into the
+/// shared home: its downloads and checkouts.
+pub(crate) const LINKED_CARGO_HOME_DIRS: [&str; 2] = ["registry", "git"];
+
+/// Where `home`'s directory `sub` resolves, canonical, when it links into
+/// another Cargo home's directory of that name; `None` when it is the home's
+/// own (or missing).
+pub(crate) fn linked_cargo_home_dir(home: &Path, sub: &str) -> Option<PathBuf> {
+    linked_cargo_home_dir_in(home, home.canonicalize().ok().as_deref(), sub)
+}
+
+/// [`linked_cargo_home_dir`] for a home whose canonical path is `own`.
+fn linked_cargo_home_dir_in(home: &Path, own: Option<&Path>, sub: &str) -> Option<PathBuf> {
+    let target = home.join(sub).canonicalize().ok()?;
+    (target.file_name() == Some(std::ffi::OsStr::new(sub))
+        && target.parent().is_some_and(|parent| Some(parent) != own))
+    .then_some(target)
+}
+
 /// Drop the Windows extended-length (`\\?\`) verbatim prefix that
 /// [`Path::canonicalize`] returns on Windows.
 ///

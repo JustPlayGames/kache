@@ -48,6 +48,7 @@ mod notice;
 mod opcounts;
 mod otel;
 mod out_dir_alias;
+mod package_dirs;
 mod path_normalizer;
 mod pe_pdb;
 mod phase_trace;
@@ -1742,6 +1743,7 @@ fn run_compiler_invocation_inner(
             target_seed::before_probe_for(&config, args, &env);
             // Started here so the trace also covers the OUT_DIR alias check.
             let trace = phase_trace::start_for("rustc", args, &env);
+            package_dirs::respell_for(&mut env);
             let exit = match out_dir_alias::apply_for(&config, args, &mut env) {
                 Some(exit) => exit,
                 None => wrapper::run_for(&config, args, &env)?,
