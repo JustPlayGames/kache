@@ -33,10 +33,10 @@ fn run(
     results: &std::path::Path,
     deny_missing_tools: bool,
 ) -> std::process::ExitStatus {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kache-scenario"));
+    let mut command = Command::new(scenario_bin());
     command
         .arg("--kache")
-        .arg(env!("CARGO_BIN_EXE_kache-scenario"))
+        .arg(scenario_bin())
         .arg("--scenarios")
         .arg(root)
         .arg("--select")
@@ -119,4 +119,13 @@ os = ["{other_os}"]"#
         json["fixtures"][0]["skip_reason"]["current_os"],
         std::env::consts::OS
     );
+}
+
+/// The `kache-scenario` binary Cargo built for these tests, read when the
+/// test runs (a nextest archive moves it), never through `env!`.
+fn scenario_bin() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_kache-scenario")
+            .expect("CARGO_BIN_EXE_kache-scenario is set by `cargo test` and `cargo nextest run`"),
+    )
 }

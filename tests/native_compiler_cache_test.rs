@@ -144,15 +144,15 @@ fn native_clang_cl_restores_objects_and_runs_through_a_warm_daemon() {
     let launcher = install.join(&name);
     let daemon_launcher = frontend_only.join(&name);
     for target in [&launcher, &daemon_launcher] {
-        std::fs::copy(env!("CARGO_BIN_EXE_kache-clang-cl"), target).unwrap();
+        std::fs::copy(common::bin_exe("kache-clang-cl"), target).unwrap();
     }
     std::fs::copy(
-        env!("CARGO_BIN_EXE_kache-engine"),
+        common::bin_exe("kache-engine"),
         install.join(format!("kache-engine{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();
     std::fs::copy(
-        env!("CARGO_BIN_EXE_kache"),
+        common::bin_exe("kache"),
         install.join(format!("kache{}", std::env::consts::EXE_SUFFIX)),
     )
     .unwrap();

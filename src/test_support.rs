@@ -55,6 +55,25 @@ impl Drop for KunobiConfigGuard {
     }
 }
 
+/// The kache package's folder (`CARGO_MANIFEST_DIR`), as Cargo or nextest
+/// sets it for the test process when it runs.
+///
+/// Read when the test runs, never through `env!`, so a nextest archive run on
+/// another machine (`--workspace-remap`) finds the fixtures there. Read once:
+/// a few tests point the variable at a fixture package while they hold the
+/// process-state lock, and call this first, so a reader on another thread
+/// never sees their value.
+pub(crate) fn manifest_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .expect("CARGO_MANIFEST_DIR is set by `cargo test` and `cargo nextest run`"),
+        )
+    })
+    .clone()
+}
+
 /// A `Config` rooted in `cache_dir` with every optional feature off, for
 /// tests that need a store without reading the developer's configuration.
 /// Start `command` without a controlling terminal, so a child that shows

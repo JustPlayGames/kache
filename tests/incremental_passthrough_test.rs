@@ -7,8 +7,8 @@ use std::fs;
 #[allow(dead_code)]
 mod common;
 
-fn kache_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_kache")
+fn kache_binary() -> std::path::PathBuf {
+    common::bin_exe("kache")
 }
 
 /// How the invocation opts into incremental preservation.

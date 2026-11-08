@@ -463,7 +463,7 @@ fn generated_semantic_cache_oracle_matches_bare_rustc() {
         let plain_out = TempDir::new().unwrap();
         let kache_out = TempDir::new().unwrap();
         let cache_dir = TempDir::new().unwrap();
-        let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+        let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
 
         let plain_before =
             observe_oracle_compile(workspace.path(), plain_out.path(), case.before, None);
@@ -550,7 +550,7 @@ fn generated_semantic_cache_oracle_matches_bare_rustc() {
 fn check_cfg_change_cannot_replay_cached_success() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let src_dir = TempDir::new().unwrap();
     let src = src_dir.path().join("lib.rs");
@@ -588,7 +588,7 @@ fn check_cfg_change_cannot_replay_cached_success() {
 fn allow_override_change_cannot_replay_cached_success() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let src_dir = TempDir::new().unwrap();
     let src = src_dir.path().join("lib.rs");
@@ -621,7 +621,7 @@ fn allow_override_change_cannot_replay_cached_success() {
 fn codegen_shorthand_override_order_changes_cache_key() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let (_src_dir, src) = fresh_src();
 
@@ -658,7 +658,7 @@ fn codegen_shorthand_override_order_changes_cache_key() {
 fn rustc_response_file_content_changes_cache_key() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let src_dir = TempDir::new().unwrap();
     let src = src_dir.path().join("lib.rs");
@@ -690,7 +690,7 @@ fn rustc_response_file_content_changes_cache_key() {
 fn direct_remap_path_prefix_changes_cache_key() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let workspace_a = TempDir::new().unwrap();
     let workspace_b = TempDir::new().unwrap();
     let root_a = workspace_a.path().canonicalize().unwrap();
@@ -764,7 +764,7 @@ fn direct_remap_path_prefix_changes_cache_key() {
 fn link_lib_value_changes_cache_key() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let (_src_dir, src) = fresh_src();
 
@@ -788,7 +788,7 @@ fn link_lib_value_changes_cache_key() {
 fn link_search_native_keys_but_dependency_is_skipped() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let (_src_dir, src) = fresh_src();
 
@@ -815,7 +815,7 @@ fn link_search_native_keys_but_dependency_is_skipped() {
 fn sysroot_changes_cache_key() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let (_src_dir, src) = fresh_src();
     let sysroot = rustc_sysroot();
@@ -841,7 +841,7 @@ fn sysroot_changes_cache_key() {
 fn colocated_extra_input_changes_cache_key() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
 
     // A crate dir holding the source, its `Cargo.toml`, the co-located
@@ -886,7 +886,7 @@ fn colocated_extra_input_changes_cache_key() {
 fn swapping_module_contents_changes_cache_key() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let crate_dir = TempDir::new().unwrap();
     let src = crate_dir.path().join("lib.rs");
@@ -925,7 +925,7 @@ fn swapping_module_contents_changes_cache_key() {
 fn unicode_distinct_source_names_remain_distinct() {
     build_kache();
     let cache_dir = TempDir::new().unwrap();
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache_dir.path());
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache_dir.path());
     let out = TempDir::new().unwrap();
     let crate_dir = TempDir::new().unwrap();
     let src = crate_dir.path().join("lib.rs");
@@ -1012,7 +1012,7 @@ fn option_env_presence_changes_cached_behavior() {
 
     for predictions in [true, false] {
         let cache = TempDir::new().unwrap();
-        let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), cache.path());
+        let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), cache.path());
         let config = isolated_config_path(cache.path());
         std::fs::write(
             &config,

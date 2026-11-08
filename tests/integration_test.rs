@@ -587,7 +587,7 @@ fn test_cli_purge_empty() {
 fn test_disabled_passthrough() {
     build_kache();
 
-    let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
+    let test_project = common::manifest_dir().join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
     let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
@@ -616,7 +616,7 @@ fn test_disabled_passthrough() {
 fn test_wrapper_hello_world() {
     build_kache();
 
-    let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
+    let test_project = common::manifest_dir().join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
     let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();
@@ -752,7 +752,7 @@ fn test_rust_compile_with_failed_strip_is_not_stored() {
     )
     .unwrap();
 
-    let test_project = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/hello-world");
+    let test_project = common::manifest_dir().join("test-projects/hello-world");
     let cache_dir = TempDir::new().unwrap();
     let _cache_dir_daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
     let target_dir = TempDir::new().unwrap();

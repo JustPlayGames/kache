@@ -649,7 +649,7 @@ content = "value"
 
     #[test]
     fn all_shipped_bench_schemas_load() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         let selectors = Selectors::parse_many(&["suite:bench".to_string()]).unwrap();
         let profiles = BenchProfile::discover(&root, &selectors).unwrap();
         assert!(!profiles.is_empty());
@@ -660,7 +660,7 @@ content = "value"
     /// such a build when it happens; this catches the scenario before it runs.
     #[test]
     fn every_shipped_cargo_bench_fetches_before_it_is_timed() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         let selectors = Selectors::parse_many(&["suite:bench".to_string()]).unwrap();
         let profiles = BenchProfile::discover(&root, &selectors).unwrap();
         let cargo_builds: Vec<_> = profiles
@@ -687,7 +687,7 @@ content = "value"
     #[cfg(target_os = "linux")]
     #[test]
     fn all_shipped_bench_shell_commands_parse_with_linux_sh() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         let selectors = Selectors::parse_many(&["suite:bench".to_string()]).unwrap();
         let profiles = BenchProfile::discover(&root, &selectors).unwrap();
 
@@ -943,7 +943,7 @@ setup_marker = "{}"
 
     #[test]
     fn discover_disambiguates_short_profile_to_exact_name() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         let base = ["suite:bench".to_string(), "backend:kache".to_string()];
 
         // `name:firefox` is a SUBSTRING match, so it catches the
@@ -980,7 +980,7 @@ setup_marker = "{}"
 
     #[test]
     fn discover_disambiguates_mbx_hk_from_its_pull_variant() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         for (name, expected) in [("hk", "bench-hk-mbx"), ("hk-pull", "bench-hk-pull-mbx")] {
             let selectors = Selectors::parse_many(&[
                 "suite:bench".into(),
@@ -998,7 +998,7 @@ setup_marker = "{}"
     /// build the tree bench-firefox builds, through `mbx exec`.
     #[test]
     fn firefox_mbx_arm_builds_the_firefox_tree_through_mbx_exec() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         let selectors = Selectors::parse_many(&[
             "suite:bench".into(),
             "backend:mbx".into(),
@@ -1032,8 +1032,7 @@ setup_marker = "{}"
     }
 
     fn repo_profile(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("../../scenarios/bench-{name}/scenario.toml"))
+        crate::test_manifest_dir().join(format!("../../scenarios/bench-{name}/scenario.toml"))
     }
 
     /// Build a profile whose only file injection is one Patch entry with the

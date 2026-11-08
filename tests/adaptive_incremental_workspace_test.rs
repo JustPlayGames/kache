@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod common;
 use common::{hermetic_command, settle_writes};
 
-fn kache_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_kache")
+fn kache_binary() -> std::path::PathBuf {
+    common::bin_exe("kache")
 }
 
 /// Events Kache recorded for `crate_name`.

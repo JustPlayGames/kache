@@ -8,7 +8,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const KACHE: &str = env!("CARGO_BIN_EXE_kache");
+static KACHE: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| common::bin_exe("kache"));
 
 fn script(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
@@ -35,7 +36,7 @@ impl Fixture {
         for dir in [&shims, &tools, &real] {
             fs::create_dir(dir).unwrap();
         }
-        std::os::unix::fs::symlink(KACHE, shims.join("cargo")).unwrap();
+        std::os::unix::fs::symlink(KACHE.as_path(), shims.join("cargo")).unwrap();
         script(
             &real.join("cargo"),
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$REAL_LOG\"\nexit 0\n",
@@ -276,7 +277,7 @@ fn a_workspace_wrapper_can_report_success_without_rewriting_existing_outputs() {
             &wrapper,
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGV_LOG\"\nexit 0\n",
         );
-        let mut cmd = common::hermetic_command(KACHE, &f.cache, Some(&f.config));
+        let mut cmd = common::hermetic_command(KACHE.as_path(), &f.cache, Some(&f.config));
         let output = cmd
             .current_dir(f.root.path())
             .arg(&wrapper)
@@ -304,7 +305,7 @@ fn a_workspace_wrapper_can_report_success_without_rewriting_existing_outputs() {
                 .unwrap()
                 .contains("incremental=keep-me")
         );
-        let output = common::hermetic_command(KACHE, &f.cache, Some(&f.config))
+        let output = common::hermetic_command(KACHE.as_path(), &f.cache, Some(&f.config))
             .current_dir(f.root.path())
             .arg(&wrapper)
             .args(["rustc", "--crate-name", "___", "--print=file-names", "-"])

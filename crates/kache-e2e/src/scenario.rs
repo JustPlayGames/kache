@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn discovers_scenario_metadata_from_shared_root() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenarios");
+        let root = crate::test_manifest_dir().join("../../scenarios");
         let scenarios = discover_metadata(&root).unwrap();
 
         let firefox = scenarios

@@ -3339,6 +3339,7 @@ mod tests {
     #[test]
     fn a_symlinked_root_maps_both_spellings_and_a_plain_root_maps_once() {
         let _lock = crate::test_support::process_state_test_lock();
+        crate::test_support::manifest_dir(); // read it before this test moves it
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir_all(real.join("out")).unwrap();
@@ -3444,6 +3445,7 @@ mod tests {
     #[test]
     fn a_base_dir_keys_the_same_across_checkouts_only_in_remapping_flags() {
         let _lock = crate::test_support::process_state_test_lock();
+        crate::test_support::manifest_dir(); // read it before this test moves it
         let dir = tempfile::tempdir().unwrap();
         let mut remapped = Vec::new();
         let mut included = Vec::new();
@@ -4411,6 +4413,7 @@ mod tests {
     #[test]
     fn a_hermetic_key_leaves_out_only_the_out_dir() {
         let _lock = crate::test_support::process_state_test_lock();
+        crate::test_support::manifest_dir(); // read it before this test moves it
         let dir = tempfile::tempdir().unwrap();
         let config = crate::test_support::test_config(dir.path().join("cache"));
         let run = |target: &str, cargo_home: &str| Run {

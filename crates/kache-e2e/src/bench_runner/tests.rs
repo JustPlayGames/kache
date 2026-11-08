@@ -118,8 +118,7 @@ fn the_prediction_line_counts_rustc_units_not_all_compiles() {
 fn phase_times_read_the_fields_the_schema_publishes_under_timing() {
     let schema: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../docs/commands/report.schema.json"),
+            crate::test_manifest_dir().join("../../docs/commands/report.schema.json"),
         )
         .expect("the published report schema"),
     )

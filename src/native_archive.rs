@@ -1661,7 +1661,7 @@ pub(crate) fn gnu_crs_longname_archive_for_tests(payload: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     /// Build a 60-byte GNU `ar` header + data + even padding for one member.
     fn member(name: &str, data: &[u8]) -> Vec<u8> {
@@ -4557,8 +4557,7 @@ mod tests {
     /// libFuzzer being available in pull-request CI.
     #[test]
     fn fuzz_regression_corpus_is_total_and_deterministic() {
-        let corpus =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_archive_fuzz");
+        let corpus = crate::test_support::manifest_dir().join("tests/fixtures/native_archive_fuzz");
         let mut cases = std::fs::read_dir(&corpus)
             .unwrap_or_else(|error| panic!("read {}: {error}", corpus.display()))
             .map(|entry| entry.unwrap().path())

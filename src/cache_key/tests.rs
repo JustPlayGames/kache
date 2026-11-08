@@ -19918,6 +19918,7 @@ fn a_discovery_identity_is_the_shared_one_when_predictions_are_on() {
 #[test]
 fn a_guarded_record_is_refused_when_the_tree_changed() {
     let _lock = key_test_lock();
+    crate::test_support::manifest_dir(); // read it before this test moves it
     let dir = tempfile::tempdir().unwrap();
     let package = dir
         .path()

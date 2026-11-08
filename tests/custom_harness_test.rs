@@ -53,7 +53,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn copy_fixture() -> TempDir {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-projects/custom-harness");
+    let fixture = common::manifest_dir().join("test-projects/custom-harness");
     let tmp = TempDir::new_in(scratch_dir()).unwrap();
     copy_dir(&fixture, tmp.path());
     tmp

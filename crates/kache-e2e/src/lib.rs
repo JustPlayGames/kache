@@ -99,6 +99,17 @@ pub fn run_kache_compiler_shim(family: &str) -> ! {
     }
 }
 
+/// This crate's folder (`CARGO_MANIFEST_DIR`), read when the test runs, never
+/// through `env!`, so a nextest archive run on another machine
+/// (`--workspace-remap`) finds the scenarios there.
+#[cfg(test)]
+pub(crate) fn test_manifest_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set by `cargo test` and `cargo nextest run`"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::to_portable_str;

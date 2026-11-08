@@ -424,8 +424,7 @@ fn terminal_formatting_shares_cc_keys_with_cold_and_warm_probes() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
-    let fake_cc =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let fake_cc = crate::test_support::manifest_dir().join("tests/fixtures/mock_cc_diagnostics.sh");
     let compiler = CcCompiler::new();
     let file_hasher = crate::cache_key::FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
@@ -487,8 +486,7 @@ fn a_key_from_before_the_input_race_fixes_is_never_todays() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
-    let fake_cc =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let fake_cc = crate::test_support::manifest_dir().join("tests/fixtures/mock_cc_diagnostics.sh");
     let compiler = CcCompiler::new();
     let file_hasher = crate::cache_key::FileHasher::new();
     let path_normalizer = crate::path_normalizer::PathNormalizer::empty();
@@ -531,8 +529,7 @@ fn terminal_formatting_shares_the_compile_first_read_set_memo() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
-    let fake_cc =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_diagnostics.sh");
+    let fake_cc = crate::test_support::manifest_dir().join("tests/fixtures/mock_cc_diagnostics.sh");
     let memo = |flags: &[&str]| {
         let mut args = vec![
             fake_cc.to_string_lossy().into_owned(),
@@ -3662,7 +3659,7 @@ fn wa_debug_prefix_map_changes_cache_key_issue_644() {
     // A checked-in executable avoids ETXTBSY when another test forks
     // while a runtime-created script is still open for writing.
     let fake_cc =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_constant_output.sh");
+        crate::test_support::manifest_dir().join("tests/fixtures/mock_cc_constant_output.sh");
     let source = temp.path().join("unit.S");
     fs::write(&source, "/* fake compiler ignores this */\n").unwrap();
     let output = temp.path().join("unit.o");
@@ -7309,8 +7306,7 @@ fn cl_debug_path_inputs_folds_source_output_and_dir() {
 fn include_dir_test_compiler(dir: &Path) -> (CcCompiler, PathBuf, PathBuf) {
     use std::fs;
 
-    let fake_cc =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_cc_static.sh");
+    let fake_cc = crate::test_support::manifest_dir().join("tests/fixtures/mock_cc_static.sh");
     let source = dir.join("unit.c");
     fs::write(&source, "int x;\n").unwrap();
     (CcCompiler::new(), fake_cc, source)
