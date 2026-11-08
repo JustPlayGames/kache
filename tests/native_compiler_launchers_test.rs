@@ -1,5 +1,8 @@
 //! Exercise CC/CXX launchers as native executables, including on Windows.
-use std::path::{Path, PathBuf};
+#[allow(dead_code)]
+mod common;
+
+use std::path::Path;
 use std::process::Command;
 
 #[test]
@@ -60,16 +63,16 @@ fn native_aliases_forward_to_the_selected_driver_without_a_shell() {
     std::fs::create_dir_all(&toolchain).unwrap();
     std::fs::write(root.join("config.toml"), "").unwrap();
     let engine_name = format!("kache-engine{}", std::env::consts::EXE_SUFFIX);
-    let engine_source = Path::new(env!("CARGO_BIN_EXE_kache-engine"));
+    let engine_source = &common::bin_exe("kache-engine");
     let engine_size = std::fs::metadata(engine_source).unwrap().len();
     let engine_source_identity = kache_fs::file_identity(engine_source).unwrap();
     for (binary, driver) in [
-        (env!("CARGO_BIN_EXE_kache-clang-cl"), "clang-cl"),
-        (env!("CARGO_BIN_EXE_kache-cl"), "cl"),
+        (common::bin_exe("kache-clang-cl"), "clang-cl"),
+        (common::bin_exe("kache-cl"), "cl"),
     ] {
         let real = toolchain.join(format!("{driver}{}", std::env::consts::EXE_SUFFIX));
         std::fs::copy(std::env::current_exe().unwrap(), &real).unwrap();
-        let original_name = PathBuf::from(binary);
+        let original_name = binary.clone();
         for (case, filename) in [
             ("original", original_name.file_name().unwrap()),
             ("short", std::ffi::OsStr::new("KACHE-~1.EXE")),
@@ -80,7 +83,7 @@ fn native_aliases_forward_to_the_selected_driver_without_a_shell() {
             let launcher = install.join(filename);
             // On NTFS, an engine created first can own KACHE-~1.EXE as its
             // short name. Reserve the launcher's name before its companion.
-            std::fs::copy(binary, &launcher).unwrap();
+            std::fs::copy(&binary, &launcher).unwrap();
             let engine = install.join(&engine_name);
             assert!(!engine.try_exists().unwrap());
             std::fs::copy(engine_source, &engine).unwrap();

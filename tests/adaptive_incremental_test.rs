@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod common;
 use common::hermetic_command;
 
-fn kache_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_kache")
+fn kache_binary() -> std::path::PathBuf {
+    common::bin_exe("kache")
 }
 
 fn fixture_events(cache_dir: &Path) -> Vec<Value> {

@@ -33,7 +33,7 @@ fn cached_check_outputs_allow_cargo_and_clippy_fix() {
         let _daemon = common::DaemonGuard::new(&kache, &cache);
         let run = |args: &[&str]| {
             let output = common::hermetic_command(
-                env!("CARGO"),
+                common::cargo(),
                 &cache,
                 Some(&common::isolated_config_path(&cache)),
             )

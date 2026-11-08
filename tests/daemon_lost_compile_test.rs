@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 #[allow(dead_code)]
 mod common;
 
-const FRONTEND: &str = env!("CARGO_BIN_EXE_kache");
+static FRONTEND: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| common::bin_exe("kache"));
 
 /// The fake compiler: its first compile writes a half output and an `.rmeta`
 /// and then runs until it is killed; the next one records what it found and
@@ -66,7 +67,7 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(FRONTEND);
+        let mut command = Command::new(FRONTEND.as_path());
         command
             .env_clear()
             .env("PATH", env!("PATH"))

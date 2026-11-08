@@ -22,7 +22,8 @@ use common::{hermetic_command, settle_writes, stop_daemon};
 /// Path to the binary under test. Cargo sets `CARGO_BIN_EXE_kache` to the
 /// artifact it built for this integration test — under `cargo llvm-cov` that
 /// is the instrumented binary, so spawning it counts toward coverage.
-const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
+static KACHE_BIN: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| common::bin_exe("kache"));
 
 /// Idle timeout for every daemon these tests start. A backstop, not the
 /// cleanup: `Env`'s `Drop` stops the daemon, so it stays warm for the whole
@@ -34,7 +35,7 @@ const DAEMON_IDLE_BACKSTOP_SECS: &str = "60";
 /// config path, and HOME/CARGO_HOME so nothing touches the developer's real
 /// setup and no background daemon is contacted.
 fn kache(home: &Path, cache_dir: &Path) -> Command {
-    kache_as(Path::new(KACHE_BIN), home, cache_dir)
+    kache_as(KACHE_BIN.as_path(), home, cache_dir)
 }
 
 /// [`kache`], run through `program`: a compiler shim or a link to the binary.
@@ -78,8 +79,7 @@ impl Drop for Env {
     /// Stop the daemon this test started, if any, before its dirs go away.
     fn drop(&mut self) {
         stop_daemon(
-            kache_process_as(Path::new(KACHE_BIN), &self.home, &self.cache)
-                .args(["daemon", "stop"]),
+            kache_process_as(KACHE_BIN.as_path(), &self.home, &self.cache).args(["daemon", "stop"]),
             &self.cache,
         );
     }
@@ -105,13 +105,13 @@ impl Env {
         args: &[&str],
     ) -> std::process::Output {
         let output = hermetic_command(
-            env!("CARGO"),
+            common::cargo(),
             &self.cache,
             Some(&self.cache.join("config.toml")),
         )
         .args(args)
         .current_dir(project)
-        .env("RUSTC_WRAPPER", KACHE_BIN)
+        .env("RUSTC_WRAPPER", KACHE_BIN.as_path())
         .env("KACHE_LOG", "off")
         .env("HOME", &self.home)
         .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
@@ -277,13 +277,13 @@ fn unknown_subcommand_is_a_usage_error() {
 #[test]
 fn test_runner_passes_the_exit_code_through() {
     let e = env();
-    let dir = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = TempDir::new_in(common::target_tmpdir()).unwrap();
     let probe = dir.path().join(format!(
         "probe-0123456789abcdef{}",
         std::env::consts::EXE_SUFFIX
     ));
-    std::fs::hard_link(env!("CARGO_BIN_EXE_kache-engine"), &probe)
-        .or_else(|_| std::fs::copy(env!("CARGO_BIN_EXE_kache-engine"), &probe).map(drop))
+    std::fs::hard_link(common::bin_exe("kache-engine"), &probe)
+        .or_else(|_| std::fs::copy(common::bin_exe("kache-engine"), &probe).map(drop))
         .unwrap();
     for scheduler in ["1", "0"] {
         e.cmd()
@@ -420,7 +420,7 @@ fn stale_takes_the_since_forms() {
 fn a_closed_stdout_ends_quietly() {
     let e = env();
     for args in [["--json", "--help"], ["--json", "list"]] {
-        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        let mut command = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache);
         command
             .args(args)
             .stdout(std::process::Stdio::piped())
@@ -1527,7 +1527,7 @@ fn terminal_session(
 fn init_preview_reports_the_recovery_question_a_terminal_run_asks() {
     let e = env();
     let recovery = |args: &[&str], stdin_terminal: bool| {
-        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        let mut command = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache);
         command
             .args(["init", "--check", "--no-service", "--no-shell", "--json"])
             .args(args)
@@ -1574,7 +1574,7 @@ fn terminal_color_policy_and_wrapping_match_the_actual_command() {
         (Some("1"), "xterm", false),
         (None, "dumb", false),
     ] {
-        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        let mut command = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache);
         command
             .args(["init", "--check", "--no-service", "--no-shell"])
             .env_remove("NO_COLOR")
@@ -1592,7 +1592,7 @@ fn terminal_color_policy_and_wrapping_match_the_actual_command() {
     }
     // The plan table comes before the question, which nobody answers here.
     let plan = |columns: u16, env_columns: Option<&str>| {
-        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        let mut command = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache);
         command
             .args(["init", "--no-service", "--no-shell"])
             .env("NO_COLOR", "1")
@@ -2293,7 +2293,7 @@ fn targets_lists_a_tracked_target_and_flags_its_deleted_worktree() {
 
     // Windows keeps the daemon's working directory open until it exits.
     stop_daemon(
-        kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache).args(["daemon", "stop"]),
+        kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache).args(["daemon", "stop"]),
         &e.cache,
     );
     std::fs::remove_dir_all(project.path()).unwrap();
@@ -2481,7 +2481,7 @@ fn doctor_probes_the_cargo_target_dir_for_the_link_layout() {
     )
     .unwrap();
 
-    let output = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache)
+    let output = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache)
         // The environment names the target dir too, and the check has to read
         // the config this test writes.
         .env_remove("CARGO_TARGET_DIR")
@@ -2506,7 +2506,7 @@ fn doctor_probes_the_cargo_target_dir_for_the_link_layout() {
 fn doctor_reports_an_unresolved_output_directory_without_claiming_link_support() {
     let e = env();
     let project = TempDir::new().unwrap();
-    let output = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache)
+    let output = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache)
         .env("CARGO_TARGET_DIR", "")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -2690,17 +2690,21 @@ fn doctor_reports_reachable_daemon_version() {
     let e = env();
     let project = scaffold_lib("kachedoc", "pub fn d() -> u8 { 1 }\n");
     let target_dir = project.path().join("target");
-    let build = hermetic_command(env!("CARGO"), &e.cache, Some(&e.cache.join("config.toml")))
-        .args(["build", "--lib"])
-        .current_dir(project.path())
-        .env("RUSTC_WRAPPER", KACHE_BIN)
-        .env("KACHE_LOG", "off")
-        .env("HOME", &e.home)
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .env("CARGO_INCREMENTAL", "0")
-        .output()
-        .expect("run build");
+    let build = hermetic_command(
+        common::cargo(),
+        &e.cache,
+        Some(&e.cache.join("config.toml")),
+    )
+    .args(["build", "--lib"])
+    .current_dir(project.path())
+    .env("RUSTC_WRAPPER", KACHE_BIN.as_path())
+    .env("KACHE_LOG", "off")
+    .env("HOME", &e.home)
+    .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
+    .env("CARGO_TARGET_DIR", &target_dir)
+    .env("CARGO_INCREMENTAL", "0")
+    .output()
+    .expect("run build");
     assert!(build.status.success(), "build failed");
 
     // doctor queries the live daemon; same binary -> version + epoch match.
@@ -2906,12 +2910,12 @@ fn init_recognizes_both_binaries_from_the_current_installation() {
     };
     std::fs::create_dir_all(service.parent().unwrap()).unwrap();
     let other = e.home.join("other-kache");
-    std::fs::copy(KACHE_BIN, &other).unwrap();
+    std::fs::copy(KACHE_BIN.as_path(), &other).unwrap();
     // A hardlinked frontend can belong to a different engine installation.
     // Keep the fixture on the binary's volume so the hardlink is portable.
-    let foreign = tempfile::tempdir_in(Path::new(KACHE_BIN).parent().unwrap()).unwrap();
+    let foreign = tempfile::tempdir_in(KACHE_BIN.as_path().parent().unwrap()).unwrap();
     let foreign_frontend = foreign.path().join("kache");
-    std::fs::hard_link(KACHE_BIN, &foreign_frontend).unwrap();
+    std::fs::hard_link(KACHE_BIN.as_path(), &foreign_frontend).unwrap();
     kache_fs::testutil::write_executable(
         &foreign.path().join("kache-engine"),
         "#!/bin/sh\nexit 1\n",
@@ -2924,8 +2928,8 @@ fn init_recognizes_both_binaries_from_the_current_installation() {
     )))
     .unwrap();
     for (exe, action) in [
-        (Path::new(KACHE_BIN), "keep"),
-        (Path::new(env!("CARGO_BIN_EXE_kache-engine")), "keep"),
+        (KACHE_BIN.as_path(), "keep"),
+        (&common::bin_exe("kache-engine"), "keep"),
         (other.as_path(), "update"),
         (foreign_frontend.as_path(), "update"),
     ] {
@@ -2997,7 +3001,7 @@ exit 0
             .cmd()
             .args(["init", "--yes", "--no-shell", "--json"])
             .env("PATH", path)
-            .env("KACHE_TEST_BIN", KACHE_BIN)
+            .env("KACHE_TEST_BIN", KACHE_BIN.as_path())
             .env("KACHE_TEST_START_FAILS", if fails { "1" } else { "0" })
             .timeout(std::time::Duration::from_secs(30))
             .output()
@@ -3076,7 +3080,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .cmd()
         .args(["init", "--yes", "--no-service", "--no-shell"])
         .env("PATH", path)
-        .env("KACHE_TEST_BIN", KACHE_BIN)
+        .env("KACHE_TEST_BIN", KACHE_BIN.as_path())
         .env("KACHE_TEST_SERVICE_PID", &marker)
         .env("KACHE_TEST_SERVICE_ARGS", e.home.join("service.args"))
         .timeout(std::time::Duration::from_secs(30))
@@ -3577,7 +3581,7 @@ fn init_saves_shell_setup_preserves_cargo_choices_and_is_idempotent() {
     for name in ["cc", "c++", "gcc", "g++", "clang", "clang++"] {
         assert_eq!(
             std::fs::canonicalize(e.home.join(".local/lib/kache/shims").join(name)).unwrap(),
-            std::fs::canonicalize(KACHE_BIN).unwrap()
+            std::fs::canonicalize(KACHE_BIN.as_path()).unwrap()
         );
     }
     e.cmd()
@@ -3709,7 +3713,7 @@ fn init_repairs_each_half_of_terminal_setup_and_reports_activation() {
     assert_eq!(std::fs::read_to_string(&rc).unwrap(), repaired);
     assert_eq!(
         std::fs::canonicalize(shims.join("cc")).unwrap(),
-        std::fs::canonicalize(KACHE_BIN).unwrap()
+        std::fs::canonicalize(KACHE_BIN.as_path()).unwrap()
     );
     e.cmd()
         .env(
@@ -3781,12 +3785,12 @@ fn init_leaves_unsupported_shells_and_managed_dotfiles_alone() {
 #[cfg(unix)]
 fn second_kache_binary(link: &Path) {
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-    if std::fs::hard_link(KACHE_BIN, link).is_err() {
-        std::fs::copy(KACHE_BIN, link).unwrap();
+    if std::fs::hard_link(KACHE_BIN.as_path(), link).is_err() {
+        std::fs::copy(KACHE_BIN.as_path(), link).unwrap();
     }
     let engine = link.with_file_name("kache-engine");
-    if std::fs::hard_link(env!("CARGO_BIN_EXE_kache-engine"), &engine).is_err() {
-        std::fs::copy(env!("CARGO_BIN_EXE_kache-engine"), &engine).unwrap();
+    if std::fs::hard_link(common::bin_exe("kache-engine"), &engine).is_err() {
+        std::fs::copy(common::bin_exe("kache-engine"), &engine).unwrap();
     }
 }
 
@@ -3874,7 +3878,7 @@ fn a_frontend_installed_as_its_own_engine_fails_without_recursing() {
 fn two_kache_installs_on_path_do_not_run_each_other() {
     let e = env();
     let root = tempfile::Builder::new()
-        .tempdir_in(Path::new(KACHE_BIN).parent().unwrap())
+        .tempdir_in(KACHE_BIN.as_path().parent().unwrap())
         .unwrap();
     let root = root.path();
     let other_kache = root.join("other-install/bin/kache");
@@ -3884,7 +3888,7 @@ fn two_kache_installs_on_path_do_not_run_each_other() {
     let shims_b = root.join("shims-b");
     std::fs::create_dir_all(&shims_a).unwrap();
     std::fs::create_dir_all(&shims_b).unwrap();
-    std::os::unix::fs::symlink(KACHE_BIN, shims_a.join("cc")).unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN.as_path(), shims_a.join("cc")).unwrap();
     std::os::unix::fs::symlink(&other_kache, shims_b.join("cc")).unwrap();
     let path = shim_test_path(root, &[&shims_a, &shims_b]);
 
@@ -3907,7 +3911,7 @@ fn two_kache_installs_on_path_do_not_run_each_other() {
 fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
     let e = env();
     let root = tempfile::Builder::new()
-        .tempdir_in(Path::new(KACHE_BIN).parent().unwrap())
+        .tempdir_in(KACHE_BIN.as_path().parent().unwrap())
         .unwrap();
     let root = root.path();
     let copies = root.join("copies");
@@ -3960,7 +3964,7 @@ fn a_self_spawned_gc_behind_a_shim_runs_gc() {
     let root = TempDir::new().unwrap();
     let shims = root.path().join("shims");
     std::fs::create_dir_all(&shims).unwrap();
-    std::os::unix::fs::symlink(KACHE_BIN, shims.join("cc")).unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN.as_path(), shims.join("cc")).unwrap();
     let path = shim_test_path(root.path(), &[&shims]);
 
     kache_as(&shims.join("cc"), &e.home, &e.cache)
@@ -4891,20 +4895,24 @@ fn workspace_wrapper_via_cargo_build_env_and_path() {
         new_path.push(p);
     }
 
-    let build = hermetic_command(env!("CARGO"), &e.cache, Some(&e.cache.join("config.toml")))
-        .args(["build", "--lib"])
-        .current_dir(project.path())
-        .env("PATH", new_path)
-        .env("RUSTC_WRAPPER", KACHE_BIN)
-        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "mydriver")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env("KACHE_LOG", "off")
-        .env("HOME", &e.home)
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .env("CARGO_INCREMENTAL", "0")
-        .output()
-        .expect("run cargo build");
+    let build = hermetic_command(
+        common::cargo(),
+        &e.cache,
+        Some(&e.cache.join("config.toml")),
+    )
+    .args(["build", "--lib"])
+    .current_dir(project.path())
+    .env("PATH", new_path)
+    .env("RUSTC_WRAPPER", KACHE_BIN.as_path())
+    .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "mydriver")
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env("KACHE_LOG", "off")
+    .env("HOME", &e.home)
+    .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
+    .env("CARGO_TARGET_DIR", &target_dir)
+    .env("CARGO_INCREMENTAL", "0")
+    .output()
+    .expect("run cargo build");
 
     assert!(
         build.status.success(),
@@ -4941,20 +4949,24 @@ fn workspace_wrapper_via_cargo_config_and_path() {
         new_path.push(p);
     }
 
-    let build = hermetic_command(env!("CARGO"), &e.cache, Some(&e.cache.join("config.toml")))
-        .args(["build", "--lib"])
-        .current_dir(project.path())
-        .env("PATH", new_path)
-        .env("RUSTC_WRAPPER", KACHE_BIN)
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
-        .env("KACHE_LOG", "off")
-        .env("HOME", &e.home)
-        .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .env("CARGO_INCREMENTAL", "0")
-        .output()
-        .expect("run cargo build");
+    let build = hermetic_command(
+        common::cargo(),
+        &e.cache,
+        Some(&e.cache.join("config.toml")),
+    )
+    .args(["build", "--lib"])
+    .current_dir(project.path())
+    .env("PATH", new_path)
+    .env("RUSTC_WRAPPER", KACHE_BIN.as_path())
+    .env_remove("RUSTC_WORKSPACE_WRAPPER")
+    .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+    .env("KACHE_LOG", "off")
+    .env("HOME", &e.home)
+    .env("KACHE_DAEMON_IDLE_TIMEOUT", DAEMON_IDLE_BACKSTOP_SECS)
+    .env("CARGO_TARGET_DIR", &target_dir)
+    .env("CARGO_INCREMENTAL", "0")
+    .output()
+    .expect("run cargo build");
 
     assert!(
         build.status.success(),
@@ -5311,7 +5323,7 @@ fn daemon_start_needs_no_more_path_than_its_own_socket() {
 /// rustc cache is removed so only kache's record can decide.
 #[test]
 fn a_target_clippy_checked_last_seeds_a_new_checkout() {
-    let clippy = std::process::Command::new(env!("CARGO"))
+    let clippy = std::process::Command::new(common::cargo())
         .args(["clippy", "--version"])
         .output();
     if !clippy.is_ok_and(|out| out.status.success()) {
@@ -5545,12 +5557,12 @@ fn the_target_info_probe_seeds_a_new_checkout() {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let shim = root.path().join("shim/cargo");
         std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
-        symlink(KACHE_BIN, &shim).unwrap();
+        symlink(KACHE_BIN.as_path(), &shim).unwrap();
         for (name, program, prefix, intermediate) in [
             ("cargo-shim-target", shim.as_path(), vec![], "custom"),
             (
                 "cargo-proxy-build",
-                Path::new(KACHE_BIN),
+                KACHE_BIN.as_path(),
                 vec!["cargo", "--"],
                 "target",
             ),
@@ -5564,7 +5576,7 @@ fn the_target_info_probe_seeds_a_new_checkout() {
             command
                 .current_dir(&checkout)
                 .env("KACHE_REAL_CARGO", &fake)
-                .env("KACHE_TEST_BINARY", KACHE_BIN)
+                .env("KACHE_TEST_BINARY", KACHE_BIN.as_path())
                 .env_remove("CARGO_TARGET_DIR")
                 .env_remove("CARGO_BUILD_TARGET_DIR")
                 .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -5752,8 +5764,8 @@ fn daemon_readiness_channel_precedes_a_fresh_running_status() {
     use kunobi_daemon::launch::DaemonCommand;
     use std::time::{Duration, Instant};
     let e = env();
-    let configured = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
-    let mut command = DaemonCommand::new(KACHE_BIN);
+    let configured = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache);
+    let mut command = DaemonCommand::new(KACHE_BIN.as_path());
     command.args(["daemon", "run"]).readiness_channel();
     for (name, value) in configured.get_envs() {
         match value {
@@ -5838,7 +5850,7 @@ fn diff_still_fails_when_stdout_is_closed() {
     let e = env();
     for (later, code) in [(&["b", "c"][..], 1), (&["b"][..], 0)] {
         write_diff_sessions(&e, &[("s1", &["a"]), ("s2", later)]);
-        let mut command = kache_process_as(Path::new(KACHE_BIN), &e.home, &e.cache);
+        let mut command = kache_process_as(KACHE_BIN.as_path(), &e.home, &e.cache);
         command
             .args(["--json", "diff"])
             .stdout(std::process::Stdio::piped())
@@ -5871,8 +5883,8 @@ fn copy_kache_binary(path: &Path) {
         "kache-engine"
     });
     for (source, destination) in [
-        (KACHE_BIN, path),
-        (env!("CARGO_BIN_EXE_kache-engine"), engine.as_path()),
+        (KACHE_BIN.as_path(), path),
+        (common::bin_exe("kache-engine").as_path(), engine.as_path()),
     ] {
         #[cfg(unix)]
         {
@@ -5881,7 +5893,11 @@ fn copy_kache_binary(path: &Path) {
                 .arg(destination)
                 .status()
                 .unwrap();
-            assert!(status.success(), "copying {source} failed: {status}");
+            assert!(
+                status.success(),
+                "copying {} failed: {status}",
+                source.display()
+            );
         }
         #[cfg(not(unix))]
         std::fs::copy(source, destination).unwrap();

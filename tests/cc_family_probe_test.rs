@@ -20,14 +20,13 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::path::PathBuf;
 #[allow(dead_code)]
 mod common;
 
 /// Path to the kache binary under test (Cargo sets this for the
 /// integration-test harness).
-fn kache_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_kache")
+fn kache_binary() -> std::path::PathBuf {
+    common::bin_exe("kache")
 }
 
 /// The marker the fake compiler prints — proof the probe reached *it*
@@ -59,7 +58,7 @@ fn family_probe_forwards_to_real_compiler_recovered_from_cc_env() {
     // Reproduce the cc crate's mis-parse: CC = "<kache> <real-compiler>".
     // The cc crate would invoke `kache -E <probe_file>`, dropping the
     // real compiler from argv — so kache must recover it from CC here.
-    let cc_value = format!("{} {}", kache_binary(), fake.display());
+    let cc_value = format!("{} {}", kache_binary().display(), fake.display());
 
     let output = common::hermetic_command(
         kache_binary(),
@@ -103,7 +102,7 @@ fn family_probe_without_kache_cc_does_not_use_fake_compiler() {
     let probe_file = dir.path().join("detect_compiler_family.c");
     fs::write(&probe_file, b"int main(void){return 0;}\n").unwrap();
 
-    let _ = PathBuf::from(kache_binary());
+    let _ = kache_binary();
     let output = common::hermetic_command(
         kache_binary(),
         &dir.path().join("cache"),

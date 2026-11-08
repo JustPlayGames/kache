@@ -62,7 +62,7 @@ impl Project {
     }
 
     fn build_with_stderr(&self) -> (Vec<serde_json::Value>, String) {
-        let output = hermetic_command(env!("CARGO"), &self.cache, Some(&self.config))
+        let output = hermetic_command(common::cargo(), &self.cache, Some(&self.config))
             .args(["build", "--offline"])
             .current_dir(&self.root)
             .env("RUSTC_WRAPPER", kache_binary())

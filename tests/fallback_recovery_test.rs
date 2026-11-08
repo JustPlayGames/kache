@@ -70,10 +70,7 @@ printf 'complete-object' > "$TEST_OBJECT"
         .map(String::from)
         .collect();
         Self {
-            _daemon: common::DaemonGuard::new(
-                env!("CARGO_BIN_EXE_kache"),
-                dir.path().join("cache"),
-            ),
+            _daemon: common::DaemonGuard::new(common::bin_exe("kache"), dir.path().join("cache")),
             dir,
             compiler,
             fallback,
@@ -82,7 +79,7 @@ printf 'complete-object' > "$TEST_OBJECT"
     }
     fn command(&self, compiler_exit: i32) -> Command {
         let mut command = common::hermetic_command(
-            env!("CARGO_BIN_EXE_kache"),
+            common::bin_exe("kache"),
             &self.dir.path().join("cache"),
             Some(&self.dir.path().join("absent.toml")),
         );

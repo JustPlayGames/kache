@@ -5,8 +5,8 @@ use std::fs;
 mod common;
 use std::time::{Duration, Instant};
 
-fn kache_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_kache")
+fn kache_binary() -> std::path::PathBuf {
+    common::bin_exe("kache")
 }
 
 fn process_is_running(pid: i32) -> bool {
@@ -29,7 +29,10 @@ fn probe_recovers_when_wrapper_fork_bombs() {
 
     kache_fs::testutil::write_executable(
         &wrapper,
-        format!("#!/bin/sh\nexec {} \"$0\" \"$@\"\n", kache_binary()),
+        format!(
+            "#!/bin/sh\nexec {} \"$0\" \"$@\"\n",
+            kache_binary().display()
+        ),
     );
 
     let start = Instant::now();

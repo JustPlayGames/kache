@@ -44,7 +44,7 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
     );
 
     let cache = dir.path().join("cache");
-    let daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let config = dir.path().join("kache.toml");
     fs::write(&config, "").unwrap();
     let args = [
@@ -61,7 +61,7 @@ fn msvc_preserves_arguments_diagnostics_and_exit_status() {
         for code in [0, 23] {
             let log = dir.path().join(format!("{mode}-{code}.argv"));
             let mut command =
-                common::hermetic_command(env!("CARGO_BIN_EXE_kache"), &cache, Some(&config));
+                common::hermetic_command(common::bin_exe("kache"), &cache, Some(&config));
             command
                 .current_dir(dir.path())
                 .arg(&compiler)

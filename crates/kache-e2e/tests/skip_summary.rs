@@ -23,9 +23,9 @@ clean = "unused"
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_kache-scenario"))
+    let output = Command::new(scenario_bin())
         .arg("--kache")
-        .arg(env!("CARGO_BIN_EXE_kache-scenario"))
+        .arg(scenario_bin())
         .arg("--scenarios")
         .arg(temp.path())
         .arg("--select")
@@ -40,4 +40,13 @@ clean = "unused"
         String::from_utf8_lossy(&output.stderr)
             .contains("PASS: all executed fixtures green (1 skipped)")
     );
+}
+
+/// The `kache-scenario` binary Cargo built for these tests, read when the
+/// test runs (a nextest archive moves it), never through `env!`.
+fn scenario_bin() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_kache-scenario")
+            .expect("CARGO_BIN_EXE_kache-scenario is set by `cargo test` and `cargo nextest run`"),
+    )
 }

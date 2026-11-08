@@ -104,7 +104,7 @@ impl Fixture {
         settle_writes(&[&self.package]);
 
         let before = self.events().len();
-        let output = hermetic_command(env!("CARGO"), self.cache.path(), Some(&self.config()))
+        let output = hermetic_command(common::cargo(), self.cache.path(), Some(&self.config()))
             .args(["test", "--offline", "--no-run", "--message-format=json"])
             .current_dir(&self.package)
             .env("RUSTC_WRAPPER", &self.kache)

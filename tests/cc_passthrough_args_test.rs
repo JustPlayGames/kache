@@ -16,8 +16,8 @@ use std::process::Command;
 #[allow(dead_code)]
 mod common;
 
-fn kache_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_kache")
+fn kache_binary() -> std::path::PathBuf {
+    common::bin_exe("kache")
 }
 
 struct FixtureDir(tempfile::TempDir);

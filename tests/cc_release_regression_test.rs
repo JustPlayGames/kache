@@ -1,7 +1,6 @@
 //! External C/C++ reports exercised through real clang and Make.
 #![cfg(unix)]
 
-use std::path::Path;
 use std::process::Command;
 
 #[allow(dead_code)]
@@ -23,16 +22,16 @@ fn real_cc_regression(issue: &str) {
         }
     }
     let scratch = tempfile::tempdir().unwrap();
-    let _daemon =
-        common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), scratch.path().join("cache"));
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), scratch.path().join("cache"));
     let mut command = common::hermetic_command(
         "bash",
         &scratch.path().join("cache"),
         Some(&scratch.path().join("config.toml")),
     );
     let output = command
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cc_release_regressions.sh"))
-        .args([env!("CARGO_BIN_EXE_kache"), "clang", issue])
+        .arg(common::manifest_dir().join("tests/fixtures/cc_release_regressions.sh"))
+        .arg(common::bin_exe("kache"))
+        .args(["clang", issue])
         .arg(scratch.path())
         .output()
         .expect("run real clang/Make regression");

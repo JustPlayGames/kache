@@ -87,7 +87,7 @@ static OWNS_DAEMONS: std::sync::Once = std::sync::Once::new();
 
 fn bootstrap_kache() -> Result<PathBuf, String> {
     if reuse_outer_build() {
-        return Ok(PathBuf::from(env!("CARGO_BIN_EXE_kache")));
+        return Ok(bin_exe("kache"));
     }
     let target_dir = bootstrap_target_dir();
     let output = std::process::Command::new("cargo")
@@ -157,6 +157,65 @@ pub fn scan(_input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     code.parse().unwrap()
 }
 "#;
+
+/// A path Cargo hands the test process when it runs it, such as
+/// `CARGO_MANIFEST_DIR` or `CARGO_BIN_EXE_<name>`.
+///
+/// Read when the test runs, never through `env!`: `env!` bakes in the paths
+/// of the machine that compiled the test, while `cargo test` and
+/// `cargo nextest run` set these variables for every run, and a nextest
+/// archive run elsewhere (`--workspace-remap`, `--extract-to`) points them at
+/// that machine's checkout and binaries.
+#[allow(dead_code)]
+fn run_env_path(var: &str) -> PathBuf {
+    std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| {
+        panic!("{var} is not set: run the tests through `cargo test` or `cargo nextest run`")
+    })
+}
+
+/// The binary `name` of this package that Cargo built for the tests
+/// (`CARGO_BIN_EXE_<name>`, read when the test runs).
+#[allow(dead_code)]
+pub fn bin_exe(name: &str) -> PathBuf {
+    run_env_path(&format!("CARGO_BIN_EXE_{name}"))
+}
+
+/// The package's folder (`CARGO_MANIFEST_DIR`, read when the test runs).
+#[allow(dead_code)]
+pub fn manifest_dir() -> PathBuf {
+    run_env_path("CARGO_MANIFEST_DIR")
+}
+
+/// The Cargo running the tests (`CARGO`), or the first `cargo` on `PATH` when
+/// a runner started the test binary without one (nextest from an archive).
+/// That one is usually rustup's proxy, so such a runner also sets
+/// `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN` as the proxy does for `cargo test`:
+/// tests that move `HOME` would otherwise send rustup looking elsewhere.
+#[allow(dead_code)]
+pub fn cargo() -> PathBuf {
+    if let Some(cargo) = std::env::var_os("CARGO") {
+        return PathBuf::from(cargo);
+    }
+    let name = format!("cargo{}", std::env::consts::EXE_SUFFIX);
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join(&name))
+        .find(|path| path.is_file())
+        .expect("CARGO is not set and no cargo is on PATH")
+}
+
+/// A scratch folder inside the target folder these tests run from, on the
+/// same file system as their binaries (what `CARGO_TARGET_TMPDIR` names when
+/// Cargo compiles the test; nothing sets it when the test runs).
+#[allow(dead_code)]
+pub fn target_tmpdir() -> PathBuf {
+    let mut dir = std::env::current_exe().expect("test binary path");
+    dir.pop(); // test binary
+    dir.pop(); // deps/
+    dir.pop(); // <profile>/
+    let dir = dir.join("tmp");
+    std::fs::create_dir_all(&dir).expect("create the target's tmp folder");
+    dir
+}
 
 /// Keeps tests off the developer's real `~/.config/kache/config.toml`.
 pub fn isolated_config_path(cache_dir: &Path) -> PathBuf {
@@ -439,7 +498,7 @@ pub fn daemon_publishes_pending(cache_dir: &Path) -> Option<u64> {
 fn status_binary() -> PathBuf {
     match KACHE_BIN.get() {
         Some(Ok(path)) => path.clone(),
-        _ => PathBuf::from(env!("CARGO_BIN_EXE_kache")),
+        _ => bin_exe("kache"),
     }
 }
 

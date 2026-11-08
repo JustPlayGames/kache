@@ -1,13 +1,13 @@
 #![cfg(target_os = "macos")]
 
+#[allow(dead_code)]
+mod common;
+
 use std::process::Command;
 
 #[test]
 fn kache_binaries_embed_local_network_privacy_metadata() {
-    for binary in [
-        env!("CARGO_BIN_EXE_kache"),
-        env!("CARGO_BIN_EXE_kache-engine"),
-    ] {
+    for binary in [common::bin_exe("kache"), common::bin_exe("kache-engine")] {
         assert_privacy_metadata(binary);
     }
 }

@@ -24,8 +24,10 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
-const FRONTEND: &str = env!("CARGO_BIN_EXE_kache");
-const ENGINE: &str = env!("CARGO_BIN_EXE_kache-engine");
+static FRONTEND: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| common::bin_exe("kache"));
+static ENGINE: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| common::bin_exe("kache-engine"));
 const LIMIT: Duration = Duration::from_secs(30);
 
 struct Fixture {
@@ -53,9 +55,9 @@ impl Fixture {
         }
         std::fs::write(fixture.path("config.toml"),
             "[cache]\ntrust_daemon_execution=true\nlocal_only=true\nnative_runtime_warmup=false\nauto_gc=false\nindex_auto_compact=false\nscheduler=false\ndaemon_publish=false\nprefetch_enabled=false\nmin_store_compile_ms=0\n").unwrap();
-        std::fs::copy(FRONTEND, fixture.path("install/kache.exe")).unwrap();
-        std::fs::copy(ENGINE, fixture.path("install/kache-engine.exe")).unwrap();
-        std::fs::copy(FRONTEND, fixture.path("frontend-only/kache.exe")).unwrap();
+        std::fs::copy(FRONTEND.as_path(), fixture.path("install/kache.exe")).unwrap();
+        std::fs::copy(ENGINE.as_path(), fixture.path("install/kache-engine.exe")).unwrap();
+        std::fs::copy(FRONTEND.as_path(), fixture.path("frontend-only/kache.exe")).unwrap();
         assert!(!fixture.path("frontend-only/kache-engine.exe").exists());
         fixture
     }

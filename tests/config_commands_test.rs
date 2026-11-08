@@ -1,10 +1,13 @@
 //! Scriptable configuration edits through the shipped frontend and engine.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
 fn run(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_kache"))
+    Command::new(common::bin_exe("kache"))
         .args(args)
         .current_dir(root)
         .env("HOME", root.join("home"))
@@ -112,7 +115,7 @@ fn project_scope_finds_the_nearest_existing_project_file() {
 fn get_and_list_report_file_values_without_applying_environment_overrides() {
     let root = tempfile::tempdir().unwrap();
     success(root.path(), &["config", "set", "cache.local_only", "false"]);
-    let output = Command::new(env!("CARGO_BIN_EXE_kache"))
+    let output = Command::new(common::bin_exe("kache"))
         .args(["config", "get", "cache.local_only"])
         .env("KACHE_CONFIG", root.path().join("selected.toml"))
         .env("KACHE_LOCAL_ONLY", "1")

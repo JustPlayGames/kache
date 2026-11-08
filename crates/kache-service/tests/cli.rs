@@ -6,7 +6,10 @@ use std::{
 
 #[test]
 fn version_flag_runs_the_service_entrypoint() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_kache-service"))
+    // Read when the test runs, never through `env!`: a nextest archive moves it.
+    let service = std::env::var_os("CARGO_BIN_EXE_kache-service")
+        .expect("CARGO_BIN_EXE_kache-service is set by `cargo test` and `cargo nextest run`");
+    let mut child = Command::new(service)
         .arg("--version")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

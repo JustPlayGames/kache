@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 mod common;
 use common::hermetic_command;
 
-fn kache_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_kache")
+fn kache_binary() -> std::path::PathBuf {
+    common::bin_exe("kache")
 }
 
 const PROBE: &str = "probe-0123456789abcdef";
@@ -111,7 +111,7 @@ impl Fixture {
     /// `kache test-runner <program> <args>` in its own process group, with
     /// every variable the runner reads cleared.
     fn runner(&self, program: &Path, mode: &str) -> Command {
-        self.runner_of(Path::new(kache_binary()), program, mode)
+        self.runner_of(&kache_binary(), program, mode)
     }
 
     /// [`Self::runner`] with another `kache`.
@@ -457,7 +457,7 @@ fn a_project_runner_that_starts_kache_again_does_not_loop() {
         fixture.path().join(".cargo/config.toml"),
         format!(
             "[target.'cfg(unix)']\nrunner = ['./wrap', '{}', 'test-runner']\n",
-            kache_binary()
+            kache_binary().display()
         ),
     )
     .unwrap();

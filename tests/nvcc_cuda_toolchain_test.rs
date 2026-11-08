@@ -17,7 +17,8 @@ use common::{hermetic_command, stop_daemon};
 
 /// Path to the binary under test. Cargo sets `CARGO_BIN_EXE_kache` to the
 /// artifact it built for this integration test.
-const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
+static KACHE_BIN: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| common::bin_exe("kache"));
 
 /// A `kache` invocation wired to a throwaway environment: its own cache dir,
 /// config path, and HOME/CARGO_HOME so nothing touches the developer's real
@@ -28,7 +29,11 @@ fn kache(home: &Path, cache_dir: &Path) -> Command {
 
 /// [`kache`] as a plain [`std::process::Command`].
 fn kache_process(home: &Path, cache_dir: &Path) -> std::process::Command {
-    let mut cmd = hermetic_command(KACHE_BIN, cache_dir, Some(&cache_dir.join("config.toml")));
+    let mut cmd = hermetic_command(
+        KACHE_BIN.as_path(),
+        cache_dir,
+        Some(&cache_dir.join("config.toml")),
+    );
     cmd.env("KACHE_LOG", "off")
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))

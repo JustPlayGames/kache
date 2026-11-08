@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-const KACHE_BIN: &str = env!("CARGO_BIN_EXE_kache");
+static KACHE_BIN: std::sync::LazyLock<std::path::PathBuf> =
+    std::sync::LazyLock::new(|| common::bin_exe("kache"));
 
 // Only the env plumbing is shared; this file drives the Cargo-built binary,
 // so the bootstrap helpers in `common` stay unused here.
@@ -20,13 +21,14 @@ use common::hermetic_command;
 
 /// `kache cargo` wired to a throwaway HOME, cache, and target directory.
 fn proxied_cargo(home: &Path, cache: &Path, target: &Path) -> Command {
-    let mut command = hermetic_command(KACHE_BIN, cache, Some(&cache.join("config.toml")));
+    let mut command =
+        hermetic_command(KACHE_BIN.as_path(), cache, Some(&cache.join("config.toml")));
     command
         .env("HOME", home)
         .env("CARGO_HOME", home.join(".cargo"))
         .env("CARGO_TARGET_DIR", target)
         .env("CARGO_INCREMENTAL", "0")
-        .env("RUSTC_WRAPPER", KACHE_BIN)
+        .env("RUSTC_WRAPPER", KACHE_BIN.as_path())
         .env("KACHE_LOG", "off")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
@@ -42,7 +44,7 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
     let project = dir.path().join("project");
     let target = project.join("target");
     let cache = dir.path().join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let shims = dir.path().join("shims");
     let real = dir.path().join("real");
     let ready = dir.path().join("ready");
@@ -52,7 +54,7 @@ fn cargo_shim_holds_target_lease_for_whole_test() {
     std::fs::create_dir_all(&real).unwrap();
     std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
     std::fs::write(target.join("debug/output"), "still needed").unwrap();
-    std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN.as_path(), shims.join("cargo")).unwrap();
     let fake = real.join("cargo");
     std::fs::write(
         &fake,
@@ -114,7 +116,7 @@ fn cargo_shim_says_it_waits_for_target_cleanup_unless_quiet() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         let cache = dir.path().join("cache");
-        let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+        let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
         let shims = dir.path().join("shims");
         let real = dir.path().join("real");
         let started = dir.path().join("started");
@@ -124,7 +126,7 @@ fn cargo_shim_says_it_waits_for_target_cleanup_unless_quiet() {
             std::fs::create_dir_all(path).unwrap();
         }
         std::fs::write(project.join("Cargo.toml"), "[workspace]\n").unwrap();
-        std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
+        std::os::unix::fs::symlink(KACHE_BIN.as_path(), shims.join("cargo")).unwrap();
         kache_fs::testutil::write_executable(&real.join("cargo"), "#!/bin/sh\n: > \"$STARTED\"\n");
         // Held the way `kache clean` and the daemon hold it while they delete.
         let cleanup = std::fs::OpenOptions::new()
@@ -199,7 +201,7 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
     let project = home.join("work/project");
     let cargo_home = home.join(".cargo");
     let cache = dir.path().join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let cold_target = dir.path().join("target-cold");
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::create_dir_all(&cargo_home).unwrap();
@@ -219,7 +221,7 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
     let mut cold = proxied_cargo(&home, &cache, &cold_target);
     cold.args(["cargo", "--", "check", "--quiet"])
         .current_dir(&project)
-        .env("KACHE_REAL_CARGO", env!("CARGO"));
+        .env("KACHE_REAL_CARGO", common::cargo());
     let cold = cold.output().unwrap();
     assert!(
         cold.status.success(),
@@ -232,7 +234,7 @@ fn canonical_cargo_home_alias_keeps_existing_cargo_unit_fresh() {
     let mut warm = proxied_cargo(&home, &cache, &cold_target);
     warm.args(["cargo", "--", "check", "--verbose", "--color=never"])
         .current_dir(&project)
-        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("KACHE_REAL_CARGO", common::cargo())
         .env("CARGO_TERM_COLOR", "always");
     let warm = warm.output().unwrap();
     assert!(
@@ -284,7 +286,7 @@ fn collapsed_rustflags_stay_out_of_the_environment_cargo_passes_on() {
     let home = root.join("home");
     let cargo_home = home.join(".cargo");
     let cache = root.join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let plain = home.join("plain/project");
     let aliased = home.join("aliased/project");
     std::fs::create_dir_all(&cargo_home).unwrap();
@@ -307,7 +309,7 @@ fn collapsed_rustflags_stay_out_of_the_environment_cargo_passes_on() {
         command
             .args(["cargo", "--", "check", "--quiet"])
             .current_dir(project)
-            .env("KACHE_REAL_CARGO", env!("CARGO"));
+            .env("KACHE_REAL_CARGO", common::cargo());
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
@@ -337,7 +339,7 @@ fn worktree_build_dir_stays_out_of_nested_cargo_builds() {
     let root = dir.path().canonicalize().unwrap();
     let home = root.join("home");
     let cache = root.join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let guest = root.join("guest");
     let host = root.join("host");
     let nested_target = root.join("nested-target");
@@ -379,7 +381,7 @@ fn worktree_build_dir_stays_out_of_nested_cargo_builds() {
     command
         .args(["cargo", "--", "build", "--quiet"])
         .current_dir(&host)
-        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("KACHE_REAL_CARGO", common::cargo())
         .env_remove("RUSTC_WRAPPER");
     let output = command.output().unwrap();
     assert!(
@@ -409,7 +411,7 @@ fn collapsed_single_use_rustc_option_passes_cargo_target_probe() {
     let home = root.join("home");
     let cargo_home = home.join(".cargo");
     let cache = root.join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let project = home.join("work/project");
     std::fs::create_dir_all(&cargo_home).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
@@ -428,7 +430,7 @@ fn collapsed_single_use_rustc_option_passes_cargo_target_probe() {
     command
         .args(["cargo", "--", "check", "--quiet"])
         .current_dir(&project)
-        .env("KACHE_REAL_CARGO", env!("CARGO"));
+        .env("KACHE_REAL_CARGO", common::cargo());
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -477,7 +479,7 @@ fn build_dir_override_needs_a_cargo_that_knows_the_key() {
         std::fs::create_dir_all(&project).unwrap();
         versioned_fake_cargo(&fake_cargo, version);
 
-        let output = Command::new(KACHE_BIN)
+        let output = Command::new(KACHE_BIN.as_path())
             .arg("cargo")
             .arg("--")
             .args(args)
@@ -512,7 +514,7 @@ fn explicit_rustflags_keep_their_cargo_precedence() {
     let project = home.join("work/project");
     let cargo_home = home.join(".cargo");
     let cache = dir.path().join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let target = dir.path().join("target");
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::create_dir_all(&cargo_home).unwrap();
@@ -538,7 +540,7 @@ fn explicit_rustflags_keep_their_cargo_precedence() {
     command
         .args(["cargo", "--", "check", "--quiet"])
         .current_dir(&project)
-        .env("KACHE_REAL_CARGO", env!("CARGO"));
+        .env("KACHE_REAL_CARGO", common::cargo());
     command.env("RUSTFLAGS", "--cfg from_env");
     let output = command.output().unwrap();
     assert!(
@@ -613,10 +615,10 @@ fn cargo_lease_probe(shimmed: bool, script: &str) -> (tempfile::TempDir, PathBuf
     let program = if shimmed {
         let shim = dir.path().join("shims/cargo");
         std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(KACHE_BIN, &shim).unwrap();
+        std::os::unix::fs::symlink(KACHE_BIN.as_path(), &shim).unwrap();
         shim
     } else {
-        PathBuf::from(KACHE_BIN)
+        PathBuf::from(KACHE_BIN.as_path())
     };
     let mut command = hermetic_command(program, &cache, Some(&config));
     if !shimmed {
@@ -659,7 +661,7 @@ fn non_utf8_cargo_argument_passes_through_without_cli_panic() {
     let fake_cargo = dir.path().join("cargo");
     kache_fs::testutil::write_executable(&fake_cargo, "#!/bin/sh\nexit 0\n");
 
-    let output = Command::new(KACHE_BIN)
+    let output = Command::new(KACHE_BIN.as_path())
         .args(["cargo", "--", "build"])
         .arg(OsString::from_vec(vec![b'f', b'o', 0x80]))
         .env("KACHE_REAL_CARGO", &fake_cargo)
@@ -683,7 +685,7 @@ fn non_utf8_wrapper_argument_fails_closed_before_compiler_execution() {
         format!("#!/bin/sh\ntouch '{}'\n", sentinel.display()),
     );
 
-    let output = Command::new(KACHE_BIN)
+    let output = Command::new(KACHE_BIN.as_path())
         .arg(&fake_rustc)
         .arg(OsString::from_vec(vec![b's', b'r', b'c', b'/', 0x80]))
         .env("RUSTC", &fake_rustc)
@@ -719,7 +721,7 @@ fn configured_build_dir_reaches_cargo_without_proxy_override() {
         "#!/bin/sh\nprintf '%s %s' \"${CARGO_BUILD_BUILD_DIR-unset}\" \"$*\" > \"$KACHE_TEST_CAPTURE\"\n",
     );
 
-    let output = Command::new(KACHE_BIN)
+    let output = Command::new(KACHE_BIN.as_path())
         .args(["cargo", "--", "build"])
         .current_dir(&project)
         .env("HOME", &home)
@@ -766,7 +768,7 @@ fn proxied_shared_target_build(project: &Path, home: &Path, cache: &Path, target
     command
         .args(["cargo", "--", "build", "--quiet"])
         .current_dir(project)
-        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("KACHE_REAL_CARGO", common::cargo())
         .env("KACHE_CACHE_EXECUTABLES", "1");
     let output = command.output().unwrap();
     // Each build's events are logged before the next build's: the test
@@ -790,7 +792,7 @@ fn cargo_proxy_isolates_fingerprints_while_sharing_final_target_and_kache() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     let cache = dir.path().join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     let shared_target = dir.path().join("shared-target");
     let worktree_a = dir.path().join("worktree-a");
     let worktree_b = dir.path().join("worktree-b");
@@ -867,7 +869,7 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
     let project = dir.path().join("project");
     let target = project.join("target");
     let cache = dir.path().join("cache");
-    let _daemon = common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache);
+    let _daemon = common::DaemonGuard::new(common::bin_exe("kache"), &cache);
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::create_dir_all(home.join(".cargo")).unwrap();
     std::fs::write(
@@ -881,7 +883,7 @@ fn receipt_cleanup_removes_old_feature_units_and_keeps_next_check_fresh() {
         let output = command
             .current_dir(&project)
             .args(args)
-            .env("KACHE_REAL_CARGO", env!("CARGO"))
+            .env("KACHE_REAL_CARGO", common::cargo())
             .env("KACHE_TARGET_LIVENESS", if enabled { "1" } else { "0" })
             .env("KACHE_AUTO_GC", "0")
             .env("KACHE_LOG", "warn")
@@ -1032,7 +1034,7 @@ impl ReceiptAcceptance {
         )
         .unwrap();
         let fixture = Self {
-            _daemon: common::DaemonGuard::new(env!("CARGO_BIN_EXE_kache"), &cache),
+            _daemon: common::DaemonGuard::new(common::bin_exe("kache"), &cache),
             _dir: dir,
             home,
             project,
@@ -1054,7 +1056,7 @@ impl ReceiptAcceptance {
         let output = proxied_cargo(&self.home, &self.cache, &self.target)
             .current_dir(&self.project)
             .args(args)
-            .env("KACHE_REAL_CARGO", env!("CARGO"))
+            .env("KACHE_REAL_CARGO", common::cargo())
             .env("KACHE_TARGET_LIVENESS", if enabled { "1" } else { "0" })
             .env("KACHE_AUTO_GC", "0")
             .env("KACHE_LOG", "kache::target_processes=debug")
@@ -1450,7 +1452,7 @@ fn receipt_cleanup_rejects_parent_directory_paths_in_a_receipt() {
 fn receipt_cleanup_rejects_a_changed_custom_cargo_executable() {
     let fixture = ReceiptAcceptance::new();
     let cargo = fixture._dir.path().join("custom-cargo");
-    let real_cargo = env!("CARGO").replace('\'', "'\\''");
+    let real_cargo = common::cargo().display().to_string().replace('\'', "'\\''");
     let script = format!("#!/bin/sh\nexec '{real_cargo}' \"$@\"\n");
     kache_fs::testutil::write_executable(&cargo, &script);
     let run = |args: &[&str]| {
@@ -1592,7 +1594,7 @@ fn checks_use_a_separate_target_through_the_shim_and_explicit_proxy() {
     let project = root.join("project");
     let home = root.join("home");
     let cache = root.join("cache");
-    let _daemon = common::DaemonGuard::new(KACHE_BIN, &cache);
+    let _daemon = common::DaemonGuard::new(KACHE_BIN.as_path(), &cache);
     let shims = root.join("shims");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(home.join(".cargo")).unwrap();
@@ -1602,8 +1604,8 @@ fn checks_use_a_separate_target_through_the_shim_and_explicit_proxy() {
     std::fs::write(&cargo, "#!/bin/sh\ncase \"$*\" in *locate-project*) echo \"$PROJECT/Cargo.toml\"; exit 0;; *--version*) echo 'cargo 1.99.1'; exit 0;; esac\nprintf 'target=%s\\nbuild=%s\\n' \"${CARGO_TARGET_DIR-unset}\" \"${CARGO_BUILD_BUILD_DIR-unset}\"\n").unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
     let shim = shims.join("cargo");
-    std::os::unix::fs::symlink(KACHE_BIN, &shim).unwrap();
-    for front in [&shim, Path::new(KACHE_BIN)] {
+    std::os::unix::fs::symlink(KACHE_BIN.as_path(), &shim).unwrap();
+    for front in [&shim, KACHE_BIN.as_path()] {
         for (subcommand, setting, expected) in [
             ("check", "1", "check"),
             ("clippy", "1", "check"),
@@ -1621,7 +1623,7 @@ fn checks_use_a_separate_target_through_the_shim_and_explicit_proxy() {
                 .env_remove("CARGO_TARGET_DIR")
                 .env_remove("CARGO_BUILD_TARGET_DIR")
                 .env_remove("CARGO_BUILD_BUILD_DIR");
-            if front == Path::new(KACHE_BIN) {
+            if front == KACHE_BIN.as_path() {
                 command.arg("cargo");
             }
             let output = command.arg(subcommand).output().unwrap();
@@ -1655,7 +1657,7 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
     let home = root.join("home");
     let project = root.join("project");
     let cache = root.join("cache");
-    let _daemon = common::DaemonGuard::new(KACHE_BIN, &cache);
+    let _daemon = common::DaemonGuard::new(KACHE_BIN.as_path(), &cache);
     let target = project.join("target");
     std::fs::create_dir_all(home.join(".cargo")).unwrap();
     std::fs::create_dir_all(project.join("src")).unwrap();
@@ -1672,7 +1674,7 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
     command
         .current_dir(&project)
         .args(["cargo", "check", "--offline"])
-        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("KACHE_REAL_CARGO", common::cargo())
         .env("KACHE_SEPARATE_CHECK_TARGETS", "1")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
@@ -1705,10 +1707,14 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
     let version = Command::new("rustc").arg("--version").output().unwrap();
     let version = String::from_utf8(version.stdout).unwrap();
     let release = version.split_whitespace().nth(1).unwrap();
-    let preview = hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
-        .args(["clean", "--cache", "--rustc-version", release, "--json"])
-        .output()
-        .unwrap();
+    let preview = hermetic_command(
+        KACHE_BIN.as_path(),
+        &cache,
+        Some(&cache.join("config.toml")),
+    )
+    .args(["clean", "--cache", "--rustc-version", release, "--json"])
+    .output()
+    .unwrap();
     assert!(
         preview.status.success(),
         "{}",
@@ -1731,7 +1737,7 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
     let clippy = proxied_cargo(&home, &cache, &target)
         .current_dir(&project)
         .args(["cargo", "clippy", "--offline"])
-        .env("KACHE_REAL_CARGO", env!("CARGO"))
+        .env("KACHE_REAL_CARGO", common::cargo())
         .env("KACHE_SEPARATE_CHECK_TARGETS", "1")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
@@ -1743,11 +1749,15 @@ fn a_real_check_finishes_while_the_build_target_is_locked_and_records_its_compil
         String::from_utf8_lossy(&clippy.stderr)
     );
     let run = |args: &[&str]| {
-        hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap()
+        hermetic_command(
+            KACHE_BIN.as_path(),
+            &cache,
+            Some(&cache.join("config.toml")),
+        )
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
     };
     let after_clippy = run(&["clean", "--cache", "--rustc-version", release, "--json"]);
     assert!(after_clippy.status.success());
@@ -1839,7 +1849,7 @@ fn shimmed_cargo_version(root: &Path, dirs: &[&Path]) -> Command {
     for dir in [&shims, &cache, &project] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    std::os::unix::fs::symlink(KACHE_BIN, shims.join("cargo")).unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN.as_path(), shims.join("cargo")).unwrap();
     std::fs::write(shims.join(".kache-shims"), "").unwrap();
     let base_path = std::env::var_os("PATH").unwrap();
     let path = std::env::join_paths(

@@ -24,7 +24,7 @@ fn build(root: &Path, donor: Option<&Path>, extra_flags: &str) -> Output {
     command
         .current_dir(root)
         .args(["build", "--offline", "--quiet"])
-        .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_kache"))
+        .env("RUSTC_WRAPPER", common::bin_exe("kache"))
         .env("CARGO_TARGET_DIR", root.join("target"))
         .env("CARGO_INCREMENTAL", "1")
         .env("KACHE_PRESERVE_INCREMENTAL", "0")
@@ -145,7 +145,7 @@ fn managed_command(
     command
         .current_dir(root)
         .args(["build", "--offline", "--quiet"])
-        .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_kache"))
+        .env("RUSTC_WRAPPER", common::bin_exe("kache"))
         .env("CARGO_TARGET_DIR", root.join("target"))
         .env("CARGO_INCREMENTAL", "1")
         .env("KACHE_BASE_DIR", root)
@@ -818,7 +818,7 @@ fn absolute_source_keeps_file_macro_semantics_without_publishing_a_seed() {
     let cache = root.join("cache");
     let _daemon = common::DaemonGuard::new(common::kache_binary(), &cache);
     let output = common::hermetic_command(
-        env!("CARGO_BIN_EXE_kache"),
+        common::bin_exe("kache"),
         &cache,
         Some(&root.join("absent.toml")),
     )
@@ -888,7 +888,7 @@ fn automatic_command(
     command
         .current_dir(root)
         .args(["build", "--offline", "--quiet"])
-        .env("RUSTC_WRAPPER", env!("CARGO_BIN_EXE_kache"))
+        .env("RUSTC_WRAPPER", common::bin_exe("kache"))
         .env("CARGO_TARGET_DIR", root.join("target"))
         .env("CARGO_INCREMENTAL", "1")
         .env("KACHE_PRESERVE_INCREMENTAL", "0")
