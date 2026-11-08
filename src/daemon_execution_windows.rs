@@ -201,6 +201,7 @@ pub(super) async fn handle(
     request: ExecutionRequest,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
+    _lane_marks: [Instant; 2],
 ) -> Result<()> {
     let stream: &TokioStream = connection;
     let trusted_pipeline = request

@@ -55,7 +55,9 @@ impl Execution<'_> {
         socket: &Path,
         trusted_pipeline: bool,
     ) -> Result<kache_ipc::execution::Attempt> {
-        let prepared = match self.prepare(trusted_pipeline) {
+        let prepared = self.prepare(trusted_pipeline);
+        kache_ipc::marks::mark("request_built");
+        let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::debug!(%error, "compiler request cannot be transferred");

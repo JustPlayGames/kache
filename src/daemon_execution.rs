@@ -346,9 +346,45 @@ pub(super) async fn handle(
     request: ExecutionRequest,
     daemon: &Arc<Daemon>,
     lifecycle: &Arc<Lifecycle>,
+    lane_marks: [Instant; 2],
 ) -> Result<()> {
     let stream: &TokioStream = connection;
     let client_pid = request.client_pid;
+    // Lane timers (KACHE-NEXT66-1109): the hand-off's steps, when the client's
+    // environment names a phase trace directory.
+    let trace_dir = request.env.iter().find_map(|(key, value)| {
+        (key.decode().ok()? == "KACHE_PHASE_TRACE_DIR")
+            .then(|| value.decode().ok())
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let marks = Arc::new(std::sync::Mutex::new(vec![
+        ("accepted", lane_marks[0]),
+        ("read", lane_marks[1]),
+        ("handle", Instant::now()),
+    ]));
+    let mark = |name: &'static str| {
+        if trace_dir.is_some()
+            && let Ok(mut marks) = marks.lock()
+        {
+            marks.push((name, Instant::now()));
+        }
+    };
+    let dump = |outcome: &str| {
+        if let Some(dir) = &trace_dir
+            && let Ok(marks) = marks.lock()
+        {
+            kache_ipc::marks::write(
+                dir,
+                &format!("daemon-{client_pid}"),
+                client_pid,
+                lane_marks[0],
+                &marks,
+                &format!(",\"outcome\":\"{outcome}\""),
+            );
+        }
+    };
     let client_trust = matches!(
         request.channels,
         ExecutionChannels::UnixClient {
@@ -357,7 +393,9 @@ pub(super) async fn handle(
         }
     );
     let trusted_pipeline = trusts_pipeline(client_trust, daemon.config.trust_daemon_execution);
-    if !peer_may_delegate(stream, client_pid, trusted_pipeline) {
+    let first_peer_check = peer_may_delegate(stream, client_pid, trusted_pipeline);
+    mark("peer1");
+    if !first_peer_check {
         return write_reply(
             stream,
             &ExecutionReply::Declined {
@@ -366,7 +404,9 @@ pub(super) async fn handle(
         )
         .await;
     }
-    let prepared = match Prepared::decode(request, &daemon.version) {
+    let prepared = Prepared::decode(request, &daemon.version);
+    mark("decoded");
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
             return write_reply(
@@ -390,7 +430,10 @@ pub(super) async fn handle(
             .await;
         }
     };
-    let channel = match DescriptorChannel::new() {
+    mark("permit");
+    let channel = DescriptorChannel::new();
+    mark("channel");
+    let channel = match channel {
         Ok(channel) => channel,
         Err(error) => {
             return write_reply(
@@ -410,6 +453,7 @@ pub(super) async fn handle(
         },
     )
     .await?;
+    mark("ready_written");
     let descriptors = tokio::select! {
         _ = lifecycle.draining() => return Ok(()),
         incoming = reader.fill_buf() => {
@@ -418,17 +462,21 @@ pub(super) async fn handle(
         }
         result = tokio::time::timeout(PREPARE_TIMEOUT, channel.receive(3 + usize::from(prepared.terminal) + 2 + prepared.originals.len())) => result??,
     };
+    mark("descriptors");
     drop(channel);
     let cancellation = Cancellation::default();
     let _cancel = CancelOnDrop(cancellation.clone());
     let (entry, executable, args, mut context) =
         prepared.receive(descriptors, cancellation.clone(), Arc::clone(daemon))?;
+    mark("received");
     write_reply(stream, &ExecutionReply::Prepared).await?;
+    mark("prepared_written");
     let mut frame = Vec::new();
     let commit = tokio::select! {
         _ = lifecycle.draining() => return Ok(()),
         result = tokio::time::timeout(PREPARE_TIMEOUT, read_bounded_line(reader, &mut frame)) => result??,
     }.context("compiler client disconnected before Commit")?;
+    mark("commit_read");
     let _: ExecutionCommand = serde_json::from_str(&commit)?;
     anyhow::ensure!(
         peer_may_delegate(stream, client_pid, trusted_pipeline),
@@ -436,8 +484,11 @@ pub(super) async fn handle(
     );
     // Read while the connection still names the client, so a reused PID
     // cannot stand in for it. Its compiler children inherit the same.
+    mark("peer2");
     context.priority = Some(crate::scheduler::Priority::of_process(client_pid));
+    mark("priority");
     write_reply(stream, &ExecutionReply::Accepted).await?;
+    mark("accepted_written");
     let activity = daemon.request_clock.begin_activity();
 
     // From Accepted until the worker returns: shutdown waits for it, and its
@@ -447,7 +498,17 @@ pub(super) async fn handle(
     // is still running here, and may run it again itself.
     let in_flight = InFlight::begin(&daemon.compiles_in_flight);
     let held_open = Arc::clone(connection);
+    let worker_marks = trace_dir.is_some().then(|| Arc::clone(&marks));
     let mut worker = tokio::task::spawn_blocking(move || {
+        let worker_mark = |name: &'static str| {
+            if let Some(marks) = &worker_marks
+                && let Ok(mut marks) = marks.lock()
+            {
+                marks.push((name, Instant::now()));
+            }
+        };
+        worker_mark("worker_start");
+        let _worker_end = WorkerEnd(worker_mark);
         let _in_flight = in_flight;
         let _held_open = held_open;
         let _activity = activity;
@@ -470,6 +531,7 @@ pub(super) async fn handle(
             return Ok(());
         }
     };
+    mark("worker_joined");
     let reply = match result {
         Ok(Ok(exit_code)) => ExecutionReply::Complete { exit_code },
         Ok(Err(error)) => ExecutionReply::Failed {
@@ -479,7 +541,10 @@ pub(super) async fn handle(
             message: format!("compiler worker failed: {error}"),
         },
     };
-    match write_reply(stream, &reply).await {
+    let written = write_reply(stream, &reply).await;
+    mark("complete_written");
+    dump("complete");
+    match written {
         // The client is gone. Its compiler ran under the client's broker, so
         // the broker channel closed with it and the worker can finish before
         // the read above sees the disconnect: the same end as that branch,
@@ -492,6 +557,17 @@ pub(super) async fn handle(
             Ok(())
         }
         written => written,
+    }
+}
+
+/// Lane timers: marks the worker's end as its closure returns (after the
+/// compile and every guard it held is dropped... its guards drop after this
+/// one, being declared later).
+struct WorkerEnd<F: Fn(&'static str)>(F);
+
+impl<F: Fn(&'static str)> Drop for WorkerEnd<F> {
+    fn drop(&mut self) {
+        (self.0)("worker_end");
     }
 }
 
