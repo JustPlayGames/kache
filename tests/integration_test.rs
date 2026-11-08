@@ -2200,6 +2200,112 @@ fn test_cc_forced_include_and_param_converge_across_clones_issue_580() {
     );
 }
 
+/// The `clang-cl` on `PATH` that runs as clang-cl, if any.
+fn clang_cl_on_path() -> Option<PathBuf> {
+    let path = std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(format!("clang-cl{}", std::env::consts::EXE_SUFFIX)))
+        .find(|path| path.is_file())?;
+    let probe = std::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    probe.status.success().then_some(path)
+}
+
+/// The result of the last compile of `name` the report holds.
+fn last_result(report: &serde_json::Value, name: &str) -> String {
+    report["all_events"]
+        .as_array()
+        .expect("report should include all_events")
+        .iter()
+        .rev()
+        .find(|event| event["crate_name"].as_str() == Some(name))
+        .and_then(|event| event["result"].as_str())
+        .unwrap_or("none")
+        .to_string()
+}
+
+/// A clang-cl compile (cargo-xwin's, as for webrtc-sys) of a source and
+/// headers that a checkout generates under itself hits in another checkout
+/// when the object spells no path: the key reads those paths through the
+/// prefix maps. clang-cl's argv is left as given (#299), so an object that
+/// does spell its checkout (a `__FILE__` in a header there, or any debug
+/// info) stays keyed to that checkout.
+#[test]
+fn test_clang_cl_keys_converge_across_checkouts_unless_the_object_spells_one() {
+    let Some(clang_cl) = clang_cl_on_path() else {
+        eprintln!("skipping: no clang-cl on PATH");
+        return;
+    };
+    if cfg!(windows) {
+        eprintln!("skipping: Windows hosts keep clang-cl keys path-literal");
+        return;
+    }
+    build_kache();
+    let cache_dir = TempDir::new().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache_dir.path());
+    let clones = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+    for clone in &clones {
+        let out = clone.path().join("out");
+        std::fs::create_dir_all(out.join("include")).unwrap();
+        std::fs::create_dir_all(out.join("src")).unwrap();
+        std::fs::write(out.join("include/gen.h"), "#define GEN_VALUE 3\n").unwrap();
+        std::fs::write(
+            out.join("include/where.h"),
+            "inline const char *where_am_i() { return __FILE__; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("src/gen.cc"),
+            "#include \"gen.h\"\nint gen() { return GEN_VALUE; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("src/where.cc"),
+            "#include \"where.h\"\nconst char *where() { return where_am_i(); }\n",
+        )
+        .unwrap();
+    }
+    let compile = |clone: &TempDir, name: &str, extra: &[&str]| {
+        let out = clone.path().join("out");
+        let include = format!("-I{}", out.join("include").display());
+        let object = format!("-Fo{}", out.join(format!("{name}.o")).display());
+        let source = out.join(format!("src/{name}.cc"));
+        let mut args = vec![
+            clang_cl.to_str().unwrap(),
+            "--target=x86_64-pc-windows-msvc",
+            "-nologo",
+            "-c",
+            "-O2",
+            "-Brepro",
+            &include,
+            &object,
+        ];
+        args.extend_from_slice(extra);
+        // cc-rs's spelling: a Unix path after `--`, not read as a `/` flag.
+        args.extend(["--", source.to_str().unwrap()]);
+        run_kache_cc(clone.path(), cache_dir.path(), &args);
+        last_result(&kache_report(cache_dir.path()), &format!("{name}.cc"))
+    };
+
+    assert_eq!(compile(&clones[0], "gen", &[]), "miss");
+    assert_eq!(compile(&clones[1], "gen", &[]), "local_hit");
+
+    // `__FILE__` names the first checkout's header in its object.
+    assert_eq!(compile(&clones[0], "where", &[]), "miss");
+    assert_ne!(compile(&clones[1], "where", &[]), "local_hit");
+    let object = std::fs::read(clones[1].path().join("out/where.o")).unwrap();
+    let spells = |root: &Path| {
+        let root = root.to_str().unwrap().as_bytes();
+        object.windows(root.len()).any(|window| window == root)
+    };
+    assert!(spells(clones[1].path()) && !spells(clones[0].path()));
+
+    // A debug object spells its paths in CodeView.
+    assert_ne!(compile(&clones[0], "gen", &["-Z7"]), "local_hit");
+    assert_ne!(compile(&clones[1], "gen", &["-Z7"]), "local_hit");
+}
+
 /// cc-rs emits `-mno-omit-leaf-frame-pointer` when Rust requests forced
 /// frame pointers (and in debug-mode tool setup), so every aws-lc-sys TU of
 /// a macOS debug build passed through on it (#839). The flag is
