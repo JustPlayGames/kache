@@ -15,6 +15,25 @@ pub fn run(version: &str) -> Result<i32> {
 /// Other frontend binaries continue to select their role from argv[0].
 pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
     let started_at = std::time::Instant::now();
+    let trace_dir = std::env::var_os("KACHE_PHASE_TRACE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+    if trace_dir.is_some() {
+        kache_ipc::marks::enable();
+    }
+    let dump = |outcome: &str| {
+        if let Some(dir) = &trace_dir {
+            kache_ipc::marks::mark("dump");
+            kache_ipc::marks::write(
+                dir,
+                &format!("client-{}", std::process::id()),
+                std::process::id(),
+                started_at,
+                &kache_ipc::marks::take(),
+                &format!(",\"outcome\":\"{outcome}\""),
+            );
+        }
+    };
     let mut args = std::env::args_os().collect::<Vec<_>>();
     native_launcher_role(&mut args, binary_name);
     anyhow::ensure!(
@@ -28,6 +47,7 @@ pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
     } else {
         std::env::current_dir()?.join(executable)
     };
+    kache_ipc::marks::mark("exe");
     if engine_only(&args)
         || std::env::var_os("KACHE_FAMILY_PROBE_ACTIVE").is_some()
         || std::env::var_os("KACHE_BUILD_SCRIPT_PATH").is_some()
@@ -37,14 +57,17 @@ pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
     #[cfg(any(unix, windows))]
     {
         let env = kache_config::InvocationEnv::capture();
+        kache_ipc::marks::mark("env");
         if env
             .var_os("KACHE_ACTIVE")
             .is_none_or(|value| value.is_empty())
         {
             let prepared = (|| -> Result<_> {
                 let config = kache_config::Config::load_for(&env)?;
+                kache_ipc::marks::mark("config");
                 #[cfg(unix)]
                 let (files, terminal) = crate::Stdio::capture()?.into_files();
+                kache_ipc::marks::mark("stdio");
                 #[cfg(windows)]
                 let (files, terminal) = (Vec::new(), false);
                 Ok((config, files, terminal))
@@ -79,14 +102,19 @@ pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
                     Ok(kache_ipc::execution::Attempt::Unavailable)
                 };
                 return match next_step(attempt, bootstrap)? {
-                    Next::Exit(exit) => Ok(exit),
+                    Next::Exit(exit) => {
+                        dump("exit");
+                        Ok(exit)
+                    }
                     Next::Engine(forward) => {
+                        dump("engine");
                         forward_engine(&executable, version, &args, started_at, forward)
                     }
                 };
             }
         }
     }
+    dump("plain");
     forward_engine(&executable, version, &args, started_at, Forward::Plain)
 }
 

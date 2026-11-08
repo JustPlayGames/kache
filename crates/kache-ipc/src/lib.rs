@@ -708,6 +708,8 @@ mod tests {
     }
 }
 
+pub mod marks;
+
 /// Unix descriptor transfer and its close-on-exec admission boundary.
 #[cfg(unix)]
 pub mod descriptors;

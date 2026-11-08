@@ -9741,8 +9741,15 @@ async fn handle_connection_started_at(
             Ok(Request::ExecuteV1(req)) => {
                 #[cfg(any(unix, windows))]
                 {
-                    let result =
-                        execution::handle(&stream, &mut reader, *req, daemon, lifecycle).await;
+                    let result = execution::handle(
+                        &stream,
+                        &mut reader,
+                        *req,
+                        daemon,
+                        lifecycle,
+                        [request_started_at, start],
+                    )
+                    .await;
                     retire_for_newer_client(daemon, lifecycle, client_version.as_deref());
                     return result;
                 }

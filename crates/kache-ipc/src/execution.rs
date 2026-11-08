@@ -242,6 +242,7 @@ fn exchange(
         kache_protocol::execution::ExecutionChannels::UnixClient { .. }
     ) {
         let (client, files) = unix_client::Client::prepare(request, descriptors)?;
+        crate::marks::mark("broker");
         (Some(client), Some(files))
     } else {
         (None, None)
@@ -252,12 +253,15 @@ fn exchange(
     let stream = Connection::connect(socket)?;
     #[cfg(windows)]
     let stream = Connection::connect(socket, request.channels.trusted_pipeline(true))?;
+    crate::marks::mark("connected");
     write_message(
         &mut &stream,
         &kache_protocol::Request::ExecuteV1(Box::new(request.clone())),
     )?;
+    crate::marks::mark("request_sent");
     let mut reader = std::io::BufReader::new(&stream);
     let ready = read_reply(&mut reader)?;
+    crate::marks::mark("ready");
     if let ExecutionReply::Declined { reason } = &ready {
         return Err(DaemonDeclined(reason.clone()).into());
     }
@@ -294,6 +298,7 @@ fn exchange(
         #[cfg(unix)]
         let descriptors = files.as_slice();
         crate::descriptors::send(datagram.as_fd(), &ticket.key, descriptors)?;
+        crate::marks::mark("descriptors_sent");
     }
 
     #[cfg(windows)]
@@ -311,6 +316,7 @@ fn exchange(
         matches!(read_reply(&mut reader)?, ExecutionReply::Prepared),
         "compiler execution was not prepared"
     );
+    crate::marks::mark("prepared");
 
     // macOS can drain an in-flight socket when its last sender descriptor
     // closes. Prepared confirms the daemon has installed its own descriptors.
@@ -319,6 +325,7 @@ fn exchange(
 
     stream.prepare_commit()?;
     send_commit(&mut &stream, committed).context("sending compiler Commit")?;
+    crate::marks::mark("commit_sent");
     #[cfg(windows)]
     stream.commit_written()?;
     ensure!(
@@ -328,6 +335,7 @@ fn exchange(
         ),
         "daemon did not acknowledge compiler execution"
     );
+    crate::marks::mark("accepted");
     #[cfg(windows)]
     loop {
         match read_reply(&mut reader)? {
@@ -354,9 +362,12 @@ fn exchange(
                 // writes Complete. Completion still comes from that handler.
                 unix_client = None;
             }
+            crate::marks::mark("serviced");
             continue;
         }
-        return match read_reply(&mut reader).context("waiting for compiler completion")? {
+        let reply = read_reply(&mut reader).context("waiting for compiler completion")?;
+        crate::marks::mark("complete");
+        return match reply {
             ExecutionReply::Complete { exit_code } => Ok(exit_code),
             ExecutionReply::Failed { message } => bail!("{message}"),
             reply => bail!("invalid compiler completion: {reply:?}"),
