@@ -4225,6 +4225,44 @@ fn why_miss_diff_messages_dedupes_same_config_and_empty_other_features() {
 }
 
 #[test]
+fn why_miss_diff_messages_name_the_closest_entries_first() {
+    // A crate built for many targets, profiles and feature sets: the entries
+    // that share the miss's configuration (or differ in one field) must not
+    // be cut off by the many that differ in everything and sort first by key.
+    let miss = diff_meta("x86_64", "debug", &["feat"], &["lib"]);
+    let mut others: Vec<(String, crate::store::EntryMeta)> = (0..6)
+        .map(|i| {
+            (
+                format!("a-far{i}"),
+                diff_meta("wasm32", "release", &[&format!("w{i}")], &["bin"]),
+            )
+        })
+        .collect();
+    others.push((
+        "y-near".to_string(),
+        diff_meta("x86_64", "debug", &["other"], &["lib"]),
+    ));
+    others.push((
+        "z-same".to_string(),
+        diff_meta("x86_64", "debug", &["feat"], &["lib"]),
+    ));
+    let (messages, _) = why_miss_diff_messages(
+        &miss,
+        others.iter().map(|(key, meta)| (key.as_str(), meta)),
+        5,
+    );
+
+    assert!(
+        messages[0].contains("same config as z-same"),
+        "the same-config entry says what changed and comes first: {messages:?}"
+    );
+    assert!(
+        messages[1].contains("different features vs y-near"),
+        "an entry one field away comes next: {messages:?}"
+    );
+}
+
+#[test]
 fn explain_crate_last_miss_rows_name_the_key_its_config_and_what_shifts_it() {
     use crate::events::EventResult;
     let miss = build_event("dep", EventResult::Miss, 10, 20, 30, "abcdef0123456789");
