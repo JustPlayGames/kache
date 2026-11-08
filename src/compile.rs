@@ -200,7 +200,7 @@ pub(crate) fn run_rustc(
     let spawned = std::time::Instant::now();
     let mut cmd = env.command(rustc)?;
     #[cfg(target_os = "linux")]
-    if may_stop && stop_rule == StopRule::WhenAlone {
+    if may_stop {
         // It may be frozen while Kache decides: never leave it frozen.
         freeze::resume_if_orphaned(&mut cmd);
     }
@@ -524,11 +524,20 @@ fn stop_compile(child: &mut Child, rule: StopRule) -> bool {
 
 #[cfg(target_os = "linux")]
 thread_local! {
-    /// The linking compile whose dep-info `on_dep_info` is deciding about on
-    /// this thread, and whether the decision froze it
-    /// ([`hold_while_deciding`]).
-    static DECIDING: std::cell::Cell<Option<(libc::pid_t, bool)>> =
+    /// The compile whose dep-info `on_dep_info` is deciding about on this
+    /// thread, whether the decision froze it ([`hold_while_deciding`],
+    /// [`hold_while_waiting`]), and whether it links.
+    static DECIDING: std::cell::Cell<Option<Decision>> =
         const { std::cell::Cell::new(None) };
+}
+
+/// The compile an `on_dep_info` decision is about.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct Decision {
+    pid: libc::pid_t,
+    frozen: bool,
+    links: bool,
 }
 
 /// The span of one `on_dep_info` decision. A compile the decision froze is
@@ -536,7 +545,7 @@ thread_local! {
 /// one that let it go on resumed it already.
 struct Deciding {
     #[cfg(target_os = "linux")]
-    previous: Option<(libc::pid_t, bool)>,
+    previous: Option<Decision>,
 }
 
 impl Deciding {
@@ -544,10 +553,11 @@ impl Deciding {
     fn enter(child: &Child, rule: StopRule) -> Self {
         #[cfg(target_os = "linux")]
         {
-            let deciding = (rule == StopRule::WhenAlone)
-                .then(|| libc::pid_t::try_from(child.id()).ok())
-                .flatten()
-                .map(|pid| (pid, false));
+            let deciding = libc::pid_t::try_from(child.id()).ok().map(|pid| Decision {
+                pid,
+                frozen: false,
+                links: rule == StopRule::WhenAlone,
+            });
             Self {
                 previous: DECIDING.with(|slot| slot.replace(deciding)),
             }
@@ -560,7 +570,10 @@ impl Deciding {
 impl Drop for Deciding {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        if let Some((pid, true)) = DECIDING.with(|slot| slot.replace(self.previous)) {
+        if let Some(Decision {
+            pid, frozen: true, ..
+        }) = DECIDING.with(|slot| slot.replace(self.previous))
+        {
             // SAFETY: the compile is this process's child, not reaped while
             // its output is read (the reaping waits for the reader that runs
             // this decision), so `pid` names no other process.
@@ -580,12 +593,34 @@ impl Drop for Deciding {
 /// whose wrapper dies ([`freeze::resume_if_orphaned`]).
 pub(crate) fn hold_while_deciding() {
     #[cfg(target_os = "linux")]
+    freeze_decided(true);
+}
+
+/// Freeze the compile that `on_dep_info` is deciding about, whether it links
+/// or not, until the decision is taken: the caller is about to wait for a peer
+/// that compiles the same key, and a compile left running would do that work
+/// a second time. Resumed as [`hold_while_deciding`]'s, and by the kernel when
+/// the wrapper dies ([`freeze::resume_if_orphaned`]). Linux only; outside a
+/// decision this does nothing.
+pub(crate) fn hold_while_waiting() {
+    #[cfg(target_os = "linux")]
+    freeze_decided(false);
+}
+
+/// SIGSTOP the decided compile once, if it links or `only_linking` is false.
+#[cfg(target_os = "linux")]
+fn freeze_decided(only_linking: bool) {
     DECIDING.with(|slot| {
-        if let Some((pid, false)) = slot.get()
+        if let Some(decision) = slot.get()
+            && !decision.frozen
+            && (decision.links || !only_linking)
             // SAFETY: as in `Deciding::drop`.
-            && unsafe { libc::kill(pid, libc::SIGSTOP) } == 0
+            && unsafe { libc::kill(decision.pid, libc::SIGSTOP) } == 0
         {
-            slot.set(Some((pid, true)));
+            slot.set(Some(Decision {
+                frozen: true,
+                ..decision
+            }));
         }
     });
 }
@@ -1469,7 +1504,7 @@ fi
     /// is taken, and the compile then goes on to its end when the decision
     /// lets it; held and then stopped, it is killed like any stopped compile.
     /// Outside a decision, and for a compile that does not link, holding does
-    /// nothing.
+    /// nothing; a decision that waits for a peer freezes either kind.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_held_linking_compile_is_frozen_until_the_decision() {
@@ -1479,10 +1514,12 @@ fi
         hold_while_deciding();
         let script = "printf '%s\\n' '{\"$message_type\":\"artifact\",\"artifact\":\"x.d\",\"emit\":\"dep-info\"}' >&2; \
              i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; echo finished";
-        for (rule, stop) in [
-            (StopRule::WhenAlone, false),
-            (StopRule::WhenAlone, true),
-            (StopRule::Kill, false),
+        for (rule, stop, waits) in [
+            (StopRule::WhenAlone, false, false),
+            (StopRule::WhenAlone, true, false),
+            (StopRule::Kill, false, false),
+            (StopRule::Kill, false, true),
+            (StopRule::Kill, true, true),
         ] {
             let mut child = Command::new("sh")
                 .args(["-c", script])
@@ -1496,7 +1533,11 @@ fi
             let stderr = child.stderr.take().unwrap();
             let mut states = Vec::new();
             let mut decide = || {
-                hold_while_deciding();
+                if waits {
+                    hold_while_waiting();
+                } else {
+                    hold_while_deciding();
+                }
                 let started = std::time::Instant::now();
                 while state(pid) != Some('T')
                     && started.elapsed() < std::time::Duration::from_millis(300)
@@ -1517,17 +1558,20 @@ fi
                 rule,
             )
             .unwrap();
-            let held = rule == StopRule::WhenAlone;
+            let held = rule == StopRule::WhenAlone || waits;
             assert_eq!(
                 states.iter().all(|state| *state == Some('T')),
                 held,
-                "{rule:?}: {states:?}"
+                "{rule:?} waits={waits}: {states:?}"
             );
-            assert_eq!(captured.stopped, stop, "{rule:?}");
+            assert_eq!(captured.stopped, stop, "{rule:?} waits={waits}");
             if stop {
                 assert!(!status.success());
             } else {
-                assert!(status.success(), "{rule:?}: the compile was not resumed");
+                assert!(
+                    status.success(),
+                    "{rule:?} waits={waits}: the compile was not resumed"
+                );
                 assert_eq!(stdout, b"finished\n");
             }
         }
