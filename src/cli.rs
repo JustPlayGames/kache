@@ -2974,7 +2974,10 @@ fn uncached_compile_lines(
 
 /// What differs between the missed key's configuration and each other
 /// stored entry's (target, profile, features, crate types), at most `limit`
-/// lines and how many more there were.
+/// lines and how many more there were. The closest entries come first (a
+/// same-config entry, then those one field away), so that a crate stored for
+/// many targets and feature sets still names the change that matters before
+/// the cap cuts it off.
 fn why_miss_diff_messages<'a, I>(
     miss_meta: &crate::store::EntryMeta,
     other_entries: I,
@@ -2983,6 +2986,15 @@ fn why_miss_diff_messages<'a, I>(
 where
     I: IntoIterator<Item = (&'a str, &'a crate::store::EntryMeta)>,
 {
+    let distance = |other: &crate::store::EntryMeta| {
+        usize::from(miss_meta.target != other.target)
+            + usize::from(miss_meta.profile != other.profile)
+            + usize::from(miss_meta.features != other.features)
+            + usize::from(miss_meta.crate_types != other.crate_types)
+    };
+    let mut other_entries: Vec<(&str, &crate::store::EntryMeta)> =
+        other_entries.into_iter().collect();
+    other_entries.sort_by_key(|(_, other)| distance(other));
     // Every same-config entry says the same thing, so they share one line.
     let mut diffs: Vec<(Option<&'static str>, String)> = Vec::new();
     let mut push = |same_config: Option<&'static str>, message: String| {
