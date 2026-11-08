@@ -33,6 +33,11 @@ rem that held it has ended, so nothing still uses them. When the test ended
 rem so is the last of the run in its slot, its folder stays (nextest runs
 rem nothing after the run). Other runs' folders are never touched.
 rem
+rem The test's kache configuration is its folder's too (XDG_CONFIG_HOME,
+rem which kache reads before the profile on every platform), so a test that
+rem forgets to pin its config cannot read the developer's own, whose
+rem runtime_dir names their running daemon. See nextest-own-temp.sh.
+rem
 rem The test's exit status is passed on unchanged.
 setlocal EnableExtensions DisableDelayedExpansion
 set "KT_BASE=%TEMP%"
@@ -60,6 +65,7 @@ exit /b %ERRORLEVEL%
 set "TEMP=%KT_DIR%"
 set "TMP=%KT_DIR%"
 set "TMPDIR=%KT_DIR%"
+mkdir "%KT_DIR%\f" 2>nul && set "XDG_CONFIG_HOME=%KT_DIR%\f"
 %*
 set "KT_STATUS=%ERRORLEVEL%"
 set /a KT_WAIT=0
