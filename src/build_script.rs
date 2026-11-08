@@ -96,6 +96,18 @@ const LAUNCHER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/build-script-l
 // Version 1 could omit whitespace-padded Cargo declarations.
 const PREDICTION_SCHEMA: u32 = 2;
 const PREDICTION_PREFIX: &str = "build-script:";
+/// How many distinct declarations of one configuration are kept, each in a
+/// row of its own under [`variant_prefix`], so that a run recorded under any
+/// of them is found ([`Run::restore_another_variant`]).
+const PREDICTION_VARIANTS: usize = 4;
+
+/// The rows of a configuration's declaration variants, named after
+/// `identity` (a [`PREDICTION_PREFIX`] row, which their names extend, so they
+/// keep its retention and plain form).
+fn variant_prefix(identity: &str) -> String {
+    format!("{identity}:variant:")
+}
+
 /// The variables Cargo sets that pick the configuration a script runs in;
 /// a prediction is kept per binary and configuration ([`Run::identity_in`]).
 const PREDICTION_CONFIGURATION: &[&str] = &["TARGET", "HOST", "PROFILE", "OPT_LEVEL", "DEBUG"];
@@ -878,6 +890,9 @@ fn run_cached(real: &Path, argv: &[std::ffi::OsString]) -> Result<i32> {
             Lookup::Hit => return Ok(0),
             Lookup::Miss(key) => missed_key = Some(key),
         }
+    }
+    if run.restore_another_variant(prediction.as_ref(), readonly.as_ref())? {
+        return Ok(0);
     }
     // Checkouts building the same commit at once all reach the same script
     // with nothing stored yet, and each ran it: a slow one (a C library's
@@ -1968,15 +1983,61 @@ impl Run {
         stored_prediction(&self.store, &self.identity())
     }
 
+    /// Record `prediction` as this configuration's newest, and as one of its
+    /// variants ([`PREDICTION_VARIANTS`]).
     fn record_prediction(&self, prediction: &Prediction) -> Result<()> {
         let json = serde_json::to_string(prediction)?;
-        self.store.file_hash_cache().put_input_prediction(
-            &self.identity(),
+        let identity = self.identity();
+        let predictions = self.store.file_hash_cache();
+        predictions.put_input_prediction(&identity, PREDICTION_SCHEMA, Some(CRATE_NAME), &json)?;
+        let prefix = variant_prefix(&identity);
+        let variant = format!("{prefix}{}", &blake3::hash(json.as_bytes()).to_hex()[..32]);
+        predictions.put_input_prediction_keeping(
+            &prefix,
+            &variant,
             PREDICTION_SCHEMA,
             Some(CRATE_NAME),
             &json,
+            PREDICTION_VARIANTS,
         )?;
         Ok(())
+    }
+
+    /// Look up the runs this configuration's other declarations key, newest
+    /// first, and restore the first one stored; `tried` is the one already
+    /// looked up. `true` when one was restored.
+    ///
+    /// A script can declare other inputs in one configuration: cc probes
+    /// `AR_<target>`, `AR_<target with underscores>`, `TARGET_AR` and `AR`
+    /// and stops at the first one set, declaring each it read, so a build
+    /// whose wrapper sets `AR_x86_64-pc-windows-msvc` declares one variable
+    /// and a build that sets only `AR_x86_64_pc_windows_msvc` declares two.
+    /// With only the newest declarations, two such builds took turns missing
+    /// the run the other had just recorded and running the script again (a
+    /// shared build machine, 2026-11-06/07: every C build script of a Windows
+    /// cross build, each time a build of the other kind had run in between).
+    fn restore_another_variant(
+        &self,
+        tried: Option<&Prediction>,
+        readonly: Option<&Store>,
+    ) -> Result<bool> {
+        let predictions = self.store.file_hash_cache();
+        let names = predictions
+            .input_prediction_names_under(&variant_prefix(&self.identity()), PREDICTION_VARIANTS)?;
+        let mut looked_up: Vec<Prediction> = tried.cloned().into_iter().collect();
+        for name in names {
+            let Some(prediction) = stored_prediction(&self.store, &name)? else {
+                continue;
+            };
+            if looked_up.contains(&prediction) {
+                continue;
+            }
+            if let Lookup::Hit = self.restore_recorded(&prediction, readonly)? {
+                return Ok(true);
+            }
+            looked_up.push(prediction);
+        }
+        Ok(false)
     }
 
     /// The key a recorded run is stored under: everything Cargo would compare
@@ -6083,6 +6144,85 @@ mod tests {
             }
         };
         (make("a/target"), make("b/target"))
+    }
+
+    /// Two builds of one configuration whose script declares other variables
+    /// (cc, below a wrapper that sets `AR_<target>` and without it) each find
+    /// the run they recorded, whichever of them recorded last.
+    #[test]
+    fn each_declaration_variant_of_a_configuration_finds_its_own_run() {
+        const SET: &str = "KACHE_TEST_VARIANT_AR_TARGET";
+        const FALLBACK: &str = "KACHE_TEST_VARIANT_AR";
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (wrapped, plain) = two_targets(dir.as_path());
+        let again = Run {
+            store: Store::open(&wrapped.config).unwrap(),
+            config: wrapped.config.clone(),
+            binary_hash: wrapped.binary_hash.clone(),
+            environment: checkout_environment(
+                &dir.as_path().join("c/target"),
+                &dir.as_path().join("cargo"),
+            ),
+            start: std::time::Instant::now(),
+        };
+        let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let set = |value: Option<&str>| {
+            // SAFETY: the process-state lock serialises environment edits.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(SET, value),
+                    None => std::env::remove_var(SET),
+                }
+                std::env::remove_var(FALLBACK);
+            }
+        };
+
+        set(Some("wrapper"));
+        wrapped
+            .record(
+                format!("cargo:rerun-if-changed=build.rs\ncargo:rerun-if-env-changed={SET}\n")
+                    .as_bytes(),
+                b"",
+                5,
+                after,
+            )
+            .unwrap();
+        set(None);
+        plain
+            .record(
+                format!(
+                    "cargo:rerun-if-changed=build.rs\ncargo:rerun-if-env-changed={SET}\n\
+                     cargo:rerun-if-env-changed={FALLBACK}\n"
+                )
+                .as_bytes(),
+                b"",
+                5,
+                after,
+            )
+            .unwrap();
+
+        set(Some("wrapper"));
+        let newest = again.prediction().unwrap().expect("a recorded run");
+        assert_eq!(newest.env.len(), 2, "the plain build recorded last");
+        assert!(
+            matches!(
+                again.restore_recorded(&newest, None).unwrap(),
+                Lookup::Miss(_)
+            ),
+            "the plain build's declarations key another run"
+        );
+        let found = again.restore_another_variant(Some(&newest), None).unwrap();
+        set(None);
+        assert!(
+            found,
+            "the wrapped build's run is found under its own declarations"
+        );
+        let events = crate::events::read_events(&again.config.event_log_path()).unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.result).collect::<Vec<_>>(),
+            [EventResult::Miss, EventResult::Miss, EventResult::LocalHit]
+        );
     }
 
     /// cl.exe on a Czech Windows prints its warnings in CP852, so a script
