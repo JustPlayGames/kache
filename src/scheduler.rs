@@ -603,6 +603,70 @@ pub fn begin_keyless_compile(
     }
 }
 
+/// Longest a compile that reached its dep-info waits, frozen, for a peer that
+/// holds its key's flight (see [`join_flight_at_dep_info`]). The peer started
+/// first and does the same work, so it is usually done well within this; past
+/// it the compile goes on by itself, as it did before.
+pub(crate) const DEP_INFO_FLIGHT_WAIT: Duration = Duration::from_secs(600);
+
+/// What a compile that started before its key found of that key's flight
+/// once its dep-info gave it the key.
+pub(crate) enum DepInfoFlight {
+    /// Nobody held it: this compile holds it now, until its entry is stored,
+    /// and a peer that reaches the same key waits for it.
+    Owner(StoreLock),
+    /// A peer held it and let it go (stored, failed or died) within the
+    /// wait: look in the store again.
+    PeerDone,
+    /// The flight could not be used, or a peer still held it at the end of
+    /// the wait: compile on without it.
+    Unavailable,
+}
+
+/// The flight of the key a compile learned at its dep-info (the compile-first
+/// path, which had no key to join one with before it started). The same
+/// flight as [`begin_miss`]'s, so a compile that keyed first and one that
+/// compiled first wait for each other alike. `before_wait` runs before any
+/// wait, for the caller to give its permit back and freeze its compile: a
+/// waiter never holds slots, so an owner that still waits for slots (as
+/// [`begin_miss`] takes the flight before the permit) never waits on it. The
+/// wait is bounded ([`DEP_INFO_FLIGHT_WAIT`], within the invocation's
+/// allowance) and ends when the owner's lock goes, which the kernel releases
+/// when the owner dies.
+pub(crate) fn join_flight_at_dep_info(
+    cache_dir: &Path,
+    enabled: bool,
+    identity: &FlightIdentity,
+    before_wait: impl FnOnce(),
+) -> DepInfoFlight {
+    if !enabled {
+        return DepInfoFlight::Unavailable;
+    }
+    let scheduler = match Scheduler::open(cache_dir) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::debug!("scheduler unusable ({error:#}); no flight at the dep-info");
+            return DepInfoFlight::Unavailable;
+        }
+    };
+    scheduler.join_flight_at_dep_info(identity, DEP_INFO_FLIGHT_WAIT, before_wait)
+}
+
+/// Take the flight of `identity` if nobody holds it, without waiting.
+pub(crate) fn try_take_flight(
+    cache_dir: &Path,
+    enabled: bool,
+    identity: &FlightIdentity,
+) -> Option<StoreLock> {
+    if !enabled {
+        return None;
+    }
+    let scheduler = Scheduler::open(cache_dir).ok()?;
+    StoreLock::try_acquire(&scheduler.flight_path(identity))
+        .ok()
+        .flatten()
+}
+
 enum FlightJoin {
     Owner(StoreLock),
     Waited,
@@ -699,6 +763,44 @@ impl Scheduler {
             _flight: None,
             weights_dir: Some(self.weights_dir()),
         }
+    }
+
+    fn join_flight_at_dep_info(
+        &self,
+        identity: &FlightIdentity,
+        longest: Duration,
+        before_wait: impl FnOnce(),
+    ) -> DepInfoFlight {
+        let _trace = crate::phase_trace::phase("flight_join");
+        let path = self.flight_path(identity);
+        let started = Instant::now();
+        let (joined, outcome) = match StoreLock::try_acquire(&path) {
+            Ok(Some(lock)) => (DepInfoFlight::Owner(lock), SchedulerOutcome::Admitted),
+            Ok(None) => {
+                before_wait();
+                let _trace_wait = crate::phase_trace::phase("flight_wait");
+                let wait = BudgetWait::start(longest);
+                let outcome = wait_for_lock(&path, wait.timeout, self.poll_interval);
+                crate::opcounts::record_flight_wait(started.elapsed());
+                match outcome {
+                    Ok(true) => (DepInfoFlight::PeerDone, SchedulerOutcome::PeerCompleted),
+                    Ok(false) => (
+                        DepInfoFlight::Unavailable,
+                        SchedulerOutcome::TimeoutFallback,
+                    ),
+                    Err(error) => {
+                        tracing::debug!("dep-info flight wait failed ({error:#})");
+                        (DepInfoFlight::Unavailable, unavailable_outcome())
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!("dep-info flight lock failed ({error:#})");
+                (DepInfoFlight::Unavailable, unavailable_outcome())
+            }
+        };
+        record_decision(SchedulerPhase::Flight, outcome, started.elapsed());
+        joined
     }
 
     fn join_flight(&self, identity: &FlightIdentity) -> FlightJoin {
@@ -4204,6 +4306,46 @@ mod tests {
             crate::opcounts::flight_wait_ms() >= flight_wait_before + 80,
             "the blocked time must be attributed to flight_wait_ms"
         );
+    }
+
+    /// A compile that learned its key at its dep-info while a peer holds the
+    /// key's flight lets go (its permit, through `before_wait`) before it
+    /// waits, never waits past its bound, and wakes as the owner lets go.
+    #[test]
+    fn a_dep_info_waiter_lets_go_first_and_waits_within_its_bound() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 2);
+        let identity = FlightIdentity::rustc("held", &["lib".into()], false).with_key("key");
+        let bound = Duration::from_millis(80);
+        let join = |let_go: &mut bool| {
+            scheduler.join_flight_at_dep_info(&identity, bound, || *let_go = true)
+        };
+        let mut owner_let_go = false;
+        let DepInfoFlight::Owner(owner) = join(&mut owner_let_go) else {
+            panic!("nobody held the flight");
+        };
+        assert!(!owner_let_go, "a compile that takes the flight never waits");
+
+        let (mut let_go, started) = (false, Instant::now());
+        assert!(matches!(join(&mut let_go), DepInfoFlight::Unavailable));
+        assert!(let_go, "the waiter kept its permit while it waited");
+        assert!(started.elapsed() >= bound);
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(owner);
+        });
+        let mut let_go = false;
+        assert!(
+            matches!(
+                scheduler
+                    .join_flight_at_dep_info(&identity, Duration::from_secs(10), || let_go = true),
+                DepInfoFlight::PeerDone
+            ),
+            "the waiter did not wake when the owner let go"
+        );
+        release.join().unwrap();
+        assert!(let_go);
     }
 
     #[test]

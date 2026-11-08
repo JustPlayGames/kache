@@ -7390,19 +7390,23 @@ fn compile_before_key(
     crate::out_dir_alias::register_before_compile();
     // No key yet, but the compile still takes a slot in the scheduler's
     // pool, as every other compile does.
-    let miss_guard = scheduler::begin_keyless_compile(
+    let mut miss_guard = Some(scheduler::begin_keyless_compile(
         &config.cache_dir,
         config.scheduler,
         crate_name,
         args.invokes_linker(),
         config.test_lease.as_deref(),
-    );
+    ));
     let compile_start = std::time::Instant::now();
     // An entry could exist: key from the dep-info rustc writes right
     // after expansion, and stop the compile if that key is stored. This
     // is the closure the pre-pass would have found, at the same point
     // in time, without a second rustc.
     let mut hit_closure = None;
+    // The flight of the key the dep-info gave, held until this compile's
+    // entry is stored (the end of this function), so that a peer reaching
+    // the same key waits for it instead of compiling it too.
+    let mut key_flight = None;
     let executed = if stop_on_hit {
         let tree = tree_guard.clone();
         let mut on_dep_info = || {
@@ -7410,19 +7414,23 @@ fn compile_before_key(
             // is being stored: either is likely this compile's hit. Keying
             // takes long enough for rustc to start its codegen, after which
             // a compile that links can no longer be stopped: freeze it first
-            // (a compile that does not link is not frozen; it can be killed
-            // at any point).
+            // (a compile that does not link is not frozen here; it can be
+            // killed at any point, and is frozen only while it waits for a
+            // peer compiling the same key).
             crate::compile::hold_while_deciding();
             let Some(dep_info) = emitted_dep_info(args) else {
                 return true;
             };
-            let keyed = stop_on_hit_key(ctx, dep_info.clone(), tree.clone());
-            let stored = keyed.ok().is_some_and(|keyed| {
-                stored_at_dep_info(ctx.store, &keyed.cache_key, crate_name)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            });
+            let Ok(keyed) = stop_on_hit_key(ctx, dep_info.clone(), tree.clone()) else {
+                return true;
+            };
+            let stored = match stored_or_peer_compiled(ctx, &keyed.cache_key, &mut miss_guard) {
+                AtDepInfo::Stored => true,
+                AtDepInfo::Compile(flight) => {
+                    key_flight = flight;
+                    false
+                }
+            };
             if stored {
                 hit_closure = Some((dep_info, tree.clone()));
             }
@@ -7435,10 +7443,13 @@ fn compile_before_key(
     // A compile the stop let go on (it had started its linker or codegen)
     // ran to its end and is keyed and stored as any other compile.
     let hit_closure = hit_closure.filter(|_| stopped_on_hit(&executed));
-    if hit_closure.is_none() {
-        miss_guard.record_compile_rss(crate_name);
+    if hit_closure.is_none()
+        && let Some(guard) = &miss_guard
+    {
+        guard.record_compile_rss(crate_name);
     }
     drop(miss_guard);
+    let _key_flight = key_flight;
     if let Some((dep_info, tree)) = hit_closure {
         // Stopped before anything reached Cargo. Key again from the
         // closure the compile wrote, and restore like any hit.
@@ -7551,6 +7562,75 @@ fn compile_before_key(
     // Whatever the store step reported, the compile succeeded and its
     // outputs are in place.
     stored.or(Ok(exit_code))
+}
+
+/// What a compile that keyed at its dep-info does next.
+enum AtDepInfo {
+    /// Its key is stored, or a peer stored it while this compile waited:
+    /// stop and restore.
+    Stored,
+    /// Compile on, holding the key's flight when it could be taken.
+    Compile(Option<crate::store::StoreLock>),
+}
+
+/// At its dep-info a compile that started before its key knows the key. Look
+/// for the entry; when there is none, take the key's flight, or, when a peer
+/// holds it (another checkout compiling the same unit right now), wait for
+/// that peer and look again once it is done, instead of compiling the unit a
+/// second time. While it waits the compile is frozen and its permit given back
+/// ([`scheduler::join_flight_at_dep_info`]); one that goes on after all (the
+/// peer failed, died or took too long) takes a permit again.
+fn stored_or_peer_compiled(
+    ctx: &CompileFirst<'_>,
+    cache_key: &str,
+    miss_guard: &mut Option<MissGuard>,
+) -> AtDepInfo {
+    let CompileFirst {
+        config,
+        args,
+        store,
+        crate_name,
+        ..
+    } = *ctx;
+    let stored = || {
+        stored_at_dep_info(store, cache_key, crate_name)
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    if stored() {
+        return AtDepInfo::Stored;
+    }
+    let identity =
+        FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()).with_key(cache_key);
+    let joined =
+        scheduler::join_flight_at_dep_info(&config.cache_dir, config.scheduler, &identity, || {
+            tracing::debug!("{crate_name}: a peer compiles its key; waiting for it");
+            crate::compile::hold_while_waiting();
+            *miss_guard = None;
+        });
+    let flight = match joined {
+        scheduler::DepInfoFlight::Owner(lock) => return AtDepInfo::Compile(Some(lock)),
+        scheduler::DepInfoFlight::PeerDone => {
+            if stored() {
+                tracing::debug!("{crate_name}: the peer stored its key; restoring it");
+                return AtDepInfo::Stored;
+            }
+            tracing::debug!("{crate_name}: the peer left no entry; compiling it here");
+            scheduler::try_take_flight(&config.cache_dir, config.scheduler, &identity)
+        }
+        scheduler::DepInfoFlight::Unavailable => None,
+    };
+    if miss_guard.is_none() {
+        *miss_guard = Some(scheduler::begin_keyless_compile(
+            &config.cache_dir,
+            config.scheduler,
+            crate_name,
+            args.invokes_linker(),
+            config.test_lease.as_deref(),
+        ));
+    }
+    AtDepInfo::Compile(flight)
 }
 
 /// May this compile start before its key and be stopped on a hit? rustc has
