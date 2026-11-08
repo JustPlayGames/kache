@@ -26,6 +26,15 @@
 # ended with the test and left the folder behind. Only SIGKILL, which nextest
 # sends once its grace period is over, still ends the script at once.
 #
+# Nor does a test reach the developer's own kache. HOME and the XDG folders
+# point into the test's folder too: a test that forgets to pin its config
+# would otherwise read ~/.config/kache/config.toml, whose runtime_dir and
+# local_store name the developer's running daemon and store, ask that daemon
+# to replace itself when the test's build is newer, find its systemd user
+# unit and start it again, and write kache.log lines into ~/.cache/kache.
+# Cargo and rustup keep their own homes, resolved from the real HOME first.
+# Without a folder of its own the test runs as before.
+#
 # The test's exit status is passed on unchanged, a signal as the same signal.
 set -u
 base=${TMPDIR:-/tmp}
@@ -33,6 +42,14 @@ if ! dir=$(mktemp -d "${base%/}/kt.XXXXXX" 2>/dev/null); then
     exec "$@"
 fi
 export TMPDIR="$dir" TMP="$dir" TEMP="$dir"
+if [ -n "${HOME:-}" ]; then
+    export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+fi
+if mkdir -p "$dir/h" "$dir/f" "$dir/c" "$dir/d" "$dir/s" && mkdir -m 700 "$dir/r"; then
+    export HOME="$dir/h" XDG_CONFIG_HOME="$dir/f" XDG_CACHE_HOME="$dir/c" \
+        XDG_DATA_HOME="$dir/d" XDG_STATE_HOME="$dir/s" XDG_RUNTIME_DIR="$dir/r"
+    unset DBUS_SESSION_BUS_ADDRESS
+fi
 trap : HUP INT TERM
 "$@"
 status=$?
