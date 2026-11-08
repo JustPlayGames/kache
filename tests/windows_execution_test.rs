@@ -1017,7 +1017,12 @@ fn unicode_diagnostics_reach_a_real_console_on_misses_and_cache_hits() {
                 "--nocapture",
             ])
             .env("KACHE_NATIVE_RUSTC", rustc)
-            .env("KACHE_NATIVE_CONSOLE_RESULT", &result),
+            .env("KACHE_NATIVE_CONSOLE_RESULT", &result)
+            // `command` clears the environment and drops every CARGO_* variable, but the
+            // fixture's own `Fixture::new` finds the binaries through the run-time
+            // CARGO_BIN_EXE_* paths (common::bin_exe), so hand it this run's.
+            .env("CARGO_BIN_EXE_kache", FRONTEND.as_path())
+            .env("CARGO_BIN_EXE_kache-engine", ENGINE.as_path()),
     );
     assert_eq!(
         std::fs::read(result).unwrap(),
