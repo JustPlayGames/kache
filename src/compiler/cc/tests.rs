@@ -5074,11 +5074,23 @@ fn cc_preprocess_memo_key_ignores_only_volatile_environment() {
     }
 }
 
+/// A clang-cl debug object spells its paths, so its key keeps them; a
+/// non-debug one maps them off Windows, as gcc's and clang's do.
 #[test]
-fn cc_prefix_maps_empty_for_clang_cl() {
+fn cc_prefix_maps_for_clang_cl_only_without_debug_info() {
     let cwd = std::path::Path::new("/work/proj");
     let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c"])).unwrap();
-    assert!(cc_prefix_maps_cfg(&cl, cwd, None, None, &[]).is_empty());
+    assert_eq!(
+        cc_prefix_maps_cfg(&cl, cwd, None, None, &[]).is_empty(),
+        cfg!(windows)
+    );
+    for debug in ["/Z7", "-Zi", "-g"] {
+        let cl = CcArgs::parse(&s(&["clang-cl", "-c", "/work/proj/a.c", debug])).unwrap();
+        assert!(
+            cc_prefix_maps_cfg(&cl, cwd, None, None, &[]).is_empty(),
+            "{debug}"
+        );
+    }
     let gnu = CcArgs::parse(&s(&["gcc", "-c", "/work/proj/a.c"])).unwrap();
     assert!(!cc_prefix_maps_cfg(&gnu, cwd, None, None, &[]).is_empty());
 }
@@ -5092,8 +5104,9 @@ fn cc_prefix_maps_empty_for_clang_cl() {
 /// turned that probe into an error, so `-ffile-reproducible` was reported
 /// unsupported and dropped. Without it, `__FILE__` kept mozbuild's
 /// forward slashes and chromium's `base\location.cc` `static_assert`
-/// failed. clang-cl gets empty prefix maps (#295), so the composed argv
-/// (what `execute` spawns) must be byte-identical to the original `rest`.
+/// failed. kache injects no prefix maps into a clang-cl argv (#295), so the
+/// composed argv (what `execute` spawns) must be byte-identical to the
+/// original `rest`, and the key probe must carry none either.
 #[test]
 fn clang_cl_invocation_injects_no_flags_issue_299() {
     let cwd = std::path::Path::new("/work/proj");
@@ -5106,16 +5119,19 @@ fn clang_cl_invocation_injects_no_flags_issue_299() {
         "-Foa.obj",
     ]))
     .unwrap();
+    // The key may map the checkout's paths; the argv never carries them.
     let maps = cc_prefix_maps_cfg(&cl, cwd, None, None, &[]);
-    assert!(
-        maps.is_empty(),
-        "clang-cl must get no prefix maps (#295/#299)"
-    );
-    let composed = compose_cc_args(&cl.rest, file_prefix_map_args(&maps));
+    let composed = compose_cc_args(&cl.rest, injected_prefix_map_args(&cl, &maps));
     assert_eq!(
         composed, cl.rest,
         "kache must inject nothing into a clang-cl argv, or it poisons \
              `-Werror` compiles/probes (#299); got {composed:?}"
+    );
+    assert!(
+        !key_preprocess_args(&cl, &maps)
+            .iter()
+            .any(|arg| arg.contains("prefix-map")),
+        "the key probe must expand what the compile compiles"
     );
 }
 

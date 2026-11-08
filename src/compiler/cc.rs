@@ -1687,7 +1687,7 @@ struct PreprocessHash {
 fn key_preprocess_args(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Vec<String> {
     compose_cc_args(
         &build_preprocess_args(parsed),
-        file_prefix_map_args(prefix_maps),
+        injected_prefix_map_args(parsed, prefix_maps),
     )
 }
 
@@ -4353,6 +4353,24 @@ fn cc_flags_need_resolved_invocation(parsed: &CcArgs) -> bool {
     })
 }
 
+/// Whether a clang-cl compile's key reads its paths through the prefix maps.
+///
+/// The key names a source and the headers it read by path, and a checkout's
+/// generated headers (cxx's `OUT_DIR/cxxbridge/include`) and sources sit
+/// under that checkout: every checkout keyed the same translation unit apart
+/// (webrtc-sys under cargo-xwin, 2026-11-08), though a non-debug object is the
+/// same bytes. Nothing is rewritten in the compile, so a path the object
+/// could carry stays bound to its checkout: one the expansion spells (a
+/// `__FILE__` in a header under a root) makes the key path-bound, and the
+/// object scan after the compile stores no object that spells a root.
+///
+/// Not for a debug compile, whose object always spells its paths, and not on
+/// a Windows host, where a path can reach the object in a spelling (drive
+/// letter case, separators) the scan does not look for.
+fn cl_maps_key_inputs(parsed: &CcArgs) -> bool {
+    !cfg!(windows) && !cl_debug_present(parsed)
+}
+
 /// MSVC debug-info markers that embed absolute CodeView paths into the
 /// object. clang-cl puts debug info in the `.obj` for all of these (no
 /// compile-time PDB — box-confirmed), so each is a single cacheable
@@ -4723,13 +4741,13 @@ fn cc_prefix_maps_cfg(
     sdk_root: Option<&Path>,
     configured_base_dirs: &[String],
 ) -> Vec<CcPrefixMap> {
-    // clang-cl ignores `-ffile-prefix-map`, so prefix-mapping the key over
-    // an object that still embeds raw paths would miscache. Until Layer 3
-    // proves a cl path-remap, cl keys stay path-literal (unnormalised
-    // `-###` abs paths make them per-machine — misses, never miscache) and
-    // `execute` injects nothing. (The MSVC dialect doesn't use
-    // `-isysroot`/`SDKROOT` anyway, on any host.)
-    if parsed.family.dialect() == Dialect::Cl {
+    // clang-cl ignores `-ffile-prefix-map`, so `execute` injects nothing
+    // (#299) and a clang-cl object keeps every path it spells. A debug
+    // object always spells some (CodeView's object name and command line),
+    // so its key stays path-literal. Otherwise the maps rewrite only what
+    // the key reads; see [`cl_maps_key_inputs`]. (The MSVC dialect doesn't
+    // use `-isysroot`/`SDKROOT` anyway, on any host.)
+    if parsed.family.dialect() == Dialect::Cl && !cl_maps_key_inputs(parsed) {
         return Vec::new();
     }
     let mut maps: Vec<CcPrefixMap> = Vec::new();
@@ -5617,6 +5635,16 @@ fn cc_follows_windows_drive_prefix(input: &[u8], start: usize) -> bool {
 /// The compiler receives the broadest map first and the most specific
 /// last, mirroring rustc remap ordering. The byte-normalizer above
 /// applies most-specific first.
+/// The `-ffile-prefix-map` flags a compile and its key probe get. clang-cl
+/// gets none: it ignores them, and its argv stays exactly as given (#299).
+/// Its maps rewrite only what the key reads ([`cl_maps_key_inputs`]).
+fn injected_prefix_map_args(parsed: &CcArgs, prefix_maps: &[CcPrefixMap]) -> Vec<String> {
+    if parsed.family.dialect() == Dialect::Cl {
+        return Vec::new();
+    }
+    file_prefix_map_args(prefix_maps)
+}
+
 fn file_prefix_map_args(prefix_maps: &[CcPrefixMap]) -> Vec<String> {
     prefix_maps
         .iter()
@@ -8559,7 +8587,7 @@ impl CcCompiler {
         let _trace = crate::phase_trace::phase("cc_compile");
         let mut command = parsed.invocation_env.command(&parsed.program)?;
         let prefix_maps = cc_prefix_maps(parsed, &self.base_dirs);
-        let mut appended = file_prefix_map_args(&prefix_maps);
+        let mut appended = injected_prefix_map_args(parsed, &prefix_maps);
         appended.extend(extra);
         let args = compose_cc_args(&parsed.rest, appended);
         command.args(&args);
