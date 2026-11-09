@@ -76,6 +76,8 @@ pub(crate) struct Lease {
     kind: LeaseKind,
     completion: Completion,
     worktree_seed_key: Option<String>,
+    /// The donor profile whose state this lease imported.
+    worktree_seed_donor: Option<PathBuf>,
     worktree_bootstrap: bool,
     _lock: UnitLock,
 }
@@ -335,6 +337,7 @@ impl AdaptiveUnit {
                 previous,
             },
             worktree_seed_key: None,
+            worktree_seed_donor: None,
             worktree_bootstrap: false,
             _lock: lock,
         })
@@ -403,6 +406,7 @@ impl AdaptiveUnit {
             kind: LeaseKind::Seed,
             completion: Completion::DeferredSeed { previous },
             worktree_seed_key: None,
+            worktree_seed_donor: None,
             worktree_bootstrap: false,
             _lock: lock,
         })
@@ -469,6 +473,7 @@ impl AdaptiveUnit {
                 state: busy.clone(),
             },
             worktree_seed_key: None,
+            worktree_seed_donor: None,
             worktree_bootstrap: false,
             _lock: lock,
         })
@@ -509,6 +514,7 @@ impl AdaptiveUnit {
             kind: LeaseKind::Immediate,
             completion: Completion::Immediate { restore },
             worktree_seed_key: None,
+            worktree_seed_donor: None,
             worktree_bootstrap: false,
             _lock: lock,
         })
@@ -564,6 +570,7 @@ impl AdaptiveUnit {
                 previous,
             },
             worktree_seed_key: None,
+            worktree_seed_donor: None,
             worktree_bootstrap: false,
             _lock: lock,
         })
