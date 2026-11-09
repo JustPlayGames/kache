@@ -698,19 +698,25 @@ impl AdaptiveUnit {
         };
         let stored =
             crate::atomic::atomic_replace_deferrable(&self.state_path, &bytes, durable).is_ok();
+        // Unflushed: this runs on every ordinary build of the unit, cache hits
+        // included, and a flush here cost two journal commits per hit (one per
+        // unit and target folder; seconds each when the disk is busy). The
+        // lease that publishes the marker flushes it first.
         #[cfg(unix)]
         if !state.in_flight {
-            let _ = self.prepare_in_flight_record();
+            let _ = self.prepare_in_flight_record(false);
         }
         stored
     }
 
-    /// Prepare immutable marker bytes while recording an ordinary build.
-    /// Publishing another link then needs only a directory flush. A live
-    /// lease retains its observation and counters in Completion; recovery
-    /// discards any in-flight graph before consulting those fields.
+    /// Prepare immutable marker bytes while recording an ordinary build,
+    /// flushed only when `durable` (a lease about to publish it). Publishing
+    /// another link then needs the marker's own flush, a no-op once its
+    /// writeback has run, and a directory flush. A live lease retains its
+    /// observation and counters in Completion; recovery discards any
+    /// in-flight graph before consulting those fields.
     #[cfg(unix)]
-    fn prepare_in_flight_record(&self) -> Option<PathBuf> {
+    fn prepare_in_flight_record(&self, durable: bool) -> Option<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
 
         let path = self.unit_dir.join("in-flight.json");
@@ -718,7 +724,7 @@ impl AdaptiveUnit {
         if fs::symlink_metadata(&path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
-            let _ = crate::atomic::atomic_write_and_replace_with(
+            let _ = crate::atomic::atomic_write_and_replace_deferrable(
                 &path,
                 true,
                 |stage| {
@@ -727,6 +733,7 @@ impl AdaptiveUnit {
                     Ok(())
                 },
                 |_| Ok(()),
+                durable,
             );
         }
         let metadata = fs::symlink_metadata(&path).ok()?;
@@ -744,9 +751,14 @@ impl AdaptiveUnit {
 
     #[cfg(unix)]
     fn publish_in_flight_record(&self) -> bool {
-        let Some(source) = self.prepare_in_flight_record() else {
+        let Some(source) = self.prepare_in_flight_record(true) else {
             return false;
         };
+        // An ordinary build prepared it without a flush: its bytes must be on
+        // disk before the link below makes them the unit's state.
+        if crate::atomic::fsync_file(&source).is_err() {
+            return false;
+        }
         let Ok(stage) = tempfile::Builder::new()
             .prefix("in-flight-")
             .tempdir_in(&self.unit_dir)
@@ -760,8 +772,8 @@ impl AdaptiveUnit {
         if fs::rename(linked, &self.state_path).is_err() {
             return false;
         }
-        // Marker data was flushed when created. The new state.json entry
-        // must be durable before the caller starts rustc or removes a graph.
+        // Marker data was flushed above. The new state.json entry must be
+        // durable before the caller starts rustc or removes a graph.
         crate::atomic::fsync_dir(&self.unit_dir).is_ok()
     }
 
