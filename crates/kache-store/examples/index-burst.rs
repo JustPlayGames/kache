@@ -30,6 +30,10 @@ impl ArtifactPolicy for Policy {
     }
 }
 type Store = ArtifactStore<Policy>;
+
+/// One worker's latencies: prefetch, its mutex wait, prediction read, and
+/// (start, prefetch, prediction) per hit.
+type WorkerTimes = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<(f64, f64, f64)>);
 static OPENS: Mutex<Vec<f64>> = Mutex::new(Vec::new());
 static READS: Mutex<Vec<f64>> = Mutex::new(Vec::new());
 
@@ -183,89 +187,87 @@ fn main() -> Result<()> {
             next_identity.clone(),
             cfg.clone(),
         );
-        workers.push(std::thread::spawn(
-            move || -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<(f64, f64, f64)>)> {
-                let mut prefetch = Vec::new();
-                let mut mutex_wait = Vec::new();
-                let mut predict = Vec::new();
-                let mut timeline = Vec::new();
-                let mut opens = Vec::new();
-                let mut reads = Vec::new();
-                let mut rng = 0x9E3779B97F4A7C15u64 ^ (worker as u64 * 7919);
-                let mut next = || {
-                    rng ^= rng << 13;
-                    rng ^= rng >> 7;
-                    rng ^= rng << 17;
-                    rng
-                };
-                let pace = Duration::from_secs_f64(threads as f64 / hits_per_sec);
-                let mut due = Instant::now();
-                while !stop.load(Ordering::Relaxed) {
-                    let now = Instant::now();
-                    if now < due {
-                        std::thread::sleep(due - now);
-                    }
-                    due += pace;
-                    let hit_start = ms(started);
-                    // A unit's inputs: a run of neighbouring paths (one crate's
-                    // deps) from a random place.
-                    let base = (next() as usize) % paths.len();
-                    let t = Instant::now();
-                    let mut waited = 0.0;
-                    let own = if pooled {
-                        Some(Store::open(&cfg)?)
-                    } else {
-                        None
-                    };
-                    for i in 0..files_per_hit {
-                        let index = (base + i) % paths.len();
-                        let (path, size) = &paths[index];
-                        let fp = FileFingerprint {
-                            path: path.clone(),
-                            size: (*size).max(65_536),
-                            mtime_ns: stamp,
-                            ctime_ns: stamp,
-                            inode: 1_000_000 + index as i64,
-                        };
-                        let found = if let Some(own) = &own {
-                            own.file_hash_cache().get(&fp)?
-                        } else {
-                            let w = Instant::now();
-                            let store = hash_store.lock().unwrap();
-                            waited += ms(w);
-                            store.file_hash_cache().get(&fp)?
-                        };
-                        if found.is_none() && learned.lock().unwrap().insert(index) {
-                            pending
-                                .lock()
-                                .unwrap()
-                                .push((fp, blake3::hash(path.as_bytes()).to_hex().to_string()));
-                        }
-                    }
-                    drop(own);
-                    prefetch.push(ms(t));
-                    mutex_wait.push(waited);
-                    let t = Instant::now();
-                    let store = Store::open(&cfg)?;
-                    opens.push(ms(t));
-                    let identity = &identities
-                        [next_identity.fetch_add(1, Ordering::Relaxed) % identities.len()];
-                    let r = Instant::now();
-                    let _ = store.file_hash_cache().get_input_prediction(identity);
-                    reads.push(ms(r));
-                    drop(store);
-                    predict.push(ms(t));
-                    timeline.push((
-                        hit_start,
-                        *prefetch.last().unwrap(),
-                        *predict.last().unwrap(),
-                    ));
+        workers.push(std::thread::spawn(move || -> Result<WorkerTimes> {
+            let mut prefetch = Vec::new();
+            let mut mutex_wait = Vec::new();
+            let mut predict = Vec::new();
+            let mut timeline = Vec::new();
+            let mut opens = Vec::new();
+            let mut reads = Vec::new();
+            let mut rng = 0x9E3779B97F4A7C15u64 ^ (worker as u64 * 7919);
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let pace = Duration::from_secs_f64(threads as f64 / hits_per_sec);
+            let mut due = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now < due {
+                    std::thread::sleep(due - now);
                 }
-                OPENS.lock().unwrap().extend(opens);
-                READS.lock().unwrap().extend(reads);
-                Ok((prefetch, mutex_wait, predict, timeline))
-            },
-        ));
+                due += pace;
+                let hit_start = ms(started);
+                // A unit's inputs: a run of neighbouring paths (one crate's
+                // deps) from a random place.
+                let base = (next() as usize) % paths.len();
+                let t = Instant::now();
+                let mut waited = 0.0;
+                let own = if pooled {
+                    Some(Store::open(&cfg)?)
+                } else {
+                    None
+                };
+                for i in 0..files_per_hit {
+                    let index = (base + i) % paths.len();
+                    let (path, size) = &paths[index];
+                    let fp = FileFingerprint {
+                        path: path.clone(),
+                        size: (*size).max(65_536),
+                        mtime_ns: stamp,
+                        ctime_ns: stamp,
+                        inode: 1_000_000 + index as i64,
+                    };
+                    let found = if let Some(own) = &own {
+                        own.file_hash_cache().get(&fp)?
+                    } else {
+                        let w = Instant::now();
+                        let store = hash_store.lock().unwrap();
+                        waited += ms(w);
+                        store.file_hash_cache().get(&fp)?
+                    };
+                    if found.is_none() && learned.lock().unwrap().insert(index) {
+                        pending
+                            .lock()
+                            .unwrap()
+                            .push((fp, blake3::hash(path.as_bytes()).to_hex().to_string()));
+                    }
+                }
+                drop(own);
+                prefetch.push(ms(t));
+                mutex_wait.push(waited);
+                let t = Instant::now();
+                let store = Store::open(&cfg)?;
+                opens.push(ms(t));
+                let identity =
+                    &identities[next_identity.fetch_add(1, Ordering::Relaxed) % identities.len()];
+                let r = Instant::now();
+                let _ = store.file_hash_cache().get_input_prediction(identity);
+                reads.push(ms(r));
+                drop(store);
+                predict.push(ms(t));
+                timeline.push((
+                    hit_start,
+                    *prefetch.last().unwrap(),
+                    *predict.last().unwrap(),
+                ));
+            }
+            OPENS.lock().unwrap().extend(opens);
+            READS.lock().unwrap().extend(reads);
+            Ok((prefetch, mutex_wait, predict, timeline))
+        }));
     }
     std::thread::sleep(Duration::from_secs(seconds));
     stop.store(true, Ordering::Relaxed);
