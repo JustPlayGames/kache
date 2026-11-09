@@ -2771,7 +2771,7 @@ fn strict_flush_serializes_the_windows_readonly_open_window() {
                 assert!(notify_and_wait(Step::PermissionsRead(readonly)));
             }));
         });
-        flusher.db().busy_handler(Some(waiting_for_writer)).unwrap();
+        flusher.db.own_mut().busy_handler(Some(waiting_for_writer)).unwrap();
         flusher.finish_strict_durability(&worker_key)
     });
 
@@ -5199,7 +5199,7 @@ fn evict_waits_for_a_competing_writer_and_still_evicts() {
 
     let dir = tempfile::tempdir().unwrap();
     let (store, config) = store_with_one_evictable_entry(dir.path(), "contended");
-    store.db().busy_handler(Some(wait_for_lock)).unwrap();
+    store.db.own_mut().busy_handler(Some(wait_for_lock)).unwrap();
     // The wrapper that spawned the auto-GC worker is still writing its
     // own durability flag when the worker starts evicting.
     let competitor = Connection::open(config.index_db_path()).unwrap();
@@ -5351,7 +5351,7 @@ fn disk_pressure_skips_a_hardlinked_entry_without_the_write_lock() {
     let retainer = dir.path().join("target-copy.rlib");
     std::fs::hard_link(store.blob_path(&meta.files[0].hash), &retainer).unwrap();
     store.set_last_accessed_for_test("held", "-1 hour");
-    store.db().busy_handler(Some(give_up)).unwrap();
+    store.db.own_mut().busy_handler(Some(give_up)).unwrap();
     let build = Connection::open(config.index_db_path()).unwrap();
     build.execute_batch("BEGIN IMMEDIATE").unwrap();
 
