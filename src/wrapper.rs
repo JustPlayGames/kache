@@ -3805,17 +3805,21 @@ pub(crate) fn run_for(
         None,
         None,
     )?;
+    kache_ipc::marks::thread_mark("parsed_returned");
 
     if exit == 0 {
         retire_prestaged_executables(effective_config, &compiler, &args);
+        kache_ipc::marks::thread_mark("retired");
         complete_current_extra_inputs_after_success(
             effective_config,
             &args,
             extra_inputs.as_ref(),
         )?;
+        kache_ipc::marks::thread_mark("extra_done");
         // Cargo hardlinks and runs the binary after this wrapper returns, so
         // this is the last moment to put the launcher in its place.
         crate::build_script::install_shim(effective_config, &args);
+        kache_ipc::marks::thread_mark("shim_done");
     }
     Ok(exit)
 }
@@ -5073,11 +5077,13 @@ fn run_parsed_rustc(
                 key_record,
             );
         }
+        kache_ipc::marks::thread_mark("adaptive_start");
         observe_adaptive_hit(
             adaptive_unit.as_ref(),
             adaptive_key_fields.as_ref(),
             &cache_key,
         );
+        kache_ipc::marks::thread_mark("adaptive_done");
         return Ok(0);
     }
 
