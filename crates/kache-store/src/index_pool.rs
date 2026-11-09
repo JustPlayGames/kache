@@ -386,6 +386,18 @@ impl IndexConn {
         }
     }
 
+    /// The connection a store that pools nothing holds, mutably: rusqlite
+    /// 0.41 takes `&mut` to install a busy handler, which a test does.
+    #[cfg(test)]
+    pub(crate) fn own_mut(&self) -> std::cell::RefMut<'_, Connection> {
+        std::cell::RefMut::map(self.slot.borrow_mut(), |slot| {
+            &mut slot
+                .as_mut()
+                .expect("a store without a pool always holds its connection")
+                .db
+        })
+    }
+
     /// Whether the store holds a connection now.
     #[cfg(test)]
     pub(crate) fn holds(&self) -> bool {
