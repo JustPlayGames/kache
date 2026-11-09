@@ -129,13 +129,18 @@ fn printed(workspace: &Path) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
-fn results_for(cache: &Path, skip: usize, krate: &str) -> Vec<String> {
+/// Each event of `krate` after the first `skip`: its result, and whether it
+/// ran rustc's dep-info pre-pass before the lookup.
+fn results_for(cache: &Path, skip: usize, krate: &str) -> Vec<(String, bool)> {
     common::settled_events(cache)
         .lines()
         .skip(skip)
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["crate_name"] == krate)
-        .map(|event| event["result"].as_str().unwrap_or_default().to_string())
+        .map(|event| {
+            let result = event["result"].as_str().unwrap_or_default().to_string();
+            (result, event["dep_info_runs"].as_u64().unwrap_or(0) > 0)
+        })
         .collect()
 }
 
@@ -161,10 +166,19 @@ fn a_package_that_bakes_its_manifest_dir_hits_in_another_pool_member() {
     for krate in ["bakes", "app"] {
         let results = results_for(&cache, before, krate);
         assert!(
-            !results.is_empty() && results.iter().all(|result| result == "local_hit"),
+            !results.is_empty() && results.iter().all(|(result, _)| result == "local_hit"),
             "{krate} ran rustc in the second member: {results:?}"
         );
     }
+    // The first member's prediction row serves the second: its package paths
+    // are cut under the registry spelling rustc read them through, not the
+    // shared one CARGO_MANIFEST_DIR now names, or every registry hit in a new
+    // member paid the dep-info pre-pass.
+    let bakes = results_for(&cache, before, "bakes");
+    assert!(
+        bakes.iter().all(|(_, pre_pass)| !pre_pass),
+        "bakes ran the dep-info pre-pass in the second member: {bakes:?}"
+    );
     // What the package bakes is the shared directory, valid in every member.
     let baked = printed(&first);
     assert!(

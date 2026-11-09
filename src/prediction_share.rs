@@ -46,20 +46,41 @@ pub(crate) use kache_protocol::SharedPrediction;
 /// registry paths made relative.
 pub(crate) use kache_protocol::PlainRow;
 
+/// How far a shared row goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// Other machines, through the remote: no local path may go.
+    Remote,
+    /// The other Cargo homes of this machine over the same registry.
+    Machine,
+}
+
 /// One path or value as it may travel: a path under `registry` made relative
 /// to it, anything else with no root kept, and `None` for any other absolute
 /// path, which would carry a local path to the remote.
-fn for_remote_value(value: &str, registry: Option<&Path>) -> Option<Portable> {
+///
+/// On this machine, a path inside another registry package directory is
+/// kept as written: the wrapper spells a package's `CARGO_MANIFEST_DIR`
+/// through the directory a Cargo home's `registry` links to
+/// ([`crate::package_dirs`]), the same directory for every home over it.
+/// Made relative, the next home would place it under its own link and find
+/// its own value different. A reader checks it on disk like any other path.
+fn for_remote_value(value: &str, registry: Option<&Path>, reach: Reach) -> Option<Portable> {
     if !Path::new(value).has_root() {
         return Some(Portable::Literal(value.to_string()));
     }
-    let suffix = crate::cache_key::registry_suffix(value, registry?)?;
-    Some(Portable::Registry(suffix))
+    if let Some(suffix) = registry.and_then(|registry| crate::cache_key::registry_suffix(value, registry)) {
+        return Some(Portable::Registry(suffix));
+    }
+    let in_a_package = Path::new(value)
+        .ancestors()
+        .any(crate::cache_key::is_registry_package);
+    (reach == Reach::Machine && in_a_package).then(|| Portable::Literal(value.to_string()))
 }
 
-fn for_remote_entry(entry: &Portable, registry: Option<&Path>) -> Option<Portable> {
+fn for_remote_entry(entry: &Portable, registry: Option<&Path>, reach: Reach) -> Option<Portable> {
     match entry {
-        Portable::Literal(value) => for_remote_value(value, registry),
+        Portable::Literal(value) => for_remote_value(value, registry, reach),
         relative => Some(relative.clone()),
     }
 }
@@ -70,19 +91,35 @@ pub(crate) fn for_remote_portable(
     row: &PortablePrediction,
     registry: Option<&Path>,
 ) -> Option<SharedPrediction> {
+    shared_portable(row, registry, Reach::Remote)
+}
+
+/// [`for_remote_portable`] for the other Cargo homes of this machine.
+pub(crate) fn for_machine_portable(
+    row: &PortablePrediction,
+    registry: &Path,
+) -> Option<SharedPrediction> {
+    shared_portable(row, Some(registry), Reach::Machine)
+}
+
+fn shared_portable(
+    row: &PortablePrediction,
+    registry: Option<&Path>,
+    reach: Reach,
+) -> Option<SharedPrediction> {
     Some(SharedPrediction::Portable(PortablePrediction {
         schema: row.schema,
         sources: row
             .sources
             .iter()
-            .map(|source| for_remote_entry(source, registry))
+            .map(|source| for_remote_entry(source, registry, reach))
             .collect::<Option<_>>()?,
         env_deps: row
             .env_deps
             .iter()
             .map(|(name, value)| {
                 let value = match value {
-                    Some(value) => Some(for_remote_entry(value, registry)?),
+                    Some(value) => Some(for_remote_entry(value, registry, reach)?),
                     None => None,
                 };
                 Some((name.clone(), value))
@@ -94,19 +131,28 @@ pub(crate) fn for_remote_portable(
 
 /// A registry unit's shared row as it may travel; see [`for_remote_portable`].
 pub(crate) fn for_remote_plain(row: &InputPrediction, registry: &Path) -> Option<SharedPrediction> {
+    shared_plain(row, registry, Reach::Remote)
+}
+
+/// [`for_remote_plain`] for the other Cargo homes of this machine.
+pub(crate) fn for_machine_plain(row: &InputPrediction, registry: &Path) -> Option<SharedPrediction> {
+    shared_plain(row, registry, Reach::Machine)
+}
+
+fn shared_plain(row: &InputPrediction, registry: &Path, reach: Reach) -> Option<SharedPrediction> {
     Some(SharedPrediction::Plain(PlainRow {
         schema: row.schema,
         sources: row
             .sources
             .iter()
-            .map(|source| for_remote_value(source.to_str()?, Some(registry)))
+            .map(|source| for_remote_value(source.to_str()?, Some(registry), reach))
             .collect::<Option<_>>()?,
         env_deps: row
             .env_deps
             .iter()
             .map(|(name, value)| {
                 let value = match value {
-                    Some(value) => Some(for_remote_value(value, Some(registry))?),
+                    Some(value) => Some(for_remote_value(value, Some(registry), reach)?),
                     None => None,
                 };
                 Some((name.clone(), value))
