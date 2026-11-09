@@ -353,7 +353,7 @@ pub(super) async fn handle(
     // Lane timers (KACHE-NEXT66-1109): the hand-off's steps, when the client's
     // environment names a phase trace directory.
     let trace_dir = request.env.iter().find_map(|(key, value)| {
-        (key.decode().ok()? == "KACHE_PHASE_TRACE_DIR")
+        (key.decode().ok()? == "KACHE_LANE_MARKS_DIR")
             .then(|| value.decode().ok())
             .flatten()
             .filter(|value| !value.is_empty())
@@ -508,7 +508,17 @@ pub(super) async fn handle(
             }
         };
         worker_mark("worker_start");
-        let _worker_end = WorkerEnd(worker_mark);
+        if worker_marks.is_some() {
+            kache_ipc::marks::thread_begin();
+        }
+        let _worker_end = WorkerEnd(|name| {
+            if let Some(marks) = &worker_marks
+                && let Ok(mut marks) = marks.lock()
+            {
+                marks.extend(kache_ipc::marks::thread_take());
+                marks.push((name, Instant::now()));
+            }
+        });
         let _in_flight = in_flight;
         let _held_open = held_open;
         let _activity = activity;

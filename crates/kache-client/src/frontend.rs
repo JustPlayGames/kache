@@ -15,7 +15,7 @@ pub fn run(version: &str) -> Result<i32> {
 /// Other frontend binaries continue to select their role from argv[0].
 pub fn run_with_binary_name(version: &str, binary_name: &str) -> Result<i32> {
     let started_at = std::time::Instant::now();
-    let trace_dir = std::env::var_os("KACHE_PHASE_TRACE_DIR")
+    let trace_dir = std::env::var_os("KACHE_LANE_MARKS_DIR")
         .filter(|value| !value.is_empty())
         .map(std::path::PathBuf::from);
     if trace_dir.is_some() {
