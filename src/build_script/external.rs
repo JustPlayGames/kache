@@ -10,6 +10,18 @@ use std::path::{Path, PathBuf};
 const MAX_ENTRIES: usize = 1024;
 const MAX_BYTES: u64 = 64 << 20;
 
+// Fork: inputs past the content budget are keyed by their metadata instead
+// of leaving the run uncached, up to this many entries. On the build machine
+// four scripts name such inputs (KACHE-NEXT67): alsa-sys, freetype-sys and
+// yeslogic-fontconfig-sys name /usr/lib/x86_64-linux-gnu (4,491 entries,
+// 1.9 GiB), webrtc-sys that too and its prebuilt libwebrtc (one 82 MiB
+// archive). Upstream's rule would run each of them again in every new
+// target folder, webrtc-sys's C++ build among them. A path outside every
+// checkout keeps its stamps across checkouts, so its metadata keys the
+// run as well everywhere; any change of a name, size, time or inode runs
+// the script again.
+const MAX_METADATA_ENTRIES: usize = 16_384;
+
 /// The named paths not reconstructed by OUT_DIR/target replay. Preserve the
 /// original spelling: resolving `link/..` lexically can name a different file.
 pub(super) fn paths(stdout: &str, environment: &Environment) -> Vec<String> {
@@ -57,12 +69,18 @@ pub(super) fn fold_inputs(
     // Finish the bounded metadata walk before hashing any content. A large
     // first library or a directory with too many entries stays cheap.
     for path in &paths {
-        budget.inspect(path, 0).map_err(|error| {
-            anyhow::anyhow!(
-                "external build-script link input {}: {error:#}",
-                path.display()
-            )
-        })?;
+        match budget.inspect(path, 0) {
+            Ok(()) => {}
+            Err(error) if error.is::<OverBudget>() => {
+                return fold_metadata(hasher, declared_paths, &paths);
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "external build-script link input {}: {error:#}",
+                    path.display()
+                ));
+            }
+        }
     }
     let mut entries = MAX_ENTRIES;
     for (declared, path) in declared_paths.iter().zip(&paths) {
@@ -72,6 +90,98 @@ pub(super) fn fold_inputs(
     }
     Ok(())
 }
+
+/// Fork: the inputs' names, kinds, sizes, modification times and inodes,
+/// as [`MAX_METADATA_ENTRIES`] allows, in place of their contents.
+fn fold_metadata(
+    hasher: &mut blake3::Hasher,
+    declared_paths: &[String],
+    paths: &[PathBuf],
+) -> Result<()> {
+    let mut entries = MAX_METADATA_ENTRIES;
+    for (declared, path) in declared_paths.iter().zip(paths) {
+        let mut listing = Vec::new();
+        list_metadata(path, Path::new(""), 0, &mut entries, &mut listing).map_err(|error| {
+            anyhow::anyhow!(
+                "external build-script link input {}: {error:#}",
+                path.display()
+            )
+        })?;
+        listing.sort();
+        fold(hasher, "external_link_path", declared.as_bytes());
+        fold(
+            hasher,
+            "external_link_metadata",
+            listing.join("\n").as_bytes(),
+        );
+    }
+    Ok(())
+}
+
+fn list_metadata(
+    path: &Path,
+    relative: &Path,
+    depth: usize,
+    entries: &mut usize,
+    listing: &mut Vec<String>,
+) -> Result<()> {
+    *entries = entries
+        .checked_sub(1)
+        .context("too many external link inputs to list")?;
+    // Followed as `Budget::inspect` follows them: a link names its target.
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            listing.push(format!("{}\tmissing", relative.display()));
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(depth < 64, "external link input is nested too deeply");
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |time| time.as_nanos());
+    #[cfg(unix)]
+    let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+    #[cfg(not(unix))]
+    let inode = 0u64;
+    if metadata.is_file() {
+        listing.push(format!(
+            "{}\tfile\t{}\t{modified}\t{inode}",
+            relative.display(),
+            metadata.len()
+        ));
+    } else if metadata.is_dir() {
+        listing.push(format!("{}\tdir", relative.display()));
+        for child in std::fs::read_dir(path)? {
+            let child = child?;
+            list_metadata(
+                &child.path(),
+                &relative.join(child.file_name()),
+                depth + 1,
+                entries,
+                listing,
+            )?;
+        }
+    } else {
+        anyhow::bail!("external link input is not a regular file or directory");
+    }
+    Ok(())
+}
+
+/// The content budget ran out: too many entries or too many bytes to hash.
+#[derive(Debug)]
+struct OverBudget(&'static str);
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for OverBudget {}
 
 struct Budget {
     entries: usize,
@@ -83,7 +193,7 @@ impl Budget {
         self.entries = self
             .entries
             .checked_sub(1)
-            .context("too many external link inputs to digest")?;
+            .ok_or(OverBudget("too many external link inputs to digest"))?;
         let metadata = match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -104,7 +214,7 @@ impl Budget {
             self.bytes = self
                 .bytes
                 .checked_sub(metadata.len())
-                .context("external link inputs are too large to digest")?;
+                .ok_or(OverBudget("external link inputs are too large to digest"))?;
         } else if metadata.is_dir() {
             for child in std::fs::read_dir(path)? {
                 self.inspect(&child?.path(), depth)?;
@@ -175,6 +285,58 @@ mod tests {
         };
         budget.inspect(&dir.path().join("absent"), 0).unwrap();
         assert_eq!(budget.entries, 0);
+    }
+
+    // Fork: a search directory past the content budget (a system library
+    // directory) keys the run by its listing, not by refusing the cache.
+    #[cfg(unix)]
+    #[test]
+    fn inputs_past_the_content_budget_are_keyed_by_their_metadata() {
+        let _lock = crate::test_support::process_state_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let system = dir.path().join("lib");
+        std::fs::create_dir(&system).unwrap();
+        for index in 0..MAX_ENTRIES + 10 {
+            std::fs::write(system.join(format!("lib{index}.so")), b"x").unwrap();
+        }
+        let environment = Environment {
+            out_dir: dir.path().join("out"),
+            manifest_dir: dir.path().to_path_buf(),
+            target: None,
+            ownership_roots: Vec::new(),
+            mappings: Vec::new(),
+            spellings: Vec::new(),
+            base_dirs: Vec::new(),
+            dependency_roots: Vec::new(),
+        };
+        let hasher = crate::cache_key::FileHasher::persistent(&dir.path().join("index.db"));
+        let inputs = vec![system.to_string_lossy().into_owned()];
+        let key = || {
+            let mut digest = blake3::Hasher::new();
+            fold_inputs(&mut digest, &inputs, &environment, &hasher).map(|()| digest.finalize())
+        };
+        let first = key().expect("a large directory is keyed, not refused");
+        assert_eq!(hasher.stats().bytes_hashed, 0, "its contents are not read");
+        assert_eq!(key().unwrap(), first);
+        std::fs::write(system.join("libnew.so"), b"y").unwrap();
+        let added = key().unwrap();
+        assert_ne!(added, first, "a new library runs the script again");
+        let library = system.join("lib0.so");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&library)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_ne!(key().unwrap(), added, "a rewritten library runs it again");
+        for index in 0..MAX_METADATA_ENTRIES {
+            std::fs::write(system.join(format!("more{index}.so")), b"x").unwrap();
+        }
+        assert!(
+            key().is_err(),
+            "past the listing budget the run stays uncached"
+        );
     }
 
     #[cfg(unix)]
