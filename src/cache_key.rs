@@ -2344,7 +2344,7 @@ fn home_free_portable(
     record: &PortablePrediction,
     registry: &Path,
 ) -> Option<PortablePrediction> {
-    match crate::prediction_share::for_remote_portable(record, Some(registry))? {
+    match crate::prediction_share::for_machine_portable(record, registry)? {
         crate::prediction_share::SharedPrediction::Portable(row) => Some(row),
         crate::prediction_share::SharedPrediction::Plain(_) => None,
     }
@@ -2373,7 +2373,7 @@ fn registry_relocatable_record_in(
     tree: Option<&str>,
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 ) -> Option<(String, PortablePrediction)> {
-    let registry = registry_src_of(&vars)?;
+    let registry = registry_src_of(args, &vars)?;
     let identity = registry_relocatable_identity(args, vars.clone())?;
     let (_, record) = relocatable_record_in(args, dep_info, tree, vars)?;
     Some((identity, home_free_portable(&record, &registry)?))
@@ -2411,7 +2411,7 @@ fn rustc_registry_prediction_identity_in(
     vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 ) -> Option<String> {
     let target = args.target_dir_from_args()?;
-    let registry = registry_src_of(&vars)?;
+    let registry = registry_src_of(args, &vars)?;
     if !target.is_absolute() {
         return None;
     }
@@ -2476,7 +2476,7 @@ fn registry_row_here(row: &InputPrediction, registry: &Path) -> Option<InputPred
 }
 
 fn move_registry_row(row: &InputPrediction, from: &Path, to: &Path) -> Option<InputPrediction> {
-    match crate::prediction_share::for_remote_plain(row, from)? {
+    match crate::prediction_share::for_machine_plain(row, from)? {
         crate::prediction_share::SharedPrediction::Plain(row) => {
             crate::prediction_share::plain_from_remote(&row, to)
         }
@@ -2565,10 +2565,8 @@ fn shared_prediction_args(args: &[String], target: &Path) -> Vec<String> {
 }
 
 pub(crate) fn shared_prediction_can_record(args: &RustcArgs, dep_info: &DepInfo) -> bool {
-    let manifest_dir = args
-        .invocation_env()
-        .var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from);
+    let vars: Vec<_> = args.invocation_env().vars_os().collect();
+    let manifest_dir = rustc_package_dir(args, &vars);
     shared_prediction_can_record_in(args, dep_info, manifest_dir.as_deref())
 }
 
@@ -2884,13 +2882,13 @@ fn predicted_key_inputs(
         .or_else(|| file_hasher.input_prediction(shared.as_deref()?))
         .or_else(|| {
             let shared = shared.as_deref()?;
-            let record = remote_plain_row(shared, &registry_src_of(&vars)?)?;
+            let record = remote_plain_row(shared, &registry_src_of(args, &vars)?)?;
             from_remote = Some(shared);
             Some(record)
         })
         .or_else(|| {
             // Another Cargo home's row for the same registry unit.
-            let registry = registry_src_of(&vars)?;
+            let registry = registry_src_of(args, &vars)?;
             let identity = rustc_registry_prediction_identity(args)?;
             registry_row_here(&file_hasher.input_prediction(&identity)?, &registry)
         })
@@ -2986,7 +2984,7 @@ fn relocated_key_inputs(
     let out_dir = env_var_in(&vars, "OUT_DIR")
         .and_then(|value| file_hasher.invocation_env.resolve(Path::new(value)))
         .and_then(|path| path.into_os_string().into_string().ok());
-    let registry = registry_src_of(&vars);
+    let registry = registry_src_of(args, &vars);
     let home_free = registry_relocatable_identity(args, vars.clone());
     let identity = relocatable_prediction_identity(args, vars).ok_or(Rejection::NoRecord)?;
     let out_dir = out_dir.ok_or(Rejection::NoRecord)?;
@@ -3163,12 +3161,45 @@ pub(crate) fn is_shared_target_identity(identity: &str) -> bool {
     identity.starts_with(SHARED_PREDICTION_PREFIX)
 }
 
-/// `<CARGO_HOME>/registry/src` for a registry unit, from its
-/// `CARGO_MANIFEST_DIR`.
+/// `<CARGO_HOME>/registry/src` for a registry unit, spelled as rustc reads
+/// the package ([`rustc_package_dir`]).
 pub(crate) fn registry_src_of(
+    args: &RustcArgs,
     vars: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Option<PathBuf> {
-    registry_src_root(Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?)).map(Path::to_path_buf)
+    registry_src_root(&rustc_package_dir(args, vars)?).map(Path::to_path_buf)
+}
+
+/// The unit's package directory as rustc reads it: `CARGO_MANIFEST_DIR`,
+/// unless that is a registry package and the source file rustc compiles sits
+/// in the same package (index and name) under another registry spelling;
+/// then the source's.
+///
+/// The two differ in a Cargo home whose `registry` links into another home's
+/// ([`crate::package_dirs`]): the wrapper spells `CARGO_MANIFEST_DIR` through
+/// the link's target, while Cargo still hands rustc the source, and rustc
+/// reports what it read (dep-info, working directory) through the home it
+/// runs with. Rows and identities cut and place the unit's paths under the
+/// registry root they name; taken from `CARGO_MANIFEST_DIR`, no source sat
+/// under it, no row was shared, and every hit in another Cargo home or target
+/// directory paid the dep-info pre-pass.
+fn rustc_package_dir(
+    args: &RustcArgs,
+    vars: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<PathBuf> {
+    let manifest_dir = Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?);
+    let from_source = args
+        .source_file
+        .as_deref()
+        .filter(|source| source.is_absolute() && is_registry_package(manifest_dir))
+        .and_then(|source| source.ancestors().skip(1).find(|dir| is_registry_package(dir)))
+        .filter(|dir| same_registry_package(dir, manifest_dir));
+    Some(from_source.unwrap_or(manifest_dir).to_path_buf())
+}
+
+/// Do two registry package directories name the same index and package?
+fn same_registry_package(a: &Path, b: &Path) -> bool {
+    a.components().rev().take(2).eq(b.components().rev().take(2))
 }
 
 /// Is a row filed under `identity` free of machine-specific paths, so that it
@@ -8821,7 +8852,8 @@ fn portable_roots(
 ) -> Option<PortableRoots> {
     let out_dir = args.resolve_invocation_path(Path::new(env_var_in(vars, "OUT_DIR")?))?;
     let target = args.target_dir()?;
-    let registry_src = registry_src_root(Path::new(env_var_in(vars, "CARGO_MANIFEST_DIR")?))?;
+    let package_dir = rustc_package_dir(args, vars)?;
+    let registry_src = registry_src_root(&package_dir)?;
     Some(PortableRoots {
         canonical_target: std::fs::canonicalize(&target).ok()?,
         registry_src: registry_src.to_path_buf(),
