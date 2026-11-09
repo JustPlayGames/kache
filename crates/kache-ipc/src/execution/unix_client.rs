@@ -158,7 +158,30 @@ impl Client {
             frame.last() == Some(&b'\n'),
             "incomplete native process request"
         );
-        let command = serde_json::from_slice(&frame)?;
+        let command: Command = serde_json::from_slice(&frame)?;
+        if crate::marks::enabled() {
+            use kache_protocol::execution::unix::Workspace as W;
+            crate::marks::mark(match &command {
+                Command::Workspace(W::Reflink { .. }) => "svc_reflink",
+                Command::Workspace(W::Copy { .. }) => "svc_copy",
+                Command::Workspace(W::Hardlink { .. }) => "svc_hardlink",
+                Command::Workspace(W::Remove { .. }) => "svc_remove",
+                Command::Workspace(W::CreateDirectories { .. }) => "svc_mkdirs",
+                Command::Workspace(W::Permissions { .. }) => "svc_permissions",
+                Command::Workspace(W::Touch { .. }) => "svc_touch",
+                Command::Workspace(W::Write { .. }) => "svc_write",
+                Command::Workspace(W::PrepareFile { .. }) => "svc_prepare_file",
+                Command::Workspace(W::PrepareBytes { .. }) => "svc_prepare_bytes",
+                Command::Workspace(W::Publish { .. }) => "svc_publish",
+                Command::Workspace(W::Discard { .. }) => "svc_discard",
+                Command::Spawn { .. } => "svc_spawn",
+                Command::TryWait { .. } => "svc_trywait",
+                Command::Kill { .. } => "svc_kill",
+                Command::Release { .. } => "svc_release",
+                #[allow(unreachable_patterns)]
+                _ => "svc_other",
+            });
+        }
         let (reply, files) = match self.execute(command) {
             Ok(result) => result,
             Err(error) => (
@@ -186,6 +209,7 @@ impl Client {
                 result => result?,
             }
         }
+        crate::marks::mark("svc_done");
         Ok(true)
     }
 
