@@ -118,7 +118,7 @@ fn next_step(
         Attempt::Completed(exit) => Next::Exit(exit),
         Attempt::Declined => Next::Engine(Forward::Declined),
         Attempt::Lost => Next::Engine(Forward::DaemonLost),
-        Attempt::Unavailable => Next::Engine(Forward::Plain),
+        Attempt::Unavailable | Attempt::LocalOnly => Next::Engine(Forward::Plain),
     })
 }
 
@@ -382,11 +382,13 @@ mod tests {
                 "{bootstrapped:?}"
             );
         }
-        // A daemon that answered is never started again.
+        // A daemon that answered is never started again, nor one for a
+        // request this process cannot hand off (upstream #1867).
         for (first, next) in [
             (Attempt::Completed(0), Next::Exit(0)),
             (Attempt::Lost, Next::Engine(Forward::DaemonLost)),
             (Attempt::Declined, Next::Engine(Forward::Declined)),
+            (Attempt::LocalOnly, Next::Engine(Forward::Plain)),
         ] {
             assert_eq!(
                 next_step(first, || panic!("started a daemon after {first:?}")).unwrap(),

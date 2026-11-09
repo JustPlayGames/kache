@@ -59,7 +59,7 @@ impl Execution<'_> {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::debug!(%error, "compiler request cannot be transferred");
-                return Ok(kache_ipc::execution::Attempt::Unavailable);
+                return Ok(kache_ipc::execution::Attempt::LocalOnly);
             }
         };
         #[cfg(unix)]
@@ -155,6 +155,41 @@ impl Execution<'_> {
             #[cfg(unix)]
             jobserver,
         })
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn an_untransferable_invocation_does_not_request_daemon_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let files = (0..3)
+            .map(|_| tempfile::tempfile().unwrap())
+            .collect::<Vec<_>>();
+        let env = InvocationEnv::from_parts(
+            Vec::<(OsString, OsString)>::new(),
+            None,
+            None,
+            root.path().to_owned(),
+        );
+        let execution = Execution {
+            entry: ExecutionEntry::Original,
+            args: &["rustc".into(), "-vV".into()],
+            env: &env,
+            executable: &root.path().join("kache"),
+            started_at: Instant::now(),
+            files: &files,
+            terminal: false,
+            client_version: "fixture",
+        };
+        assert_eq!(
+            execution
+                .try_execute_attempt(&root.path().join("absent"), false)
+                .unwrap(),
+            kache_ipc::execution::Attempt::LocalOnly
+        );
     }
 }
 
@@ -365,6 +400,13 @@ mod tests {
         assert_eq!(
             execution.try_execute(&root.path().join("absent")).unwrap(),
             None
+        );
+        assert_eq!(
+            execution
+                .try_execute_attempt(&root.path().join("absent"), false)
+                .unwrap(),
+            kache_ipc::execution::Attempt::LocalOnly,
+            "starting a daemon cannot fix a request we could not prepare"
         );
     }
 }

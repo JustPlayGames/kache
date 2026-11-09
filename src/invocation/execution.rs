@@ -21,12 +21,7 @@ pub(crate) fn try_execute_with_trust(
     context: &InvocationContext,
     trusted_pipeline: bool,
 ) -> Result<Option<i32>> {
-    Ok(
-        match try_execute_attempt(socket, args, context, trusted_pipeline)? {
-            Attempt::Completed(exit) => Some(exit),
-            Attempt::Declined | Attempt::Unavailable | Attempt::Lost => None,
-        },
-    )
+    try_execute_attempt(socket, args, context, trusted_pipeline).map(Attempt::exit_code)
 }
 
 /// [`try_execute_with_trust`], telling a daemon that went away during the
@@ -42,7 +37,7 @@ pub(crate) fn try_execute_attempt(
         Ok(files) => files,
         Err(error) => {
             tracing::debug!(%error, "compiler streams cannot be transferred");
-            return Ok(Attempt::Unavailable);
+            return Ok(Attempt::LocalOnly);
         }
     };
     #[cfg(windows)]
@@ -51,7 +46,7 @@ pub(crate) fn try_execute_attempt(
         Ok(path) => path,
         Err(error) => {
             tracing::debug!(%error, "compiler client executable cannot be resolved");
-            return Ok(Attempt::Unavailable);
+            return Ok(Attempt::LocalOnly);
         }
     };
     let args = args
