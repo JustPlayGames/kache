@@ -10582,6 +10582,7 @@ fn write_event_with(
         config.event_log_max_size,
         config.event_log_keep_lines,
         &config.cache_dir,
+        events::ArchiveLimits::from_config(config),
     );
     let _ = events::rotate_transfers_if_needed(
         &config.transfer_log_path(),
