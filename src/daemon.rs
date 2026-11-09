@@ -1952,8 +1952,10 @@ pub(crate) struct Daemon {
     recent_transfers: std::sync::Mutex<std::collections::VecDeque<TransferEvent>>,
     file_hash_cache: Arc<Mutex<HashMap<FileHashCacheKey, String>>>,
     file_hash_warmup: Arc<FileHashWarmup>,
-    /// HashFiles' own index connection ([`Daemon::with_hash_store`]): a
-    /// wrapper's prefetch never queues behind the store mutex.
+    /// HashFiles' own index connection ([`Daemon::with_hash_store`]) for
+    /// the file-hash rows it writes: a wrapper's prefetch never queues
+    /// behind the store mutex. Its reads take pooled connections
+    /// ([`Daemon::with_hash_reader`]).
     hash_store: OnceLock<Mutex<Store>>,
     /// The connection [`Daemon::checkpoint_index`] checkpoints through.
     checkpoint_store: OnceLock<Mutex<Store>>,
@@ -3604,6 +3606,40 @@ impl Daemon {
         f(&guard)
     }
 
+    /// Run a HashFiles read on `reader`, this request's own store, opened
+    /// from the connection pool at its first use; [`Self::with_hash_store`]
+    /// when it cannot be opened.
+    ///
+    /// The reads used to go through the hash store's one connection and
+    /// mutex, which every HashFiles request of the daemon shares and the
+    /// 250 ms memo-row flush holds through its write transaction: in a
+    /// landing's burst (four new target folders, every file unknown) the
+    /// lookups queued one at a time behind each other and the flush. In WAL
+    /// mode reads take no lock another reader or the writer holds, so each
+    /// request reads on its own connection and only the writes stay on the
+    /// hash store's (KACHE-NEXT67: 60 lookups a hit at 140 hits a second on a
+    /// copy of the build machine's 31 GB index, mutex p50 33-44 ms a hit,
+    /// pooled 11-12 ms).
+    fn with_hash_reader<T>(
+        &self,
+        reader: &mut Option<Store>,
+        f: impl FnOnce(&Store) -> Result<T>,
+    ) -> Result<T> {
+        if reader.is_none() {
+            match Store::open(&self.config) {
+                Ok(store) => *reader = Some(store),
+                Err(error) => {
+                    tracing::debug!("HashFiles reads on the hash store: {error:#}");
+                    return self.with_hash_store(f);
+                }
+            }
+        }
+        match reader.as_ref() {
+            Some(store) => f(store),
+            None => self.with_hash_store(f),
+        }
+    }
+
     /// Write the file-hash rows HashFiles requests learned since the last
     /// call, in one transaction with a short wait. The rows only save later
     /// reads (settled hashes are in the in-memory cache already), so a busy
@@ -4035,6 +4071,8 @@ impl Daemon {
     /// [`Self::handle_hash_files`] with the wall clock supplied.
     fn handle_hash_files_at(&self, req: &HashFilesRequest, clock: impl Fn() -> i64) -> Response {
         let mut results = Vec::with_capacity(req.files.len());
+        // This request's own pooled index view, opened at its first lookup.
+        let mut own = None;
 
         for file in &req.files {
             let key = FileHashCacheKey {
@@ -4126,7 +4164,7 @@ impl Daemon {
             // record to the batched flush, so nothing here waits for a writer.
             let path = Path::new(&file.path);
             let computed: anyhow::Result<(String, bool, u64)> =
-                match self.with_hash_store(|store| Ok(store.file_hash_lookup(path))) {
+                match self.with_hash_reader(&mut own, |store| Ok(store.file_hash_lookup(path))) {
                     Ok(crate::cache_key::FileHashLookup::Hit(hash)) => Ok((hash, true, 0)),
                     Ok(crate::cache_key::FileHashLookup::NeedsHash(fp)) => {
                         crate::cache_key::hash_file(path).map(|hash| {
@@ -4136,7 +4174,7 @@ impl Daemon {
                             let settled_now = crate::cache_key::stamp_is_settled(&fp, observed_ns);
                             let redated = !settled_now
                                 && self
-                                    .with_hash_store(|store| {
+                                    .with_hash_reader(&mut own, |store| {
                                         Ok(store.file_hash_cache().redated_pin(&fp, &hash))
                                     })
                                     .unwrap_or(false);

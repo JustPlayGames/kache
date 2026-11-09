@@ -5396,7 +5396,9 @@ fn test_handle_hash_files_uses_memory_cache() {
 /// other commit holds while it waits for the index's write lock: its memo
 /// reads and writes go through a connection of their own, and the rows it
 /// learns are written in one batch afterwards
-/// ([`Daemon::flush_file_hash_records`]).
+/// ([`Daemon::flush_file_hash_records`]). Nor behind the hash store's mutex,
+/// which that batch holds through its write transaction: its reads take a
+/// pooled connection of their own ([`Daemon::with_hash_reader`]).
 #[test]
 fn hash_files_do_not_wait_for_the_store_mutex() {
     let dir = tempfile::tempdir().unwrap();
@@ -5412,8 +5414,13 @@ fn hash_files_do_not_wait_for_the_store_mutex() {
         let daemon = std::sync::Arc::clone(&daemon);
         std::thread::spawn(move || {
             let _guard = daemon.store_lock().unwrap().lock().unwrap();
-            held_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(1500));
+            daemon
+                .with_hash_store(|_| {
+                    held_tx.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    Ok(())
+                })
+                .unwrap();
         })
     };
     held_rx.recv().unwrap();
@@ -5427,7 +5434,7 @@ fn hash_files_do_not_wait_for_the_store_mutex() {
     assert_eq!(result.hash.as_deref(), Some(expected.as_str()));
     assert!(
         waited < std::time::Duration::from_millis(1000),
-        "the request waited {waited:?} for the store mutex"
+        "the request waited {waited:?} for a store mutex"
     );
 
     daemon.flush_file_hash_records();
