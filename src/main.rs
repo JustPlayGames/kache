@@ -1762,6 +1762,7 @@ fn run_compiler_invocation_inner(
         #[cfg(unix)]
         jobserver,
     } = context;
+    kache_ipc::marks::thread_mark("inner_start");
     #[cfg(unix)]
     let _jobserver = kache_ipc::jobserver::Scope::enter(jobserver);
     let _io = invocation::io::InvocationIoScope::enter(io);
@@ -1808,6 +1809,7 @@ fn run_compiler_invocation_inner(
         scheduler::pressure::InvocationPressureScope::enter(config.scheduler_memory_pressure);
     let _scheduler_wait = config.scheduler.then(scheduler::InvocationWaitScope::enter);
     let _priority = scheduler::InvocationPriorityScope::enter(priority);
+    kache_ipc::marks::thread_mark("config_loaded");
 
     if config.disabled {
         // Caching off — pass straight through to the real compiler. The
@@ -1859,6 +1861,7 @@ fn run_compiler_invocation_inner(
             // Cargo's first call for a target directory it has not built:
             // let the daemon copy registry units in before Cargo looks.
             target_seed::before_probe_for(&config, args, &env);
+            kache_ipc::marks::thread_mark("trace_start");
             // Started here so the trace also covers the OUT_DIR alias check.
             let trace = phase_trace::start_for("rustc", args, &env);
             package_dirs::respell_for(&mut env);
@@ -1866,7 +1869,9 @@ fn run_compiler_invocation_inner(
                 Some(exit) => exit,
                 None => wrapper::run_for(&config, args, &env)?,
             };
+            kache_ipc::marks::thread_mark("work_done");
             drop(trace);
+            kache_ipc::marks::thread_mark("trace_dropped");
             exit
         }
         Some(WrapperTarget::Rustdoc) => compiler::rustdoc::run_for(&config, args, &env)?,
@@ -1878,6 +1883,7 @@ fn run_compiler_invocation_inner(
             adapter.display_name()
         ),
     };
+    kache_ipc::marks::thread_mark("inner_exit");
     Ok(exit_code)
 }
 

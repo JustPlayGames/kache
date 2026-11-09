@@ -59,3 +59,26 @@ pub fn write(
     out.push_str(&format!("],\"written_us\":{}}}\n", now.saturating_duration_since(base).as_micros()));
     let _ = std::fs::write(dir.join(format!("{file}.json")), out);
 }
+
+thread_local! {
+    static THREAD_MARKS: std::cell::RefCell<Option<Vec<(&'static str, Instant)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start collecting marks on this thread (a daemon worker running one compile).
+pub fn thread_begin() {
+    THREAD_MARKS.with(|marks| *marks.borrow_mut() = Some(Vec::new()));
+}
+
+/// Record a mark on this thread when [`thread_begin`] started collecting.
+pub fn thread_mark(name: &'static str) {
+    THREAD_MARKS.with(|marks| {
+        if let Some(marks) = marks.borrow_mut().as_mut() {
+            marks.push((name, Instant::now()));
+        }
+    });
+}
+
+/// This thread's marks, and stop collecting.
+pub fn thread_take() -> Vec<(&'static str, Instant)> {
+    THREAD_MARKS.with(|marks| marks.borrow_mut().take().unwrap_or_default())
+}
