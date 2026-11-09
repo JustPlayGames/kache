@@ -100,6 +100,21 @@ pub enum Attempt {
     /// the whole daemon is gone. The caller may run the compiler locally,
     /// once, instead of failing the build.
     Lost,
+    /// This invocation cannot be handed to a daemon in its current process
+    /// context (upstream #1867): the request could not be made, or the
+    /// daemon's peer check refused it before Commit. Starting a daemon
+    /// cannot help, so none is started; the caller compiles locally.
+    LocalOnly,
+}
+
+impl Attempt {
+    /// The daemon's exit code for a completed compile.
+    pub fn exit_code(self) -> Option<i32> {
+        match self {
+            Self::Completed(exit) => Some(exit),
+            Self::Declined | Self::Unavailable | Self::Lost | Self::LocalOnly => None,
+        }
+    }
 }
 
 /// The daemon's end of a committed compile closed before its answer: the
@@ -153,17 +168,13 @@ pub fn try_execute(
     request: &ExecutionRequest,
     #[cfg(unix)] descriptors: &[BorrowedFd<'_>],
 ) -> Result<Option<i32>> {
-    Ok(
-        match try_execute_attempt(
-            socket,
-            request,
-            #[cfg(unix)]
-            descriptors,
-        )? {
-            Attempt::Completed(exit) => Some(exit),
-            Attempt::Declined | Attempt::Unavailable | Attempt::Lost => None,
-        },
+    try_execute_attempt(
+        socket,
+        request,
+        #[cfg(unix)]
+        descriptors,
     )
+    .map(Attempt::exit_code)
 }
 
 /// [`try_execute`], telling a running daemon's refusal apart from no daemon.
@@ -208,11 +219,29 @@ pub fn try_execute_attempt(
         // Not a hang: the daemon is gone or declined. Nothing to wait out.
         let _ = std::fs::remove_file(&marker);
     }
+    finish_attempt(result, committed)
+}
+
+/// Whether a failure before Commit was the daemon refusing this process
+/// (its peer check), which a daemon started anew would refuse too.
+fn permission_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+fn finish_attempt(result: Result<i32>, committed: bool) -> Result<Attempt> {
     match result {
         Ok(exit) => Ok(Attempt::Completed(exit)),
         Err(error) if !committed && error.downcast_ref::<DaemonDeclined>().is_some() => {
             tracing::debug!(%error, "daemon declined compiler execution");
             Ok(Attempt::Declined)
+        }
+        Err(error) if !committed && permission_denied(&error) => {
+            tracing::debug!(%error, "daemon refused this process's compiler request");
+            Ok(Attempt::LocalOnly)
         }
         Err(error) if !committed => {
             tracing::debug!(%error, "daemon did not prepare compiler execution");
@@ -428,6 +457,68 @@ fn read_reply(reader: &mut impl BufRead) -> Result<ExecutionReply> {
     Ok(serde_json::from_slice(&frame)?)
 }
 
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    // Upstream #1867's cases on the fork's `Attempt`: its `Recoverable` is
+    // the fork's `Unavailable`, `Complete` is `Completed`; a committed
+    // compile whose daemon went away is the fork's `Lost`.
+    #[test]
+    fn precommit_permission_denial_requires_local_execution() {
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let error = anyhow::Error::from(error).context("checking daemon process security");
+        assert_eq!(
+            finish_attempt(Err(error), false).unwrap(),
+            Attempt::LocalOnly
+        );
+    }
+
+    #[test]
+    fn absent_busy_or_stale_daemon_still_allows_a_start() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            assert_eq!(
+                finish_attempt(Err(std::io::Error::from(kind).into()), false).unwrap(),
+                Attempt::Unavailable
+            );
+        }
+        assert_eq!(
+            finish_attempt(
+                Err(anyhow::anyhow!("unsupported execution protocol")),
+                false
+            )
+            .unwrap(),
+            Attempt::Unavailable
+        );
+    }
+
+    #[test]
+    fn committed_errors_never_become_a_start_or_a_plain_local_fallback() {
+        let error = finish_attempt(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("will not be run again locally"));
+        assert_eq!(
+            finish_attempt(
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into()),
+                true
+            )
+            .unwrap(),
+            Attempt::Lost
+        );
+        assert_eq!(finish_attempt(Ok(17), true).unwrap(), Attempt::Completed(17));
+        assert_eq!(Attempt::Completed(17).exit_code(), Some(17));
+        assert_eq!(Attempt::Unavailable.exit_code(), None);
+        assert_eq!(Attempt::LocalOnly.exit_code(), None);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -629,10 +720,7 @@ mod tests {
     }
 
     fn disconnected_exchange(stage: Disconnect) -> Result<Option<i32>> {
-        Ok(match attempted_exchange(stage)? {
-            Attempt::Completed(exit) => Some(exit),
-            Attempt::Declined | Attempt::Unavailable | Attempt::Lost => None,
-        })
+        attempted_exchange(stage).map(Attempt::exit_code)
     }
 
     fn attempted_exchange(stage: Disconnect) -> Result<Attempt> {
@@ -1388,6 +1476,11 @@ mod windows_tests {
             "{error:#}"
         );
         assert_eq!(try_execute(&socket, &request(root.path())).unwrap(), None);
+        assert_eq!(
+            try_execute_attempt(&socket, &request(root.path())).unwrap(),
+            Attempt::LocalOnly,
+            "restarting cannot make this weaker daemon's context compatible"
+        );
         std::fs::write(root.path().join("done"), b"done").unwrap();
         while child.0.try_wait().unwrap().is_none() {
             assert!(

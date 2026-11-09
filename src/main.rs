@@ -1586,6 +1586,7 @@ fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
     } else if wrappers_above(context.env.var_os(KACHE_ACTIVE_ENV).as_deref()).is_none() {
         use invocation::execution::Attempt;
         let config = config::Config::load_for(&context.env)?;
+        let mut local_only = false;
         match invocation::execution::try_execute_attempt(
             &config.socket_path(),
             args,
@@ -1594,6 +1595,9 @@ fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
         )? {
             Attempt::Completed(exit) => std::process::exit(exit),
             Attempt::Lost => lost = true,
+            // Upstream #1867: a request this process cannot hand off (its
+            // streams, or the daemon's peer check) is not helped by a start.
+            Attempt::LocalOnly => local_only = true,
             Attempt::Declined | Attempt::Unavailable => {}
         }
         // Upstream #1718 starts the coordinator after every declined request
@@ -1602,6 +1606,7 @@ fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
         // costs one request, not a health probe and a second request
         // (Windows declines every hand-off). Updates restart the daemon.
         if !lost
+            && !local_only
             && !cfg!(test)
             && !config.disabled
             && daemon::is_running(&config).is_ok_and(|running| !running)
@@ -1615,7 +1620,7 @@ fn run_wrapper_mode(args: &[String], daemon_attempted: bool) -> Result<()> {
                 )? {
                     Attempt::Completed(exit) => std::process::exit(exit),
                     Attempt::Lost => lost = true,
-                    Attempt::Declined | Attempt::Unavailable => {}
+                    Attempt::Declined | Attempt::Unavailable | Attempt::LocalOnly => {}
                 },
                 Err(error) => tracing::debug!(%error, "compiler daemon did not start"),
             }
