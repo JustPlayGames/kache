@@ -4822,11 +4822,25 @@ fn run_parsed_rustc(
                     &key_record,
                 ) {
                     Ok(()) => {
+                        kache_ipc::marks::thread_mark("t_hit_returned");
                         observe_adaptive_hit(
                             adaptive_unit.as_ref(),
                             adaptive_key_fields.as_ref(),
                             &cache_key,
                         );
+                        kache_ipc::marks::thread_mark("t_adaptive_observed");
+                        drop(discovery_flight);
+                        kache_ipc::marks::thread_mark("t_flight_dropped");
+                        drop(key_outputs);
+                        kache_ipc::marks::thread_mark("t_key_outputs_dropped");
+                        drop(guard_inputs);
+                        kache_ipc::marks::thread_mark("t_guard_inputs_dropped");
+                        drop(adaptive_unit);
+                        kache_ipc::marks::thread_mark("t_adaptive_unit_dropped");
+                        drop(store);
+                        kache_ipc::marks::thread_mark("t_store_dropped");
+                        drop(fallback_stores);
+                        kache_ipc::marks::thread_mark("t_fallbacks_dropped");
                         return Ok(0);
                     }
                     Err(e) => {
