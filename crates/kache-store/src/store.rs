@@ -1654,6 +1654,9 @@ pub struct ArtifactStore<P: ArtifactPolicy> {
     /// Where [`Self::get`] sends a hit's access stamp instead of writing it
     /// ([`Self::send_hit_stamps_to`]).
     hit_stamps: Option<HitStampSink>,
+    /// Where an input prediction read sends the row's daily use stamp
+    /// instead of writing it ([`Self::send_prediction_touches_to`]).
+    prediction_touches: Option<PredictionTouchSink>,
     /// Entries whose access stamp someone holds and has not written yet
     /// ([`Self::pin_entries_with`]); eviction keeps them like freshly
     /// stamped ones.
@@ -1742,6 +1745,14 @@ pub fn bookkeeping_wait(wait: Duration) -> Duration {
 /// taken the stamp and will write it ([`ArtifactStore::stamp_hits`]), so the
 /// hit writes nothing. `false` makes the hit stamp the index itself.
 pub type HitStampSink = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Takes an input prediction row's daily use stamp off the read path: called
+/// with the row's identity and the time of the read when
+/// [`crate::file_hash::FileHashCache::get_input_prediction`] would refresh its
+/// `last_used`, and returns `true` when it has taken the stamp and will write
+/// it ([`ArtifactStore::stamp_input_predictions`]), so the read writes
+/// nothing. `false` makes the read stamp the row itself.
+pub type PredictionTouchSink = Box<dyn Fn(&str, i64) -> bool + Send + Sync>;
 
 /// Says whether an entry's access stamp is taken but not yet written: such an
 /// entry may be mid-restore, so eviction must keep it
@@ -3252,6 +3263,12 @@ impl<P: ArtifactPolicy> crate::file_hash::IndexSource for ArtifactStore<P> {
     fn index(&self) -> crate::index_pool::IndexGuard<'_> {
         self.db()
     }
+
+    fn hand_prediction_touch(&self, identity: &str, now: i64) -> bool {
+        self.prediction_touches
+            .as_ref()
+            .is_some_and(|sink| sink(identity, now))
+    }
 }
 
 impl<P: ArtifactPolicy> ArtifactStore<P> {
@@ -3304,6 +3321,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             size_sweep_walk_budget: SIZE_SWEEP_WALK_BUDGET,
             read_only: false,
             hit_stamps: None,
+            prediction_touches: None,
             pending_pins: None,
             busy_memo_rows: None,
             busy_wait: std::cell::Cell::new(INDEX_BUSY_WAIT),
@@ -3413,6 +3431,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             size_sweep_walk_budget: SIZE_SWEEP_WALK_BUDGET,
             read_only: true,
             hit_stamps: None,
+            prediction_touches: None,
             pending_pins: None,
             busy_memo_rows: None,
             busy_wait: std::cell::Cell::new(busy_wait),
@@ -4197,6 +4216,36 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// its own sweeps meanwhile ([`Self::pin_entries_with`]).
     pub fn send_hit_stamps_to(&mut self, sink: HitStampSink) {
         self.hit_stamps = Some(sink);
+    }
+
+    /// Send the daily use stamps of this store's input prediction reads to
+    /// `sink` instead of writing them on the read path
+    /// ([`PredictionTouchSink`]). The sink must write them to this store's
+    /// index ([`Self::stamp_input_predictions`]).
+    pub fn send_prediction_touches_to(&mut self, sink: PredictionTouchSink) {
+        self.prediction_touches = Some(sink);
+    }
+
+    /// Write input prediction use stamps that reads handed off
+    /// ([`PredictionTouchSink`]): each row named gets `last_used` = its time,
+    /// never an earlier one, in one transaction. A row no longer in the
+    /// index is skipped.
+    pub fn stamp_input_predictions(&self, touches: &[(String, i64)]) -> Result<()> {
+        self.refuse_write("stamp input predictions")?;
+        if touches.is_empty() {
+            return Ok(());
+        }
+        self.with_write_transaction(|store| {
+            let db = store.db();
+            let mut update = db.prepare_cached(
+                "UPDATE input_predictions SET last_used = ?2
+                 WHERE identity = ?1 AND last_used < ?2",
+            )?;
+            for (identity, used) in touches {
+                update.execute(params![identity, used])?;
+            }
+            Ok(())
+        })
     }
 
     /// Whether this store hands memo rows a busy index refuses to a

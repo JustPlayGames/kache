@@ -6125,6 +6125,57 @@ async fn send_hash_files_request_client_roundtrip() {
     assert_eq!(results[0].error, None);
 }
 
+/// A worker the daemon runs asks it in process: HashFiles answers with no
+/// socket to connect to, and the store a worker opens hands its prediction
+/// use stamps to the daemon, which writes them at its next stamp flush.
+#[cfg(unix)]
+#[test]
+fn a_daemon_worker_asks_its_daemon_in_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let socket_path = config.socket_path();
+    assert!(!socket_path.exists(), "nothing listens");
+    let daemon = Arc::new(Daemon::new(config.clone()));
+    let file_path = dir.path().join("input.bin");
+    std::fs::write(&file_path, b"hash me in process").unwrap();
+    let req = hash_files_request(&file_path).0.files.remove(0);
+
+    let env = crate::invocation::InvocationEnv::capture();
+    let _scope = crate::wrapper::InvocationWrapperScope::enter_for(&env, Some(daemon.clone()));
+    let results = send_hash_files_request(&socket_path, vec![req]).expect("in process");
+    assert_eq!(
+        results[0].hash.as_deref(),
+        Some(blake3::hash(b"hash me in process").to_hex().as_str())
+    );
+
+    let mut store = Store::open(&config).unwrap();
+    crate::wrapper::send_hit_stamps_to_daemon(&config, &mut store);
+    store
+        .file_hash_cache()
+        .put_input_prediction("unit", 1, None, "payload")
+        .unwrap();
+    let last_used = |store: &Store| -> i64 {
+        store
+            .file_hash_cache()
+            .db()
+            .query_row(
+                "SELECT last_used FROM input_predictions WHERE identity = 'unit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    store
+        .file_hash_cache()
+        .db()
+        .execute("UPDATE input_predictions SET last_used = 1000", [])
+        .unwrap();
+    assert!(store.file_hash_cache().get_input_prediction("unit").unwrap().is_some());
+    assert_eq!(last_used(&store), 1000, "the read handed its stamp over");
+    daemon.flush_hit_stamps();
+    assert!(last_used(&store) > 1000, "the daemon's flush wrote it");
+}
+
 #[tokio::test]
 async fn test_socket_build_started_roundtrip_without_remote() {
     let dir = tempfile::tempdir().unwrap();
