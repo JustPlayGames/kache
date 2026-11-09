@@ -61,8 +61,11 @@ impl RustcHitContext<'_> {
             object_output: String::new(),
         }
         .report(self.config, meta);
+        kache_ipc::marks::thread_mark("hit_reported");
         record_input_prediction(self.config, prediction_store, self.args, true, key);
+        kache_ipc::marks::thread_mark("hit_pred_done");
         clean_incremental_dir(self.config, self.args);
+        kache_ipc::marks::thread_mark("hit_finished");
         Ok(())
     }
 }
