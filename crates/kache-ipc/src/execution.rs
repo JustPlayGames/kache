@@ -512,7 +512,10 @@ mod recovery_tests {
             .unwrap(),
             Attempt::Lost
         );
-        assert_eq!(finish_attempt(Ok(17), true).unwrap(), Attempt::Completed(17));
+        assert_eq!(
+            finish_attempt(Ok(17), true).unwrap(),
+            Attempt::Completed(17)
+        );
         assert_eq!(Attempt::Completed(17).exit_code(), Some(17));
         assert_eq!(Attempt::Unavailable.exit_code(), None);
         assert_eq!(Attempt::LocalOnly.exit_code(), None);
