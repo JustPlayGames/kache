@@ -144,6 +144,51 @@ fn make_due(config: &Config, idents: &[String], pct: usize) {
     });
 }
 
+/// Make every key's entry due for its access stamp: a hit stamps an entry
+/// only once per `HIT_STAMP_INTERVAL`, so a key an earlier run stamped
+/// would not stamp again.
+fn make_keys_stamp(config: &Config, keys: &[String]) {
+    let store = Store::open(config).expect("store");
+    let _ = store.with_write_transaction(|store| {
+        let cache = store.file_hash_cache();
+        let db = cache.db();
+        let mut update = db.prepare(
+            "UPDATE entries SET last_accessed = datetime('now', '-2 days') WHERE cache_key = ?1",
+        )?;
+        for key in keys {
+            update.execute(rusqlite::params![key])?;
+        }
+        Ok(())
+    });
+}
+
+/// What the process's threads are doing, sampled from `/proc/self/task`
+/// every 100 ms: state, system call number and kernel wait channel.
+fn sample_threads(done: &AtomicBool) -> std::collections::HashMap<String, usize> {
+    let mut seen = std::collections::HashMap::new();
+    while !done.load(Ordering::Relaxed) {
+        if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+            for task in tasks.flatten() {
+                let path = task.path();
+                let read =
+                    |name: &str| std::fs::read_to_string(path.join(name)).unwrap_or_default();
+                let stat = read("stat");
+                let state = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .unwrap_or("?")
+                    .to_owned();
+                let syscall = read("syscall");
+                let call = syscall.split_whitespace().next().unwrap_or("?").to_owned();
+                let wchan = read("wchan");
+                *seen.entry(format!("{state} {call} {wchan}")).or_insert(0) += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    seen
+}
+
 #[test]
 #[ignore = "rig: needs KACHE_BURST_RIG and a copy of an index"]
 fn hit_burst_rig() {
@@ -153,9 +198,12 @@ fn hit_burst_rig() {
     let dir = PathBuf::from(dir);
     let mode = std::env::var("RIG_MODE").unwrap_or_else(|_| "base".into());
     let routed = mode == "all";
-    let hash_in_process = routed || mode.contains('h');
-    let stamps_in_process = routed || mode.contains('s');
-    let touches_batched = routed || mode.contains('t');
+    // "base" names none of the three (its 's' is not StampHits: until
+    // KACHE-NEXT76 the base mode handed its stamps over in process).
+    let flags = if mode == "base" { "" } else { mode.as_str() };
+    let hash_in_process = routed || flags.contains('h');
+    let stamps_in_process = routed || flags.contains('s');
+    let touches_batched = routed || flags.contains('t');
     let threads = env_num("RIG_THREADS", 20) as usize;
     let seconds = env_num("RIG_SECONDS", 20);
     let hits_per_sec = env_num("RIG_HITS_PER_SEC", 140);
@@ -165,6 +213,19 @@ fn hit_burst_rig() {
 
     let mut config = test_config(&dir);
     config.input_predictions = true;
+    // The daemon's shared index connections (KACHE-NEXT76): RIG_POOL idle
+    // connections (0: a connection per store, as before the pool), and
+    // RIG_CEIL the idle connections a burst may keep (0: the cap alone).
+    let pool_idle = env_num("RIG_POOL", 0) as usize;
+    if pool_idle > 0 {
+        kache_store::pool_index_connections(pool_idle);
+    }
+    let ceiling = env_num("RIG_CEIL", 0) as usize;
+    if ceiling > 0 {
+        kache_store::keep_burst_index_connections(ceiling);
+    }
+    let writers = env_num("RIG_WRITERS", 0) as usize;
+    let write_gap = Duration::from_millis(env_num("RIG_WRITE_GAP_MS", 20));
     let synth = env_num("RIG_SYNTH", 0) as usize;
     let mut file_lines = if synth > 0 {
         synth_files(&config, &dir.join("synth"), synth)
@@ -194,6 +255,7 @@ fn hit_burst_rig() {
 
     let due_pct = env_num("RIG_DUE_PCT", 100) as usize;
     make_due(&config, &idents, due_pct);
+    make_keys_stamp(&config, &keys);
     let socket = config.socket_path();
     let cache_dir = config.cache_dir.clone();
     let daemon = Arc::new(Daemon::new(config.clone()));
@@ -259,10 +321,37 @@ fn hit_burst_rig() {
         })
     };
 
+    // Writers beside the hits, as a burst's misses and bookkeeping are:
+    // each takes the index's write lock in turn, and one waiting for it
+    // holds its connection.
+    let writer_threads: Vec<_> = (0..writers)
+        .map(|writer| {
+            let (config, done, dir) = (config.clone(), done.clone(), dir.clone());
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !done.load(Ordering::Relaxed) {
+                    let store = Store::open(&config).expect("store");
+                    let _ = store.remember_incremental_dir(
+                        &dir.join(format!("rig-incr/w{writer}-{i}-{}", std::process::id())),
+                    );
+                    drop(store);
+                    i += 1;
+                    std::thread::sleep(write_gap);
+                }
+                i
+            })
+        })
+        .collect();
+    let thread_sampler = std::env::var("RIG_SAMPLE").is_ok().then(|| {
+        let done = done.clone();
+        std::thread::spawn(move || sample_threads(&done))
+    });
+    let pool_before = kache_store::index_pool_stats();
     let (user0, sys0) = cpu_seconds();
     let start = Instant::now() + Duration::from_millis(200);
     let times = Arc::new(Mutex::new(Times::default()));
     let failures = Arc::new(AtomicUsize::new(0));
+    let stamp_times = Arc::new(Mutex::new(Vec::<f64>::new()));
     let files = Arc::new(files);
     let keys = Arc::new(keys);
     let idents = Arc::new(idents);
@@ -274,12 +363,13 @@ fn hit_burst_rig() {
                 socket.clone(),
                 cache_dir.clone(),
             );
-            let (files, keys, idents, times, failures) = (
+            let (files, keys, idents, times, failures, stamp_times) = (
                 files.clone(),
                 keys.clone(),
                 idents.clone(),
                 times.clone(),
                 failures.clone(),
+                stamp_times.clone(),
             );
             std::thread::spawn(move || {
                 let env = crate::invocation::InvocationEnv::capture();
@@ -310,17 +400,32 @@ fn hit_burst_rig() {
                         if stamps_in_process {
                             let d = daemon.clone();
                             let dir = cache_dir.to_string_lossy().into_owned();
+                            let timed = stamp_times.clone();
                             store.send_hit_stamps_to(Box::new(move |key| {
-                                d.handle_stamp_hits(&kache_protocol::StampHitsRequest {
-                                    cache_dir: dir.clone(),
-                                    keys: vec![key.to_string()],
-                                })
-                                .ok
+                                let t = Instant::now();
+                                let ok = d
+                                    .handle_stamp_hits(&kache_protocol::StampHitsRequest {
+                                        cache_dir: dir.clone(),
+                                        keys: vec![key.to_string()],
+                                    })
+                                    .ok;
+                                timed
+                                    .lock()
+                                    .expect("stamps")
+                                    .push(t.elapsed().as_secs_f64() * 1e3);
+                                ok
                             }));
                         } else {
                             let (socket, dir) = (socket.clone(), cache_dir.clone());
+                            let timed = stamp_times.clone();
                             store.send_hit_stamps_to(Box::new(move |key| {
-                                send_hit_stamp(&socket, &dir, key)
+                                let t = Instant::now();
+                                let ok = send_hit_stamp(&socket, &dir, key);
+                                timed
+                                    .lock()
+                                    .expect("stamps")
+                                    .push(t.elapsed().as_secs_f64() * 1e3);
+                                ok
                             }));
                         }
                         if touches_batched {
@@ -378,12 +483,32 @@ fn hit_burst_rig() {
     }
     let wall = start.elapsed().as_secs_f64();
     let (user1, sys1) = cpu_seconds();
+    let pool_after = kache_store::index_pool_stats();
     // Let the ticks write what was handed over, as the daemon does.
     std::thread::sleep(Duration::from_millis(600));
     daemon.flush_hit_stamps();
     daemon.flush_file_hash_records();
     done.store(true, Ordering::Relaxed);
     sampler.join().expect("sampler");
+    if let Some(sampler) = thread_sampler {
+        let mut seen: Vec<(String, usize)> = sampler
+            .join()
+            .expect("thread sampler")
+            .into_iter()
+            .collect();
+        seen.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+        let all: usize = seen.iter().map(|(_, n)| n).sum();
+        for (what, n) in seen.iter().take(14) {
+            println!(
+                "sample {n:6} {:5.1}% {what}",
+                *n as f64 * 100.0 / all.max(1) as f64
+            );
+        }
+    }
+    let writes: u64 = writer_threads
+        .into_iter()
+        .map(|writer| writer.join().expect("writer"))
+        .sum();
 
     let times = std::mem::take(&mut *times.lock().expect("times"));
     println!(
@@ -398,6 +523,21 @@ fn hit_burst_rig() {
     println!("{}", summary("store_open_ms", times.store_open));
     println!("{}", summary("prediction_read_ms", times.prediction));
     println!("{}", summary("input_hash_prefetch_ms", times.prefetch));
+    println!(
+        "{}",
+        summary(
+            "stamp_ms",
+            std::mem::take(&mut *stamp_times.lock().expect("stamps"))
+        )
+    );
+    println!(
+        "pool idle_cap={pool_idle} ceiling={ceiling} writers={writers} writes={writes} opened={} reused={} closed_over_cap={} in_use_max={} idle_after={}",
+        pool_after.opened - pool_before.opened,
+        pool_after.reused - pool_before.reused,
+        pool_after.closed_over_cap - pool_before.closed_over_cap,
+        pool_after.in_use_max,
+        pool_after.idle
+    );
     println!("{}", summary("lookup_ms", times.lookup));
     println!(
         "wall={wall:.1}s cpu_user={:.1}s cpu_sys={:.1}s peak_threads={} prefetch_failures={} processes=1",
