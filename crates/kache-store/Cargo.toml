@@ -19,6 +19,10 @@ test-support = []
 name = "bench-cc-memos"
 required-features = ["test-support"]
 
+[[example]]
+name = "index-burst"
+required-features = ["test-support"]
+
 [dependencies]
 kache-core = { version = "1.2.2", path = "../kache-core", default-features = false }
 kache-format = { version = "1.2.2", path = "../kache-format" }
