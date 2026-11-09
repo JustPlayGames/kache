@@ -179,6 +179,14 @@ const FILE_HASH_LOOKUP_CHUNK: usize = 256;
 pub trait IndexSource {
     /// The connection, for one statement or transaction.
     fn index(&self) -> crate::index_pool::IndexGuard<'_>;
+
+    /// Hand the daily use stamp of the input prediction row `identity`, read
+    /// at `now`, to whoever writes such stamps in batches
+    /// ([`crate::store::PredictionTouchSink`]). `false`, the default, makes
+    /// the read write it itself.
+    fn hand_prediction_touch(&self, _identity: &str, _now: i64) -> bool {
+        false
+    }
 }
 
 /// A [`FileHashCache`]'s connection, for as long as one statement needs it.
@@ -247,6 +255,15 @@ impl<'db> FileHashCache<'db> {
         db.pragma_update(None, "synchronous", "NORMAL")?;
         ensure_file_hash_cache_schema(&db)?;
         Ok(Self::Owned(db))
+    }
+
+    /// [`IndexSource::hand_prediction_touch`] of the store this cache lends
+    /// its connection from; `false` for a plain connection.
+    fn hand_prediction_touch(&self, identity: &str, now: i64) -> bool {
+        match self {
+            Self::Store(store, _) => store.hand_prediction_touch(identity, now),
+            _ => false,
+        }
     }
 
     pub fn db(&self) -> IndexRef<'_> {
@@ -504,8 +521,12 @@ impl<'db> FileHashCache<'db> {
             return Ok(None);
         };
         // Best-effort: a stamp that cannot be written costs an early prune
-        // and a repeated pre-pass, never the hit.
+        // and a repeated pre-pass, never the hit. A store with a touch sink
+        // (the daemon's workers) hands it over: the write would take the
+        // index's write lock on the hit path, behind a landing's burst of
+        // stores.
         if prediction_touch_due(last_used, now)
+            && !self.hand_prediction_touch(identity, now)
             && let Err(error) = self.db().execute(
                 "UPDATE input_predictions SET last_used = ?2 WHERE identity = ?1",
                 params![identity, now],

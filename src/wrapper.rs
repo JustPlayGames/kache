@@ -1164,6 +1164,35 @@ fn open_primary_and_fallback_for(
 /// (`Store::record_restored_file_hashes`): the hit does not wait for them,
 /// and the daemon writes them once the index lets it.
 pub(crate) fn send_hit_stamps_to_daemon(config: &Config, store: &mut Store) {
+    // A worker of the daemon whose store this is (most hits) hands its
+    // stamps, memo rows and prediction use stamps to it in process: the
+    // daemon's own socket answers a stamp within 10 ms or not at all, and in
+    // a landing's burst its accept queue made each hit wait that long.
+    #[cfg(unix)]
+    if let Some(daemon) =
+        invocation_daemon().filter(|daemon| daemon.serves_store(&config.cache_dir))
+    {
+        let cache_dir = config.cache_dir.to_string_lossy().into_owned();
+        let stamps = std::sync::Arc::clone(&daemon);
+        store.send_hit_stamps_to(Box::new(move |key| {
+            stamps
+                .handle_stamp_hits(&kache_protocol::StampHitsRequest {
+                    cache_dir: cache_dir.clone(),
+                    keys: vec![key.to_string()],
+                })
+                .ok
+        }));
+        let touches = std::sync::Arc::clone(&daemon);
+        store.send_prediction_touches_to(Box::new(move |identity, now| {
+            touches.take_prediction_touch(identity, now)
+        }));
+        crate::key_bridge::register_through_daemon(config.socket_path(), config.cache_dir.clone());
+        store.send_busy_memo_rows_to(Box::new(move |rows| {
+            daemon.defer_memo_rows(rows.to_vec());
+            true
+        }));
+        return;
+    }
     #[cfg(unix)]
     {
         let socket = config.socket_path();
@@ -9772,6 +9801,16 @@ thread_local! {
     static PRECOMPILED_EXIT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
     static PRECOMPILED_REBUILT: std::cell::RefCell<RebuiltArtifacts> = std::cell::RefCell::new(RebuiltArtifacts::default());
     static INVOCATION_SETTINGS: std::cell::RefCell<Option<InvocationWrapperSettings>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The daemon running this invocation, when a worker of its runs it.
+#[cfg(unix)]
+pub(crate) fn invocation_daemon() -> Option<std::sync::Arc<crate::daemon::Daemon>> {
+    INVOCATION_SETTINGS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|settings| settings.daemon.clone())
+    })
 }
 
 struct InvocationWrapperSettings {

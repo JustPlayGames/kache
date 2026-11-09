@@ -16794,6 +16794,59 @@ fn stamp_hits_writes_access_times_and_adds_the_hits() {
     assert!(!store.contains("gone"), "a key no longer stored stays absent");
 }
 
+/// A store with a touch sink (a daemon worker's) hands an input prediction
+/// read's daily use stamp over instead of writing it on the hit path, and
+/// the batch writer stamps each row with its read's time, never an earlier
+/// one.
+#[test]
+fn prediction_use_stamps_go_to_the_sink_and_are_written_in_a_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, _config) = store_with_one_evictable_entry(dir.path(), "entry");
+    let last_used = |store: &Store, identity: &str| -> i64 {
+        store
+            .db()
+            .query_row(
+                "SELECT last_used FROM input_predictions WHERE identity = ?1",
+                params![identity],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    store
+        .file_hash_cache()
+        .put_input_prediction("unit", 1, None, "payload")
+        .unwrap();
+    store
+        .db()
+        .execute("UPDATE input_predictions SET last_used = 1000", [])
+        .unwrap();
+    let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&handed);
+    store.send_prediction_touches_to(Box::new(move |identity, now| {
+        sink.lock().unwrap().push((identity.to_string(), now));
+        true
+    }));
+
+    assert_eq!(
+        store.file_hash_cache().get_input_prediction("unit").unwrap(),
+        Some((1, "payload".into()))
+    );
+    let taken = std::mem::take(&mut *handed.lock().unwrap());
+    assert_eq!(taken.len(), 1, "the due stamp went to the sink");
+    assert_eq!(last_used(&store, "unit"), 1000, "and the read wrote nothing");
+
+    store.stamp_input_predictions(&taken).unwrap();
+    assert_eq!(last_used(&store, "unit"), taken[0].1);
+    store
+        .stamp_input_predictions(&[("unit".into(), 2000), ("gone".into(), 3000)])
+        .unwrap();
+    assert_eq!(
+        last_used(&store, "unit"),
+        taken[0].1,
+        "an earlier read's time never moves the stamp back"
+    );
+}
+
 /// A stamp taken and not yet written pins its entry against eviction like
 /// a written one: the hit may be restoring the entry's blobs right now.
 #[test]

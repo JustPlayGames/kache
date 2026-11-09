@@ -1978,6 +1978,10 @@ pub(crate) struct Daemon {
     /// number of hits each, written by [`Daemon::flush_hit_stamps`]. Until
     /// then the daemon's sweeps keep these entries ([`Daemon::pending_pins`]).
     pending_hit_stamps: Arc<Mutex<HashMap<String, u32>>>,
+    /// Input prediction rows' daily use stamps the daemon's own workers
+    /// handed over ([`Daemon::take_prediction_touch`]), by identity with the
+    /// latest read's time, written by [`Daemon::flush_hit_stamps`].
+    pending_prediction_touches: Mutex<HashMap<String, i64>>,
     /// The connection [`Daemon::flush_hit_stamps`] writes through: a batch
     /// may wait for the index's write lock, and nobody waits for it.
     stamp_store: OnceLock<Mutex<Store>>,
@@ -2533,6 +2537,7 @@ impl Daemon {
             events_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_predictions: Mutex::new(HashMap::new()),
             pending_hit_stamps: Arc::new(Mutex::new(HashMap::new())),
+            pending_prediction_touches: Mutex::new(HashMap::new()),
             adoption_registrar: OnceLock::new(),
             pending_adoptions: Arc::new(Mutex::new(HashSet::new())),
             stamp_store: OnceLock::new(),
@@ -3743,11 +3748,70 @@ impl Daemon {
         Response::ok()
     }
 
+    /// Whether this daemon's own store is the one at `cache_dir`: a worker
+    /// of this daemon hands that store's bookkeeping straight to it.
+    #[cfg(unix)]
+    pub(crate) fn serves_store(&self, cache_dir: &Path) -> bool {
+        self.config.cache_dir == cache_dir
+    }
+
+    /// Whether this daemon listens at `socket_path`: a request a worker of
+    /// this daemon would send there can be answered in process.
+    #[cfg(unix)]
+    pub(crate) fn serves_socket(&self, socket_path: &Path) -> bool {
+        self.config.socket_path() == socket_path
+    }
+
+    /// Take an input prediction row's daily use stamp from one of this
+    /// daemon's own workers (in the same process: no request). Refused when
+    /// [`MAX_PENDING_HIT_STAMPS`] are waiting; the read then stamps the row
+    /// itself.
+    #[cfg(unix)]
+    pub(crate) fn take_prediction_touch(&self, identity: &str, now: i64) -> bool {
+        let Ok(mut pending) = self.pending_prediction_touches.lock() else {
+            return false;
+        };
+        if let Some(used) = pending.get_mut(identity) {
+            *used = (*used).max(now);
+            return true;
+        }
+        if pending.len() >= MAX_PENDING_HIT_STAMPS {
+            return false;
+        }
+        pending.insert(identity.to_owned(), now);
+        true
+    }
+
+    /// Write the prediction use stamps taken since the last call in one
+    /// transaction on the stamp connection; a batch the index refused goes
+    /// back for the next call (a later read's time wins).
+    fn flush_prediction_touches(&self) {
+        let batch: Vec<(String, i64)> = match self.pending_prediction_touches.lock() {
+            Ok(mut pending) if !pending.is_empty() => pending.drain().collect(),
+            _ => return,
+        };
+        let written = self.with_stamp_store(|store| store.stamp_input_predictions(&batch));
+        if let Err(error) = written {
+            tracing::debug!("prediction use stamps not written yet: {error:#}");
+            if let Ok(mut pending) = self.pending_prediction_touches.lock() {
+                for (identity, used) in batch {
+                    if pending.len() >= MAX_PENDING_HIT_STAMPS {
+                        break;
+                    }
+                    let slot = pending.entry(identity).or_insert(used);
+                    *slot = (*slot).max(used);
+                }
+            }
+        }
+    }
+
     /// Write the hit stamps taken since the last call in one transaction on
     /// the stamp connection. A stamp leaves the pending set only once its
     /// transaction committed, so the sweeps' pin never has a gap; a batch the
-    /// index refused stays for the next call.
+    /// index refused stays for the next call. The prediction use stamps
+    /// workers handed over go next, in a transaction of their own.
     pub(crate) fn flush_hit_stamps(&self) {
+        self.flush_prediction_touches();
         let batch: Vec<(String, u32)> = match self.pending_hit_stamps.lock() {
             Ok(pending) if !pending.is_empty() => {
                 pending.iter().map(|(k, n)| (k.clone(), *n)).collect()
@@ -10572,6 +10636,17 @@ pub fn send_hash_files_request(
     if files.is_empty() {
         return Ok(Vec::new());
     }
+    // A worker of the daemon at `socket_path` asks it in process: through
+    // the socket each request waited on the daemon's accept queue and a
+    // blocking-pool hand-off, the whole burst's at once in a landing.
+    #[cfg(unix)]
+    if let Some(daemon) =
+        crate::wrapper::invocation_daemon().filter(|daemon| daemon.serves_socket(socket_path))
+    {
+        return hash_files_results_from_response(
+            daemon.handle_hash_files(&HashFilesRequest { files }),
+        );
+    }
     let req = Request::HashFiles(HashFilesRequest { files });
     let resp_str = send_request_with_timeout(socket_path, &req, std::time::Duration::from_secs(3))?;
     hash_files_results_from_response_line(&resp_str)
@@ -10631,7 +10706,10 @@ fn hash_warmup_results_from_response(
 }
 
 fn hash_files_results_from_response_line(resp_str: &str) -> Result<Vec<HashFileResult>> {
-    let resp: Response = serde_json::from_str(resp_str)?;
+    hash_files_results_from_response(serde_json::from_str(resp_str)?)
+}
+
+fn hash_files_results_from_response(resp: Response) -> Result<Vec<HashFileResult>> {
     if !resp.ok {
         anyhow::bail!(
             "daemon hash_files error: {}",
