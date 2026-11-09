@@ -582,7 +582,7 @@ fn daemon_idle_timeout_defaults_to_disabled() {
 }
 
 #[test]
-fn the_event_log_rotates_at_64_mib_by_default() {
+fn event_log_and_archive_limits_have_defaults_and_parse() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
@@ -592,6 +592,17 @@ fn the_event_log_rotates_at_64_mib_by_default() {
 
     std::fs::write(&config_path, "[cache]\nevent_log_max_size = \"8MiB\"\n").unwrap();
     assert_eq!(Config::load().unwrap().event_log_max_size, 8 * 1024 * 1024);
+    let config = Config::load().unwrap();
+    assert_eq!(config.event_archive_days, 8);
+    assert_eq!(config.event_archive_max_size, 512 << 20);
+    std::fs::write(
+        &config_path,
+        "[cache]\nevent_archive_days = 30\nevent_archive_max_size = \"2GiB\"\n",
+    )
+    .unwrap();
+    let config = Config::load().unwrap();
+    assert_eq!(config.event_archive_days, 30);
+    assert_eq!(config.event_archive_max_size, 2 << 30);
 }
 
 #[test]
@@ -3440,6 +3451,8 @@ fn test_file_config_roundtrip() {
             exclude: Some(vec!["vendor/problem/**".to_string()]),
             event_log_max_size: Some("10MiB".to_string()),
             event_log_keep_lines: Some(500),
+            event_archive_days: None,
+            event_archive_max_size: None,
             compression_level: Some(3),
             s3_concurrency: Some(8),
             prefetch_enabled: None,
@@ -4116,6 +4129,8 @@ fn test_config_store_dir() {
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
@@ -4218,6 +4233,8 @@ fn test_config_index_db_path() {
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
@@ -4316,6 +4333,8 @@ fn test_config_event_log_path() {
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
@@ -4433,6 +4452,8 @@ fn test_config_socket_path() {
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
+        event_archive_days: 8,
+        event_archive_max_size: 512 << 20,
         compression_level: 3,
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
@@ -5184,6 +5205,8 @@ fn test_save_and_load_file_config() {
             exclude: None,
             event_log_max_size: None,
             event_log_keep_lines: None,
+            event_archive_days: None,
+            event_archive_max_size: None,
             compression_level: Some(5),
             s3_concurrency: None,
             prefetch_enabled: None,
