@@ -5,6 +5,9 @@ use std::sync::mpsc;
 
 use crate::test_support::{Flavor, on_a_runtime_of_its_own};
 
+#[cfg(unix)]
+mod burst_rig;
+
 /// How long a wait the tests below end themselves may last before it fails
 /// the test: it only turns a hang into a failure, never decides a result. A
 /// loaded machine (the suite beside other builds) stretches a step that takes
