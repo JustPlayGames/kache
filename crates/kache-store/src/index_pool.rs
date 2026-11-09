@@ -44,6 +44,69 @@ pub fn pool_index_connections(idle_per_index: usize) {
     IDLE_CAP.store(idle_per_index.max(1), Ordering::Relaxed);
 }
 
+/// Idle connections a burst may keep past [`IDLE_CAP`]; 0 while none.
+static BURST_CEILING: AtomicUsize = AtomicUsize::new(0);
+
+/// How long after the last connection opened for want of an idle one the
+/// pool keeps up to [`BURST_CEILING`] idle connections.
+const BURST_HOLD: Duration = Duration::from_secs(30);
+
+/// When a store last opened a connection because none was idle, in
+/// milliseconds since [`epoch`] (0: never).
+static LAST_SHORTAGE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(epoch().elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
+/// Let a burst keep the connections it opened, up to `ceiling` idle ones
+/// per index, until no store has had to open one for [`BURST_HOLD`].
+///
+/// A landing's first burst asks for more connections at once than the
+/// idle cap keeps (the box's daemon: 24 idle, up to 118 in use). Each
+/// statement past the cap then opened a connection (a file open, the
+/// schema read, its pragmas) and closed it again as it gave it back,
+/// thousands of times a burst. A connection kept past the cap gives its
+/// page cache back first ([`Connection::release_memory`]), so the burst
+/// costs its open files and parsed schemas, not its pages; past the hold,
+/// each one given back past the cap is closed as before, and the daemon's
+/// idle close ([`close_idle_index_connections`]) closes them all.
+pub fn keep_burst_index_connections(ceiling: usize) {
+    BURST_CEILING.store(ceiling, Ordering::Relaxed);
+}
+
+/// The idle connections the pool keeps now: the cap, or in a burst the
+/// ceiling.
+fn idle_room() -> usize {
+    let cap = idle_cap();
+    let ceiling = burst_ceiling();
+    if ceiling <= cap {
+        return cap;
+    }
+    let last = LAST_SHORTAGE_MS.load(Ordering::Relaxed);
+    let held = u64::try_from(BURST_HOLD.as_millis()).unwrap_or(u64::MAX);
+    if last != 0 && now_ms().saturating_sub(last) < held {
+        ceiling
+    } else {
+        cap
+    }
+}
+
+fn burst_ceiling() -> usize {
+    #[cfg(test)]
+    if let Some(ceiling) = TEST_BURST_CEILING.get() {
+        return ceiling;
+    }
+    BURST_CEILING.load(Ordering::Relaxed)
+}
+
 fn idle_cap() -> usize {
     #[cfg(test)]
     if let Some(cap) = TEST_IDLE_CAP.get() {
@@ -57,6 +120,14 @@ thread_local! {
     /// Pooling for one test's thread, which [`pool_index_connections`] would
     /// turn on for every test in the process.
     static TEST_IDLE_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// [`keep_burst_index_connections`] for one test's thread.
+    static TEST_BURST_CEILING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Keep up to `ceiling` idle connections in a burst, on this thread.
+#[cfg(test)]
+pub(crate) fn burst_on_this_thread(ceiling: usize) {
+    TEST_BURST_CEILING.set(Some(ceiling));
 }
 
 /// Pool with `idle_per_index` idle connections (0: off) on this thread.
@@ -139,8 +210,15 @@ impl Pool {
             STATS.stale.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        let cap = idle_cap();
+        let room = idle_room();
+        // Past the cap the connection keeps no pages: released before the
+        // pool's lock is taken (it frees what its cache holds).
+        if room > cap && lock_counted(&self.idle).is_some_and(|idle| idle.conns.len() >= cap) {
+            let _ = pooled.db.release_memory();
+        }
         let rejected = match lock_counted(&self.idle) {
-            Some(mut idle) if idle.conns.len() < idle_cap() => {
+            Some(mut idle) if idle.conns.len() < room => {
                 idle.conns.push(pooled);
                 None
             }
@@ -225,6 +303,7 @@ impl Pooled {
     pub(crate) fn opened(db: Connection, path: &Path, pooled: bool) -> Self {
         if pooled {
             STATS.opened.fetch_add(1, Ordering::Relaxed);
+            LAST_SHORTAGE_MS.store(now_ms(), Ordering::Relaxed);
             in_use_add();
         }
         Self {

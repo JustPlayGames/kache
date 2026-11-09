@@ -26,7 +26,7 @@ pub use blob_drift::{BlobRefcountDrift, blob_refcount_drift};
 pub use eviction_evidence::{EvictionEvidenceCohort, EvictionHorizonEvidence};
 pub use index_pool::{
     IndexGuard, IndexPoolStats, close_idle_index_connections, index_pool_stats, index_pool_used,
-    pool_index_connections,
+    keep_burst_index_connections, pool_index_connections,
 };
 pub use store::*;
 

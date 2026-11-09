@@ -1,5 +1,5 @@
 use super::*;
-use crate::index_pool::pool_on_this_thread;
+use crate::index_pool::{burst_on_this_thread, pool_on_this_thread};
 
 /// Mark the connection a store's next statement takes with its page cache
 /// size, which belongs to the connection: a store that reads `tag` back took
@@ -96,6 +96,40 @@ fn connections_given_back_past_the_idle_cap_are_closed() {
     let size = |db: &Connection| db.query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0));
     assert_eq!(size(&held_c).unwrap(), -4, "the one idle connection");
     assert_eq!(size(&held_d).unwrap(), -UNMARKED, "the second was closed");
+}
+
+#[test]
+fn a_burst_keeps_the_connections_it_opened_up_to_its_ceiling() {
+    pool_on_this_thread(1);
+    burst_on_this_thread(2);
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let (a, b, c) = (
+        Store::open(&config).unwrap(),
+        Store::open(&config).unwrap(),
+        Store::open(&config).unwrap(),
+    );
+    // Three statements at once: two connections are opened for want of
+    // an idle one, and three are given back.
+    let held = [a.db(), b.db(), c.db()];
+    for (tag, db) in (4..).zip(&held) {
+        db.pragma_update(None, "cache_size", -tag).unwrap();
+    }
+    drop(held);
+    let again = [a.db(), b.db(), c.db()];
+    let mut tags: Vec<i64> = again
+        .iter()
+        .map(|db| {
+            -db.query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))
+                .unwrap()
+        })
+        .collect();
+    tags.sort_unstable();
+    assert_eq!(
+        tags,
+        [4, 5, UNMARKED],
+        "two kept (the ceiling), the third closed and opened afresh"
+    );
 }
 
 #[test]
