@@ -4454,6 +4454,26 @@ mod tests {
         drop(alone);
     }
 
+    #[test]
+    fn an_8_gib_desktop_runs_a_second_compile_while_2_gib_stay_free() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = temp_cache();
+        // 8 GiB, 4 available: the reserve is a quarter (2 GiB), not 4 GiB.
+        let _memory = PinnedMemory::new(4, 8);
+        let scheduler = gate_scheduler(dir.path(), 8);
+        let first = scheduler.acquire_permit_expecting(1, GIB / 2).unwrap();
+        // 4 - 0.5 still taking - 0.5 = 3 GiB left, over the reserve.
+        let second = scheduler
+            .acquire_permit_expecting(1, GIB / 2)
+            .expect("a second compile runs while 2 GiB stay free");
+        // 4 - 1 - 1.5 = 1.5 GiB left, under it.
+        assert!(
+            scheduler.acquire_permit_expecting(1, 3 * GIB / 2).is_none(),
+            "a third that would eat into the 2 GiB waits"
+        );
+        drop((first, second));
+    }
+
     /// In a cgroup, while every compile involved has a measured peak, the
     /// gate keeps a smaller reserve and counts the cache the cgroup reclaims
     /// first. One compile still running on a guessed peak brings back the
