@@ -2589,15 +2589,54 @@ fn restore_symlink(out_dir: &Path, symlink: &Symlink) -> Result<()> {
         );
     }
     let path = out_dir.join(link);
+    create_symlink(Path::new(&symlink.target), &path)
+}
+
+/// Create a restored OUT_DIR symlink at `path` that names `target`, spelled
+/// as recorded (relative to the link's directory, or absolute).
+///
+/// Windows keeps a link's kind, file or directory, and resolves a directory
+/// link only as a directory, so the kind comes from what `target` names now:
+/// a target that does not exist (yet) refuses the restore and the script
+/// runs, as it did on Windows before. A link the system refuses to create
+/// (no Developer Mode and no elevation) refuses the restore too. cxx-build
+/// links its headers and the package this way wherever it may, which kept
+/// every run of a cxx crate's build script (webrtc-sys: about a minute)
+/// out of the cache in each new target directory.
+fn create_symlink(target: &Path, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(&symlink.target, &path)?;
+        std::os::unix::fs::symlink(target, path)?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let resolved = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            path.parent()
+                .context("restored build-script symlink has no parent")?
+                .join(target)
+        };
+        let metadata = std::fs::metadata(&resolved).with_context(|| {
+            format!(
+                "build-script symlink target is missing: {} -> {}",
+                path.display(),
+                target.display()
+            )
+        })?;
+        if metadata.is_dir() {
+            std::os::windows::fs::symlink_dir(target, path)?;
+        } else {
+            std::os::windows::fs::symlink_file(target, path)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     anyhow::bail!(
-        "build-script symlinks are only restored on Unix: {}",
-        path.display()
+        "build-script symlinks are not restored on this system: {} -> {}",
+        path.display(),
+        target.display()
     )
 }
 
@@ -5431,7 +5470,36 @@ mod tests {
             .unwrap()
     }
 
-    #[cfg(unix)]
+    /// A symlink as cxx-build makes one: on Windows a directory link for a
+    /// directory, a file link otherwise (it needs Developer Mode or an
+    /// elevated process there, as cxx-build's own links do).
+    #[cfg(any(unix, windows))]
+    fn cxx_link(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        let (target, link) = (target.as_ref(), link.as_ref());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("a test link");
+        #[cfg(windows)]
+        {
+            let target = PathBuf::from(
+                target
+                    .to_str()
+                    .expect("a UTF-8 test path")
+                    .replace('/', "\\"),
+            );
+            if link
+                .parent()
+                .expect("a link under OUT_DIR")
+                .join(&target)
+                .is_dir()
+            {
+                std::os::windows::fs::symlink_dir(&target, link).expect("a test link");
+            } else {
+                std::os::windows::fs::symlink_file(&target, link).expect("a test link");
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn cxx_source_links_restore_in_a_new_checkout_and_cargo_home() {
         let mut lock = crate::test_support::process_state_test_lock();
@@ -5478,27 +5546,23 @@ mod tests {
             "generated header",
         )
         .unwrap();
-        std::os::unix::fs::symlink(
+        cxx_link(
             &a.environment.manifest_dir,
             out.join("cxxbridge/crate/demo"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(
+        );
+        cxx_link(
             dir.as_path().join("a/cargo/registry/src/cxx/include/cxx.h"),
             out.join("cxxbridge/include/rust/cxx.h"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(
+        );
+        cxx_link(
             out.join("cxxbridge/include/demo/src/main.rs.h"),
             out.join("absolute-internal.h"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("main.rs.h", out.join("cxxbridge/include/demo/src/main.rs"))
-            .unwrap();
+        );
+        cxx_link("main.rs.h", out.join("cxxbridge/include/demo/src/main.rs"));
         // A relative link which climbs out to the package is rooted too.
         let mut relative = relative_to_ancestor(out, &dir.as_path().join("a")).unwrap();
         relative.push_str("cargo/registry/src/x-1.0.0");
-        std::os::unix::fs::symlink(relative, out.join("relative-package")).unwrap();
+        cxx_link(relative, out.join("relative-package"));
         let after = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
         a.record(b"cargo:rerun-if-changed=build.rs\n", b"", 5, after)
             .unwrap();
