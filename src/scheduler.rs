@@ -132,6 +132,11 @@ const MARKER_WAIT: Duration = Duration::from_secs(1);
 /// How soon a discovery flight or an empty permit scan retries. A permit
 /// scan that found a held slot sleeps in [`permit_wait`] instead.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long a peer on another tree waits for a discovery flight's holder
+/// ([`join_discovery_flight_of_tree`]) before it keys without the flight:
+/// long enough for a small unit's holder to compile and store, so a peer
+/// with the same key restores its entry rather than compiling it too.
+const OTHER_TREE_GRACE: Duration = Duration::from_secs(2);
 
 /// What [`join_discovery_flight`] found: the flight, and whether another
 /// process held it first. Only after a wait can the previous holder have
@@ -146,14 +151,51 @@ pub(crate) struct DiscoveryFlight {
 /// a cache-key lock. The holder keeps this guard through prediction publish.
 /// Errors and timeout leave the ordinary key/compile path available.
 pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> DiscoveryFlight {
+    join_discovery_flight_of_tree(cache_dir, identity, None)
+}
+
+/// [`join_discovery_flight`] for a unit under a tree guard, `tree` its
+/// digest. The holder notes its tree beside the flight. What it publishes is
+/// usable only under that digest, so a peer on another tree (a checkout of
+/// another branch) gains nothing from the holder's whole compile: after
+/// [`OTHER_TREE_GRACE`] it keys without the flight, as a peer whose wait ran
+/// out does, and compiles beside the holder. A peer on the holder's tree, or
+/// one that cannot read the note yet, waits as before.
+pub(crate) fn join_discovery_flight_of_tree(
+    cache_dir: &Path,
+    identity: &str,
+    tree: Option<&str>,
+) -> DiscoveryFlight {
     let _trace = crate::phase_trace::phase("discovery_flight_wait");
     let path = cache_dir
         .join("scheduler/discovery")
         .join(blake3::hash(identity.as_bytes()).to_hex().as_str());
     let started = Instant::now();
     let wait = BudgetWait::start(WAIT_TIMEOUT);
-    let result = match acquire_discovery(&path, wait.timeout, POLL_INTERVAL) {
-        Ok((lock, waited)) => DiscoveryFlight { lock, waited },
+    let mut other_tree = false;
+    let result = match acquire_discovery(&path, tree, wait.timeout, OTHER_TREE_GRACE, POLL_INTERVAL)
+    {
+        Ok(Discovery::Held(mut lock, waited)) => {
+            if let Some(tree) = tree {
+                lock.mark_note(tree);
+            }
+            DiscoveryFlight {
+                lock: Some(lock),
+                waited,
+            }
+        }
+        Ok(Discovery::Busy) => DiscoveryFlight {
+            lock: None,
+            waited: true,
+        },
+        Ok(Discovery::OtherTree) => {
+            other_tree = true;
+            crate::phase_trace::decision("discovery_flight", "other_tree");
+            DiscoveryFlight {
+                lock: None,
+                waited: false,
+            }
+        }
         Err(error) => {
             tracing::debug!("discovery flight unavailable: {error:#}");
             DiscoveryFlight {
@@ -168,7 +210,7 @@ pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> Discove
         } else {
             SchedulerOutcome::Admitted
         }
-    } else if result.waited {
+    } else if result.waited || other_tree {
         SchedulerOutcome::TimeoutFallback
     } else {
         unavailable_outcome()
@@ -177,18 +219,51 @@ pub(crate) fn join_discovery_flight(cache_dir: &Path, identity: &str) -> Discove
     result
 }
 
-/// Take the flight at `path`, waiting up to `timeout` for its holder. The
-/// flag says whether a wait happened: a flight taken at once had no holder,
-/// so nothing can have been published since the caller last looked.
+/// What [`acquire_discovery`] found.
+enum Discovery {
+    /// The flight, and whether a wait came first: a flight taken at once
+    /// had no holder, so nothing can have been published since the caller
+    /// last looked.
+    Held(StoreLock, bool),
+    /// Still held when the wait ran out.
+    Busy,
+    /// Held past the grace by a holder that noted another tree.
+    OtherTree,
+}
+
+/// Take the flight at `path`, waiting up to `timeout` for its holder, or
+/// only up to `grace` when the holder noted a tree other than `tree`.
 fn acquire_discovery(
     path: &Path,
+    tree: Option<&str>,
     timeout: Duration,
+    grace: Duration,
     poll: Duration,
-) -> Result<(Option<StoreLock>, bool)> {
+) -> Result<Discovery> {
     if let Some(lock) = acquire_within(path, Duration::ZERO, Duration::ZERO)? {
-        return Ok((Some(lock), false));
+        return Ok(Discovery::Held(lock, false));
     }
-    Ok((acquire_within(path, timeout, poll)?, true))
+    let start = std::time::Instant::now();
+    let mut attempt = 0;
+    loop {
+        crate::invocation::process::check()?;
+        if let Some(lock) = StoreLock::try_acquire(path)? {
+            return Ok(Discovery::Held(lock, true));
+        }
+        let waited = start.elapsed();
+        if waited >= timeout {
+            return Ok(Discovery::Busy);
+        }
+        if waited >= grace
+            && let Some(tree) = tree
+            && StoreLock::held_note(path).is_some_and(|holder| holder != tree)
+        {
+            return Ok(Discovery::OtherTree);
+        }
+        let nap = crate::store::lock_poll_interval(attempt).min(poll);
+        std::thread::sleep(nap.min(timeout.saturating_sub(waited)));
+        attempt += 1;
+    }
 }
 
 /// Lock `path`, retrying until `timeout`. `None` when it stayed busy.
@@ -4229,26 +4304,88 @@ mod tests {
         assert_eq!(more.iter().filter(|path| path.exists()).count(), 1);
     }
 
+    /// A peer on another tree than the flight's holder noted stops waiting
+    /// after the grace; one on the holder's tree, or one that finds no note
+    /// yet, waits as before.
+    #[test]
+    fn discovery_flights_stop_another_trees_wait_after_the_grace() {
+        let dir = temp_cache();
+        let path = dir.path().join("discovery/unit");
+        let join = |tree: Option<&str>| {
+            acquire_discovery(
+                &path,
+                tree,
+                Duration::from_millis(300),
+                Duration::from_millis(20),
+                Duration::from_millis(2),
+            )
+            .unwrap()
+        };
+        let Discovery::Held(mut owner, _) = join(Some("a")) else {
+            panic!("an unheld flight is taken");
+        };
+        assert!(
+            matches!(join(Some("b")), Discovery::Busy),
+            "no note yet: another tree cannot tell, and waits"
+        );
+        owner.mark_note("a");
+        let started = Instant::now();
+        assert!(matches!(join(Some("b")), Discovery::OtherTree));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "it stopped at the grace"
+        );
+        assert!(
+            matches!(join(Some("a")), Discovery::Busy),
+            "the holder's tree waits"
+        );
+        assert!(
+            matches!(join(None), Discovery::Busy),
+            "an unguarded unit waits"
+        );
+        drop(owner);
+        assert!(
+            StoreLock::held_note(&path).is_none(),
+            "the note goes with the holder"
+        );
+    }
+
     #[test]
     fn discovery_flights_hold_until_publish_and_fail_open() {
         let dir = temp_cache();
         let path = dir.path().join("discovery/unit");
-        let (owner, waited) = acquire_discovery(&path, Duration::ZERO, Duration::ZERO).unwrap();
-        let owner = owner.unwrap();
+        let Discovery::Held(owner, waited) =
+            acquire_discovery(&path, None, Duration::ZERO, Duration::ZERO, Duration::ZERO).unwrap()
+        else {
+            panic!("an unheld flight is taken");
+        };
         assert!(!waited, "an unheld flight is taken without waiting");
-        let (lock, waited) =
-            acquire_discovery(&path, Duration::from_millis(20), Duration::from_millis(2)).unwrap();
-        assert!(lock.is_none());
-        assert!(waited, "a timed-out join waited");
+        assert!(
+            matches!(
+                acquire_discovery(
+                    &path,
+                    None,
+                    Duration::from_millis(20),
+                    Duration::ZERO,
+                    Duration::from_millis(2)
+                )
+                .unwrap(),
+                Discovery::Busy
+            ),
+            "a timed-out join finds the flight still held"
+        );
         let waiter_path = path.clone();
         let waiter = std::thread::spawn(move || {
-            let (guard, waited) = acquire_discovery(
+            let Discovery::Held(_guard, waited) = acquire_discovery(
                 &waiter_path,
+                None,
                 Duration::from_secs(5),
+                Duration::ZERO,
                 Duration::from_millis(2),
             )
-            .unwrap();
-            assert!(guard.is_some());
+            .unwrap() else {
+                panic!("a join that outlives the holder takes the flight");
+            };
             assert!(waited, "a join that outlived the holder waited");
             assert_eq!(
                 fs::read(waiter_path.with_extension("published")).unwrap(),

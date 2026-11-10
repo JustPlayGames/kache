@@ -1925,6 +1925,9 @@ pub struct StoreLock {
     /// The storing mark this holder wrote ([`StoreLock::mark_storing`]),
     /// removed before the lock is released.
     storing: Option<PathBuf>,
+    /// The note this holder left beside the lock ([`StoreLock::mark_note`]),
+    /// removed before the lock is released.
+    note: Option<PathBuf>,
 }
 
 /// Lock guard for a cache key. Dropping it releases the OS lock.
@@ -1942,6 +1945,12 @@ pub fn try_lock_key_in(store_dir: &Path, cache_key: &str) -> Result<Option<KeyLo
 /// Windows refuses other processes a read of a locked file's bytes.
 fn storing_mark_path(lock_path: &Path) -> PathBuf {
     lock_path.with_extension("storing")
+}
+
+/// The note beside a lock file ([`StoreLock::mark_note`]): a file of its own
+/// for the same reason as the storing mark.
+fn note_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("note")
 }
 
 /// Whether a holder of `cache_key`'s lock in `store_dir` is storing its
@@ -2165,11 +2174,38 @@ impl StoreLock {
         // A storing mark found while holding the lock is one a holder that
         // died left behind ([`StoreLock::mark_storing`]).
         let _ = fs::remove_file(storing_mark_path(path));
+        let _ = fs::remove_file(note_path(path));
         Ok(Self {
             file,
             path: path.to_path_buf(),
             storing: None,
+            note: None,
         })
+    }
+
+    /// Leave `note` beside the lock for peers that find it held
+    /// ([`StoreLock::held_note`]): what this holder is doing, in a word or a
+    /// digest. It goes when the lock is released; one a holder killed
+    /// meanwhile left is removed by the next holder as it takes the lock.
+    /// Best effort: a note that cannot be written reads as none.
+    pub fn mark_note(&mut self, note: &str) {
+        let path = note_path(&self.path);
+        let tmp = path.with_extension(format!("note.{}", std::process::id()));
+        if fs::write(&tmp, note).is_ok() && fs::rename(&tmp, &path).is_ok() {
+            self.note = Some(path);
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+
+    /// The note the holder of the lock at `path` left
+    /// ([`StoreLock::mark_note`]). Read while the lock is held, it is the
+    /// current holder's, or none yet: a new holder removes its predecessor's
+    /// before it writes its own.
+    pub fn held_note(path: &Path) -> Option<String> {
+        fs::read_to_string(note_path(path))
+            .ok()
+            .filter(|note| !note.is_empty())
     }
 
     /// Say beside the lock file that its holder now stores the key's entry,
@@ -2270,6 +2306,9 @@ impl Drop for StoreLock {
         // Before the unlock: the next holder never sees this holder's mark.
         if let Some(mark) = self.storing.take() {
             let _ = fs::remove_file(mark);
+        }
+        if let Some(note) = self.note.take() {
+            let _ = fs::remove_file(note);
         }
         let _ = self.file.unlock();
     }
