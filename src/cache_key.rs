@@ -4522,7 +4522,9 @@ fn resolve_key_inputs(
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
-            let flight = crate::scheduler::join_discovery_flight(cache_dir, &identity);
+            let tree = out.tree_guard.as_ref().map(|guard| guard.digest.as_str());
+            let flight =
+                crate::scheduler::join_discovery_flight_of_tree(cache_dir, &identity, tree);
             followed_a_peer = flight.waited;
             let mut lock = flight.lock;
             // The previous owner may have published while this process

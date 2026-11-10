@@ -6515,12 +6515,13 @@ fn a_flight_waiter_digests_the_tree_again() {
 }
 
 /// Checkouts of one workspace share a unit's discovery flight. A checkout
-/// whose tree differs from the owner's cannot use the owner's record, and
-/// must not keep the flight through its own compile: every other checkout
-/// would then wait for that compile too, one checkout at a time. A checkout
-/// with the owner's tree still waits for the owner and uses its record.
+/// whose tree differs from the owner's cannot use the owner's record: it
+/// neither waits for the owner's whole compile nor takes the flight, but
+/// keys without it once the short grace for a small unit has passed. A
+/// checkout with the owner's tree still waits for the owner and uses its
+/// record.
 #[test]
-fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
+fn a_checkout_on_another_tree_keys_without_waiting_for_the_owner() {
     let _lock = key_test_lock();
     if get_rustc_version(Path::new("rustc")).is_err() {
         return;
@@ -6578,15 +6579,18 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
         .expect("the guard was taken before the compile");
     let record = workspace_portable_prediction(&closure, &roots, Some(&tree)).unwrap();
 
+    let released = std::sync::atomic::AtomicBool::new(false);
     let (started, ready) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let wait = |name: &'static str, source: &'static str| {
             let started = started.clone();
+            let released = &released;
             scope.spawn(move || {
                 let (root, env, args) = checkout(name, source);
                 let hasher = hasher(&env);
                 started.send(()).unwrap();
                 let (result, outputs) = resolve(&args, &hasher);
+                let before_release = !released.load(std::sync::atomic::Ordering::SeqCst);
                 let deferred = result
                     .as_ref()
                     .is_err_and(|error| error.is::<DeferredDiscovery>());
@@ -6597,6 +6601,7 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
                     outputs.used_prediction,
                     deferred,
                     held,
+                    before_release,
                 )
             })
         };
@@ -6605,12 +6610,23 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
         ready.recv().unwrap();
         ready.recv().unwrap();
         // Let both find no record and the flight held, so each join is a
-        // real wait. The owner then publishes and releases.
+        // real wait; another tree's ends after the grace (bounded here: a
+        // waiter would sit until the owner releases). The owner then
+        // publishes and releases.
         std::thread::sleep(std::time::Duration::from_millis(200));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !other_tree.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         owner.record_portable_prediction(&identity, Some("kt"), &record);
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
         drop(owner.take_discovery_flight());
 
-        let (_, inputs, predicted, deferred, held) = other_tree.join().unwrap();
+        let (_, inputs, predicted, deferred, held, before_release) = other_tree.join().unwrap();
+        assert!(
+            before_release,
+            "another tree does not wait for the owner's whole compile"
+        );
         assert!(
             !deferred && !held,
             "another tree keys without the flight instead of compiling under it"
@@ -6618,7 +6634,8 @@ fn a_waiter_that_cannot_use_the_owners_record_releases_the_flight() {
         assert!(!predicted);
         assert!(inputs.is_some(), "the pre-pass found the closure");
 
-        let (root, inputs, predicted, deferred, held) = same_tree.join().unwrap();
+        let (root, inputs, predicted, deferred, held, before_release) = same_tree.join().unwrap();
+        assert!(!before_release, "the owner's tree waits for the owner");
         assert!(!deferred);
         assert!(predicted, "the owner's tree uses the owner's record");
         assert!(held, "and keeps the flight until it publishes");
