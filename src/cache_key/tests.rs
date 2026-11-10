@@ -1791,6 +1791,27 @@ fn windows_link_argument_files_change_the_folded_key_and_fail_closed_when_gone()
         first,
         "reverting recovers the old key"
     );
+    // The same resource in another target directory (a new worktree's
+    // `<OUT_DIR>/resource.res`): only its bytes and place are keyed.
+    let moved_arg = if cfg!(windows) {
+        dir.path().join("other-target").join("first.res")
+    } else {
+        PathBuf::from("C:/other-target/first.res")
+    };
+    let moved_res = file_hasher.resolve_path(&moved_arg).unwrap();
+    std::fs::create_dir_all(moved_res.parent().unwrap()).unwrap();
+    std::fs::copy(&first_res, &moved_res).unwrap();
+    assert_eq!(
+        key(&[moved_arg.as_path(), second_arg.as_path()], None).unwrap(),
+        first,
+        "a resource keys by its bytes, not its directory"
+    );
+    std::fs::write(&moved_res, windows_test_resource(b"resource v3")).unwrap();
+    assert_ne!(
+        key(&[moved_arg.as_path(), second_arg.as_path()], None).unwrap(),
+        first,
+        "the moved resource's bytes still reach the key"
+    );
     for argument in [
         "C:/extra.obj",
         "/MANIFESTINPUT:app.xml",
