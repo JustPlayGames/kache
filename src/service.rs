@@ -620,6 +620,15 @@ fn ownership_probe_deadline() -> std::time::Instant {
 /// Whether the installed login service owns this configured runtime instance.
 /// The manager's environment can differ from a build's in either direction.
 /// Failed or unsupported ownership probes start the requested instance directly.
+///
+/// Fork (tasty): on Linux, a unit the manager probe cannot read as kache's
+/// own (a drop-in, `UMask=`, `Nice=`, the fork's `TimeoutStopSec=`, a
+/// wrapped `ExecStart`) falls back to the fork's rule (179fc181): the
+/// service reads the home folder's config and keeps its store in the home
+/// folder's cache. Upstream answers "not managed" there, and every
+/// auto-start would then run a daemon outside the service: without the
+/// unit's capability drop, priority and umask, beside a manager that
+/// cannot start its own while that daemon holds the run lock.
 pub(crate) fn manages_instance_until(
     config: &crate::config::Config,
     deadline: std::time::Instant,
@@ -630,10 +639,19 @@ pub(crate) fn manages_instance_until(
     #[cfg(target_os = "linux")]
     {
         let budget = deadline.min(ownership_probe_deadline());
-        let Some(socket) = systemd_environment::socket(&service, budget) else {
-            return Ok(false);
-        };
-        Ok(canonical_or_original(&config.socket_path()) == canonical_or_original(&socket))
+        if let Some(socket) = systemd_environment::socket(&service, budget) {
+            return Ok(
+                canonical_or_original(&config.socket_path()) == canonical_or_original(&socket)
+            );
+        }
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        configured_instance_matches(
+            &config.socket_path(),
+            login_service_cache_dir(&home),
+            crate::config::host_config_path()
+                .into_iter()
+                .chain(std::iter::once(login_service_config_file(&home))),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -653,6 +671,21 @@ pub(crate) fn manages_instance_until(
                 .chain(std::iter::once(crate::config::config_file_path())),
         )
     }
+}
+
+/// The user config file the login service's daemon reads: `config_file_path`
+/// without a build's `XDG_CONFIG_HOME` (the fork's fallback in
+/// [`manages_instance_until`]).
+#[cfg(target_os = "linux")]
+fn login_service_config_file(home: &Path) -> PathBuf {
+    home.join(".config").join("kache").join("config.toml")
+}
+
+/// The store the login service's daemon keeps without a configured one:
+/// `default_cache_dir` without a build's `XDG_CACHE_HOME`.
+#[cfg(target_os = "linux")]
+fn login_service_cache_dir(home: &Path) -> PathBuf {
+    home.join(".cache").join("kache")
 }
 
 #[cfg(any(test, not(target_os = "linux")))]
@@ -723,7 +756,6 @@ fn startup_log_for(managed: bool, runtime_log: PathBuf) -> StartupLog {
     }
 }
 
-#[cfg(any(test, not(target_os = "linux")))]
 fn configured_instance_matches(
     requested_socket: &Path,
     mut store: PathBuf,
@@ -1583,6 +1615,23 @@ mod tests {
             error
                 .to_string()
                 .contains("reading login service configuration")
+        );
+    }
+
+    /// The fork's fallback for a unit the manager probe cannot read: the
+    /// service's store is the home folder's cache, whatever a build's
+    /// `XDG_CACHE_HOME` says, and its config the home folder's file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_login_services_default_store_is_the_home_folders_cache() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            login_service_cache_dir(home),
+            PathBuf::from("/home/someone/.cache/kache")
+        );
+        assert_eq!(
+            login_service_config_file(home),
+            PathBuf::from("/home/someone/.config/kache/config.toml")
         );
     }
 
