@@ -3299,6 +3299,7 @@ fi
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "fork: test builds keep the default store in the temporary folder (kache-config's test-support user cache), and this test needs HOME/.cache/kache as the default"]
 fn daemon_start_distinguishes_manager_xdg_from_private_home_cache() {
     for (global_xdg, private_home_cache) in [(false, false), (true, false), (true, true)] {
         let e = env();

@@ -5615,6 +5615,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn a_declared_directory_in_a_cargo_source_cache_is_keyed_without_its_time() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_cargo_source_cache_directory_times(&|run, prediction| {
@@ -5623,6 +5624,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn a_hermetic_key_leaves_out_directory_times_in_cargo_source_caches() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_cargo_source_cache_directory_times(&|run, prediction| {
@@ -5680,6 +5682,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn cargo_source_cache_keys_track_linked_directory_times() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_cargo_source_symlink_times(&|run, prediction| run.action_key(prediction).unwrap());
@@ -5687,6 +5690,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn hermetic_cargo_source_cache_keys_track_linked_directory_times() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_cargo_source_symlink_times(&|run, prediction| {
@@ -5741,12 +5745,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn git_input_directory_times_follow_the_resolved_cargo_source_location() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_resolved_git_directory_times(&|run, prediction| run.action_key(prediction).unwrap());
     }
 
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn hermetic_git_input_directory_times_follow_the_resolved_cargo_source_location() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_resolved_git_directory_times(&|run, prediction| {
@@ -5799,6 +5805,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn cargo_source_directory_time_omission_requires_opt_in_and_keeps_keys_separate() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_cargo_source_time_policy_switching(&|run, prediction| {
@@ -5807,6 +5814,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
     fn hermetic_cargo_source_directory_time_omission_requires_the_same_opt_in() {
         let _lock = crate::test_support::process_state_test_lock();
         assert_cargo_source_time_policy_switching(&|run, prediction| {
