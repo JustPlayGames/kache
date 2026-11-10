@@ -20,7 +20,10 @@
 //!   stalled that long is critical. The cgroup's own `memory.pressure` is
 //!   read when there is one, so a container sees its limit rather than the
 //!   host's: the cgroup of the client a daemon-run compile serves, where the
-//!   compiler runs.
+//!   compiler runs. A critical reading while the memory available is at
+//!   least [`ROOMY_RESERVES`] times the gate's reserve moves the ceiling as a
+//!   warning does (see [`ceiling_level`]): such stalls are reclaim of a full
+//!   page cache, not a shortage.
 //! - Windows: no stall measure exists, so the memory the machine has left:
 //!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
 //!   total, or commit (physical memory and page file) under
@@ -137,6 +140,34 @@ pub(crate) fn fits(reading: MemoryReading, pending: u64, expected: u64, measured
         _ => (reading.available, reserve_bytes(reading.total)),
     };
     available.saturating_sub(pending).saturating_sub(expected) >= reserve
+}
+
+/// How many reserves ([`reserve_bytes`]) of memory must be available for a
+/// Linux critical reading to move the ceiling as a warning: 40 % of the
+/// memory with the default reserve.
+pub(crate) const ROOMY_RESERVES: u64 = 2;
+
+/// The level a reading moves the ceiling by on Linux, given the memory
+/// `reading` the gate sees.
+///
+/// Linux counts time in compaction and in direct reclaim of page cache as a
+/// memory stall, so a machine that keeps most of its memory as cache reads
+/// critical under a burst of allocations while far from short: on a 196 GB
+/// build machine critical readings came every busy hour with 178-185 GB
+/// available, and each one ran every compile of the cache one at a time.
+/// While the memory available is at least [`ROOMY_RESERVES`] reserves, a
+/// critical reading therefore halves the ceiling, as a warning does; below
+/// that, or without a reading, it is one slot as before. The gate ([`fits`])
+/// still weighs every compile against the memory itself.
+pub(crate) fn ceiling_level(level: Level, reading: Option<MemoryReading>) -> Level {
+    match (level, reading) {
+        (Level::Critical, Some(reading))
+            if reading.available >= reserve_bytes(reading.total).saturating_mul(ROOMY_RESERVES) =>
+        {
+            Level::Warning
+        }
+        _ => level,
+    }
 }
 
 /// `[cache] scheduler_memory_pressure`, set once at wrapper startup.
@@ -290,7 +321,9 @@ pub(crate) fn ask(weight: u32, pool: u32, ceiling: u32) -> u32 {
 
 /// The most slots compiles may hold, as the readings so far have moved it.
 ///
-/// - Critical: one slot, at once.
+/// - Critical: one slot, at once. On Linux, only while memory is short (see
+///   [`ceiling_level`]); a critical stall with room to spare moves it as a
+///   warning.
 /// - Warning: half the slots, rounded up, at most once per [`SETTLE`]. A
 ///   warning that persists keeps halving down to the compile reserve (see
 ///   [`super::reserve_for`]), so compiles keep a quarter of the pool while
@@ -387,10 +420,24 @@ pub(crate) fn ceiling(root: &Path, pool: u32) -> u32 {
     ceiling_observed(root, pool).0
 }
 
+/// The ceiling for this wrapper's pool after taking a reading, and the
+/// level read (not the one it moved the ceiling by: see [`ceiling_level`]).
 pub(crate) fn ceiling_observed(root: &Path, pool: u32) -> (u32, Option<Level>) {
     let level = now();
     let ceiling = match level {
-        Some(level) => shared(root, pool, level, super::queue::millis(SystemTime::now())),
+        Some(level) => {
+            let moved_by = if cfg!(target_os = "linux") && level == Level::Critical {
+                ceiling_level(level, memory_now())
+            } else {
+                level
+            };
+            shared(
+                root,
+                pool,
+                moved_by,
+                super::queue::millis(SystemTime::now()),
+            )
+        }
         None => pool,
     };
     (ceiling, level)
@@ -1014,6 +1061,64 @@ mod tests {
             set_enabled(true);
             assert_eq!(now(), Some(Level::Critical));
         }
+        force(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_critical_stall_with_memory_to_spare_halves_instead_of_one_slot() {
+        const GIB: u64 = 1 << 30;
+        let reading = |available| MemoryReading {
+            available,
+            total: 196 * GIB,
+            reclaimable: None,
+        };
+        let roomy = 2 * reserve_bytes(196 * GIB);
+        force(Some(Level::Critical));
+        for (memory, first, sustained, why) in [
+            (
+                Some(reading(180 * GIB)),
+                96,
+                48,
+                "reclaim stalls, 180 of 196 GB available",
+            ),
+            (
+                Some(reading(roomy)),
+                96,
+                48,
+                "exactly two reserves available",
+            ),
+            (
+                Some(reading(roomy - 1)),
+                1,
+                1,
+                "short of two reserves: one slot",
+            ),
+            (None, 1, 1, "no memory reading: one slot"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            force_memory(memory);
+            assert_eq!(super::ceiling(dir.path(), 192), first, "{why}");
+            assert_eq!(
+                ceiling_observed(dir.path(), 192).1,
+                Some(Level::Critical),
+                "the level read is still reported as critical"
+            );
+            // Halving waits a settling period: age the stored cut by hand.
+            for _ in 0..4 {
+                let record = dir.path().join("pressure");
+                let mut stored = stored(&record);
+                stored.cut = stored.cut.saturating_sub(SETTLE_MS);
+                std::fs::write(&record, stored.render()).unwrap();
+                super::ceiling(dir.path(), 192);
+            }
+            assert_eq!(
+                super::ceiling(dir.path(), 192),
+                sustained,
+                "{why}: sustained"
+            );
+        }
+        force_memory(None);
         force(None);
     }
 
