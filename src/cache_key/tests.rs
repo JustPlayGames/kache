@@ -23058,12 +23058,13 @@ mod build_script_target_paths {
             };
             // Ours drops the target folder's name from every `-L` kind under the unit's
             // target (a search path's spelling never reaches an output; what it finds is
-            // keyed by the scans), upstream only from rlib native paths in OUT_DIR. Units
-            // whose sources keep absolute paths (trybuild, coverage) stay apart by other
-            // fields in both.
+            // keyed by the scans), upstream only from rlib native paths in OUT_DIR. A
+            // coverage unit keeps every raw prefix and stays apart; a trybuild unit keeps
+            // OUT_DIR's prefix only when it reads from OUT_DIR (upstream #1879), which this
+            // one does not, so with ours it shares its key across target folders.
             let (ka, kb) = (key(&a, &out_a), key(&b, &out_b));
             let label = format!("{kind} {crate_type} {extra:?}");
-            if matches!(extra, ["--cfg=trybuild"] | ["-Cinstrument-coverage"]) {
+            if matches!(extra, ["-Cinstrument-coverage"]) {
                 assert_ne!(ka.0, kb.0, "{label}");
             } else {
                 assert_eq!(ka.0, kb.0, "{label}: inside the unit's target folder");

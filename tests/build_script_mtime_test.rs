@@ -437,6 +437,7 @@ fn registry_fixture(source: &Path, cargo_home: &Path) -> PathBuf {
 /// stamps every directory with the time of the unpack, so a fresh Cargo home
 /// gives a declared directory there a new time over the same files.
 #[test]
+#[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
 fn a_fresh_unpack_in_the_cargo_home_keeps_the_script_run() {
     build_kache();
     let temp = tempfile::tempdir().unwrap();
@@ -515,6 +516,7 @@ fn assert_explicit_cargo_source_directory_keeps_its_observed_time(hermetic: bool
 }
 
 #[test]
+#[ignore = "fork: run keys are content-only (inputs::RUN_KEYS_INPUT_TIMES); upstream #1881 tests timed keys"]
 fn an_explicit_cargo_source_directory_keeps_its_observed_time_by_default() {
     assert_explicit_cargo_source_directory_keeps_its_observed_time(false);
 }
