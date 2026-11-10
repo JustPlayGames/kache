@@ -35,7 +35,8 @@
 //! ([`fits`]) admits a compile only while the memory available now, less
 //! what compiles admitted in the last moments are still expected to take
 //! and less the compile's own expected peak, stays above a reserve: the
-//! larger of [`RESERVE_PERCENT`] of the memory and [`RESERVE_FLOOR`]. The
+//! larger of [`RESERVE_PERCENT`] of the memory and a floor, [`RESERVE_FLOOR`]
+//! or a quarter of the memory where that is less. The
 //! available memory is what the operating system reports, so it sees
 //! everything else on the machine (a WSL2 VM, an IDE, a browser, another
 //! user's builds), which slots sized from total memory never did. One
@@ -76,13 +77,25 @@ pub(crate) const WINDOWS_MIN_COMMIT_PERCENT: u64 = 5;
 /// Share of the machine's memory, in percent, the memory gate keeps free.
 pub(crate) const RESERVE_PERCENT: u64 = 20;
 
-/// The least memory the gate keeps free, whatever the share: below this a
-/// desktop pages out.
+/// The least memory the gate keeps free, whatever the share, on a machine
+/// with 16 GiB or more: below this a desktop pages out.
 pub(crate) const RESERVE_FLOOR: u64 = 4 * 1024 * 1024 * 1024;
 
-/// The memory the gate keeps free on a machine with `total` bytes.
+/// The floor on a machine with less than 16 GiB is the memory divided by
+/// this, a quarter, where [`RESERVE_FLOOR`] would be most of what an idle
+/// desktop leaves: on 8 GB Windows (about 5 GB available idle) a 4 GiB
+/// floor let one compile run at a time, and a cold build of a 1,200-unit
+/// workspace took 4,554 s against 1,665 s with the gate off. A quarter
+/// (2 GiB there) still keeps the desktop's share free.
+pub(crate) const SMALL_RESERVE_DIVISOR: u64 = 4;
+
+/// The memory the gate keeps free on a machine with `total` bytes: the
+/// larger of [`RESERVE_PERCENT`] and a floor of [`RESERVE_FLOOR`], or of a
+/// quarter of the memory ([`SMALL_RESERVE_DIVISOR`]) where that is less.
+/// From 16 GiB up the floor is [`RESERVE_FLOOR`], as before.
 pub(crate) fn reserve_bytes(total: u64) -> u64 {
-    (total / 100 * RESERVE_PERCENT).max(RESERVE_FLOOR)
+    let floor = (total / SMALL_RESERVE_DIVISOR).min(RESERVE_FLOOR);
+    (total / 100 * RESERVE_PERCENT).max(floor)
 }
 
 /// Share of the memory, in percent, the gate keeps free while every compile
@@ -1065,13 +1078,17 @@ mod tests {
     }
 
     #[test]
-    fn the_reserve_is_a_fifth_of_memory_and_never_under_4_gib() {
+    fn the_reserve_is_a_fifth_of_memory_over_a_floor_of_4_gib_or_a_quarter() {
         const GIB: u64 = 1 << 30;
-        assert_eq!(reserve_bytes(8 * GIB), 4 * GIB);
+        // Under 16 GiB the floor is a quarter of the memory: 8 GiB keeps 2.
+        assert_eq!(reserve_bytes(8 * GIB), 2 * GIB);
+        assert_eq!(reserve_bytes(12 * GIB), 3 * GIB);
+        // From 16 GiB up, as before: 4 GiB, then a fifth.
+        assert_eq!(reserve_bytes(16 * GIB), 4 * GIB);
         assert_eq!(reserve_bytes(20 * GIB), 4 * GIB);
         assert_eq!(reserve_bytes(64 * GIB), 64 * GIB / 100 * 20);
         assert_eq!(reserve_bytes(196 * GIB), 196 * GIB / 100 * 20);
-        assert_eq!(reserve_bytes(0), 4 * GIB);
+        assert_eq!(reserve_bytes(0), 0);
     }
 
     #[test]
