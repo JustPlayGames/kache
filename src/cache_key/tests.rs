@@ -22890,3 +22890,53 @@ fn out_dir_include_spellings_share_one_collapsed_fingerprint() {
         "a crate-relative dotted spelling stays as rustc recorded it"
     );
 }
+
+/// rust-embed lists each embedded file twice on Windows, as the canonical
+/// `\\?\C:\…\a.svg` it includes and as the `C:\…/a.svg` it tracks: the
+/// file is read once and both spellings get its hash.
+#[cfg(windows)]
+#[test]
+fn a_windows_file_named_twice_in_one_closure_is_read_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("icons").join("bot.svg");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"<svg/>").unwrap();
+    // Only a settled stamp carries a hash to another spelling, as for a memo
+    // row: NTFS's change time cannot be set back, so wait it out.
+    std::thread::sleep(std::time::Duration::from_nanos(
+        u64::try_from(HASH_SETTLE_NS).unwrap() + 100_000_000,
+    ));
+    let verbatim = std::fs::canonicalize(&file).unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let plain = PathBuf::from(format!(
+        "{}/icons/bot.svg",
+        root.to_str().unwrap().trim_start_matches(r"\\?\")
+    ));
+    assert_ne!(verbatim, plain, "two spellings of one file");
+    let hasher = FileHasher::persistent(&dir.path().join("index.db"));
+    let first = hasher.hash(&verbatim).unwrap();
+    assert_eq!(hasher.hash(&plain).unwrap(), first);
+    assert_eq!(
+        hasher.stats().cache_misses,
+        1,
+        "the second spelling reuses the first read"
+    );
+    // Each spelling keeps a stamp under its own path, which the env-use scan
+    // and the checks after the compile stat again: the first one's would
+    // read as a changed file there.
+    for spelling in [&verbatim, &plain] {
+        let recent = hasher.recent_hashes.borrow().get(spelling).cloned().unwrap();
+        assert_eq!(
+            recent.fingerprint,
+            Some(FileFingerprint::from_path(spelling).unwrap())
+        );
+    }
+    hasher
+        .env_dep_use(&plain, "OUT_DIR")
+        .expect("the second spelling scans as unchanged");
+    // Another file is still read.
+    let other = dir.path().join("icons").join("other.svg");
+    std::fs::write(&other, b"<svg/>").unwrap();
+    hasher.hash(&other).unwrap();
+    assert_eq!(hasher.stats().cache_misses, 2);
+}
