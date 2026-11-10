@@ -177,16 +177,14 @@ pub(super) fn restore(environment: &Environment, link: &RootedSymlink) -> Result
         );
     }
     let path = environment.out_dir.join(name);
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, path)?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    anyhow::bail!(
-        "build-script symlinks are only restored on Unix: {}",
-        path.display()
-    )
+    // The roots are canonical, which on Windows spells them `\\?\C:\...`;
+    // the link names the plain form, as the build script's own link did.
+    #[cfg(windows)]
+    let target = match target.to_str() {
+        Some(spelled) => PathBuf::from(kache_fs::paths::strip_verbatim_prefix(spelled).as_ref()),
+        None => target,
+    };
+    super::create_symlink(&target, &path)
 }
 
 #[cfg(all(test, unix))]
