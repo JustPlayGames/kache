@@ -3057,6 +3057,13 @@ fn try_open_index_db(db_path: &Path, mode: IndexMode) -> std::result::Result<Con
     for attempt in 1..=STORE_OPEN_MAX_ATTEMPTS {
         match Connection::open(db_path).and_then(|db| {
             initialize_db(&db, mode)?;
+            // KACHE-NEXT77 lead only: pragmas a rig round sets on every index connection.
+            if let Ok(pragmas) = std::env::var("KACHE_RIG_PRAGMAS") {
+                for pragma in pragmas.split(';').filter(|p| !p.trim().is_empty()) {
+                    let (name, value) = pragma.split_once('=').expect("name=value");
+                    db.pragma_update(None, name.trim(), value.trim())?;
+                }
+            }
             if DEFER_WAL_CHECKPOINTS.load(Ordering::Relaxed) {
                 db.pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
             }

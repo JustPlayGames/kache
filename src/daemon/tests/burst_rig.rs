@@ -17,6 +17,12 @@
 //! hits), `RIG_SAMPLE` (the threads' state, system call and wait channel
 //! from /proc), and the stamps' time when they are timed (`s`, `base`).
 use super::*;
+#[cfg(feature = "rig-mimalloc")]
+#[global_allocator]
+static RIG_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(feature = "rig-jemalloc")]
+#[global_allocator]
+static RIG_ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -194,6 +200,83 @@ fn sample_threads(done: &AtomicBool) -> std::collections::HashMap<String, usize>
     seen
 }
 
+/// KACHE-NEXT77: process and box counters around a round: the process's
+/// faults and context switches (getrusage, every thread), the box's TLB
+/// shootdown, function-call and reschedule interrupts (/proc/interrupts),
+/// and SQLite's own allocation status.
+fn lead_counters() -> Vec<(&'static str, f64)> {
+    // SAFETY: getrusage writes one `rusage` into the zeroed struct it is
+    // given, which lives on this stack frame for the whole call.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage
+    };
+    let mut out = vec![
+        ("minflt", usage.ru_minflt as f64),
+        ("majflt", usage.ru_majflt as f64),
+        ("nvcsw", usage.ru_nvcsw as f64),
+        ("nivcsw", usage.ru_nivcsw as f64),
+    ];
+    let interrupts = std::fs::read_to_string("/proc/interrupts").unwrap_or_default();
+    for name in ["TLB", "CAL", "RES"] {
+        let total: f64 = interrupts
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{name}:")))
+            .map(|line| {
+                line.split_whitespace()
+                    .skip(1)
+                    .filter_map(|v| v.parse::<f64>().ok())
+                    .sum()
+            })
+            .unwrap_or(-1.0);
+        out.push((name, total));
+    }
+    for (name, op) in [
+        ("sq_malloc_count_hw", rusqlite::ffi::SQLITE_STATUS_MALLOC_COUNT),
+        ("sq_memory_used_hw", rusqlite::ffi::SQLITE_STATUS_MEMORY_USED),
+        ("sq_pagecache_overflow_hw", rusqlite::ffi::SQLITE_STATUS_PAGECACHE_OVERFLOW),
+    ] {
+        let (mut current, mut high) = (0i64, 0i64);
+        // SAFETY: sqlite3_status64 writes two i64 into the locals passed,
+        // which outlive the call; it takes SQLite's own mutex.
+        unsafe { rusqlite::ffi::sqlite3_status64(op, &mut current, &mut high, 1) };
+        out.push((name, high as f64));
+    }
+    out
+}
+
+fn lead_delta(before: &[(&'static str, f64)], after: &[(&'static str, f64)]) -> String {
+    before
+        .iter()
+        .zip(after)
+        .map(|((name, a), (_, b))| {
+            if name.starts_with("sq_") {
+                format!("{name}={b:.0}")
+            } else {
+                format!("{name}={:.0}", b - a)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// KACHE-NEXT77: what the process's threads are doing, from their schedstat:
+/// summed time on a CPU and time runnable but waiting for one, over the
+/// threads alive at both ends of the window.
+fn schedstat_sum() -> std::collections::HashMap<String, (u64, u64)> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+        for task in tasks.flatten() {
+            let text = std::fs::read_to_string(task.path().join("schedstat")).unwrap_or_default();
+            let mut parts = text.split_whitespace().map(|v| v.parse::<u64>().unwrap_or(0));
+            let (run, wait) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+            out.insert(task.file_name().to_string_lossy().into_owned(), (run, wait));
+        }
+    }
+    out
+}
+
 #[test]
 #[ignore = "rig: needs KACHE_BURST_RIG and a copy of an index"]
 fn hit_burst_rig() {
@@ -201,6 +284,21 @@ fn hit_burst_rig() {
         return;
     };
     let dir = PathBuf::from(dir);
+    // KACHE-NEXT77: RIG_MEMSTATUS=0 turns SQLite's allocation statistics
+    // off (each sqlite3_malloc/free then skips the global SQLITE_MUTEX_STATIC_MEM).
+    if std::env::var("RIG_MEMSTATUS").as_deref() == Ok("0") {
+        // SAFETY: nothing in this process uses SQLite yet (the rig runs
+        // alone, --exact); sqlite3_config is only legal while SQLite is shut
+        // down, which sqlite3_shutdown guarantees, and the variadic argument
+        // is the int SQLITE_CONFIG_MEMSTATUS takes.
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_shutdown();
+            let rc = rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0 as libc::c_int);
+            rusqlite::ffi::sqlite3_initialize();
+            rc
+        };
+        println!("memstatus off rc={rc}");
+    }
     let mode = std::env::var("RIG_MODE").unwrap_or_else(|_| "base".into());
     let routed = mode == "all";
     // "base" names none of the three (its 's' is not StampHits: until
@@ -348,6 +446,19 @@ fn hit_burst_rig() {
     });
     let pool_before = kache_store::index_pool_stats();
     let (user0, sys0) = cpu_seconds();
+    let lead0 = lead_counters();
+    let sched_mid = Arc::new(Mutex::new(None::<(std::collections::HashMap<String, (u64, u64)>, std::collections::HashMap<String, (u64, u64)>)>));
+    {
+        let sched_mid = sched_mid.clone();
+        let window = Duration::from_secs_f64((seconds as f64 / 2.0).max(1.0));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            let a = schedstat_sum();
+            std::thread::sleep(window);
+            let b = schedstat_sum();
+            *sched_mid.lock().expect("sched") = Some((a, b));
+        });
+    }
     let start = Instant::now() + Duration::from_millis(200);
     let times = Arc::new(Mutex::new(Times::default()));
     let failures = Arc::new(AtomicUsize::new(0));
@@ -483,6 +594,23 @@ fn hit_burst_rig() {
     }
     let wall = start.elapsed().as_secs_f64();
     let (user1, sys1) = cpu_seconds();
+    let lead1 = lead_counters();
+    println!("lead {}", lead_delta(&lead0, &lead1));
+    if let Some((a, b)) = sched_mid.lock().expect("sched").take() {
+        let (mut run, mut wait, mut n) = (0u64, 0u64, 0usize);
+        for (tid, (r1, w1)) in &b {
+            if let Some((r0, w0)) = a.get(tid) {
+                run += r1 - r0;
+                wait += w1 - w0;
+                n += 1;
+            }
+        }
+        println!(
+            "schedstat window threads={n} on_cpu_s={:.1} runqueue_wait_s={:.1}",
+            run as f64 / 1e9,
+            wait as f64 / 1e9
+        );
+    }
     let pool_after = kache_store::index_pool_stats();
     // Let the ticks write what was handed over, as the daemon does.
     std::thread::sleep(Duration::from_millis(600));
