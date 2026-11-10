@@ -9193,6 +9193,9 @@ pub struct FileHasher<'db> {
     discovery_flight: RefCell<Option<crate::store::StoreLock>>,
     prefetched: RefCell<HashMap<FileFingerprint, PrefetchedHash>>,
     recent_hashes: RefCell<HashMap<PathBuf, RecentHash>>,
+    /// The hash and stamp of the first spelling hashed of each file, by its
+    /// plain spelling ([`plain_spelling`]): Windows only, empty elsewhere.
+    spellings: RefCell<HashMap<PathBuf, (String, ObservedFingerprint)>>,
     env_dep_uses: RefCell<HashMap<(String, String), SourceEnvDepUse>>,
     stats: FileHashStatsCells,
     too_new: TooNewGuard,
@@ -9305,6 +9308,43 @@ struct RecentHash {
     header_scan: Option<(i64, String)>,
 }
 
+/// The Win32 spelling of an absolute `path` on a drive: `\\?\C:\a\b`,
+/// `C:\a/b` and `c:\a\b` all give `C:\a\b`, the one file they name. `None`
+/// for any other path, and for one whose two spellings could name different
+/// files: a `.` or `..` (resolved by Win32, literal after `\\?\`), a name
+/// ending in a dot or a space (stripped by Win32 only), a `/` inside a
+/// verbatim name, a UNC or device path. Always `None` off Windows.
+#[cfg(windows)]
+fn plain_spelling(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut plain = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
+                    plain.push(format!("{}:", char::from(disk.to_ascii_uppercase())));
+                }
+                _ => return None,
+            },
+            Component::RootDir => plain.push("\\"),
+            Component::Normal(name) => {
+                let name = name.to_str()?;
+                if name.ends_with(['.', ' ']) || name.contains('/') {
+                    return None;
+                }
+                plain.push(name);
+            }
+            Component::CurDir | Component::ParentDir => return None,
+        }
+    }
+    plain.is_absolute().then_some(plain)
+}
+
+#[cfg(not(windows))]
+fn plain_spelling(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// [`hash_file`], for a read that follows a stat of the same file.
 fn read_file_hash(path: &Path) -> Result<String> {
     #[cfg(test)]
@@ -9368,6 +9408,7 @@ impl FileHasher<'static> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
+            spellings: RefCell::new(HashMap::new()),
             env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
@@ -9397,6 +9438,7 @@ impl FileHasher<'static> {
                 discovery_flight: RefCell::new(None),
                 prefetched: RefCell::new(HashMap::new()),
                 recent_hashes: RefCell::new(HashMap::new()),
+            spellings: RefCell::new(HashMap::new()),
                 env_dep_uses: RefCell::new(HashMap::new()),
                 stats: FileHashStatsCells::default(),
                 too_new: TooNewGuard::default(),
@@ -9613,6 +9655,7 @@ impl<'db> FileHasher<'db> {
             discovery_flight: RefCell::new(None),
             prefetched: RefCell::new(HashMap::new()),
             recent_hashes: RefCell::new(HashMap::new()),
+            spellings: RefCell::new(HashMap::new()),
             env_dep_uses: RefCell::new(HashMap::new()),
             stats: FileHashStatsCells::default(),
             too_new: TooNewGuard::default(),
@@ -10775,10 +10818,19 @@ impl<'db> FileHasher<'db> {
     fn hash_and_record(&self, path: &Path) -> Result<RecentHash> {
         let _trace = crate::phase_trace::phase("input_hash");
         let resolved = self.resolve_path(path)?;
+        if let Some(recent) = self.hashed_under_another_spelling(&resolved) {
+            return Ok(recent);
+        }
         let path = resolved.as_path();
         let (hash, observed) = self.hash_inner(path, true)?;
         if let Some(observed) = &observed {
             self.guard_input(observed);
+            if let Some(plain) = plain_spelling(&resolved) {
+                self.spellings
+                    .borrow_mut()
+                    .entry(plain)
+                    .or_insert_with(|| (hash.clone(), observed.clone()));
+            }
         }
         let recent = RecentHash {
             hash,
@@ -10789,6 +10841,46 @@ impl<'db> FileHasher<'db> {
             .borrow_mut()
             .insert(resolved, recent.clone());
         Ok(recent)
+    }
+
+    /// The hash this process already took of the file `resolved` names,
+    /// under another spelling of it. On Windows one closure can name a file
+    /// twice: rust-embed's `include_bytes!` of the canonical
+    /// `\\?\C:\…\assets\a.svg` and the `C:\…\pkg/assets/a.svg` it
+    /// tracks, so a crate that embeds 1,830 icons listed 3,666 sources and
+    /// read each file twice per key. This spelling takes the first one's
+    /// hash while the file keeps the settled stamp it had then, under its
+    /// own path, and joins the too-new guard with it, so the checks after
+    /// the compile stat it as they would have.
+    fn hashed_under_another_spelling(&self, resolved: &Path) -> Option<RecentHash> {
+        let plain = plain_spelling(resolved)?;
+        let (hash, first) = self.spellings.borrow().get(&plain).cloned()?;
+        if first.fingerprint.path == resolved.to_str()? || !first.settled() {
+            return None;
+        }
+        // The file may have been written since: only the same strong stamp
+        // (size, times, NTFS file index) carries the hash over, as a memo
+        // row would.
+        let observed = ObservedFingerprint::from_path(resolved).ok()?;
+        let now = &observed.fingerprint;
+        let first = &first.fingerprint;
+        if !file_hash_memo_eligible(now.inode, cfg!(windows))
+            || (now.size, now.mtime_ns, now.ctime_ns, now.inode)
+                != (first.size, first.mtime_ns, first.ctime_ns, first.inode)
+        {
+            return None;
+        }
+        self.record_hit();
+        self.guard_input(&observed);
+        let recent = RecentHash {
+            hash,
+            fingerprint: Some(observed.fingerprint),
+            header_scan: None,
+        };
+        self.recent_hashes
+            .borrow_mut()
+            .insert(resolved.to_path_buf(), recent.clone());
+        Some(recent)
     }
 
     /// Validate and hash a compiled resource from one open file. Whole-file
