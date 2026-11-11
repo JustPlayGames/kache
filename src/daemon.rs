@@ -3705,25 +3705,36 @@ impl Daemon {
         }
     }
 
-    /// Write the memo rows wrappers handed over, in one transaction on the
-    /// hash store's connection. Rows that no longer describe their file are
-    /// left out ([`Store::write_handed_memo_rows`]); a batch the index
-    /// refused stays for the next call.
+    /// Write the memo rows wrappers handed over, on the hash store's
+    /// connection, in transactions that each hold the write lock briefly.
+    /// Rows that no longer describe their file are left out
+    /// ([`Store::write_handed_memo_rows`]); the rows the index refused stay
+    /// for the next call.
     fn flush_handed_memo_rows(&self) {
         let batch = match self.pending_memo_rows.lock() {
             Ok(mut pending) if !pending.is_empty() => std::mem::take(&mut *pending),
             _ => return,
         };
-        match self.with_hash_store(|store| Ok(store.write_handed_memo_rows(&batch)?)) {
-            Ok(written) => tracing::debug!(rows = batch.len(), written, "handed memo rows"),
+        let left = match self.with_hash_store(|store| Ok(store.write_handed_memo_rows(&batch))) {
+            Ok(Ok(written)) => {
+                tracing::debug!(rows = batch.len(), written, "handed memo rows");
+                return;
+            }
+            // Only the rows the index refused go back: those before the
+            // refusal are committed ([`Store::write_handed_memo_rows`]).
+            Ok(Err(left)) => {
+                tracing::debug!("handed memo rows not written yet: {left}");
+                left.rows
+            }
             Err(error) => {
                 tracing::debug!("handed memo rows not written yet: {error:#}");
-                if let Ok(mut pending) = self.pending_memo_rows.lock() {
-                    let room = MAX_PENDING_MEMO_ROWS.saturating_sub(pending.len());
-                    let kept: Vec<_> = batch.into_iter().take(room).collect();
-                    pending.splice(0..0, kept);
-                }
+                batch
             }
+        };
+        if let Ok(mut pending) = self.pending_memo_rows.lock() {
+            let room = MAX_PENDING_MEMO_ROWS.saturating_sub(pending.len());
+            let kept: Vec<_> = left.into_iter().take(room).collect();
+            pending.splice(0..0, kept);
         }
     }
 

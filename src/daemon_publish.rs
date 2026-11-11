@@ -686,13 +686,14 @@ fn publish_staged_batch(
             store.shared_output_memo_row(Path::new(path), &output.hash, output.redated)
         })
         .collect();
-    // One short write for the whole batch; a busy index leaves the rows to
-    // the daemon's next flush rather than holding the keys for them.
+    // Short writes for the whole batch; a busy index leaves the rows it
+    // refused to the daemon's next flush rather than holding the keys for
+    // them.
     if !rows.is_empty()
-        && let Err(error) = store.write_handed_memo_rows(&rows)
+        && let Err(left) = store.write_handed_memo_rows(&rows)
     {
-        tracing::debug!(rows = rows.len(), "memo rows of a batch deferred: {error}");
-        daemon.defer_memo_rows(rows);
+        tracing::debug!("memo rows of a batch deferred: {left}");
+        daemon.defer_memo_rows(left.rows);
     }
     for published in published {
         release(daemon, config, published);

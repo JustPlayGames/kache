@@ -17249,6 +17249,163 @@ fn memo_row_for(path: &Path, redated: bool) -> MemoRow {
     }
 }
 
+/// Make every `event` (`INSERT`, `DELETE`) on `table` slow, as a cold page
+/// cache makes it on a large index: a trigger counts a million-row join.
+/// Returns what one such row costs.
+fn slow_rows(side: &Connection, table: &str, event: &str, probe: &str) -> Duration {
+    side.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS slow_n (x);
+         DELETE FROM slow_n;
+         WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000)
+             INSERT INTO slow_n SELECT x FROM c;
+         CREATE TABLE IF NOT EXISTS slow_sink (n);
+         CREATE TRIGGER slow_{table} AFTER {event} ON {table}
+             BEGIN INSERT INTO slow_sink SELECT count(*) FROM slow_n a, slow_n b; END;"
+    ))
+    .unwrap();
+    side.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    side.execute_batch(probe).unwrap();
+    let cost = started.elapsed();
+    side.execute_batch("ROLLBACK").unwrap();
+    cost
+}
+
+/// Whether `side` gets the index's write lock within `deadline`, asking as
+/// the daemon's publish worker does: again every few milliseconds.
+fn takes_the_write_lock_within(side: &Connection, deadline: Duration) -> bool {
+    side.busy_timeout(Duration::ZERO).unwrap();
+    let started = std::time::Instant::now();
+    while started.elapsed() < deadline {
+        if side.execute_batch("BEGIN IMMEDIATE").is_ok() {
+            side.execute_batch("ROLLBACK").unwrap();
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    false
+}
+
+/// Wait until something else holds the index's write lock.
+fn until_the_write_lock_is_held(side: &Connection) {
+    side.busy_timeout(Duration::ZERO).unwrap();
+    let started = std::time::Instant::now();
+    while side.execute_batch("BEGIN IMMEDIATE").is_ok() {
+        side.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the writer under test never took the write lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A memo write of many rows, each slow as on a cold page cache, holds the
+/// index's write lock a transaction at a time, so a store that asks for the
+/// lock while it runs gets it within a few of the writer's transactions,
+/// not after all its rows (KACHE-NEXT103: a seeding's rows in one
+/// transaction held the lock 20-40 s, and the publish worker's stores
+/// failed). Every row is still written.
+#[test]
+fn a_long_memo_write_lets_a_waiting_store_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let side = Connection::open(dir.path().join("index.db")).unwrap();
+    let row_cost = slow_rows(
+        &side,
+        "file_hashes",
+        "INSERT",
+        "INSERT INTO file_hashes (path, size, mtime_ns, hash) VALUES ('/probe', 1, 1, 'h')",
+    );
+    let wait = (WRITE_LOCK_HOLD + row_cost) * 3 + WRITE_LOCK_YIELD;
+    let count = (wait.as_secs_f64() * 3.0 / row_cost.as_secs_f64()).ceil() as usize + 2;
+    let rows: Vec<MemoRow> = (0..count)
+        .map(|n| {
+            let file = dir.path().join(format!("lib{n}.rlib"));
+            fs::write(&file, vec![n as u8; 128 * 1024]).unwrap();
+            memo_row_for(&file, false)
+        })
+        .collect();
+
+    let writer = {
+        let rows = rows.clone();
+        std::thread::spawn(move || store.write_handed_memo_rows(&rows).map(|n| (n, store)))
+    };
+    until_the_write_lock_is_held(&side);
+    let got_in = takes_the_write_lock_within(&side, wait);
+    let (written, store) = writer.join().unwrap().unwrap();
+
+    assert!(
+        got_in,
+        "{count} rows of {row_cost:?} each kept the write lock past {wait:?}"
+    );
+    assert_eq!(written, count);
+    for row in &rows {
+        assert_eq!(
+            store.file_hash_at(&row.fingerprint).as_ref(),
+            Some(&row.hash)
+        );
+    }
+}
+
+/// The tombstone prune, which finds its rows by a stamp no index covers,
+/// deletes them a short transaction at a time: a store that asks for the
+/// lock while it runs gets it (KACHE-NEXT103: one `DELETE` over 1.3 million
+/// tombstones held the lock 32-57 s under load). Old rows of both tables go,
+/// recent ones stay.
+#[test]
+fn a_long_tombstone_prune_lets_a_waiting_store_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let side = Connection::open(dir.path().join("index.db")).unwrap();
+    side.execute(
+        "INSERT INTO eviction_tombstones (cache_key, evicted_at) VALUES ('probe', datetime('now'))",
+        [],
+    )
+    .unwrap();
+    let row_cost = slow_rows(
+        &side,
+        "eviction_tombstones",
+        "DELETE",
+        "DELETE FROM eviction_tombstones WHERE cache_key = 'probe'",
+    );
+    let wait = (WRITE_LOCK_HOLD + row_cost) * 3 + WRITE_LOCK_YIELD;
+    let count = (wait.as_secs_f64() * 3.0 / row_cost.as_secs_f64()).ceil() as usize + 2;
+    side.execute_batch(&format!(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {count})
+             INSERT INTO eviction_tombstones (cache_key, evicted_at)
+             SELECT 'old' || x, datetime('now', '-30 days') FROM c;
+         INSERT INTO shadow_victims (cache_key, swept_at, shadow_policy) VALUES
+             ('old-shadow', datetime('now', '-30 days'), 'p'),
+             ('new-shadow', datetime('now'), 'p');"
+    ))
+    .unwrap();
+
+    let pruner = std::thread::spawn(move || store.prune_tombstones(14).map(|n| (n, store)));
+    until_the_write_lock_is_held(&side);
+    let got_in = takes_the_write_lock_within(&side, wait);
+    let (removed, store) = pruner.join().unwrap().unwrap();
+
+    assert!(
+        got_in,
+        "a prune of {count} tombstones of {row_cost:?} each kept the write lock past {wait:?}"
+    );
+    assert_eq!(removed, count);
+    assert_eq!(
+        store.tombstone_stats().unwrap().0,
+        1,
+        "the recent one stays"
+    );
+    let shadows: Vec<String> = side
+        .prepare("SELECT cache_key FROM shadow_victims")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(shadows, ["new-shadow"]);
+}
+
 /// A store with a sink hands its memo rows over when the index is busy,
 /// rather than waiting for the lock and then dropping them.
 #[test]
