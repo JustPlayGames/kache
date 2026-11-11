@@ -1716,6 +1716,47 @@ const MEMO_ROW_HANDOFF_WAIT: Duration = Duration::from_millis(5);
 /// How long a store without a sink waits before it drops its memo rows.
 const MEMO_ROW_WAIT: Duration = Duration::from_millis(100);
 
+/// The longest one bookkeeping transaction of many rows (memo rows, the
+/// tombstone prune) holds the index's write lock before it commits and lets
+/// the stores waiting for the lock in.
+pub const WRITE_LOCK_HOLD: Duration = Duration::from_millis(100);
+
+/// How long such a writer leaves the lock free between two of its
+/// transactions: longer than the publish worker's 20 ms attempts and the
+/// longest sleep of SQLite's busy handler below that (10 ms), so a store
+/// already waiting gets in before the next transaction starts.
+pub const WRITE_LOCK_YIELD: Duration = Duration::from_millis(25);
+
+/// The rows of a memo write a busy index refused, after `written` rows that
+/// it committed before the refusal.
+#[derive(Debug)]
+pub struct MemoRowsLeft {
+    /// Rows committed before the refusal.
+    pub written: usize,
+    /// The rows not written, in their order.
+    pub rows: Vec<MemoRow>,
+    /// Why the index refused them.
+    pub error: rusqlite::Error,
+}
+
+impl std::fmt::Display for MemoRowsLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} memo rows not written ({} written): {}",
+            self.rows.len(),
+            self.written,
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for MemoRowsLeft {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Note that a daemon took bookkeeping rows (memo rows, a target root,
 /// prediction rows) a busy index refused. It holds for the current
 /// invocation scope (`InvocationLinkScope`), else for the process.
@@ -3658,26 +3699,28 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         } else {
             MEMO_ROW_WAIT
         };
-        let Err(mut error) = self.write_memo_rows(&rows, wait) else {
+        let Err(mut left) = self.write_memo_rows(&rows, wait) else {
             return;
         };
-        if self.hand_busy_memo_rows(&rows) {
+        if self.hand_busy_memo_rows(&left.rows) {
             tracing::debug!(
-                rows = rows.len(),
-                "memo rows handed off (index busy): {error}"
+                rows = left.rows.len(),
+                "memo rows handed off (index busy): {}",
+                left.error
             );
             return;
         }
         // Nowhere took them: wait as long as a store without a sink would.
         if wait < MEMO_ROW_WAIT {
-            match self.write_memo_rows(&rows, MEMO_ROW_WAIT) {
+            match self.write_memo_rows(&left.rows, MEMO_ROW_WAIT) {
                 Ok(()) => return,
-                Err(again) => error = again,
+                Err(again) => left = again,
             }
         }
         tracing::debug!(
-            rows = rows.len(),
-            "memo rows not written (index busy): {error}"
+            rows = left.rows.len(),
+            "memo rows not written (index busy): {}",
+            left.error
         );
     }
 
@@ -3701,16 +3744,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.record_verified_file_hashes(verified);
     }
 
-    /// Write rows a [`MemoRowSink`] took, in one transaction with a short
-    /// wait. A row is written only while it still describes its file: the
+    /// Write rows a [`MemoRowSink`] took, in transactions of at most
+    /// [`WRITE_LOCK_HOLD`] each, each with a short wait. A row is written only while it still describes its file: the
     /// file's stamp is the row's, or for a re-dated row the row's but for a
     /// ctime at most [`REDATE_CTIME_WINDOW_NS`] later, with no row for the
     /// current stamp to overwrite. Any other row could never be served, and
-    /// could replace one that can. Returns how many were written; an error
-    /// (a busy index) writes none, and the caller may try again.
+    /// could replace one that can. Returns how many were written; a busy
+    /// index returns the rows it did not take ([`MemoRowsLeft`]), for the
+    /// caller to try again.
     ///
     /// [`REDATE_CTIME_WINDOW_NS`]: crate::file_hash::REDATE_CTIME_WINDOW_NS
-    pub fn write_handed_memo_rows(&self, rows: &[MemoRow]) -> rusqlite::Result<usize> {
+    pub fn write_handed_memo_rows(&self, rows: &[MemoRow]) -> Result<usize, MemoRowsLeft> {
         if self.read_only {
             return Ok(0);
         }
@@ -3750,30 +3794,59 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let _ = self.db().busy_timeout(self.busy_wait.get());
     }
 
-    /// One transaction for `rows`, waiting at most `wait` for the write lock.
-    fn write_memo_rows(&self, rows: &[MemoRow], wait: Duration) -> rusqlite::Result<()> {
-        let _ = self.db().busy_timeout(wait);
-        let written = (|| -> rusqlite::Result<()> {
-            self.db().execute_batch("BEGIN IMMEDIATE")?;
-            let cache = self.file_hash_cache();
-            for row in rows {
-                // A row of any size holds for exactly its stamp. A restore
-                // hands over only rows above the memo's floor, but a key's
-                // rows include small workspace files, whose rows the tree
-                // guard reads.
-                if row.redated {
-                    cache.put_redated(&row.fingerprint, &row.hash)?;
-                } else {
-                    cache.put(&row.fingerprint, &row.hash)?;
-                }
+    /// `rows` in transactions that each hold the index's write lock for at
+    /// most [`WRITE_LOCK_HOLD`] (at least one row each), with the lock left
+    /// free for [`WRITE_LOCK_YIELD`] between them. Each waits at most `wait`
+    /// for the lock. On a refusal the rows before it stay written and the
+    /// rest come back in [`MemoRowsLeft`].
+    ///
+    /// One transaction for a whole batch held the lock for 20-60 s on the
+    /// build machine when a seeding's 6,000-15,000 rows met a page cache
+    /// emptied by memory reclaim, and every store queued behind it failed
+    /// ("the index stayed busy for 20s", KACHE-NEXT103).
+    fn write_memo_rows(&self, rows: &[MemoRow], wait: Duration) -> Result<(), MemoRowsLeft> {
+        let cache = self.file_hash_cache();
+        let mut written = 0;
+        while written < rows.len() {
+            if written > 0 {
+                std::thread::sleep(WRITE_LOCK_YIELD);
             }
-            self.db().execute_batch("COMMIT")
-        })();
-        self.give_back_busy_timeout();
-        if written.is_err() && !self.db().is_autocommit() {
-            let _ = self.db().execute_batch("ROLLBACK");
+            let _ = self.db().busy_timeout(wait);
+            let started = std::time::Instant::now();
+            let mut taken = 0;
+            let committed = (|| -> rusqlite::Result<()> {
+                self.db().execute_batch("BEGIN IMMEDIATE")?;
+                for row in &rows[written..] {
+                    // A row of any size holds for exactly its stamp. A restore
+                    // hands over only rows above the memo's floor, but a key's
+                    // rows include small workspace files, whose rows the tree
+                    // guard reads.
+                    if row.redated {
+                        cache.put_redated(&row.fingerprint, &row.hash)?;
+                    } else {
+                        cache.put(&row.fingerprint, &row.hash)?;
+                    }
+                    taken += 1;
+                    if started.elapsed() >= WRITE_LOCK_HOLD {
+                        break;
+                    }
+                }
+                self.db().execute_batch("COMMIT")
+            })();
+            self.give_back_busy_timeout();
+            if let Err(error) = committed {
+                if !self.db().is_autocommit() {
+                    let _ = self.db().execute_batch("ROLLBACK");
+                }
+                return Err(MemoRowsLeft {
+                    written,
+                    rows: rows[written..].to_vec(),
+                    error,
+                });
+            }
+            written += taken;
         }
-        written
+        Ok(())
     }
 
     /// The memoised hash for `path` at its current stamp, read-only.
@@ -9035,14 +9108,54 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     pub fn prune_tombstones(&self, keep_days: u64) -> Result<usize> {
         self.refuse_write("prune tombstones")?;
         let cutoff = format!("-{keep_days} days");
-        let removed = self.db().execute(
-            "DELETE FROM eviction_tombstones WHERE evicted_at < datetime('now', ?1)",
-            params![cutoff],
-        )?;
-        self.db().execute(
-            "DELETE FROM shadow_victims WHERE swept_at < datetime('now', ?1)",
-            params![cutoff],
-        )?;
+        let removed = self.prune_rows_older_than("eviction_tombstones", "evicted_at", &cutoff)?;
+        self.prune_rows_older_than("shadow_victims", "swept_at", &cutoff)?;
+        Ok(removed)
+    }
+
+    /// Delete the rows of `table` whose `stamp` is older than `cutoff` (an
+    /// SQLite date modifier). Neither table has an index on its stamp, so
+    /// finding them reads the whole table: that read takes no lock, and the
+    /// rows then go by key in transactions of at most [`WRITE_LOCK_HOLD`],
+    /// with the lock free for [`WRITE_LOCK_YIELD`] between them. One
+    /// `DELETE ... WHERE stamp < ...` held the write lock for its whole scan
+    /// of 1.3 million tombstones: 10-12 s on a quiet copy of the build
+    /// machine's index with a cold page cache, 32-57 s under load, and every
+    /// store queued behind it failed (KACHE-NEXT103).
+    fn prune_rows_older_than(&self, table: &str, stamp: &str, cutoff: &str) -> Result<usize> {
+        let keys: Vec<String> = {
+            let db = self.db();
+            let mut stmt = db.prepare(&format!(
+                "SELECT cache_key FROM {table} WHERE {stamp} < datetime('now', ?1)"
+            ))?;
+            stmt.query_map(params![cutoff], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        // The stamp again in the delete: a key evicted anew since the read
+        // has a fresh row, which stays.
+        let delete =
+            format!("DELETE FROM {table} WHERE cache_key = ?1 AND {stamp} < datetime('now', ?2)");
+        let mut removed = 0;
+        let mut done = 0;
+        while done < keys.len() {
+            if done > 0 {
+                std::thread::sleep(WRITE_LOCK_YIELD);
+            }
+            let db = self.db();
+            let tx = begin_write_waiting(&db, "pruning tombstones")?;
+            let started = std::time::Instant::now();
+            {
+                let mut stmt = tx.prepare_cached(&delete)?;
+                for key in &keys[done..] {
+                    removed += stmt.execute(params![key, cutoff])?;
+                    done += 1;
+                    if started.elapsed() >= WRITE_LOCK_HOLD {
+                        break;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
         Ok(removed)
     }
 
