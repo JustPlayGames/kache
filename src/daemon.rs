@@ -3793,34 +3793,43 @@ impl Daemon {
         true
     }
 
-    /// Write the prediction use stamps taken since the last call in one
-    /// transaction on the stamp connection; a batch the index refused goes
+    /// Write the prediction use stamps taken since the last call on the
+    /// stamp connection, in short transactions
+    /// ([`Store::stamp_input_predictions`]); the stamps the index refused go
     /// back for the next call (a later read's time wins).
     fn flush_prediction_touches(&self) {
         let batch: Vec<(String, i64)> = match self.pending_prediction_touches.lock() {
             Ok(mut pending) if !pending.is_empty() => pending.drain().collect(),
             _ => return,
         };
-        let written = self.with_stamp_store(|store| store.stamp_input_predictions(&batch));
-        if let Err(error) = written {
-            tracing::debug!("prediction use stamps not written yet: {error:#}");
-            if let Ok(mut pending) = self.pending_prediction_touches.lock() {
-                for (identity, used) in batch {
-                    if pending.len() >= MAX_PENDING_HIT_STAMPS {
-                        break;
-                    }
-                    let slot = pending.entry(identity).or_insert(used);
-                    *slot = (*slot).max(used);
+        let written = match self.with_stamp_store(|store| Ok(store.stamp_input_predictions(&batch)))
+        {
+            Ok(Ok(())) => return,
+            Ok(Err(left)) => {
+                tracing::debug!("prediction use stamps not all written yet: {left}");
+                left.written
+            }
+            Err(error) => {
+                tracing::debug!("prediction use stamps not written yet: {error:#}");
+                0
+            }
+        };
+        if let Ok(mut pending) = self.pending_prediction_touches.lock() {
+            for (identity, used) in batch.into_iter().skip(written) {
+                if pending.len() >= MAX_PENDING_HIT_STAMPS {
+                    break;
                 }
+                let slot = pending.entry(identity).or_insert(used);
+                *slot = (*slot).max(used);
             }
         }
     }
 
-    /// Write the hit stamps taken since the last call in one transaction on
-    /// the stamp connection. A stamp leaves the pending set only once its
-    /// transaction committed, so the sweeps' pin never has a gap; a batch the
-    /// index refused stays for the next call. The prediction use stamps
-    /// workers handed over go next, in a transaction of their own.
+    /// Write the hit stamps taken since the last call on the stamp
+    /// connection, in short transactions ([`Store::stamp_hits`]). A stamp
+    /// leaves the pending set only once its transaction committed, so the
+    /// sweeps' pin never has a gap; the stamps the index refused stay for the
+    /// next call. The prediction use stamps workers handed over go first.
     pub(crate) fn flush_hit_stamps(&self) {
         self.flush_prediction_touches();
         let batch: Vec<(String, u32)> = match self.pending_hit_stamps.lock() {
@@ -3829,13 +3838,19 @@ impl Daemon {
             }
             _ => return,
         };
-        let written = self.with_stamp_store(|store| store.stamp_hits(&batch));
-        if let Err(error) = written {
-            tracing::debug!("hit stamps not written yet: {error:#}");
-            return;
-        }
+        let written = match self.with_stamp_store(|store| Ok(store.stamp_hits(&batch))) {
+            Ok(Ok(())) => batch.len(),
+            Ok(Err(left)) => {
+                tracing::debug!("hit stamps not all written yet: {left}");
+                left.written
+            }
+            Err(error) => {
+                tracing::debug!("hit stamps not written yet: {error:#}");
+                return;
+            }
+        };
         if let Ok(mut pending) = self.pending_hit_stamps.lock() {
-            for (key, count) in batch {
+            for (key, count) in batch.into_iter().take(written) {
                 if let std::collections::hash_map::Entry::Occupied(mut slot) = pending.entry(key) {
                     let left = slot.get().saturating_sub(count);
                     if left == 0 {
