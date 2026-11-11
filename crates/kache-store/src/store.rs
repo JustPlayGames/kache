@@ -1757,6 +1757,29 @@ impl std::error::Error for MemoRowsLeft {
     }
 }
 
+/// What a write of many stamps left undone when the index refused it: the
+/// first `written` are committed, the rest are not
+/// ([`ArtifactStore::stamp_hits`], [`ArtifactStore::stamp_input_predictions`]).
+#[derive(Debug)]
+pub struct RowsLeft {
+    /// Stamps committed before the refusal, from the front.
+    pub written: usize,
+    /// Why the index refused the rest.
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for RowsLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} written before: {:#}", self.written, self.error)
+    }
+}
+
+impl std::error::Error for RowsLeft {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 /// Note that a daemon took bookkeeping rows (memo rows, a target root,
 /// prediction rows) a busy index refused. It holds for the current
 /// invocation scope (`InvocationLinkScope`), else for the process.
@@ -4340,24 +4363,72 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     /// Write input prediction use stamps that reads handed off
     /// ([`PredictionTouchSink`]): each row named gets `last_used` = its time,
-    /// never an earlier one, in one transaction. A row no longer in the
-    /// index is skipped.
-    pub fn stamp_input_predictions(&self, touches: &[(String, i64)]) -> Result<()> {
-        self.refuse_write("stamp input predictions")?;
-        if touches.is_empty() {
-            return Ok(());
-        }
-        self.with_write_transaction(|store| {
-            let db = store.db();
-            let mut update = db.prepare_cached(
+    /// never an earlier one, in short transactions
+    /// ([`Self::write_stamps_briefly`]). A row no longer in the index is
+    /// skipped. A refusal leaves the stamps from [`RowsLeft::written`] on
+    /// unwritten.
+    pub fn stamp_input_predictions(&self, touches: &[(String, i64)]) -> Result<(), RowsLeft> {
+        self.refuse_write("stamp input predictions")
+            .map_err(|error| RowsLeft { written: 0, error })?;
+        self.write_stamps_briefly(touches, |db, (identity, used)| {
+            db.prepare_cached(
                 "UPDATE input_predictions SET last_used = ?2
                  WHERE identity = ?1 AND last_used < ?2",
-            )?;
-            for (identity, used) in touches {
-                update.execute(params![identity, used])?;
-            }
-            Ok(())
+            )?
+            .execute(params![identity, used])
+            .map(drop)
         })
+    }
+
+    /// Write `stamps` in transactions that each hold the index's write lock
+    /// for at most [`WRITE_LOCK_HOLD`] (at least one stamp each), with the
+    /// lock left free for [`WRITE_LOCK_YIELD`] between them, each waiting
+    /// for the lock as long as the connection's busy timeout. A refusal
+    /// keeps the transactions committed before it and returns how many
+    /// stamps they wrote.
+    ///
+    /// A stamp is an `UPDATE` of one row found by key, so a batch reads its
+    /// rows' pages at random across the index: 3,000 hit stamps held the
+    /// lock 1.1 s and 10,000 held it 4.0 s on a quiet copy of the build
+    /// machine's 31 GB index with a cold page cache, and the daemon writes
+    /// every stamp taken while the index was busy at once, right after a
+    /// stall, when its disk reads are slowest (KACHE-NEXT104).
+    fn write_stamps_briefly<T>(
+        &self,
+        stamps: &[T],
+        mut write: impl FnMut(&Connection, &T) -> rusqlite::Result<()>,
+    ) -> Result<(), RowsLeft> {
+        let mut written = 0;
+        while written < stamps.len() {
+            if written > 0 {
+                std::thread::sleep(WRITE_LOCK_YIELD);
+            }
+            let db = self.db();
+            let mut taken = 0;
+            let committed = (|| -> rusqlite::Result<()> {
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &db,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
+                let started = std::time::Instant::now();
+                for stamp in &stamps[written..] {
+                    write(&tx, stamp)?;
+                    taken += 1;
+                    if started.elapsed() >= WRITE_LOCK_HOLD {
+                        break;
+                    }
+                }
+                tx.commit()
+            })();
+            if let Err(error) = committed {
+                return Err(RowsLeft {
+                    written,
+                    error: error.into(),
+                });
+            }
+            written += taken;
+        }
+        Ok(())
     }
 
     /// Whether this store hands memo rows a busy index refuses to a
@@ -4392,31 +4463,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     /// Write access stamps that hits handed off ([`HitStampSink`]): each key
-    /// gets `last_accessed = now` and its hits added to `hit_count`, in one
-    /// transaction. A key no longer in the index is skipped.
-    pub fn stamp_hits(&self, hits: &[(String, u32)]) -> Result<()> {
-        self.refuse_write("stamp hits")?;
-        if hits.is_empty() {
-            return Ok(());
-        }
-        let db = self.db();
-        let tx =
-            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
-        {
-            let mut stamp = tx.prepare_cached(
+    /// gets `last_accessed = now` and its hits added to `hit_count`, in short
+    /// transactions ([`Self::write_stamps_briefly`]). A key no longer in the
+    /// index is skipped. A refusal leaves the stamps from
+    /// [`RowsLeft::written`] on unwritten, for the caller to keep: writing a
+    /// stamp twice would count its hits twice.
+    pub fn stamp_hits(&self, hits: &[(String, u32)]) -> Result<(), RowsLeft> {
+        self.refuse_write("stamp hits")
+            .map_err(|error| RowsLeft { written: 0, error })?;
+        self.write_stamps_briefly(hits, |db, (key, count)| {
+            db.prepare_cached(
                 "UPDATE entries SET last_accessed = datetime('now'), hit_count = hit_count + ?2, \
                  key_schema = MAX(key_schema, ?3) WHERE cache_key = ?1",
-            )?;
-            for (key, count) in hits {
-                stamp.execute(params![
-                    key,
-                    i64::from(*count),
-                    kache_format::CACHE_KEY_VERSION
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+            )?
+            .execute(params![
+                key,
+                i64::from(*count),
+                kache_format::CACHE_KEY_VERSION
+            ])
+            .map(drop)
+        })
     }
 
     /// Acquire a build lock for a cache key. Returns None if another process holds it.

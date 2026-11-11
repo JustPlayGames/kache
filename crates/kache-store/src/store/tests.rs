@@ -17406,6 +17406,57 @@ fn a_long_tombstone_prune_lets_a_waiting_store_in() {
     assert_eq!(shadows, ["new-shadow"]);
 }
 
+/// A flush of many hit stamps, each slow as on a cold page cache, holds the
+/// index's write lock a transaction at a time, so a store that asks for the
+/// lock while it runs gets it (KACHE-NEXT104: the daemon writes every stamp
+/// taken while the index was busy at once, right after a stall; 3,000 random
+/// keys held the lock 1.1 s on a quiet cold copy of the build machine's
+/// index). Every stamp is still written, once.
+#[test]
+fn a_long_hit_stamp_flush_lets_a_waiting_store_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(test_config(dir.path())).unwrap();
+    let side = Connection::open(dir.path().join("index.db")).unwrap();
+    side.execute(
+        "INSERT INTO entries (cache_key, crate_name, committed) VALUES ('probe', 'c', 1)",
+        [],
+    )
+    .unwrap();
+    let row_cost = slow_rows(
+        &side,
+        "entries",
+        "UPDATE",
+        "UPDATE entries SET hit_count = hit_count + 1 WHERE cache_key = 'probe'",
+    );
+    let wait = (WRITE_LOCK_HOLD + row_cost) * 3 + WRITE_LOCK_YIELD;
+    let count = (wait.as_secs_f64() * 3.0 / row_cost.as_secs_f64()).ceil() as usize + 2;
+    side.execute_batch(&format!(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < {count})
+             INSERT INTO entries (cache_key, crate_name, committed) SELECT 'hit' || x, 'c', 1 FROM c;"
+    ))
+    .unwrap();
+    let hits: Vec<(String, u32)> = (1..=count).map(|n| (format!("hit{n}"), 2)).collect();
+
+    let stamper = std::thread::spawn(move || store.stamp_hits(&hits).map(|()| store));
+    until_the_write_lock_is_held(&side);
+    let got_in = takes_the_write_lock_within(&side, wait);
+    let store = stamper.join().unwrap().unwrap();
+
+    assert!(
+        got_in,
+        "{count} stamps of {row_cost:?} each kept the write lock past {wait:?}"
+    );
+    let stamped: i64 = store
+        .db()
+        .query_row(
+            "SELECT count(*) FROM entries WHERE cache_key LIKE 'hit%' AND hit_count = 2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stamped as usize, count, "every stamp written once");
+}
+
 /// A store with a sink hands its memo rows over when the index is busy,
 /// rather than waiting for the lock and then dropping them.
 #[test]
