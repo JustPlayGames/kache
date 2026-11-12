@@ -7553,8 +7553,9 @@ exit 0
     let compiler = CcCompiler::new().with_invocation_env(&env);
     let maps = cc_prefix_maps(&parsed, &[]);
     let cache = FileHashCache::open(&root.join("index.db")).unwrap();
-    let new_hasher =
-        || crate::cache_key::FileHasher::from_cache_for(FileHashCache::Borrowed(cache.db()), &env);
+    // The fork's db() lends an IndexRef: keep it for the test, borrow its connection.
+    let db = cache.db();
+    let new_hasher = || crate::cache_key::FileHasher::from_cache_for(FileHashCache::Borrowed(&db), &env);
     let fingerprints = new_hasher()
         .cc_preprocess_fingerprints(
             &inputs
