@@ -12,6 +12,16 @@ use std::time::{Duration, Instant};
 
 const SCAN_LIMIT: Duration = Duration::from_secs(2);
 
+/// The limit a real scan gets. A test run starts hundreds of processes at
+/// once, and reading one that is starting or exiting can block, so a scan of
+/// the test machine's processes can pass 2 s. The pass then keeps every
+/// target, as it must, and a test that expects a removal fails as if a
+/// program held the target. Tests that need the timeout inject their scan.
+#[cfg(not(test))]
+const REAL_SCAN_LIMIT: Duration = SCAN_LIMIT;
+#[cfg(test)]
+const REAL_SCAN_LIMIT: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 pub(crate) struct ActivePrograms {
     paths: OnceCell<io::Result<BTreeSet<PathBuf>>>,
@@ -19,7 +29,7 @@ pub(crate) struct ActivePrograms {
 
 impl ActivePrograms {
     pub(crate) fn uses(&self, target: &Path) -> bool {
-        self.uses_with(target, || scan(Instant::now() + SCAN_LIMIT))
+        self.uses_with(target, || scan(Instant::now() + REAL_SCAN_LIMIT))
     }
 
     fn uses_with(
