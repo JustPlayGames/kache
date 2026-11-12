@@ -4176,6 +4176,7 @@ fn sweep_orphan_blobs_aborts_before_unlinking_on_reference_row_error() {
     let (_, orphan_path) = write_blob(orphan);
     store
         .db
+        .own_mut()
         .execute(
             "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
             params![live_hash, live.len() as i64],
@@ -4185,6 +4186,7 @@ fn sweep_orphan_blobs_aborts_before_unlinking_on_reference_row_error() {
     // blob, but reading that reference as a String must fail the whole sweep.
     store
         .db
+        .own_mut()
         .execute(
             "INSERT INTO blobs (hash, size, refcount) VALUES (?1, ?2, 1)",
             params![malformed_hash.as_bytes(), malformed.len() as i64],
@@ -4200,7 +4202,7 @@ fn sweep_orphan_blobs_aborts_before_unlinking_on_reference_row_error() {
             rusqlite::types::Type::Blob
         ))
     ));
-    assert!(store.db.is_autocommit(), "the failed sweep must roll back");
+    assert!(store.db.own_mut().is_autocommit(), "the failed sweep must roll back");
     for (path, contents) in [
         (&live_path, live.as_slice()),
         (&malformed_path, malformed.as_slice()),
@@ -4212,6 +4214,7 @@ fn sweep_orphan_blobs_aborts_before_unlinking_on_reference_row_error() {
     assert_eq!(
         store
             .db
+            .own_mut()
             .execute(
                 "DELETE FROM blobs WHERE hash = ?1",
                 [malformed_hash.as_bytes()]
@@ -4226,7 +4229,7 @@ fn sweep_orphan_blobs_aborts_before_unlinking_on_reference_row_error() {
         swept.bytes_reclaimed,
         (malformed.len() + orphan.len()) as u64
     );
-    assert!(store.db.is_autocommit(), "the next sweep must commit");
+    assert!(store.db.own_mut().is_autocommit(), "the next sweep must commit");
     assert_eq!(fs::read(live_path).unwrap(), live);
     assert!(!malformed_path.exists());
     assert!(!orphan_path.exists());
