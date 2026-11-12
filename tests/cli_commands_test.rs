@@ -3289,7 +3289,8 @@ fn systemd_probe_script() -> &'static str {
     show)
       unit="$HOME/.config/systemd/user/kache.service"
       exe=$(sed -n 's/^ExecStart=//p' "$unit" | sed 's/ daemon run$//')
-      printf 'FragmentPath=%s\nDropInPaths=\nNeedDaemonReload=no\nEnvironment=\nEnvironmentFiles=\nUnsetEnvironment=\nWorkingDirectory=\n' "$unit"
+      printf 'FragmentPath=%s\nDropInPaths=\nNeedDaemonReload=no\nEnvironment=\nEnvironmentFiles=\nUnsetEnvironment=\n' "$unit"
+      printf 'WorkingDirectory=!%s\n' "$HOME"
       printf 'ExecStart={ path=%s ; argv[]=%s daemon run ; ignore_errors=no ; }\n' "$exe" "$exe"
       exit 0 ;;
   esac
@@ -4092,7 +4093,10 @@ fn unidentifiable_shims_stop_at_the_depth_bound_until_marked() {
     run()
         .failure()
         .stderr(predicates::str::contains("loop"))
-        .stderr(predicates::str::contains(".kache-shims"));
+        .stderr(predicates::str::contains(".kache-shims"))
+        .stderr(predicates::str::contains("only Kache shims"))
+        .stderr(predicates::str::contains("Do not mark a version manager"))
+        .stderr(predicates::str::contains("KACHE_REAL_RUSTDOC").not());
 
     std::fs::write(scripts.join(".kache-shims"), "").unwrap();
     run()
