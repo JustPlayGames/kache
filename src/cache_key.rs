@@ -301,7 +301,7 @@ pub(crate) use kache_format::{BUILD_SCRIPT_KEY_VERSION, CC_KEY_VERSION, PREDICTI
 /// Order is preserved: `-Cfoo=a -Cfoo=b` and `-Cfoo=b -Cfoo=a` produce
 /// distinct strings because later flags override earlier ones in
 /// rustc's parser, so they MUST keep distinct keys.
-fn normalize_rustflags(rustflags: &str) -> String {
+pub(crate) fn normalize_rustflags(rustflags: &str) -> String {
     rustflags.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -324,7 +324,7 @@ const REMAP_FROM_SENTINEL: &str = "<REMAP_FROM>";
 /// adding/removing a remap or changing TO still diverges the key. This mirrors
 /// the cc recipe, which keys on the prefix-map `to` sentinel and scrubs the
 /// `from` build path ([`crate::compiler::cc`]).
-fn scrub_remap_from_prefixes<'a, I>(tokens: I) -> Vec<String>
+pub(crate) fn scrub_remap_from_prefixes<'a, I>(tokens: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -367,7 +367,10 @@ fn scrub_remap_value(value: &str) -> String {
 /// FROM side of a direct rustc remap. Unlike environment-provided build-system
 /// remaps, an arbitrary direct FROM may not match this invocation at all, so
 /// erasing it unconditionally would collide with a mapping that does match.
-fn normalize_direct_remap_value(value: &str, path_normalizer: &PathNormalizer) -> String {
+pub(crate) fn normalize_direct_remap_value(
+    value: &str,
+    path_normalizer: &PathNormalizer,
+) -> String {
     match value.rsplit_once('=') {
         Some((from, to)) => format!("{}={to}", path_normalizer.normalize(from)),
         None => value.to_string(),
@@ -642,7 +645,7 @@ fn env_text_key_bytes(text: &std::ffi::OsStr) -> Vec<u8> {
 /// `String` sort produced for every valid-UTF-8 environment. The
 /// lossless tiebreak pins two names that collide under U+FFFD to a
 /// deterministic order instead of platform iteration order.
-fn cargo_cfg_pairs(
+pub(crate) fn cargo_cfg_pairs(
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut pairs: Vec<(std::ffi::OsString, std::ffi::OsString)> = vars
@@ -2148,7 +2151,7 @@ fn out_dir_source_identity(file: &Path, out_dir: Option<&OsStr>) -> Option<Vec<u
 /// Linked outputs and framework/all search paths keep their existing identity.
 /// Source files always use `source_path_identity`: rustc can expose their
 /// spelling through file!(), caller locations and debug information.
-fn out_dir_native_search_identity(
+pub(crate) fn out_dir_native_search_identity(
     args: &RustcArgs,
     path: &Path,
     out_dir: Option<&OsStr>,
@@ -13077,7 +13080,7 @@ fn file_digest(path: &Path) -> Option<String> {
 }
 
 /// Get the host target triple.
-fn host_target_triple() -> &'static str {
+pub(crate) fn host_target_triple() -> &'static str {
     option_env!("TARGET").unwrap_or("unknown")
 }
 
