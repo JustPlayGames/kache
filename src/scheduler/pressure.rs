@@ -20,10 +20,11 @@
 //!   stalled that long is critical. The cgroup's own `memory.pressure` is
 //!   read when there is one, so a container sees its limit rather than the
 //!   host's: the cgroup of the client a daemon-run compile serves, where the
-//!   compiler runs. A critical reading while the memory available is at
-//!   least [`ROOMY_RESERVES`] times the gate's reserve moves the ceiling as a
-//!   warning does (see [`ceiling_level`]): such stalls are reclaim of a full
-//!   page cache, not a shortage.
+//!   compiler runs. A warning or critical reading while the memory available
+//!   is at least [`ROOMY_RESERVES`] times the gate's reserve moves the
+//!   ceiling as a calm one does (see [`ceiling_level`]): such stalls are
+//!   reclaim of a full page cache, not a shortage, and the memory gate
+//!   ([`fits`]) still weighs every compile against the memory itself.
 //! - Windows: no stall measure exists, so the memory the machine has left:
 //!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
 //!   total, or commit (physical memory and page file) under
@@ -143,8 +144,8 @@ pub(crate) fn fits(reading: MemoryReading, pending: u64, expected: u64, measured
 }
 
 /// How many reserves ([`reserve_bytes`]) of memory must be available for a
-/// Linux critical reading to move the ceiling as a warning: 40 % of the
-/// memory with the default reserve.
+/// Linux stall reading to leave the ceiling alone: 40 % of the memory with
+/// the default reserve.
 pub(crate) const ROOMY_RESERVES: u64 = 2;
 
 /// The level a reading moves the ceiling by on Linux, given the memory
@@ -152,19 +153,23 @@ pub(crate) const ROOMY_RESERVES: u64 = 2;
 ///
 /// Linux counts time in compaction and in direct reclaim of page cache as a
 /// memory stall, so a machine that keeps most of its memory as cache reads
-/// critical under a burst of allocations while far from short: on a 196 GB
-/// build machine critical readings came every busy hour with 178-185 GB
-/// available, and each one ran every compile of the cache one at a time.
+/// warning or critical under a burst of allocations while far from short: on
+/// a 196 GB build machine critical readings came every busy hour with
+/// 178-185 GB available, and each one ran every compile of the cache one at a
+/// time; halving instead still cut 192 slots to 48 with 93-145 GB available
+/// and the CPUs 31-44 % busy, so misses waited for slots the machine had.
 /// While the memory available is at least [`ROOMY_RESERVES`] reserves, a
-/// critical reading therefore halves the ceiling, as a warning does; below
-/// that, or without a reading, it is one slot as before. The gate ([`fits`])
-/// still weighs every compile against the memory itself.
+/// stall reading therefore moves the ceiling as a calm one: it does not cut
+/// it, and a ceiling cut earlier grows back. Below that, or without a
+/// reading, a warning halves it and a critical reading makes it one slot. The
+/// gate ([`fits`]) still weighs every compile against the memory itself, so
+/// what memory there is stays guarded by the reserve.
 pub(crate) fn ceiling_level(level: Level, reading: Option<MemoryReading>) -> Level {
     match (level, reading) {
-        (Level::Critical, Some(reading))
+        (Level::Warning | Level::Critical, Some(reading))
             if reading.available >= reserve_bytes(reading.total).saturating_mul(ROOMY_RESERVES) =>
         {
-            Level::Warning
+            Level::Calm
         }
         _ => level,
     }
@@ -321,9 +326,9 @@ pub(crate) fn ask(weight: u32, pool: u32, ceiling: u32) -> u32 {
 
 /// The most slots compiles may hold, as the readings so far have moved it.
 ///
-/// - Critical: one slot, at once. On Linux, only while memory is short (see
-///   [`ceiling_level`]); a critical stall with room to spare moves it as a
-///   warning.
+/// - Critical: one slot, at once. On Linux, warning and critical apply only
+///   while memory is short (see [`ceiling_level`]); a stall with room to
+///   spare moves it as a calm reading.
 /// - Warning: half the slots, rounded up, at most once per [`SETTLE`]. A
 ///   warning that persists keeps halving down to the compile reserve (see
 ///   [`super::reserve_for`]), so compiles keep a quarter of the pool while
@@ -426,7 +431,9 @@ pub(crate) fn ceiling_observed(root: &Path, pool: u32) -> (u32, Option<Level>) {
     let level = now();
     let ceiling = match level {
         Some(level) => {
-            let moved_by = if cfg!(target_os = "linux") && level == Level::Critical {
+            let moved_by = if cfg!(target_os = "linux")
+                && matches!(level, Level::Warning | Level::Critical)
+            {
                 ceiling_level(level, memory_now())
             } else {
                 level
@@ -1066,7 +1073,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_linux_critical_stall_with_memory_to_spare_halves_instead_of_one_slot() {
+    fn a_linux_stall_with_memory_to_spare_leaves_the_ceiling_open() {
         const GIB: u64 = 1 << 30;
         let reading = |available| MemoryReading {
             available,
@@ -1074,42 +1081,69 @@ mod tests {
             reclaimable: None,
         };
         let roomy = 2 * reserve_bytes(196 * GIB);
-        force(Some(Level::Critical));
-        for (memory, first, sustained, why) in [
+        for (level, memory, first, sustained, why) in [
             (
-                Some(reading(180 * GIB)),
-                96,
-                48,
-                "reclaim stalls, 180 of 196 GB available",
+                Level::Critical,
+                Some(reading(93 * GIB)),
+                192,
+                192,
+                "reclaim of a full page cache, 93 of 196 GB available",
             ),
             (
+                Level::Warning,
+                Some(reading(93 * GIB)),
+                192,
+                192,
+                "a warning with 93 of 196 GB available",
+            ),
+            (
+                Level::Critical,
                 Some(reading(roomy)),
-                96,
-                48,
+                192,
+                192,
                 "exactly two reserves available",
             ),
             (
+                Level::Warning,
+                Some(reading(roomy)),
+                192,
+                192,
+                "a warning with exactly two reserves available",
+            ),
+            (
+                Level::Critical,
                 Some(reading(roomy - 1)),
                 1,
                 1,
                 "short of two reserves: one slot",
             ),
-            (None, 1, 1, "no memory reading: one slot"),
+            (
+                Level::Warning,
+                Some(reading(roomy - 1)),
+                96,
+                48,
+                "short of two reserves: a warning halves",
+            ),
+            (Level::Critical, None, 1, 1, "no memory reading: one slot"),
+            (Level::Warning, None, 96, 48, "no memory reading: a warning halves"),
         ] {
             let dir = tempfile::tempdir().unwrap();
+            force(Some(level));
             force_memory(memory);
             assert_eq!(super::ceiling(dir.path(), 192), first, "{why}");
             assert_eq!(
                 ceiling_observed(dir.path(), 192).1,
-                Some(Level::Critical),
-                "the level read is still reported as critical"
+                Some(level),
+                "{why}: the level read is still reported as read"
             );
             // Halving waits a settling period: age the stored cut by hand.
             for _ in 0..4 {
                 let record = dir.path().join("pressure");
-                let mut stored = stored(&record);
-                stored.cut = stored.cut.saturating_sub(SETTLE_MS);
-                std::fs::write(&record, stored.render()).unwrap();
+                if let Ok(text) = std::fs::read_to_string(&record) {
+                    let mut stored = Ceiling::parse(&text).unwrap();
+                    stored.cut = stored.cut.saturating_sub(SETTLE_MS);
+                    std::fs::write(&record, stored.render()).unwrap();
+                }
                 super::ceiling(dir.path(), 192);
             }
             assert_eq!(
@@ -1118,6 +1152,23 @@ mod tests {
                 "{why}: sustained"
             );
         }
+
+        // A ceiling cut while memory was short grows back once memory is
+        // roomy again, though the stall readings go on.
+        let dir = tempfile::tempdir().unwrap();
+        force(Some(Level::Warning));
+        force_memory(Some(reading(93 * GIB)));
+        let record = dir.path().join("pressure");
+        std::fs::write(&record, ceiling(48, 0, None).render()).unwrap();
+        assert_eq!(super::ceiling(dir.path(), 192), 48, "growth waits a settling period");
+        let mut stored = stored(&record);
+        stored.calm = stored.calm.map(|since| since.saturating_sub(2 * SETTLE_MS));
+        std::fs::write(&record, stored.render()).unwrap();
+        assert_eq!(
+            super::ceiling(dir.path(), 192),
+            144,
+            "two settled periods grow it by two quarters of the pool"
+        );
         force_memory(None);
         force(None);
     }
