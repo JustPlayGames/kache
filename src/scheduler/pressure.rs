@@ -25,6 +25,8 @@
 //!   ceiling as a calm one does (see [`ceiling_level`]): such stalls are
 //!   reclaim of a full page cache, not a shortage, and the memory gate
 //!   ([`fits`]) still weighs every compile against the memory itself.
+//!   Between one and [`ROOMY_RESERVES`] reserves a critical reading moves it
+//!   as a warning: one slot only once less than a reserve is left.
 //! - Windows: no stall measure exists, so the memory the machine has left:
 //!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
 //!   total, or commit (physical memory and page file) under
@@ -148,6 +150,11 @@ pub(crate) fn fits(reading: MemoryReading, pending: u64, expected: u64, measured
 /// the default reserve.
 pub(crate) const ROOMY_RESERVES: u64 = 2;
 
+/// How many reserves of memory must be available for a Linux critical
+/// reading to halve the ceiling, as a warning does, instead of making it one
+/// slot: under this the reserve the gate keeps ([`fits`]) is already gone.
+pub(crate) const HALVING_RESERVES: u64 = 1;
+
 /// The level a reading moves the ceiling by on Linux, given the memory
 /// `reading` the gate sees.
 ///
@@ -160,17 +167,23 @@ pub(crate) const ROOMY_RESERVES: u64 = 2;
 /// and the CPUs 31-44 % busy, so misses waited for slots the machine had.
 /// While the memory available is at least [`ROOMY_RESERVES`] reserves, a
 /// stall reading therefore moves the ceiling as a calm one: it does not cut
-/// it, and a ceiling cut earlier grows back. Below that, or without a
-/// reading, a warning halves it and a critical reading makes it one slot. The
-/// gate ([`fits`]) still weighs every compile against the memory itself, so
-/// what memory there is stays guarded by the reserve.
+/// it, and a ceiling cut earlier grows back. Below that a warning halves it;
+/// so does a critical reading while at least [`HALVING_RESERVES`] reserves
+/// are left, so that memory falling past the roomy mark steps an open
+/// ceiling down rather than taking it to one slot at once. Under that, or
+/// without a reading, a critical reading makes it one slot. The gate
+/// ([`fits`]) still weighs every compile against the memory itself, so what
+/// memory there is stays guarded by the reserve.
 pub(crate) fn ceiling_level(level: Level, reading: Option<MemoryReading>) -> Level {
-    match (level, reading) {
-        (Level::Warning | Level::Critical, Some(reading))
-            if reading.available >= reserve_bytes(reading.total).saturating_mul(ROOMY_RESERVES) =>
-        {
+    let Some(reading) = reading else {
+        return level;
+    };
+    let reserves = |count: u64| reserve_bytes(reading.total).saturating_mul(count);
+    match level {
+        Level::Warning | Level::Critical if reading.available >= reserves(ROOMY_RESERVES) => {
             Level::Calm
         }
+        Level::Critical if reading.available >= reserves(HALVING_RESERVES) => Level::Warning,
         _ => level,
     }
 }
@@ -327,8 +340,9 @@ pub(crate) fn ask(weight: u32, pool: u32, ceiling: u32) -> u32 {
 /// The most slots compiles may hold, as the readings so far have moved it.
 ///
 /// - Critical: one slot, at once. On Linux, warning and critical apply only
-///   while memory is short (see [`ceiling_level`]); a stall with room to
-///   spare moves it as a calm reading.
+///   while memory is short (see [`ceiling_level`]): a stall with room to
+///   spare moves it as a calm reading, and a critical one with a reserve or
+///   more left as a warning.
 /// - Warning: half the slots, rounded up, at most once per [`SETTLE`]. A
 ///   warning that persists keeps halving down to the compile reserve (see
 ///   [`super::reserve_for`]), so compiles keep a quarter of the pool while
@@ -1073,14 +1087,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_linux_stall_with_memory_to_spare_leaves_the_ceiling_open() {
+    fn a_linux_stall_moves_the_ceiling_by_the_memory_left() {
         const GIB: u64 = 1 << 30;
         let reading = |available| MemoryReading {
             available,
             total: 196 * GIB,
             reclaimable: None,
         };
-        let roomy = 2 * reserve_bytes(196 * GIB);
+        let one = reserve_bytes(196 * GIB);
+        let roomy = 2 * one;
         for (level, memory, first, sustained, why) in [
             (
                 Level::Critical,
@@ -1113,9 +1128,30 @@ mod tests {
             (
                 Level::Critical,
                 Some(reading(roomy - 1)),
+                96,
+                48,
+                "short of two reserves: a critical reading halves",
+            ),
+            (
+                Level::Critical,
+                Some(reading(one)),
+                96,
+                48,
+                "exactly one reserve available: a critical reading halves",
+            ),
+            (
+                Level::Critical,
+                Some(reading(one - 1)),
                 1,
                 1,
-                "short of two reserves: one slot",
+                "short of one reserve: one slot",
+            ),
+            (
+                Level::Warning,
+                Some(reading(one - 1)),
+                96,
+                48,
+                "short of one reserve: a warning halves",
             ),
             (
                 Level::Warning,
