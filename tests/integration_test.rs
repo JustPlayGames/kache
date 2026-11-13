@@ -2289,7 +2289,9 @@ fn test_clang_cl_keys_converge_across_checkouts_unless_the_object_spells_one() {
         // cc-rs's spelling: a Unix path after `--`, not read as a `/` flag.
         args.extend(["--", source.to_str().unwrap()]);
         run_kache_cc(clone.path(), cache_dir.path(), &args);
-        last_result(&kache_report(cache_dir.path()), &format!("{name}.cc"))
+        // Upstream #1901 publishes a cc object under CARGO_PKG_NAME when set.
+        let published = cc_published_crate_name(&format!("{name}.cc"));
+        last_result(&kache_report(cache_dir.path()), &published)
     };
 
     assert_eq!(compile(&clones[0], "gen", &[]), "miss");
