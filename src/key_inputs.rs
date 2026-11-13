@@ -93,11 +93,12 @@ pub(crate) fn invocation_inputs(
     rustc_version: Option<&str>,
 ) -> Result<KeyInputs> {
     let args = RustcArgs::parse_for(argv, env)?;
-    // Same rule set the cache key builds, except the rust-src rule: that one
-    // reads the compiler's sysroot and commit, which means running rustc.
+    // Same rule set the cache key builds (PathNormalizer::for_invocation),
+    // except the rust-src rule: that one reads the compiler's sysroot and
+    // commit, which means running rustc. The fork keeps no profile-dir rule
+    // (upstream #1874's profile keys were not taken), so neither does this.
     let normalizer = PathNormalizer::from_invocation(args.path_normalization_root(), env)
         .with_target_dir(args.target_dir().as_deref())
-        .with_profile_dir(args.profile_dir().as_deref())
         .with_base_dirs(base_dirs);
     key_inputs_for(
         &args,
@@ -501,9 +502,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let profile = target.join("debug");
+        // The fork keys OUT_DIR search paths relative to the target dir
+        // (upstream #1874's profile-relative rule was not taken).
         let relative = native
-            .strip_prefix(&profile)
+            .strip_prefix(&target)
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -747,8 +749,10 @@ mod tests {
             None,
         )
         .unwrap();
+        // No <PROFILE> rule in the fork (#1874 not taken): a generated source
+        // under a target inside the checkout keys through <CWD>.
         assert!(
-            profiled.source_paths[0].starts_with("<PROFILE>/"),
+            profiled.source_paths[0].starts_with("<CWD>/target/debug/build/pkg/out/"),
             "{:?}",
             profiled.source_paths
         );
