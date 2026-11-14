@@ -4773,20 +4773,27 @@ fn run_parsed_rustc(
     if args.is_primary
         && let Some(target_dir) = args.target_dir()
         && let Some(workspace_root) = workspace_root.as_deref()
-        && owns_its_target(
-            workspace_root,
-            crate::build_script_inputs::cargo_home(&|name| args.invocation_env().var_os(name))
-                .as_deref(),
-        )
     {
-        register_target_root(
-            config,
-            &store,
-            &target_dir,
-            workspace_root,
-            crate::cache_key::rustc_version_text_for(args.probed_rustc(), args.invocation_env())
+        let cargo_home =
+            crate::build_script_inputs::cargo_home(&|name| args.invocation_env().var_os(name));
+        if owns_its_target(workspace_root, cargo_home.as_deref()) {
+            register_target_root(
+                config,
+                &store,
+                &target_dir,
+                workspace_root,
+                crate::cache_key::rustc_version_text_for(
+                    args.probed_rustc(),
+                    args.invocation_env(),
+                )
                 .as_deref(),
-        );
+            );
+            // A target Cargo probed before this note existed is probed again
+            // only for a new compiler: its builds note their home here.
+            if let Some(home) = cargo_home.and_then(|home| args.invocation_env().resolve(&home)) {
+                crate::target_seed::record_cargo_home(&target_dir, &home);
+            }
+        }
     }
     drop(trace_remember);
 
