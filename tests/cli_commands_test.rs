@@ -90,6 +90,16 @@ impl Env {
         kache(&self.home, &self.cache)
     }
 
+    /// The Cargo home `wrapper_cargo`'s builds run under: the test's own
+    /// `CARGO_HOME`, else `HOME`'s. A probe that seeds from such a build
+    /// names it too: kache passes over a donor built under another home.
+    fn build_cargo_home(&self) -> std::path::PathBuf {
+        std::env::var_os("CARGO_HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.home.join(".cargo"))
+    }
+
     /// Run `cargo build --lib` for `project` through the kache rustc wrapper,
     /// wired to this env's isolated cache/config/HOME. Returns the build output.
     fn wrapper_build(&self, project: &Path, target_dir: &Path) -> std::process::Output {
@@ -5517,6 +5527,7 @@ fn a_target_clippy_checked_last_seeds_a_new_checkout() {
     e.cmd()
         .current_dir(&checkout)
         .env("KACHE_SEED_NEW_TARGETS", "1")
+        .env("CARGO_HOME", e.build_cargo_home())
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -5577,6 +5588,7 @@ fn the_target_info_probe_seeds_a_new_checkout_while_no_daemon_runs() {
     e.cmd()
         .current_dir(&checkout)
         .env("KACHE_SEED_NEW_TARGETS", "1")
+        .env("CARGO_HOME", e.build_cargo_home())
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -5640,6 +5652,7 @@ fn the_target_info_probe_seeds_a_new_checkout() {
         e.cmd()
             .current_dir(checkout)
             .env("KACHE_SEED_NEW_TARGETS", seed)
+            .env("CARGO_HOME", e.build_cargo_home())
             .env_remove("CARGO_TARGET_DIR")
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -5728,6 +5741,7 @@ fn the_target_info_probe_seeds_a_new_checkout() {
                 .current_dir(&checkout)
                 .env("KACHE_REAL_CARGO", &fake)
                 .env("KACHE_TEST_BINARY", KACHE_BIN.as_path())
+                .env("CARGO_HOME", e.build_cargo_home())
                 .env_remove("CARGO_TARGET_DIR")
                 .env_remove("CARGO_BUILD_TARGET_DIR")
                 .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -5820,6 +5834,7 @@ fn a_build_that_asks_for_no_workspace_units_gets_none_from_a_running_daemon() {
         command
             .current_dir(&checkout)
             .env("KACHE_SEED_NEW_TARGETS", "1")
+            .env("CARGO_HOME", e.build_cargo_home())
             .env("CARGO_TARGET_DIR", target)
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .env_remove("CARGO_BUILD_BUILD_DIR")
@@ -5890,6 +5905,7 @@ fn a_target_seeding_filled_seeds_the_next_new_target() {
         e.cmd()
             .current_dir(&checkout)
             .env("KACHE_SEED_NEW_TARGETS", "1")
+            .env("CARGO_HOME", e.build_cargo_home())
             .env("CARGO_TARGET_DIR", target)
             .env_remove("CARGO_BUILD_TARGET_DIR")
             .env_remove("CARGO_BUILD_BUILD_DIR")
