@@ -3108,9 +3108,13 @@ pub(crate) fn before_probe_for(
     args: &[String],
     env: &crate::invocation::InvocationEnv,
 ) {
-    if !asks_for_seed(config.seed_new_targets, args) || build_names_a_target(args, env) {
+    // Every probe notes the build's Cargo home ([`CARGO_HOME_RECORD`]), also
+    // with seeding off or for another platform: the target may be a donor of
+    // a build that seeds.
+    if !is_target_info_probe(args) {
         return;
     }
+    let seeds = asks_for_seed(config.seed_new_targets, args) && !build_names_a_target(args, env);
     let Some(cwd) = env.cwd() else {
         return;
     };
@@ -3145,6 +3149,10 @@ pub(crate) fn before_probe_for(
         record_cargo_home(&cwd.join(&directory), &cargo_home);
         return;
     };
+    if !seeds {
+        // Cargo makes the target; its next probe notes the home.
+        return;
+    }
     target.cargo_home = Some(cargo_home.clone());
     let Some(version) = rustc_version_for(args.first().map(String::as_str), env) else {
         return;
