@@ -145,7 +145,10 @@ pub(crate) const CARGO_HOME_RECORD: &str = ".kache-cargo-home";
 
 /// Note `cargo_home` as the home `target_dir` is built under, when its
 /// profile directory exists and names another (or none). Written by a
-/// rename, so a seeding never reads half of it.
+/// rename, so a seeding never reads half of it. Each writer stages its own
+/// file: the daemon's workers note homes on threads of one process, and a
+/// staged name shared by them let one truncate a note another had just
+/// renamed into place.
 pub(crate) fn record_cargo_home(target_dir: &Path, cargo_home: &Path) {
     let profile = target_dir.join(PROFILE);
     if !profile.is_dir() || recorded_cargo_home(target_dir).as_deref() == Some(cargo_home) {
@@ -155,10 +158,18 @@ pub(crate) fn record_cargo_home(target_dir: &Path, cargo_home: &Path) {
     let Some(text) = cargo_home.to_str() else {
         return;
     };
-    let record = profile.join(CARGO_HOME_RECORD);
-    let staged = profile.join(format!("{CARGO_HOME_RECORD}.{}", std::process::id()));
-    if std::fs::write(&staged, text).is_err() || std::fs::rename(&staged, &record).is_err() {
-        let _ = std::fs::remove_file(&staged);
+    // A staged file that is not persisted removes itself when dropped. It
+    // is made as `fs::write` makes a file (0666 less the umask), not 0600.
+    let prefix = format!("{CARGO_HOME_RECORD}.");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix);
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
+    let Ok(mut staged) = builder.tempfile_in(&profile) else {
+        return;
+    };
+    if std::io::Write::write_all(&mut staged, text.as_bytes()).is_ok() {
+        let _ = staged.persist(profile.join(CARGO_HOME_RECORD));
     }
 }
 
@@ -3496,6 +3507,56 @@ source = "git+https://example.com/gitdep#abc"
         assert_eq!(recorded_cargo_home(&target).as_deref(), Some(Path::new("/homes/a")));
         record_cargo_home(&target, Path::new("/homes/b/"));
         assert_eq!(recorded_cargo_home(&target).as_deref(), Some(Path::new("/homes/b")));
+        let left: Vec<_> = entries(&target.join(PROFILE));
+        assert_eq!(left.len(), 1, "only the record, no staged copy: {left:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let plain = dir.path().join("plain");
+            std::fs::write(&plain, "x").unwrap();
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode(&target.join(PROFILE).join(CARGO_HOME_RECORD)),
+                mode(&plain),
+                "the record is as readable as any file the build writes"
+            );
+        }
+    }
+
+    /// The daemon's workers note homes on threads of one process: a note
+    /// once made is never seen empty while others write theirs, and no
+    /// writer's staged copy is left behind.
+    #[test]
+    fn notes_written_at_once_in_one_process_are_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(target.join(PROFILE)).unwrap();
+        record_cargo_home(&target, Path::new("/homes/a"));
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let gaps = std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let target = &target;
+                scope.spawn(move || {
+                    for round in 0..400 {
+                        let home = if (writer + round) % 2 == 0 { "/homes/a" } else { "/homes/b" };
+                        record_cargo_home(target, Path::new(home));
+                    }
+                });
+            }
+            let reader = scope.spawn(|| {
+                let mut gaps = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if recorded_cargo_home(&target).is_none() {
+                        gaps += 1;
+                    }
+                }
+                gaps
+            });
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            reader.join().expect("the reader does not panic")
+        });
+        assert_eq!(gaps, 0, "a reader saw the note missing or empty {gaps} times");
         let left: Vec<_> = entries(&target.join(PROFILE));
         assert_eq!(left.len(), 1, "only the record, no staged copy: {left:?}");
     }
