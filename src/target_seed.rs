@@ -132,6 +132,52 @@ const PROFILE: &str = "debug";
 /// Where a unit is copied before it is renamed into place.
 const STAGING: &str = ".kache-seeding-";
 
+/// The Cargo home a target's last build ran under, in its profile directory.
+///
+/// Cargo fingerprints a registry unit by its source's path, which is under
+/// the Cargo home as Cargo is given it: a unit built under one home is stale
+/// under another, even when both homes link the same registry, and so is
+/// every unit above it. A worktree pool that gives each checkout a home of
+/// its own made every seeding from another checkout a copy of 4-9 GB that
+/// the first build then rebuilt whole (Fresh 3 of 694 units, 2026-11-14). A donor whose record names another home is not used; a donor
+/// without a record is, as before.
+pub(crate) const CARGO_HOME_RECORD: &str = ".kache-cargo-home";
+
+/// Note `cargo_home` as the home `target_dir` is built under, when its
+/// profile directory exists and names another (or none). Written by a
+/// rename, so a seeding never reads half of it.
+pub(crate) fn record_cargo_home(target_dir: &Path, cargo_home: &Path) {
+    let profile = target_dir.join(PROFILE);
+    if !profile.is_dir() || recorded_cargo_home(target_dir).as_deref() == Some(cargo_home) {
+        return;
+    }
+    // A home that is not UTF-8 is left unrecorded: its donor stays usable.
+    let Some(text) = cargo_home.to_str() else {
+        return;
+    };
+    let record = profile.join(CARGO_HOME_RECORD);
+    let staged = profile.join(format!("{CARGO_HOME_RECORD}.{}", std::process::id()));
+    if std::fs::write(&staged, text).is_err() || std::fs::rename(&staged, &record).is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+}
+
+/// The home [`record_cargo_home`] noted for `target_dir`, if any.
+fn recorded_cargo_home(target_dir: &Path) -> Option<PathBuf> {
+    let home = std::fs::read_to_string(target_dir.join(PROFILE).join(CARGO_HOME_RECORD)).ok()?;
+    (!home.is_empty()).then(|| PathBuf::from(home))
+}
+
+/// Whether `donor` was built under `target`'s Cargo home, or either is
+/// unknown. Compared as given: two homes that link one registry are still
+/// two paths to Cargo.
+fn same_cargo_home(donor: &Donor, target: &NewTarget) -> bool {
+    match (&target.cargo_home, recorded_cargo_home(&donor.target_dir)) {
+        (Some(ours), Some(theirs)) => *ours == theirs,
+        _ => true,
+    }
+}
+
 /// Units a copy thread copies before it places them ([`place_staged`]).
 ///
 /// Few enough that a seeding cut short by its deadline still places what it
@@ -170,6 +216,10 @@ pub(crate) fn is_target_info_probe(args: &[String]) -> bool {
 pub(crate) struct NewTarget {
     pub(crate) target_dir: PathBuf,
     pub(crate) workspace_root: PathBuf,
+    /// The Cargo home its build reads registry sources from, as Cargo is
+    /// given it (not resolved through links): see [`CARGO_HOME_RECORD`].
+    /// `None` when unknown, and then any donor's home will do.
+    pub(crate) cargo_home: Option<PathBuf>,
 }
 
 /// The target directory a probe in `cwd` is for, when it is one this can
@@ -194,6 +244,7 @@ pub(crate) fn new_target(
     (!built(&target_dir)).then_some(NewTarget {
         target_dir,
         workspace_root,
+        cargo_home: None,
     })
 }
 
@@ -2492,6 +2543,13 @@ fn ranked_donors<'a>(
         {
             return None;
         }
+        if !same_cargo_home(donor, target) {
+            tracing::debug!(
+                "not seeding from {}: built under another Cargo home",
+                donor.target_dir.display()
+            );
+            return None;
+        }
         layout(&donor.target_dir.join(PROFILE)).map(|layout| (donor, layout))
     });
     let (own, others): (Vec<_>, Vec<_>) = usable
@@ -3081,21 +3139,27 @@ pub(crate) fn before_probe_for(
     ) else {
         return;
     };
-    let Some(target) = new_target(cwd, Some(directory.as_os_str()), false) else {
+    let Some(mut target) = new_target(cwd, Some(directory.as_os_str()), false) else {
+        // Built already: note the home this build runs under for later
+        // seedings ([`CARGO_HOME_RECORD`]).
+        record_cargo_home(&cwd.join(&directory), &cargo_home);
         return;
     };
+    target.cargo_home = Some(cargo_home.clone());
     let Some(version) = rustc_version_for(args.first().map(String::as_str), env) else {
         return;
     };
     let note = env.var_os("KACHE_LOG_FILE").is_none().then_some(env);
-    match crate::daemon::seed_new_target(
+    let seeded = crate::daemon::seed_new_target(
         config,
         &target,
         &version,
         probe_is_check_lane(env),
         workspace_units_for(env),
         note,
-    ) {
+    );
+    record_cargo_home(&target.target_dir, &cargo_home);
+    match seeded {
         Ok(seeded) if seeded.units > 0 => crate::wrapper::register_seeded_target(
             config,
             &target.target_dir,
@@ -3335,6 +3399,7 @@ source = "git+https://example.com/gitdep#abc"
         NewTarget {
             target_dir: workspace_root.join("target"),
             workspace_root,
+            cargo_home: None,
         }
     }
 
@@ -3366,6 +3431,65 @@ source = "git+https://example.com/gitdep#abc"
             !donor_built_by(&contradicted, VERSION),
             "a record overrides Cargo's cache"
         );
+    }
+
+    /// Cargo knows a registry unit by its source's path under the Cargo home
+    /// as it was given, so a donor built under another home seeds nothing
+    /// Cargo keeps: such a donor is passed over, also when both homes link
+    /// one registry. The same home, or a donor or build that names none,
+    /// seeds as before.
+    #[test]
+    fn a_donor_built_under_another_cargo_home_does_not_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("cargo");
+        std::fs::create_dir_all(shared.join("registry")).unwrap();
+        let member = dir.path().join("w01.cargo");
+        std::fs::create_dir_all(&member).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(shared.join("registry"), member.join("registry")).unwrap();
+        let seeded_under = |donor_home: Option<&Path>, home: Option<&Path>, name: &str| {
+            let donor = donor(dir.path(), &format!("{name}-donor"), Layout::Shared);
+            if let Some(donor_home) = donor_home {
+                record_cargo_home(&donor.target_dir, donor_home);
+            }
+            let mut target = checkout(dir.path(), name);
+            target.cargo_home = home.map(Path::to_path_buf);
+            seed(&target, VERSION, &[donor], no_runs().path(), later()).donor
+        };
+        assert!(
+            seeded_under(Some(&shared), Some(&member), "linked").is_none(),
+            "a home that links the donor's registry is still another home"
+        );
+        assert!(
+            seeded_under(Some(&member), Some(&shared), "back").is_none(),
+            "nor the other way round"
+        );
+        assert!(seeded_under(Some(&member), Some(&member), "same").is_some());
+        assert!(
+            seeded_under(None, Some(&member), "unrecorded").is_some(),
+            "a donor from before the record"
+        );
+        assert!(
+            seeded_under(Some(&member), None, "unknown").is_some(),
+            "a build whose home is unknown"
+        );
+    }
+
+    /// The record follows the home of the target's last build, only once its
+    /// profile directory exists.
+    #[test]
+    fn a_target_records_the_cargo_home_of_its_last_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        record_cargo_home(&target, Path::new("/homes/a"));
+        assert_eq!(recorded_cargo_home(&target), None, "nothing built yet");
+        std::fs::create_dir_all(target.join(PROFILE)).unwrap();
+        record_cargo_home(&target, Path::new("/homes/a"));
+        assert_eq!(recorded_cargo_home(&target).as_deref(), Some(Path::new("/homes/a")));
+        record_cargo_home(&target, Path::new("/homes/b/"));
+        assert_eq!(recorded_cargo_home(&target).as_deref(), Some(Path::new("/homes/b")));
+        let left: Vec<_> = entries(&target.join(PROFILE));
+        assert_eq!(left.len(), 1, "only the record, no staged copy: {left:?}");
     }
 
     /// A target whose last unit Clippy checked recorded the driver's version
@@ -4046,6 +4170,7 @@ source = "git+https://example.com/gitdep#abc"
         let target = NewTarget {
             target_dir: root.join("target"),
             workspace_root: root.clone(),
+            cargo_home: None,
         };
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
         assert!(!checkout_has_other_targets(&target, &[]));
@@ -4070,6 +4195,7 @@ source = "git+https://example.com/gitdep#abc"
         let target = NewTarget {
             target_dir: root.join("target/clippy"),
             workspace_root: root.clone(),
+            cargo_home: None,
         };
         assert!(!checkout_has_other_targets(&target, &[]));
         std::fs::create_dir_all(root.join("target/integrate-x/debug/.fingerprint")).unwrap();
@@ -4099,6 +4225,7 @@ source = "git+https://example.com/gitdep#abc"
             let same = NewTarget {
                 target_dir: donor.workspace_root.join("target/integrate-clippy"),
                 workspace_root: donor.workspace_root.clone(),
+                cargo_home: None,
             };
             let seeded = seed(
                 &same,
@@ -4833,6 +4960,7 @@ source = "git+https://example.com/gitdep#abc"
         NewTarget {
             target_dir: donor.workspace_root.join(name),
             workspace_root: donor.workspace_root.clone(),
+            cargo_home: None,
         }
     }
 
@@ -6411,6 +6539,7 @@ source = "git+https://example.com/gitdep#abc"
         let same = NewTarget {
             target_dir: donor.workspace_root.join("target").join("integrate-clippy"),
             workspace_root: donor.workspace_root.clone(),
+            cargo_home: None,
         };
         let stored = cache_storing(&dir.path().join("cache"), &["x"]);
         let seeded = seed_for_lane(
@@ -6593,6 +6722,7 @@ source = "git+https://example.com/gitdep#abc"
         let new = NewTarget {
             target_dir: own.target_dir.join("integrate-clippy"),
             workspace_root: own.workspace_root.clone(),
+            cargo_home: None,
         };
         // Used last and before: two other checkouts' donors, one unit each.
         let last = empty_donor(dir.path(), "last");

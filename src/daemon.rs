@@ -10799,6 +10799,7 @@ fn handle_seed_target(config: &Config, req: &SeedTargetRequest) -> Response {
     let target = crate::target_seed::NewTarget {
         target_dir: PathBuf::from(&req.target_dir),
         workspace_root: PathBuf::from(&req.workspace_root),
+        cargo_home: None,
     };
     let workspace_units = crate::target_seed::workspace_units_wanted(
         std::env::var_os(crate::target_seed::WORKSPACE_UNITS_ENV).as_deref(),
