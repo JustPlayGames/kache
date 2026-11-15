@@ -191,6 +191,30 @@ fn pool_member_of(home: &Path) -> Option<PathBuf> {
     (!member.is_empty() && home.join(POOL_HOME_MARK).is_file()).then(|| home.with_file_name(member))
 }
 
+/// The Cargo home a worktree pool gives the checkout `target_dir` lies in:
+/// `<dir>/<m>.cargo` holding [`POOL_HOME_MARK`] for a target under `<dir>/<m>`.
+fn pool_home_of(target_dir: &Path) -> Option<PathBuf> {
+    target_dir.ancestors().skip(1).find_map(|member| {
+        let name = member.file_name()?.to_str()?;
+        let home = member.with_file_name(format!("{name}.cargo"));
+        home.join(POOL_HOME_MARK).is_file().then_some(home)
+    })
+}
+
+/// Whether a build of `target` runs under a Cargo home other than the one
+/// its worktree pool member builds under. The pool's own `cargo fetch` of a
+/// new lockfile runs under the shared home, and its probe seeded the
+/// member's fresh target from a donor of that home, which the member's
+/// build under its own home then rebuilt whole (2 of 2 cross-home seedings
+/// after the main checkout was noted, 2026-11-15). Such a build seeds
+/// nothing and leaves the target as it is, so the member's own build seeds it.
+fn under_another_pool_home(target: &NewTarget) -> bool {
+    target
+        .cargo_home
+        .as_ref()
+        .is_some_and(|ours| pool_home_of(&target.target_dir).is_some_and(|member| member != *ours))
+}
+
 /// Whether `donor` was built under `target`'s Cargo home, or either is
 /// unknown. Compared as given: two homes that link one registry are still
 /// two paths to Cargo. A donor without a note counts as unknown, except for
@@ -2205,6 +2229,9 @@ pub(crate) fn seed_for_lane(
     check_lane: bool,
     workspace_units: WorkspaceUnits,
 ) -> Seeded {
+    if under_another_pool_home(target) {
+        return Seeded::default();
+    }
     let Ok(lockfile) = std::fs::read_to_string(target.workspace_root.join("Cargo.lock")) else {
         return Seeded::default();
     };
@@ -3510,6 +3537,38 @@ source = "git+https://example.com/gitdep#abc"
         assert!(
             seeded_under(Some(&member), None, "unknown").is_some(),
             "a build whose home is unknown"
+        );
+    }
+
+    /// A build of a pool member's target under another home (the pool's own
+    /// `cargo fetch` under the shared home) seeds nothing and leaves the
+    /// target unmade, so the member's build under its own home seeds it.
+    #[test]
+    fn a_pool_members_target_is_not_seeded_under_another_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = dir.path().join("pool");
+        let home = pool.join("w01.cargo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(POOL_HOME_MARK), "").unwrap();
+        let shared = dir.path().join("cargo");
+        let other = donor(dir.path(), "main", Layout::Shared);
+        record_cargo_home(&other.target_dir, &shared);
+        let own = donor(&pool, "w02", Layout::Shared);
+        record_cargo_home(&own.target_dir, &home);
+        let mut target = checkout(&pool, "w01");
+        target.cargo_home = Some(shared.clone());
+        let donors = [other, own];
+        let seeded = seed(&target, VERSION, &donors, no_runs().path(), later());
+        assert_eq!(seeded, Seeded::default(), "under the shared home");
+        assert!(
+            !target.target_dir.exists(),
+            "the target is left for the member's build"
+        );
+        target.cargo_home = Some(home.clone());
+        assert_eq!(
+            seed(&target, VERSION, &donors, no_runs().path(), later()).donor,
+            Some(pool.join("w02")),
+            "under the member's own home, from a donor of that home"
         );
     }
 
