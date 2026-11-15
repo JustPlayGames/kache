@@ -5960,9 +5960,34 @@ fn cc_header_probe_pastes_are_resolved<'a>(
         macros: &macro_bodies,
         pastes: &paste_patterns,
     };
+    // Only a macro a conditional can reach through bodies can carry a
+    // constructor to it. A header that defines thousands of macros nothing
+    // tests (a symbol prefix table) is then never examined
+    // (kunobi-ninja/kache#1910).
+    let mut reachable = HashSet::<&str>::new();
+    let mut unvisited: Vec<&str> = scans
+        .iter()
+        .flat_map(|scan| &scan.conditionals)
+        .map(|used| used.name.as_str())
+        .collect();
+    while let Some(name) = unvisited.pop() {
+        if reachable.insert(name)
+            && let Some(bodies) = macro_bodies.get(name)
+        {
+            unvisited.extend(
+                bodies
+                    .iter()
+                    .flat_map(|(_, uses)| uses.iter())
+                    .map(|used| used.name.as_str()),
+            );
+        }
+    }
     let mut visiting = HashSet::new();
     let mut edges = std::collections::HashMap::<&str, Vec<&str>>::new();
     for (name, parameters, uses) in scans.iter().flat_map(|scan| &scan.macro_uses) {
+        if !reachable.contains(name.as_str()) {
+            continue;
+        }
         for used in uses {
             if cc_paste_use_can_name_probe(
                 used,
@@ -5979,6 +6004,9 @@ fn cc_header_probe_pastes_are_resolved<'a>(
     }
     let mut pending = Vec::new();
     for (name, pattern) in scans.iter().flat_map(|scan| &scan.pastes) {
+        if !reachable.contains(name.as_str()) {
+            continue;
+        }
         let pattern = regex::Regex::new(pattern)?;
         if aliases.iter().any(|alias| pattern.is_match(alias)) {
             pending.push(name.as_str());
