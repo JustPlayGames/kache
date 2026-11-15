@@ -179,12 +179,31 @@ fn recorded_cargo_home(target_dir: &Path) -> Option<PathBuf> {
     (!home.is_empty()).then(|| PathBuf::from(home))
 }
 
+/// The file a worktree pool puts in each member's own Cargo home
+/// (`<pool>/<member>.cargo`, beside the member's checkout `<pool>/<member>`).
+const POOL_HOME_MARK: &str = ".pool-shared-home";
+
+/// The checkout a worktree pool member's own Cargo home serves: `<dir>/<m>`
+/// for a home `<dir>/<m>.cargo` that holds [`POOL_HOME_MARK`]. Only builds in
+/// that checkout run under that home.
+fn pool_member_of(home: &Path) -> Option<PathBuf> {
+    let member = home.file_name()?.to_str()?.strip_suffix(".cargo")?;
+    (!member.is_empty() && home.join(POOL_HOME_MARK).is_file()).then(|| home.with_file_name(member))
+}
+
 /// Whether `donor` was built under `target`'s Cargo home, or either is
 /// unknown. Compared as given: two homes that link one registry are still
-/// two paths to Cargo.
+/// two paths to Cargo. A donor without a note counts as unknown, except for
+/// a build under a pool member's own home: no checkout outside that member
+/// builds under it, so a donor there without a note was built under another
+/// (the main checkout, unnoted until its next build, donated 12 of 18
+/// cross-home seedings after A16b's install, 2026-11-15).
 fn same_cargo_home(donor: &Donor, target: &NewTarget) -> bool {
     match (&target.cargo_home, recorded_cargo_home(&donor.target_dir)) {
         (Some(ours), Some(theirs)) => *ours == theirs,
+        (Some(ours), None) => pool_member_of(ours).is_none_or(|member| {
+            donor.target_dir.starts_with(&member) || donor.workspace_root.starts_with(&member)
+        }),
         _ => true,
     }
 }
@@ -3491,6 +3510,43 @@ source = "git+https://example.com/gitdep#abc"
         assert!(
             seeded_under(Some(&member), None, "unknown").is_some(),
             "a build whose home is unknown"
+        );
+    }
+
+    /// A pool member's own Cargo home serves only that member's checkout, so
+    /// a donor without a note elsewhere was built under another home and is
+    /// passed over; one in the member's own checkout still seeds.
+    #[test]
+    fn a_pool_member_skips_a_donor_without_a_note_from_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = dir.path().join("pool");
+        let home = pool.join("w01.cargo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(POOL_HOME_MARK), "").unwrap();
+        let in_member = |donor: Donor| {
+            let mut target = checkout(&pool, "w01");
+            target.target_dir = target.target_dir.join("integrate-clippy");
+            target.cargo_home = Some(home.clone());
+            seed(&target, VERSION, &[donor], no_runs().path(), later()).donor
+        };
+        assert!(
+            in_member(donor(dir.path(), "main", Layout::Shared)).is_none(),
+            "an unnoted checkout outside the member"
+        );
+        assert!(
+            in_member(donor(&pool, "w01", Layout::Shared)).is_some(),
+            "the member's own unnoted target"
+        );
+        let unmarked = dir.path().join("loose/w02.cargo");
+        std::fs::create_dir_all(&unmarked).unwrap();
+        let mut target = checkout(dir.path(), "loose/w02");
+        target.cargo_home = Some(unmarked);
+        let other = donor(dir.path(), "other", Layout::Shared);
+        assert!(
+            seed(&target, VERSION, &[other], no_runs().path(), later())
+                .donor
+                .is_some(),
+            "a home without the pool's mark keeps an unnoted donor"
         );
     }
 
