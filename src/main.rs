@@ -112,6 +112,7 @@ mod tui_sessions;
 mod unit_prune;
 mod verify_compare;
 mod volume_gc;
+mod walk_flight;
 mod worktree_discovery;
 mod wrapper;
 mod wrapper_config;
