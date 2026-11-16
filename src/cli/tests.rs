@@ -6388,6 +6388,7 @@ fn build_event(
         store_error: String::new(),
         store_handed_off: false,
         incremental_seed: String::new(),
+        incremental_seed_attempt: String::new(),
         daemon_store_ms: 0,
         daemon_store_batch: 0,
         lookup_rejection: String::new(),
