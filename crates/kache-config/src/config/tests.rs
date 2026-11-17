@@ -1209,6 +1209,36 @@ fn input_prediction_compression_is_on_by_default_and_obeys_env_precedence() {
 }
 
 #[test]
+fn superseded_executable_cleanup_is_off_by_default() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&config_path);
+    let name = "KACHE_AUTO_CLEAN_SUPERSEDED_EXECUTABLES";
+    let _missing = NamedEnvGuard::remove(name);
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 0);
+    std::fs::write(
+        &config_path,
+        "[cache]\nauto_clean_superseded_executables = 2\n",
+    )
+    .unwrap();
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 2);
+    let _env = NamedEnvGuard::set(name, "3");
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 3);
+    drop(_env);
+    let _garbage = NamedEnvGuard::set(name, "many");
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 2);
+    drop(_garbage);
+    std::fs::write(
+        &config_path,
+        "[cache]\nignore_env = true\nauto_clean_superseded_executables = 1\n",
+    )
+    .unwrap();
+    let _ignored = NamedEnvGuard::set(name, "9");
+    assert_eq!(Config::load().unwrap().auto_clean_superseded_executables, 1);
+}
+
+#[test]
 fn memory_pressure_admission_is_on_by_default_and_obeys_env_precedence() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -3468,6 +3498,7 @@ fn test_file_config_roundtrip() {
             auto_clean_unused_units_days: None,
             input_prediction_retention_days: None,
             auto_clean_adaptive_idle_hours: None,
+            auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             build_script_omit_cargo_source_dir_mtime: None,
@@ -4145,6 +4176,7 @@ fn test_config_store_dir() {
         auto_clean_unused_units_days: 0,
         input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
@@ -4250,6 +4282,7 @@ fn test_config_index_db_path() {
         auto_clean_unused_units_days: 0,
         input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
@@ -4351,6 +4384,7 @@ fn test_config_event_log_path() {
         auto_clean_unused_units_days: 0,
         input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
@@ -4471,6 +4505,7 @@ fn test_config_socket_path() {
         auto_clean_unused_units_days: 0,
         input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,
@@ -5227,6 +5262,7 @@ fn test_save_and_load_file_config() {
             auto_clean_unused_units_days: None,
             input_prediction_retention_days: None,
             auto_clean_adaptive_idle_hours: None,
+            auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
             build_script_omit_cargo_source_dir_mtime: None,

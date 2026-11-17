@@ -2188,6 +2188,7 @@ mod tests {
                 auto_clean_unused_units_days: None,
                 input_prediction_retention_days: None,
                 auto_clean_adaptive_idle_hours: None,
+                auto_clean_superseded_executables: None,
                 target_liveness: None,
                 seed_new_targets: None,
                 build_script_hermetic: None,
