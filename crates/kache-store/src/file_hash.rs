@@ -1511,6 +1511,55 @@ fn boot_time_secs() -> Option<i64> {
     boot_time_in_proc_stat(&stat)
 }
 
+/// When Windows booted, in Unix seconds: the boot time the kernel keeps,
+/// which `NtQuerySystemInformation` reports for `SystemTimeOfDayInformation`
+/// and WMI as `Win32_OperatingSystem.LastBootUpTime`. Like Linux's `btime`
+/// it moves when the clock is set, by the size of the step. The system time
+/// minus `GetTickCount64` is not the same value: it is only as fine as the
+/// tick (about 16 ms) and can sit below the kernel's boot time, the side
+/// that serves a row from before the boot.
+#[cfg(windows)]
+fn windows_boot_time_secs() -> Option<i64> {
+    use windows_sys::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemTimeOfDayInformation,
+    };
+    // SYSTEM_TIMEOFDAY_INFORMATION, which winternl.h leaves opaque: the boot
+    // time and the current time as FILETIMEs, then the time zone bias, its id
+    // and padding, the boot time bias and the sleep time bias, 48 bytes.
+    let mut info = [0u64; 6];
+    let mut written = 0u32;
+    // SAFETY: `info` is 48 writable bytes, aligned for the 64-bit fields the
+    // call writes, alive across the call, and the length passed is their size;
+    // `written` is a live u32 the call may fill.
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SystemTimeOfDayInformation,
+            info.as_mut_ptr().cast(),
+            std::mem::size_of_val(&info) as u32,
+            &mut written,
+        )
+    };
+    if status < 0 || (written as usize) < 2 * std::mem::size_of::<u64>() {
+        return None;
+    }
+    let unix_ns = |filetime: u64| filetime_to_unix_ns((filetime >> 32) as u32, filetime as u32);
+    boot_secs_from_time_of_day(unix_ns(info[0]), unix_ns(info[1]), windows_system_time_ns())
+}
+
+/// The boot second from what `SystemTimeOfDayInformation` reports, its boot
+/// time and its current time (nanoseconds since the Unix epoch), checked
+/// against the system time read beside the call (`now_ns`): a current time
+/// off it, or a boot after it, means the bytes are not laid out as
+/// [`windows_boot_time_secs`] reads them, and the boot time is unknown.
+/// Rounded down, so a row recorded in the boot's own second is served.
+#[cfg(any(test, windows))]
+fn boot_secs_from_time_of_day(boot_ns: i64, current_ns: i64, now_ns: i64) -> Option<i64> {
+    const LAYOUT_SLACK_NS: u64 = 60_000_000_000;
+    let laid_out =
+        boot_ns > 0 && boot_ns <= current_ns && current_ns.abs_diff(now_ns) <= LAYOUT_SLACK_NS;
+    laid_out.then(|| boot_ns.div_euclid(1_000_000_000))
+}
+
 /// The `btime` line of `/proc/stat`.
 #[cfg(any(test, target_os = "linux", target_os = "android"))]
 fn boot_time_in_proc_stat(stat: &str) -> Option<i64> {
@@ -1522,10 +1571,7 @@ fn boot_time_in_proc_stat(stat: &str) -> Option<i64> {
 /// When this machine booted, in Unix seconds.
 #[cfg(windows)]
 fn boot_time_secs() -> Option<i64> {
-    // SAFETY: GetTickCount64 takes no arguments and only reads the tick count.
-    let up_ms = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
-    let up_secs = i64::try_from(up_ms / 1_000).ok()?;
-    Some(windows_system_time_ns() / 1_000_000_000 - up_secs)
+    windows_boot_time_secs()
 }
 
 /// When this machine booted, in Unix seconds.
@@ -3394,6 +3440,61 @@ mod tests {
         let stat = "cpu  1 2 3\nintr 5\nbtime 1794057339\nprocesses 9\n";
         assert_eq!(boot_time_in_proc_stat(stat), Some(1_794_057_339));
         assert_eq!(boot_time_in_proc_stat("cpu 1\nbtimes 7\n"), None);
+    }
+
+    #[test]
+    fn a_windows_boot_time_is_rounded_down_and_read_only_from_the_expected_layout() {
+        const SECOND: i64 = 1_000_000_000;
+        // 2026-11-16 19:47:39.999999999 UTC, read 15 minutes later.
+        let boot = 1_794_858_459 * SECOND + 999_999_999;
+        let now = boot + 900 * SECOND;
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now),
+            Some(1_794_858_459),
+            "a row stamped in the boot's own second must be served"
+        );
+        // The call's current time and the system time read beside it agree
+        // within a minute when the bytes hold what they are read as.
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now + 60 * SECOND),
+            Some(1_794_858_459)
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now - 60 * SECOND),
+            Some(1_794_858_459)
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now + 60 * SECOND + 1),
+            None
+        );
+        assert_eq!(
+            boot_secs_from_time_of_day(boot, now, now - 60 * SECOND - 1),
+            None
+        );
+        // A boot in the reported instant itself is still a boot; one after it,
+        // or none at all, is not.
+        assert_eq!(
+            boot_secs_from_time_of_day(now, now, now),
+            Some(1_794_859_359)
+        );
+        assert_eq!(boot_secs_from_time_of_day(now + 1, now, now), None);
+        assert_eq!(boot_secs_from_time_of_day(0, now, now), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", windows))]
+    #[test]
+    fn this_machine_booted_in_the_past() {
+        let boot = boot_time_secs().expect("this platform's boot time is known");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // 2017-07-14: no machine running these tests booted before it.
+        assert!(boot > 1_500_000_000, "boot time {boot}");
+        assert!(
+            boot <= i64::try_from(now).unwrap(),
+            "boot time {boot} is ahead of now {now}"
+        );
     }
 
     #[test]
