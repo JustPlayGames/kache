@@ -102,6 +102,8 @@ mod term;
 mod test_runner;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod time_compat_tests;
 mod timeline;
 mod timeline_client;
 mod toolchain_dylib;
