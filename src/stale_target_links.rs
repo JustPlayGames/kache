@@ -107,7 +107,7 @@ pub(crate) fn run(config: &Config, days: u64, apply: bool) -> Result<Report> {
     use std::os::unix::fs::MetadataExt;
     let store = Store::open(config)?;
     let inodes = shared_blob_inodes(&config.store_dir());
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     let mut report = Report {
         days,
         applied: apply,

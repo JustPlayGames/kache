@@ -284,7 +284,7 @@ fn run_ticks(
 
         let hb = HeartbeatEvent {
             event: HEARTBEAT_EVENT_TAG.to_string(),
-            ts: chrono::Utc::now(),
+            ts: jiff::Timestamp::now(),
             crate_name: crate_name.to_string(),
             root: ctx.root.clone(),
             pid,

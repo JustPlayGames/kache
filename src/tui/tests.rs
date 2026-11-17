@@ -506,7 +506,7 @@ fn arriving_rows_do_not_move_a_scrolled_reader() {
             100,
         ));
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let range = s.build_scroll.visible_range(20, 5);
     assert_eq!(range, 15..20, "following the newest");
 
@@ -523,13 +523,13 @@ fn arriving_rows_do_not_move_a_scrolled_reader() {
             50,
         ));
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let range = s.build_scroll.visible_range(23, 5);
     assert_eq!(range, 5..10, "same rows after three arrivals");
 
     // Rows for another, older build move nothing here.
     s.push_event(session_event("x", EventResult::Miss, "/v", "s2", 400));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.selected_session().unwrap().key, "id:s1");
     let range = s.build_scroll.visible_range(23, 5);
     assert_eq!(range, 5..10);
@@ -537,7 +537,7 @@ fn arriving_rows_do_not_move_a_scrolled_reader() {
     // At the live edge the newest rows are the view.
     s.build_scroll.end();
     s.push_event(session_event("c23", EventResult::Miss, "/w", "s1", 30));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let range = s.build_scroll.visible_range(24, 5);
     assert_eq!(range, 19..24);
 
@@ -546,11 +546,11 @@ fn arriving_rows_do_not_move_a_scrolled_reader() {
     s.build_scroll.scroll_up_by(10);
     s.build_filter = "zzz".to_string();
     s.push_event(session_event("c24", EventResult::Miss, "/w", "s1", 20));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.build_scroll.offset, 10);
     s.build_filter = "c2".to_string();
     s.push_event(session_event("c25", EventResult::Miss, "/w", "s1", 10));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.build_scroll.offset, 11, "a matching filter still counts");
 }
 
@@ -568,12 +568,11 @@ fn pause_toggles_and_is_announced() {
 
 #[test]
 fn lookup_series_buckets_by_time_and_keeps_idle_time_flat() {
-    use chrono::Duration as ChronoDuration;
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let window = Duration::from_secs(300);
     let at = |secs_ago: i64, result: EventResult| {
         let mut event = sample_build_event("x", result, 1, 1);
-        event.ts = now - ChronoDuration::seconds(secs_ago);
+        event.ts = now - jiff::SignedDuration::from_secs(secs_ago);
         event
     };
     let events = vec![
@@ -806,7 +805,7 @@ fn populated_state() -> AppState {
         }];
         scan.scanned = true;
     }
-    state.refresh_sessions(chrono::Utc::now());
+    state.refresh_sessions(jiff::Timestamp::now());
     state
 }
 
@@ -824,7 +823,7 @@ fn session_event(
     event.cache_key = format!("{crate_name}-{session}");
     event.root = root.to_string();
     event.session_id = session.to_string();
-    event.ts = chrono::Utc::now() - chrono::Duration::seconds(secs_ago);
+    event.ts = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs_ago);
     event.compile_time_ms = 2_000;
     event
 }
@@ -840,7 +839,7 @@ fn arrows_pick_a_build_and_enter_opens_why() {
         session_event("old_b", EventResult::LocalHit, "/w/old", "s-old", 899),
         session_event("new_a", EventResult::Miss, "/w/new", "s-new", 5),
     ];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.sessions.len(), 2);
     assert_eq!(s.sessions[0].key, "id:s-new", "newest on top");
     assert!(s.selected_session.is_none(), "following by default");
@@ -889,13 +888,13 @@ fn a_picked_build_stays_picked_when_rows_reorder() {
         session_event("a", EventResult::Miss, "/w/one", "s1", 500),
         session_event("b", EventResult::Miss, "/w/two", "s2", 400),
     ];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.sessions[0].key, "id:s2");
     handle_key(&mut s, KeyCode::Down);
     assert_eq!(s.selected_session.as_deref(), Some("id:s1"));
     // s1 wakes up and moves to the top.
     s.push_event(session_event("c", EventResult::Miss, "/w/one", "s1", 1));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.sessions[0].key, "id:s1");
     assert_eq!(s.selected_session().unwrap().key, "id:s1");
     assert_eq!(s.selected_index(), Some(0));
@@ -949,7 +948,7 @@ fn why_tab_collapses_a_cascade_to_its_root() {
     }
     let mut s = test_state();
     s.events = events;
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.selected_session().unwrap().key, "id:now");
 
     let lines: Vec<String> = why_lines(&mut s, 118)
@@ -1006,7 +1005,7 @@ fn why_tab_says_when_it_cannot_explain_and_how_to_fix_that() {
         session_event("x", EventResult::Miss, "/w", "now", 5),
         session_event("y", EventResult::Miss, "/w", "now", 4),
     ];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let text: Vec<String> = why_lines(&mut s, 100)
         .iter()
         .map(|line| line.to_string())
@@ -1413,10 +1412,10 @@ fn draw_ui_renders_every_tab_without_panicking() {
 fn load_history_keeps_recent_builds_once_and_tails_from_there() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("events.jsonl");
-    let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+    let cutoff = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(1);
 
     let mut old = sample_build_event("old", EventResult::Miss, 1, 1);
-    old.ts = cutoff - chrono::Duration::seconds(1);
+    old.ts = cutoff - jiff::SignedDuration::from_secs(1);
     let mut edge = sample_build_event("edge", EventResult::LocalHit, 1, 1);
     edge.ts = cutoff;
     let recent = sample_build_event("recent", EventResult::LocalHit, 1, 1);
@@ -1426,7 +1425,7 @@ fn load_history_keeps_recent_builds_once_and_tails_from_there() {
     let beat = HeartbeatEvent {
         schema: 1,
         event: "heartbeat".to_string(),
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         eta_s: None,
         crate_name: "gone".to_string(),
         root: "/w".to_string(),
@@ -1463,7 +1462,7 @@ fn sample_build_event(
     size: u64,
 ) -> events::BuildEvent {
     events::BuildEvent {
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         session_id: String::new(),
         demands: Vec::new(),
         rebuilt_package: None,
@@ -1667,7 +1666,7 @@ fn draw_ui_renders_populated_tabs_without_panicking() {
         state.stats_snapshot.entry_count = 2;
         state.stats_snapshot.total_size = 3_500_000;
         state.stats_loaded = true;
-        state.refresh_sessions(chrono::Utc::now());
+        state.refresh_sessions(jiff::Timestamp::now());
         // Transfer-tab counters/speeds.
         state.stats_snapshot.uploads_completed = 3;
         state.upload_speed_bps = 2_500_000.0;
@@ -1772,7 +1771,7 @@ fn ingest_respects_pause_and_settles_heartbeats() {
     let beat = HeartbeatEvent {
         schema: 1,
         event: "heartbeat".to_string(),
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         eta_s: Some(60),
         crate_name: "gkrust".to_string(),
         root: "/w".to_string(),
@@ -1956,7 +1955,7 @@ fn terminal_size_guard_is_exact_on_both_axes() {
 
 #[test]
 fn lookup_series_counts_an_event_from_this_instant_in_the_newest_column() {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let mut event = sample_build_event("x", EventResult::LocalHit, 1, 1);
     event.ts = now;
     let (hits, misses) = lookup_series(&[event], now, Duration::from_secs(300), 4);
@@ -2079,7 +2078,7 @@ fn mid_priority_columns_have_their_own_thresholds() {
 fn changing_build_resets_both_panels_and_a_lone_build_can_be_pinned() {
     let mut s = test_state();
     s.push_event(session_event("a", EventResult::Miss, "/w/one", "s1", 500));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert!(s.selected_session.is_none());
     // Down on the only row pins it rather than doing nothing.
     handle_key(&mut s, KeyCode::Down);
@@ -2092,7 +2091,7 @@ fn changing_build_resets_both_panels_and_a_lone_build_can_be_pinned() {
     s.why_scroll.visible_range(50, 10);
     s.why_scroll.scroll_down_by(7);
     s.push_event(session_event("b", EventResult::Miss, "/w/two", "s2", 1));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.sessions[0].key, "id:s2");
     assert_eq!(s.selected_session().unwrap().key, "id:s1");
     assert_eq!((s.build_scroll.offset, s.why_scroll.offset), (5, 7));
@@ -2108,7 +2107,7 @@ fn changing_build_resets_both_panels_and_a_lone_build_can_be_pinned() {
     s.build_scroll.visible_range(50, 10);
     s.build_scroll.scroll_up_by(3);
     s.push_event(session_event("c", EventResult::Miss, "/w/three", "s3", 0));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.selected_session().unwrap().key, "id:s3");
     assert_eq!(s.build_scroll.offset, 0);
 }
@@ -2160,7 +2159,7 @@ fn build_tab_layout_thresholds() {
 fn why_tab_marks_its_scroll_position_only_when_there_is_more() {
     let mut s = test_state();
     s.events = vec![session_event("a", EventResult::Miss, "/w", "s1", 5)];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Why);
     assert!(!screen.contains('–'), "everything fits: {screen}");
 
@@ -2169,7 +2168,7 @@ fn why_tab_marks_its_scroll_position_only_when_there_is_more() {
         e.passthrough_reason = "unsupported|flag".to_string();
         s.push_event(e);
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_lines(&mut s, Tab::Why, 100, 20).join("\n");
     assert!(screen.contains("1–16 of"), "{screen}");
     assert!(screen.contains("PgUp PgDn"), "{screen}");
@@ -2190,7 +2189,7 @@ fn why_cost_strip_mentions_copies_only_when_there_are_any() {
     let mut hit = session_event("a", EventResult::LocalHit, "/w", "s1", 5);
     hit.reflinked_bytes = 1000;
     s.events = vec![hit];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let text = why_text(&mut s, 120).join("\n");
     assert!(text.contains("restored 1000 B"), "{text}");
     assert!(!text.contains("by copy"), "{text}");
@@ -2200,7 +2199,7 @@ fn why_cost_strip_mentions_copies_only_when_there_are_any() {
     let mut hit = session_event("b", EventResult::LocalHit, "/w", "s1", 4);
     hit.copied_bytes = 1000;
     s.push_event(hit);
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let text = why_text(&mut s, 120).join("\n");
     assert!(text.contains("50% by copy"), "{text}");
 
@@ -2209,7 +2208,7 @@ fn why_cost_strip_mentions_copies_only_when_there_are_any() {
     let mut pt = session_event("cc", EventResult::Passthrough, "/w", "s2", 3);
     pt.passthrough_reason = "unsupported|flag".to_string();
     s.events = vec![pt];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let text = why_text(&mut s, 120).join("\n");
     assert!(text.contains("none: nothing was looked up"), "{text}");
     assert!(text.contains("no lookups"), "{text}");
@@ -2219,7 +2218,7 @@ fn why_cost_strip_mentions_copies_only_when_there_are_any() {
 fn why_counts_misses_in_english_and_says_when_capped() {
     let mut s = test_state();
     s.events = vec![session_event("a", EventResult::Miss, "/w", "s1", 5)];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let text = why_text(&mut s, 120).join("\n");
     assert!(text.contains("Misses by cause · 1 miss\n"), "{text}");
     assert!(!text.contains("Misses by cause · 1 misses"), "{text}");
@@ -2245,7 +2244,7 @@ fn why_counts_misses_in_english_and_says_when_capped() {
             4,
         ));
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let text = why_text(&mut s, 120).join("\n");
     assert!(
         text.contains(&format!(
@@ -2281,7 +2280,7 @@ fn fit_state() -> AppState {
         "not-a-compile|--print cfg with a long tail of arguments, and then some more".to_string();
     s.push_event(probe);
     s.push_event(session_event("m", EventResult::Miss, "/w", "s1", 3));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     s
 }
 
@@ -2387,12 +2386,12 @@ fn fmt_saved_ms_switches_units_at_one_second() {
 fn in_flight_compile_keeps_its_build_running() {
     let mut s = test_state();
     s.events = vec![session_event("a", EventResult::Miss, "/w", "s1", 300)];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.sessions[0].state, SessionState::Finished);
     let beat = HeartbeatEvent {
         schema: 1,
         event: "heartbeat".to_string(),
-        ts: chrono::Utc::now(),
+        ts: jiff::Timestamp::now(),
         crate_name: "b".to_string(),
         root: "/w".to_string(),
         pid: 7,
@@ -2401,7 +2400,7 @@ fn in_flight_compile_keeps_its_build_running() {
         eta_s: None,
     };
     s.live_heartbeats.insert(7, (Instant::now(), beat));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     assert_eq!(s.sessions[0].state, SessionState::Live);
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(screen.contains("running"), "{screen}");
@@ -2436,7 +2435,7 @@ fn now_list_layout_and_styling() {
         session_event("a", EventResult::Miss, "/w/one", "s1", 5),
         session_event("b", EventResult::LocalHit, "/w/two", "s2", 400),
     ];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
 
     let buffer = rendered_buffer(&mut s, Tab::Now, 100, 40);
     let rows: Vec<String> = (0..40).map(|y| row_text(&buffer, y)).collect();
@@ -2496,7 +2495,7 @@ fn now_list_layout_and_styling() {
 
     let mut s = test_state();
     s.events = vec![session_event("a", EventResult::Miss, "/w/one", "s1", 5)];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Now);
     assert!(screen.contains("one"), "{screen}");
     assert!(screen.contains("following the top build"), "{screen}");
@@ -2531,7 +2530,7 @@ fn now_copy_uses_the_rates_the_daemon_already_has() {
     let label = |result| {
         let mut s = test_state();
         s.events = vec![session_event("c", result, "/w", "s", 1)];
-        s.refresh_sessions(chrono::Utc::now());
+        s.refresh_sessions(jiff::Timestamp::now());
         misses_label(&s.sessions[0].tally)
     };
     assert_eq!(label(EventResult::Passthrough), "\u{2014}");
@@ -2564,7 +2563,7 @@ fn now_pages_the_build_list_and_the_wheel_moves_three() {
             100 - i,
         ));
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab_at(&mut s, Tab::Now, 100, 23);
     assert!(screen.contains("following the top build"), "{screen}");
     assert!(screen.contains("3 more, older"), "{screen}");
@@ -2626,7 +2625,7 @@ fn now_fills_the_terminal_and_pages_by_the_visible_height() {
             100 - i,
         ));
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
 
     let screen = rendered_tab(&mut s, Tab::Now);
     assert_eq!(s.now_page_size, 28);
@@ -2687,7 +2686,7 @@ fn small_now_keeps_the_selector_compact_and_the_detail_readable() {
     for event in &mut s.events {
         event.elapsed_ms = 2_100;
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     for (width, height) in [
         (60, 16),
         (60, 24),
@@ -2816,7 +2815,7 @@ fn now_keeps_hidden_analysis_and_event_scroll_untouched() {
             5,
         ));
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     rendered_buffer(&mut s, Tab::Now, 160, 44);
     s.build_scroll.scroll_up_by(7);
     let before = s.build_scroll;
@@ -2848,7 +2847,7 @@ fn now_warns_only_when_the_cause_preview_omits_older_misses() {
                 5,
             ));
         }
-        s.refresh_sessions(chrono::Utc::now());
+        s.refresh_sessions(jiff::Timestamp::now());
         let layout = now_layout(Rect::new(0, 1, 160, 43), 1);
         let buffer = rendered_buffer(&mut s, Tab::Now, 160, 44);
         let causes = region_text(&buffer, layout.causes);
@@ -2879,7 +2878,7 @@ fn now_mouse_uses_the_rendered_rows_at_the_minimum_side_by_side_height() {
             100 - i,
         ));
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let mut terminal = Terminal::new(TestBackend::new(116, 21)).unwrap();
     let area = Rect::new(3, 2, 110, 17);
     let content = Rect::new(3, 3, 110, 16);
@@ -2948,7 +2947,7 @@ fn now_shows_events_and_causes_beside_the_list_and_stacks_on_narrow_terminals() 
         session_event("crate_hot", EventResult::LocalHit, "/w/one", "s1", 5),
         session_event("crate_other", EventResult::LocalHit, "/w/two", "s2", 400),
     ];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     for (width, height) in [(160, 44), (80, 44)] {
         let layout = now_layout(Rect::new(0, 1, width, height - 1), s.sessions.len());
         if width == 160 {
@@ -3004,7 +3003,7 @@ fn now_clicks_select_visible_rows_and_the_wheel_scrolls_the_pointed_panel() {
         "s2",
         400,
     ));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let area = Rect::new(3, 2, 160, 44);
     let layout = now_layout(Rect::new(3, 3, 160, 43), s.sessions.len());
     // Render at the same dimensions to establish the event viewport.
@@ -3093,7 +3092,7 @@ fn monitor_labels_fixed_prediction_failures_in_now_and_why() {
         );
         s.events.push(event);
     }
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let why = why_text(&mut s, 250).join("\n");
     let summary = why.split("Passthroughs in this build").next().unwrap();
     assert_eq!(
@@ -3137,7 +3136,7 @@ fn now_explains_a_passthrough_without_claiming_a_cache_hit() {
     let mut event = session_event("proc_macro", EventResult::Passthrough, "/w/one", "s1", 5);
     event.passthrough_reason = "not-cacheable|non-relocatable proc macro".to_string();
     s.events.push(event);
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Now);
     assert!(
         screen.contains("No cache lookups in this build."),
@@ -3175,7 +3174,7 @@ fn now_previews_the_selected_build_and_keeps_it_across_detail_tabs() {
         "s2",
         400,
     ));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Now);
     assert!(screen.contains("Selected build"), "{screen}");
     assert!(screen.contains("/w/one"), "{screen}");
@@ -3268,7 +3267,7 @@ fn unnamed_passthroughs_collapse_and_point_at_the_build_that_missed() {
         "busy",
         400,
     ));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(screen.contains("passed through"), "{screen}");
     assert!(
@@ -3304,7 +3303,7 @@ fn unnamed_passthroughs_collapse_and_point_at_the_build_that_missed() {
         "warm",
         798,
     ));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(
         screen.contains("warm is the build with 2 misses and 2s saved"),
@@ -3328,7 +3327,7 @@ fn a_named_or_missed_event_keeps_the_build_table() {
         "quiet",
         4,
     ));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(screen.contains("build.rs"), "{screen}");
     assert!(!screen.contains("passed through"), "{screen}");
@@ -3342,7 +3341,7 @@ fn a_named_or_missed_event_keeps_the_build_table() {
         "quiet",
         4,
     ));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(screen.contains("leaf"), "{screen}");
     assert!(
@@ -3355,7 +3354,7 @@ fn a_named_or_missed_event_keeps_the_build_table() {
 fn a_cold_miss_with_no_history_does_not_mention_explain_miss() {
     let mut s = test_state();
     s.events = vec![session_event("leaf", EventResult::Miss, "/w/app", "s1", 5)];
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let text = why_text(&mut s, 100).join("\n");
     assert!(text.contains("cold    0 of 1 hit"), "{text}");
     assert!(
@@ -3439,7 +3438,7 @@ fn a_hit_only_build_is_not_the_one_with_misses() {
         "warm",
         400,
     ));
-    s.refresh_sessions(chrono::Utc::now());
+    s.refresh_sessions(jiff::Timestamp::now());
     let screen = rendered_tab(&mut s, Tab::Build);
     assert!(screen.contains("passed through"), "{screen}");
     assert!(!screen.contains("is the build with"), "{screen}");
