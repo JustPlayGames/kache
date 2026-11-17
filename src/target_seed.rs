@@ -3077,25 +3077,33 @@ fn hex_le(fingerprint: u64) -> String {
 /// the parent process. Only narrows what is seeded, so a wrong answer costs
 /// time, never a wrong build.
 fn probe_is_check_lane(env: &crate::invocation::InvocationEnv) -> bool {
-    if env.var_os("CLIPPY_ARGS").is_some() {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(ppid) = crate::invocation::cargo_pid()
-        && let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline"))
-    {
-        let args: Vec<String> = cmdline
+    env.var_os("CLIPPY_ARGS").is_some()
+        || parent_cargo_args()
+            .is_some_and(|args| matches!(cargo_subcommand(&args), Some("check" | "clippy")))
+}
+
+/// The command line of the Cargo that runs this wrapper, read from
+/// `/proc` on Linux; `None` elsewhere or when it cannot be read.
+#[cfg(target_os = "linux")]
+fn parent_cargo_args() -> Option<Vec<String>> {
+    let ppid = crate::invocation::cargo_pid()?;
+    let cmdline = std::fs::read(format!("/proc/{ppid}/cmdline")).ok()?;
+    Some(
+        cmdline
             .split(|byte| *byte == 0)
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect();
-        return matches!(cargo_subcommand(&args), Some("check" | "clippy"));
-    }
-    false
+            .collect(),
+    )
+}
+
+/// The command line of the Cargo that runs this wrapper: only read on Linux.
+#[cfg(not(target_os = "linux"))]
+fn parent_cargo_args() -> Option<Vec<String>> {
+    None
 }
 
 /// The subcommand of a Cargo command line: the first argument after the
 /// program that is neither an option nor a `+toolchain`.
-#[cfg(any(target_os = "linux", test))]
 fn cargo_subcommand(args: &[String]) -> Option<&str> {
     args.iter()
         .skip(1)
@@ -3136,24 +3144,11 @@ fn names_a_target(args: &[String]) -> bool {
 /// Linux, the Cargo command line that sent the probe. Only skips a seeding,
 /// so a wrong answer costs time, never a wrong build.
 fn build_names_a_target(args: &[String], env: &crate::invocation::InvocationEnv) -> bool {
-    if names_a_target(args)
+    names_a_target(args)
         || env
             .var_os("CARGO_BUILD_TARGET")
             .is_some_and(|target| !target.is_empty())
-    {
-        return true;
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(ppid) = crate::invocation::cargo_pid()
-        && let Ok(cmdline) = std::fs::read(format!("/proc/{ppid}/cmdline"))
-    {
-        let args: Vec<String> = cmdline
-            .split(|byte| *byte == 0)
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect();
-        return names_a_target(&args);
-    }
-    false
+        || parent_cargo_args().is_some_and(|args| names_a_target(&args))
 }
 
 /// The wrapper's side: when `args` is the probe for a target directory Cargo
