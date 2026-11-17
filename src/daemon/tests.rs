@@ -1652,6 +1652,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         auto_clean_unused_units_days: 0,
         input_prediction_retention_days: 30,
         auto_clean_adaptive_idle_hours: 0,
+        auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
         build_script_omit_cargo_source_dir_mtime: false,

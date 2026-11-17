@@ -105,6 +105,7 @@ mod tests {
             auto_clean_unused_units_days: 0,
             input_prediction_retention_days: 30,
             auto_clean_adaptive_idle_hours: 0,
+            auto_clean_superseded_executables: 0,
             target_liveness: false,
             seed_new_targets: false,
             build_script_hermetic: false,
