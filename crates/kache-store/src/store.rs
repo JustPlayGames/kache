@@ -1963,6 +1963,17 @@ const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 /// megabytes.
 pub const TOMBSTONE_RETENTION_DAYS: u64 = 14;
 
+/// How long one transaction of the tombstone prune deletes rows before it
+/// commits: it holds the index's write lock this long, plus one row and the
+/// commit.
+const PRUNE_LOCK_HOLD: Duration = Duration::from_millis(100);
+
+/// How long the tombstone prune leaves the write lock free before each of
+/// its transactions: a little longer than the longest sleep (100 ms) of
+/// SQLite's default busy handler between tries, the poll interval of a
+/// writer that has already waited a while.
+const PRUNE_LOCK_GAP: Duration = Duration::from_millis(110);
+
 /// Default maximum wait for another process to publish a key it is building.
 pub const BUILD_LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const BUILD_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -9170,6 +9181,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     ///
     /// Run from the GC sweep. A tombstone's value is the demand signal in the
     /// window after eviction; past that it is only taking up space.
+    ///
+    /// Neither table has an SQL index on its stamp, so finding the old rows
+    /// reads the whole table. That read runs outside a write transaction,
+    /// and the rows then go by key, a short transaction at a time
+    /// ([`PRUNE_LOCK_HOLD`]), each after the write lock was left free for
+    /// [`PRUNE_LOCK_GAP`], so puts get the lock while a long prune runs.
     pub fn prune_tombstones(&self, keep_days: u64) -> Result<usize> {
         self.refuse_write("prune tombstones")?;
         let cutoff = format!("-{keep_days} days");
@@ -9179,42 +9196,54 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     }
 
     /// Delete the rows of `table` whose `stamp` is older than `cutoff` (an
-    /// SQLite date modifier). Neither table has an index on its stamp, so
-    /// finding them reads the whole table: that read takes no lock, and the
-    /// rows then go by key in transactions of at most [`WRITE_LOCK_HOLD`],
-    /// with the lock free for [`WRITE_LOCK_YIELD`] between them. One
-    /// `DELETE ... WHERE stamp < ...` held the write lock for its whole scan
-    /// of 1.3 million tombstones: 10-12 s on a quiet copy of the build
-    /// machine's index with a cold page cache, 32-57 s under load, and every
-    /// store queued behind it failed (KACHE-NEXT103).
+    /// SQLite date modifier). One `DELETE ... WHERE stamp < ...` held the
+    /// write lock for its whole scan of 1.3 million tombstones: 10-12 s on a
+    /// quiet copy of the build machine's index with a cold page cache, 32-57 s
+    /// under load, and every store queued behind it failed (KACHE-NEXT103).
     fn prune_rows_older_than(&self, table: &str, stamp: &str, cutoff: &str) -> Result<usize> {
-        let keys: Vec<String> = {
-            let db = self.db();
-            let mut stmt = db.prepare(&format!(
-                "SELECT cache_key FROM {table} WHERE {stamp} < datetime('now', ?1)"
-            ))?;
-            stmt.query_map(params![cutoff], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        // The stamp again in the delete: a key evicted anew since the read
-        // has a fresh row, which stays.
+        let keys = self.keys_older_than(table, stamp, cutoff)?;
+        self.delete_old_rows_by_key(table, stamp, &keys, cutoff)
+    }
+
+    /// The keys of `table` whose `stamp` is older than `cutoff`, read
+    /// without the write lock.
+    fn keys_older_than(&self, table: &str, stamp: &str, cutoff: &str) -> Result<Vec<String>> {
+        let db = self.db();
+        let mut stmt = db.prepare(&format!(
+            "SELECT cache_key FROM {table} WHERE {stamp} < datetime('now', ?1)"
+        ))?;
+        let keys = stmt
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(keys)
+    }
+
+    /// Delete `keys` from `table`, each only while its `stamp` is still older
+    /// than `cutoff`: a key evicted again since the read has a fresh row,
+    /// which stays. Leaves the write lock free for [`PRUNE_LOCK_GAP`] before
+    /// each transaction and commits after [`PRUNE_LOCK_HOLD`]; the index
+    /// connection goes back to the pool between transactions.
+    fn delete_old_rows_by_key(
+        &self,
+        table: &str,
+        stamp: &str,
+        keys: &[String],
+        cutoff: &str,
+    ) -> Result<usize> {
         let delete =
             format!("DELETE FROM {table} WHERE cache_key = ?1 AND {stamp} < datetime('now', ?2)");
         let mut removed = 0;
-        let mut done = 0;
-        while done < keys.len() {
-            if done > 0 {
-                std::thread::sleep(WRITE_LOCK_YIELD);
-            }
+        let mut keys = keys.iter().peekable();
+        while keys.peek().is_some() {
+            std::thread::sleep(PRUNE_LOCK_GAP);
             let db = self.db();
             let tx = begin_write_waiting(&db, "pruning tombstones")?;
             let started = std::time::Instant::now();
             {
                 let mut stmt = tx.prepare_cached(&delete)?;
-                for key in &keys[done..] {
+                for key in keys.by_ref() {
                     removed += stmt.execute(params![key, cutoff])?;
-                    done += 1;
-                    if started.elapsed() >= WRITE_LOCK_HOLD {
+                    if started.elapsed() >= PRUNE_LOCK_HOLD {
                         break;
                     }
                 }
