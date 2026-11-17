@@ -3256,9 +3256,17 @@ pub(crate) fn note_in_log_for(env: &crate::invocation::InvocationEnv, line: &str
         .append(true)
         .open(&path)
     {
-        let now = jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.6fZ");
+        let now = note_time(jiff::Timestamp::now());
         let _ = writeln!(file, "{now}  INFO kache::target_seed: {line}");
     }
+}
+
+/// `at` as a seeding note's time: UTC with exactly six fraction digits,
+/// truncated, and `Z` (`2026-11-17T19:01:25.121702Z`), as chrono's
+/// `to_rfc3339_opts(SecondsFormat::Micros, true)` wrote it and as the log's
+/// file layer writes its own lines.
+pub(crate) fn note_time(at: jiff::Timestamp) -> String {
+    at.strftime("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
 }
 
 /// `rustc -vV` from the compiler Cargo is probing.
@@ -3287,6 +3295,23 @@ fn rustc_version_for(
 
 #[cfg(test)]
 mod tests {
+
+    /// What chrono 0.4.45's `to_rfc3339_opts(SecondsFormat::Micros, true)`
+    /// wrote for these instants: six digits always, truncated, never rounded.
+    #[test]
+    fn a_note_time_is_what_chrono_wrote() {
+        for (nanos, text) in [
+            (0, "2023-11-14T22:13:20.000000Z"),
+            (999, "2023-11-14T22:13:20.000000Z"),
+            (1_000, "2023-11-14T22:13:20.000001Z"),
+            (500_000_000, "2023-11-14T22:13:20.500000Z"),
+            (123_456_789, "2023-11-14T22:13:20.123456Z"),
+            (999_999_999, "2023-11-14T22:13:20.999999Z"),
+        ] {
+            let at = jiff::Timestamp::new(1_700_000_000, nanos).unwrap();
+            assert_eq!(super::note_time(at), text, "{nanos} ns");
+        }
+    }
 
     #[cfg(unix)]
     #[test]
