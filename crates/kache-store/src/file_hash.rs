@@ -1495,7 +1495,9 @@ pub fn with_weak_windows_fingerprints_for_tests<T>(run: impl FnOnce() -> T) -> T
 /// before the boot is therefore not served: the file is read once again and
 /// the row recorded then is. A clean restart costs the same single read per
 /// file. `0`, every row, where the boot time is unknown.
-fn memo_rows_valid_since() -> i64 {
+///
+/// The tree-digest memos follow the same rule.
+pub fn memo_rows_valid_since() -> i64 {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(boot) = BOOT_SECS_FOR_TESTS.with(std::cell::Cell::get) {
         return boot;
