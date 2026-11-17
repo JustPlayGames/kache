@@ -3261,7 +3261,7 @@ pub(crate) fn note_in_log_for(env: &crate::invocation::InvocationEnv, line: &str
         .append(true)
         .open(&path)
     {
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let now = jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.6fZ");
         let _ = writeln!(file, "{now}  INFO kache::target_seed: {line}");
     }
 }
