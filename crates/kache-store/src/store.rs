@@ -1493,6 +1493,119 @@ fn record_eviction_failure(stats: &mut GcStats, error: &anyhow::Error) {
     }
 }
 
+/// Where an entry removal moves the names it takes out of the store while it
+/// holds the index's write lock, so the files are removed once the lock is
+/// free again. Under the lock a rename takes the name out of the store, as an
+/// unlink did, so no publisher can adopt a file being removed; the unlink
+/// that frees a blob's extents (a filesystem journal commit, with online
+/// discard on the build machine's ext4) runs outside it. A name that cannot
+/// be moved is removed under the lock as before.
+pub(crate) struct EvictedTrash {
+    dir: PathBuf,
+    made: bool,
+    taken: Vec<PathBuf>,
+}
+
+/// The trash's folder in `store/`: a name no cache key can have, which the
+/// entry-directory walks skip.
+pub(crate) const EVICTED_TRASH_DIR: &str = "evicted.trash";
+
+impl EvictedTrash {
+    pub(crate) fn new(store_dir: &Path) -> Self {
+        Self {
+            dir: store_dir.join(EVICTED_TRASH_DIR),
+            made: false,
+            taken: Vec::new(),
+        }
+    }
+
+    /// Take `path` out of the store's names. True when it is gone from
+    /// there (moved, or already absent); false when the caller must remove
+    /// it in place.
+    pub(crate) fn take(&mut self, path: &Path) -> bool {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+            Ok(_) => {}
+        }
+        if !self.made {
+            if fs::create_dir_all(&self.dir).is_err() {
+                return false;
+            }
+            self.made = true;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let to = self.dir.join(format!(
+            "{name}.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if fs::rename(path, &to).is_err() {
+            return false;
+        }
+        self.taken.push(to);
+        true
+    }
+
+    /// Remove what this removal took. A file left behind (Windows may refuse
+    /// a delete-pending one) goes at the next sweep's [`Self::empty_leftovers`].
+    pub(crate) fn empty(&mut self) {
+        for path in self.taken.drain(..) {
+            remove_trash_item(&path);
+        }
+    }
+
+    /// Remove everything in the trash folder.
+    pub(crate) fn empty_leftovers(&self) {
+        let Ok(items) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for item in items.flatten() {
+            remove_trash_item(&item.path());
+        }
+    }
+}
+
+fn remove_trash_item(path: &Path) {
+    let result = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            #[cfg(windows)]
+            if let Ok(files) = fs::read_dir(path) {
+                for file in files.flatten() {
+                    if let Ok(meta) = fs::metadata(file.path()) {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(file.path(), perms);
+                    }
+                }
+            }
+            fs::remove_dir_all(path)
+        }
+        Ok(_meta) => {
+            #[cfg(windows)]
+            {
+                let mut perms = _meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+            fs::remove_file(path)
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(
+            "gc: could not remove {} from the trash: {e}",
+            path.display()
+        );
+    }
+}
+
 /// Registered blob bytes and blob rows an entry removal released — blobs
 /// whose last reference went away, not the entry's logical size
 /// (kunobi-ninja/kache#608). Denominated in `blobs` TABLE bytes, the same
@@ -8123,6 +8236,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         short_of_space: &mut dyn FnMut() -> bool,
         rank_again: &mut bool,
     ) -> GcStats {
+        // What a removal cut short (a crash, a kill) left between taking a
+        // name out of the store and removing the file.
+        EvictedTrash::new(&self.config.store_dir()).empty_leftovers();
         let walk_started = std::time::Instant::now();
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
@@ -9816,7 +9932,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             |row| row.get(0),
         )?;
 
-        if republished == 0 {
+        // What the pass takes out of the store's names, removed from disk once
+        // the lock is free again (see [`EvictedTrash`]).
+        let mut trash = EvictedTrash::new(&self.config.store_dir());
+        if republished == 0 && !trash.take(&entry_dir) {
             // Remove the entry directory (just meta.json in new format, may
             // have artifacts in legacy entries). Windows can surface external
             // interference as delete-pending errors (sharing violations from
@@ -9874,7 +9993,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 let blob = self.blob_path(&hash);
                 let disk =
                     crate::filesystem::blob_reclaimable_bytes(&blob).unwrap_or(size.max(0) as u64);
-                unlink_blob(&blob);
+                if !trash.take(&blob) {
+                    unlink_blob(&blob);
+                }
                 reclaim.freed_bytes += size.max(0) as u64;
                 reclaim.disk_bytes_reclaimed += disk;
                 reclaim.blobs_unlinked += 1;
@@ -9884,6 +10005,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let cleanup_hold = cleanup_locked_at.elapsed();
         reclaim.lock_held = first_hold.max(cleanup_hold);
         reclaim.lock_held_total = first_hold + cleanup_hold;
+        trash.empty();
 
         // The key's lock file outlives its entry: nothing but the full GC's
         // capped sweep removed it, and evicted keys left nearly all of a
