@@ -11777,6 +11777,71 @@ fn evict_does_not_fire_while_physical_size_is_within_budget() {
     assert!(store.contains("dup_a") && store.contains("dup_b"));
 }
 
+/// An evicted entry's directory and last-reference blob leave the store's
+/// names under the write lock and their files go after it: none is left in
+/// the store or in its trash, and a leftover of a removal cut short goes at
+/// the next sweep.
+#[test]
+fn evict_frees_files_through_the_trash_and_empties_its_leftovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100 * 1024;
+    let store = Store::open(&config).unwrap();
+    let src = dir.path().join("gone.rlib");
+    std::fs::write(&src, vec![b'g'; 300 * 1024]).unwrap();
+    store
+        .put(
+            "gone",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src);
+    store
+        .db()
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    let trash = config.store_dir().join(EVICTED_TRASH_DIR);
+    std::fs::create_dir_all(trash.join("left.1.2")).unwrap();
+    std::fs::write(trash.join("left.1.2").join("meta.json"), b"{}").unwrap();
+    std::fs::write(trash.join("blob.1.3"), b"x").unwrap();
+
+    let stats = store.evict().unwrap();
+
+    assert_eq!(stats.entries_evicted, 1);
+    assert_eq!(stats.disk_bytes_reclaimed, 300 * 1024);
+    assert!(!store.entry_dir("gone").exists());
+    let blobs: Vec<_> = walkdir_files(&config.store_dir().join("blobs"));
+    assert!(blobs.is_empty(), "the blob's file stayed: {blobs:?}");
+    let left: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
+    assert!(left.is_empty(), "the trash kept {left:?}");
+}
+
+fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(items) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for item in items.flatten() {
+        let path = item.path();
+        if path.is_dir() {
+            files.extend(walkdir_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
 /// kunobi-ninja/kache#608 (ranking + stop condition): entries whose blobs
 /// are all shared free nothing; the sweep must prefer an entry with a
 /// unique blob and stop once the bytes *actually* freed satisfy the
