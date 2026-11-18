@@ -7754,6 +7754,10 @@ impl Daemon {
             evict_write_ms: dedup_stats.evict_write_ms
                 + evict_stats.evict_write_ms
                 + age_evict_stats.evict_write_ms,
+            evict_lock_max_ms: dedup_stats
+                .evict_lock_max_ms
+                .max(evict_stats.evict_lock_max_ms)
+                .max(age_evict_stats.evict_lock_max_ms),
             housekeeping: Some(housekeeping),
         };
 

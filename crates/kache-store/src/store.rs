@@ -1326,6 +1326,11 @@ pub struct GcStats {
     /// write lock.
     #[serde(default)]
     pub evict_write_ms: u64,
+    /// The longest one removal of the run held the index's write lock in
+    /// one transaction: what a build's store waited for at most behind the
+    /// sweep, the busy handler's poll aside.
+    #[serde(default)]
+    pub evict_lock_max_ms: u64,
     /// Bytes a size-driven sweep found held by live files outside the store:
     /// last-reference blobs a target directory still clones or hardlinks.
     /// Evicting them frees nothing, so the sweep leaves them out of the bytes
@@ -1369,6 +1374,7 @@ impl GcStats {
             .entries_import_pinned
             .saturating_add(part.entries_import_pinned);
         self.evict_write_ms = self.evict_write_ms.saturating_add(part.evict_write_ms);
+        self.evict_lock_max_ms = self.evict_lock_max_ms.max(part.evict_lock_max_ms);
         // A measurement of the store, not work done: two sweeps probing the
         // same held bytes must not add up to twice as many.
         self.bytes_held = self.bytes_held.max(part.bytes_held);
@@ -1493,6 +1499,9 @@ pub struct RemovalReclaim {
     pub freed_bytes: u64,
     pub blobs_unlinked: usize,
     pub disk_bytes_reclaimed: u64,
+    /// The longest the removal held the index's write lock in one of its
+    /// two transactions, from the lock taken to the commit.
+    pub lock_held: Duration,
 }
 
 /// What a removal read at `meta.json` before taking the write lock. Under the
@@ -8250,6 +8259,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     stats.bytes_freed += reclaim.freed_bytes;
                     stats.disk_bytes_reclaimed += reclaim.disk_bytes_reclaimed;
                     stats.blobs_removed += reclaim.blobs_unlinked;
+                    stats.evict_lock_max_ms = stats
+                        .evict_lock_max_ms
+                        .max(reclaim.lock_held.as_millis() as u64);
                     current_size = current_size.saturating_sub(reclaim.freed_bytes);
                     // Telemetry, deliberately outside remove_entry_guarded so
                     // the removal mechanism stays free of it (#595). Recorded
@@ -9629,6 +9641,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let db = self.db();
         let tx =
             rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
+        let locked_at = std::time::Instant::now();
 
         // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
         // the write lock, before any decrement or unlink — if the entry was
@@ -9752,6 +9765,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // rebuild reclaims it) or orphaned blob files (the orphan sweep
         // reclaims those), never a live row without its files.
         tx.commit()?;
+        let first_hold = locked_at.elapsed();
 
         if let Some(hook) = after_logical_commit {
             hook();
@@ -9778,6 +9792,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                      unreferenced blobs stay on disk"
                 )
             })?;
+        let cleanup_locked_at = std::time::Instant::now();
 
         if let Some(hook) = before_dir_cleanup {
             hook();
@@ -9858,6 +9873,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         cleanup_tx.commit()?;
+        reclaim.lock_held = first_hold.max(cleanup_locked_at.elapsed());
 
         // The key's lock file outlives its entry: nothing but the full GC's
         // capped sweep removed it, and evicted keys left nearly all of a
