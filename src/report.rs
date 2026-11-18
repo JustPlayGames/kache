@@ -53,6 +53,9 @@ pub struct GcStatsPersisted {
     /// The longest one removal held the index's write lock.
     #[serde(default)]
     pub evict_lock_max_ms: u64,
+    /// The removals' write-lock holds summed.
+    #[serde(default)]
+    pub evict_lock_ms: u64,
     /// Stale key lock files the run unlinked. Absent, like the two below,
     /// when the run did no housekeeping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +235,7 @@ pub(crate) fn write_last_gc_run(
         entries_import_pinned: stats.entries_import_pinned,
         evict_write_ms: stats.evict_write_ms,
         evict_lock_max_ms: stats.evict_lock_max_ms,
+        evict_lock_ms: stats.evict_lock_ms,
         key_locks_removed: stats.housekeeping.map(|h| h.key_locks_removed),
         key_locks_remaining: stats.housekeeping.map(|h| h.key_locks_remaining),
         predictions_pruned: stats.housekeeping.map(|h| h.predictions_pruned),
