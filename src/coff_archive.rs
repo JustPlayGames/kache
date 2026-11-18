@@ -73,12 +73,69 @@ pub(crate) fn path_free_digest(bytes: &[u8], dir: &[u8]) -> Option<String> {
 
 /// The directory to cut out of an archive found in `own_dir`: the one its
 /// members are named under when `lib.exe` named them by absolute paths, else
-/// `own_dir`. The same where the archive was built (`cc` gives `lib.exe` the
-/// objects in `OUT_DIR`, so they agree), and the directory of the target
-/// that built it once kache restored it into another one, so a crate that
-/// bundles or links it keys the same in both.
+/// the one of their directories that is `own_dir` in the target directory
+/// that built it ([`built_dir`]), else `own_dir`. The same where the archive
+/// was built (`cc` gives `lib.exe` the objects in `OUT_DIR`, so they agree),
+/// and the directory of the target that built it once kache restored it into
+/// another one, so a crate that bundles or links it keys the same in both.
 pub(crate) fn digest_dir<'a>(bytes: &'a [u8], own_dir: &'a [u8]) -> &'a [u8] {
-    recorded_dir(bytes).unwrap_or(own_dir)
+    recorded_dir(bytes)
+        .or_else(|| built_dir(bytes, own_dir))
+        .unwrap_or(own_dir)
+}
+
+/// The folders at the end of a build script's `OUT_DIR` that name its unit
+/// below the target directory (`build\ring-<hash>\out`, or `ring\<hash>\out`
+/// with per-unit build directories): the same in every target directory.
+const UNIT_FOLDERS: usize = 3;
+
+/// For an archive whose members are named under several directories, the
+/// one of them that ends as `own_dir` does in its last [`UNIT_FOLDERS`]
+/// folders: the `OUT_DIR` that built it, whichever target directory that
+/// was. ring's archive on `*-windows-msvc` names the objects `cc` built in
+/// `OUT_DIR` and the ones `nasm` built in advance in ring's sources
+/// (`pregenerated\`), so [`recorded_dir`] reads none back; with `own_dir`
+/// cut out instead, ring keyed one way where it was built and another in
+/// every target directory kache restored it into, and so did every link of
+/// it. `None` when no member or two different directories match.
+fn built_dir<'a>(bytes: &'a [u8], own_dir: &[u8]) -> Option<&'a [u8]> {
+    let separator = |byte: &u8| *byte == b'/' || *byte == b'\\';
+    let own_dir = own_dir
+        .strip_suffix(b"/")
+        .or_else(|| own_dir.strip_suffix(b"\\"))
+        .unwrap_or(own_dir);
+    // The unit's folders, from the separator before them.
+    let tail = own_dir
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, byte)| separator(byte))
+        .nth(UNIT_FOLDERS - 1)
+        .map(|(at, _)| &own_dir[at..])?;
+    let (_, members) = parse(bytes)?;
+    let mut dir: Option<&[u8]> = None;
+    for member in &members {
+        let name = member.name;
+        let Some(end) = (0..name.len().saturating_sub(tail.len()))
+            .find(|&at| {
+                same_path(&name[at..at + tail.len()], tail)
+                    && name.get(at + tail.len()).is_some_and(separator)
+            })
+            .map(|at| at + tail.len())
+        else {
+            continue;
+        };
+        let found = &name[..end];
+        if !is_absolute(found) {
+            return None;
+        }
+        match dir {
+            None => dir = Some(found),
+            Some(dir) if same_path(dir, found) => {}
+            Some(_) => return None,
+        }
+    }
+    dir
 }
 
 /// The one absolute directory every member of the archive is named under,

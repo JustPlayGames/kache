@@ -184,3 +184,104 @@ fn a_directory_only_in_build_records_is_told_from_one_the_code_reads() {
     let cut = without_dir(SHORT, SHORT_DIR.as_bytes());
     assert!(!cut.windows(SHORT_DIR.len()).any(|w| w == SHORT_DIR.as_bytes()));
 }
+
+/// An archive of `members`, each named by its path in the long-name table
+/// as `lib.exe` names them, without linker members.
+fn archive_of(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let header = |name: &[u8], size: usize| {
+        let mut header = format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            "", 0, "", "", 644, size
+        )
+        .into_bytes();
+        header[..name.len()].copy_from_slice(name);
+        header
+    };
+    let mut table = Vec::new();
+    let mut offsets = Vec::new();
+    for (name, _) in members {
+        offsets.push(table.len());
+        table.extend_from_slice(name);
+        table.push(0);
+    }
+    let mut out = b"!<arch>\n".to_vec();
+    out.extend(header(b"//", table.len()));
+    out.extend_from_slice(&table);
+    if table.len() % 2 == 1 {
+        out.push(b'\n');
+    }
+    for ((_, data), offset) in members.iter().zip(&offsets) {
+        out.extend(header(format!("/{offset}").as_bytes(), data.len()));
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// ring's archive on `*-windows-msvc`: `lib.exe` names the objects `cc`
+/// built by their paths in `OUT_DIR` and the ones `nasm` built in advance by
+/// their paths in ring's sources, so its members are named under two
+/// directories and none is read back. Where it was built, the archive's own
+/// directory was cut out; restored into another target directory, nothing
+/// was, so ring, webrtc-sys's build script and its run, webrtc-sys and the
+/// app missed in the first checkout after the one that built them (lane 31,
+/// 2026-11-18). The one of its directories that ends as the archive's own
+/// does below the target directory is cut out instead.
+#[test]
+fn a_restored_archive_named_under_two_directories_digests_as_where_it_was_built() {
+    let pregenerated: &[u8] =
+        br"C:\Users\User\.cargo\registry\src\index\ring-0.17.14\pregenerated\x86_64-mont-nasm.o";
+    let object = |fixture| parse(fixture).expect("the fixture reads").1[0].data;
+    let built_in = |fixture, dir: &str| {
+        let compiled = format!(r"{dir}\db3b6bfb95261072-f.o");
+        let built = archive_of(&[
+            (compiled.as_bytes(), object(fixture)),
+            (pregenerated, object(fixture)),
+        ]);
+        assert_eq!(
+            recorded_dir(&built),
+            None,
+            "two directories name the members"
+        );
+        built
+    };
+    let cut = |bytes: &[u8], own_dir: &str| {
+        digest(
+            bytes,
+            std::str::from_utf8(digest_dir(bytes, own_dir.as_bytes())).unwrap(),
+        )
+    };
+    let built = built_in(SHORT, SHORT_DIR);
+    let here = cut(&built, SHORT_DIR);
+    // Where it was built, its own directory is cut out, as before.
+    assert_eq!(here, digest(&built, SHORT_DIR));
+    // Built in another target directory, it digests alike, as before.
+    assert_eq!(cut(&built_in(LONG, LONG_DIR), LONG_DIR), here);
+    // Restored into that one, it digests as it did where it was built.
+    assert_eq!(cut(&built, LONG_DIR), here);
+    assert_eq!(
+        digest_dir(&built, LONG_DIR.as_bytes()),
+        SHORT_DIR.as_bytes()
+    );
+    // An own directory without the unit's folders matches none.
+    assert_eq!(
+        digest_dir(&built, br"C:\elsewhere\out"),
+        br"C:\elsewhere\out"
+    );
+    // Members under two target directories that end alike: left to the caller.
+    let two = archive_of(&[
+        (
+            format!(r"{SHORT_DIR}\db3b6bfb95261072-f.o").as_bytes(),
+            object(SHORT),
+        ),
+        (
+            format!(r"{LONG_DIR}\db3b6bfb95261072-g.o").as_bytes(),
+            object(LONG),
+        ),
+        (pregenerated, object(SHORT)),
+    ]);
+    let third = br"C:\third\tZ\debug\build\gen-2f3778baca245d4f\out";
+    assert_eq!(digest_dir(&two, third), third);
+}

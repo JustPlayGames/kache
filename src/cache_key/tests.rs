@@ -10999,7 +10999,7 @@ fn hash_static_lib_ignores_legacy_namespaces() {
         ..fingerprint.clone()
     };
     let current_key = FileFingerprint {
-        path: format!("static-ar-v10-linked\0{}", fingerprint.path),
+        path: format!("static-ar-v11-linked\0{}", fingerprint.path),
         ..fingerprint
     };
     let cache = fh.cache.as_ref().expect("persistent cache opens");
@@ -11316,8 +11316,8 @@ fn hash_static_lib_memo_rows_are_per_use() {
     let fingerprint = FileFingerprint::from_path(&lib).unwrap();
     let cache = fh.cache.as_ref().expect("persistent cache opens");
     for (namespace, expected) in [
-        ("static-ar-v11-bundled", &bundled),
-        ("static-ar-v10-linked", &linked),
+        ("static-ar-v12-bundled", &bundled),
+        ("static-ar-v11-linked", &linked),
     ] {
         let key = FileFingerprint {
             path: format!("{namespace}\0{}", fingerprint.path),
@@ -11345,7 +11345,7 @@ fn hash_static_lib_memo_threshold_is_exclusive() {
         fh.flush_memo_as_if_settled();
         let fingerprint = FileFingerprint::from_path(&lib).unwrap();
         let key = FileFingerprint {
-            path: format!("static-ar-v10-linked\0{}", fingerprint.path),
+            path: format!("static-ar-v11-linked\0{}", fingerprint.path),
             ..fingerprint
         };
         let expected = memoized.then_some(hash);
