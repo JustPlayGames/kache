@@ -272,6 +272,12 @@ mod apple_install_name;
 // the client's PATH), and its content hash is folded. A linker that cannot be
 // placed fails closed to passthrough. Every native Linux link key changes.
 //
+// Unbumped (lane 38, 2026-11-18): a native Linux link through a driver
+// other than the PATH's `cc` also folds that driver's bytes (`link_driver`
+// among the CRT objects), so a wrapper script named by `-C linker` keys by
+// its content, not only by the banner it forwards. Links through `cc` keep
+// their keys; those through another driver change once.
+//
 // #1190 needs no bump. A trybuild unit folds a raw prefix only when the
 // working directory, the crate source, or an `OUT_DIR` the compile reads from
 // sits under it. Those are the paths rustc writes into the rmeta; `--out-dir`
@@ -5655,12 +5661,24 @@ fn compute_key_into(
             // are unchanged; content hashes are still reused only with an
             // unchanged file fingerprint, through the same guards as other
             // key inputs.
-            crate::native_link_key::probe_linux_crt_objects_memoized_for(
+            let mut objects = crate::native_link_key::probe_linux_crt_objects_memoized_for(
                 &crate::config::probe_memo_dir_for(invocation)?,
                 driver,
                 |path| file_hasher.hash(path),
                 invocation,
-            )
+            )?;
+            // A driver other than the `cc` on PATH, by its bytes. `-C linker`
+            // names it and the key leaves that path out (`codegen_inputs`),
+            // and `linker:` folds only its `--version` banner, which a
+            // wrapper script answers as the compiler it wraps does: two
+            // wrappers that link differently (one adding `-no-pie`, one
+            // RELR) shared one key, and a build restored the other's
+            // programs. The plain `cc` keeps its key (no key bump: the
+            // goldens link through it); another driver's key changes once.
+            if !is_path_cc(driver, invocation) {
+                objects.insert("link_driver".to_owned(), file_hasher.hash(driver)?);
+            }
+            Ok(objects)
         },
         |driver, rustc_version| {
             let memo_dir = crate::config::probe_memo_dir_for(invocation)?;
@@ -13920,6 +13938,18 @@ where
         identity.replace('\n', ",")
     );
     Ok(())
+}
+
+/// Whether `driver` is the `cc` a bare name finds on the client's PATH,
+/// symlinks followed: the driver a link without `-C linker` runs.
+fn is_path_cc(driver: &Path, env: &InvocationEnv) -> bool {
+    let Some(cc) = env.resolve_program(Path::new("cc")) else {
+        return false;
+    };
+    match (std::fs::canonicalize(driver), std::fs::canonicalize(&cc)) {
+        (Ok(driver), Ok(cc)) => driver == cc,
+        _ => driver == cc,
+    }
 }
 
 pub(crate) fn resolve_link_driver_for(args: &RustcArgs, env: &InvocationEnv) -> Option<PathBuf> {
