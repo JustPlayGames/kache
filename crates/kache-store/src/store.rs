@@ -8456,6 +8456,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.evict_with_stop(
             policy,
             stop_at,
+            None,
             held_probe,
             origin,
             None,
@@ -8469,6 +8470,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         &self,
         policy: &dyn crate::eviction::EvictionPolicy,
         stop_at: Option<(u64, u64)>,
+        evict_over: Option<u64>,
         held_probe: HeldProbe,
         origin: SweepOrigin,
         walk_budget: Option<Duration>,
@@ -8509,6 +8511,27 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let entries_held = held.len();
         let left_out = self.config.held_bytes_budget.left_out(bytes_held);
         let stop_at = stop_at.map(|(current, target)| (current.saturating_sub(left_out), target));
+        // The caller asked because the store less what target directories
+        // held at the last sweep was over `evict_over`; that figure is up to
+        // a sweep old, and they take and let go of tens of GB between sweeps.
+        // Measured again, a store whose own part is not over it any more
+        // has nothing to give back: evicting down to the target there only
+        // throws away entries early (on the build machine, 2026-11-18, 16 of
+        // 32 automatic sweeps were such, evicting 8-34 GB each).
+        if let (Some(over), Some((own, _))) = (evict_over, stop_at)
+            && held_probe == HeldProbe::Upfront
+            && own <= over
+        {
+            tracing::info!(
+                "gc: the store's own part is {own} bytes once {bytes_held} held by target \
+                 directories are left out, not over the trigger ({over}): nothing evicted"
+            );
+            return Ok(GcStats {
+                bytes_held,
+                entries_unreclaimable: entries_held,
+                ..GcStats::default()
+            });
+        }
         // The shadow ranks for the byte budget, which a walk without the
         // up-front probe does not know yet.
         let shadow = match stop_at {
@@ -8722,6 +8745,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 &crate::eviction::SizePressurePolicy
             };
         let mut stats = GcStats::default();
+        // An automatic sweep's first pass evicts only while the store's own
+        // part, measured by its probe, is over the trigger. A later pass
+        // follows a short disk, which goes on to the target.
+        let mut evict_over = (origin == SweepOrigin::Automatic).then_some(over);
         loop {
             let held_probe = if short_of_space() {
                 HeldProbe::PerEntry
@@ -8732,6 +8759,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let pass = self.evict_with_stop(
                 policy,
                 Some((size, target)),
+                evict_over.take(),
                 held_probe,
                 origin,
                 walk_budget,
@@ -8764,6 +8792,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         self.evict_with_stop(
             &crate::eviction::SizePressurePolicy,
+            None,
             None,
             HeldProbe::PerEntry,
             SweepOrigin::Automatic,
