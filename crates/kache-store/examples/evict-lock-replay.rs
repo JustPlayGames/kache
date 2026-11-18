@@ -146,23 +146,27 @@ fn main() -> Result<()> {
     let done = Arc::new(AtomicBool::new(false));
     let writer = {
         let done = done.clone();
-        std::thread::spawn(move || -> Result<Vec<f64>> {
+        std::thread::spawn(move || -> Result<(Vec<f64>, Vec<f64>)> {
             let mut waits = Vec::new();
+            let mut commits = Vec::new();
             while !done.load(Ordering::Relaxed) {
                 let asked = Instant::now();
                 probe.execute_batch("BEGIN IMMEDIATE")?;
                 waits.push(asked.elapsed().as_secs_f64() * 1000.0);
+                let held = Instant::now();
                 probe.execute("INSERT INTO replay_probe (n) VALUES (1)", [])?;
                 probe.execute_batch("COMMIT")?;
+                commits.push(held.elapsed().as_secs_f64() * 1000.0);
                 std::thread::sleep(gap);
             }
-            Ok(waits)
+            Ok((waits, commits))
         })
     };
     let presser = (pressure > 0).then(|| {
         let done = done.clone();
         let path = dir.join("pressure.bin");
-        std::thread::spawn(move || -> Result<u64> {
+        std::thread::spawn(move || -> Result<(u64, Vec<f64>)> {
+            let mut syncs = Vec::new();
             let chunk = vec![0x5au8; 4 << 20];
             let mut file = std::fs::File::create(&path)?;
             let mut written = 0u64;
@@ -173,7 +177,9 @@ fn main() -> Result<()> {
                     file = std::fs::File::create(&path)?;
                 }
                 file.write_all(&chunk)?;
+                let synced = Instant::now();
                 file.sync_data()?;
+                syncs.push(synced.elapsed().as_secs_f64() * 1000.0);
                 written += chunk.len() as u64;
                 let due = Duration::from_secs_f64(written as f64 / ((pressure << 20) as f64));
                 if let Some(rest) = due.checked_sub(started.elapsed()) {
@@ -182,7 +188,7 @@ fn main() -> Result<()> {
             }
             drop(file);
             let _ = std::fs::remove_file(&path);
-            Ok(written)
+            Ok((written, syncs))
         })
     });
 
@@ -193,21 +199,24 @@ fn main() -> Result<()> {
     let sweep_s = swept.elapsed().as_secs_f64();
     std::thread::sleep(Duration::from_millis(200));
     done.store(true, Ordering::Relaxed);
-    let waits = writer.join().expect("writer thread")?;
-    let pressed = match presser {
+    let (waits, commits) = writer.join().expect("writer thread")?;
+    let (pressed, syncs) = match presser {
         Some(handle) => handle.join().expect("pressure thread")?,
-        None => 0,
+        None => (0, Vec::new()),
     };
     println!(
-        "sweep: {} entries evicted, {:.1} GiB freed, {} blobs, {:.1}s, evict_write_ms {}, evict_lock_max_ms {}, pressure {} MiB",
+        "sweep: {} entries evicted, {:.1} GiB freed, {} blobs, {:.1}s, evict_write_ms {}, evict_lock_ms {}, evict_lock_max_ms {}, pressure {} MiB",
         stats.entries_evicted,
         stats.bytes_freed as f64 / (1u64 << 30) as f64,
         stats.blobs_removed,
         sweep_s,
         stats.evict_write_ms,
+        stats.evict_lock_ms,
         stats.evict_lock_max_ms,
         pressed >> 20
     );
     summary("build write-lock waits during the sweep", waits);
+    summary("build commit (insert + WAL fsync) under the lock", commits);
+    summary("pressure fdatasync of 4 MiB", syncs);
     Ok(())
 }

@@ -1331,6 +1331,10 @@ pub struct GcStats {
     /// sweep, the busy handler's poll aside.
     #[serde(default)]
     pub evict_lock_max_ms: u64,
+    /// The removals' write-lock holds summed: of [`Self::evict_write_ms`],
+    /// the part other writers had to wait behind.
+    #[serde(default)]
+    pub evict_lock_ms: u64,
     /// Bytes a size-driven sweep found held by live files outside the store:
     /// last-reference blobs a target directory still clones or hardlinks.
     /// Evicting them frees nothing, so the sweep leaves them out of the bytes
@@ -1375,6 +1379,7 @@ impl GcStats {
             .saturating_add(part.entries_import_pinned);
         self.evict_write_ms = self.evict_write_ms.saturating_add(part.evict_write_ms);
         self.evict_lock_max_ms = self.evict_lock_max_ms.max(part.evict_lock_max_ms);
+        self.evict_lock_ms = self.evict_lock_ms.saturating_add(part.evict_lock_ms);
         // A measurement of the store, not work done: two sweeps probing the
         // same held bytes must not add up to twice as many.
         self.bytes_held = self.bytes_held.max(part.bytes_held);
@@ -1502,6 +1507,8 @@ pub struct RemovalReclaim {
     /// The longest the removal held the index's write lock in one of its
     /// two transactions, from the lock taken to the commit.
     pub lock_held: Duration,
+    /// Both transactions' holds together.
+    pub lock_held_total: Duration,
 }
 
 /// What a removal read at `meta.json` before taking the write lock. Under the
@@ -8262,6 +8269,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     stats.evict_lock_max_ms = stats
                         .evict_lock_max_ms
                         .max(reclaim.lock_held.as_millis() as u64);
+                    stats.evict_lock_ms += reclaim.lock_held_total.as_millis() as u64;
                     current_size = current_size.saturating_sub(reclaim.freed_bytes);
                     // Telemetry, deliberately outside remove_entry_guarded so
                     // the removal mechanism stays free of it (#595). Recorded
@@ -9873,7 +9881,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
         cleanup_tx.commit()?;
-        reclaim.lock_held = first_hold.max(cleanup_locked_at.elapsed());
+        let cleanup_hold = cleanup_locked_at.elapsed();
+        reclaim.lock_held = first_hold.max(cleanup_hold);
+        reclaim.lock_held_total = first_hold + cleanup_hold;
 
         // The key's lock file outlives its entry: nothing but the full GC's
         // capped sweep removed it, and evicted keys left nearly all of a
