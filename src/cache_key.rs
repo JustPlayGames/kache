@@ -6216,8 +6216,8 @@ impl StaticLibUse {
     /// never share a row.
     fn memo_namespace(self) -> &'static str {
         match self {
-            Self::Bundled => "static-ar-v11-bundled",
-            Self::Linked => "static-ar-v10-linked",
+            Self::Bundled => "static-ar-v12-bundled",
+            Self::Linked => "static-ar-v11-linked",
             Self::StrippedLink => "static-ar-v1-stripped-link",
         }
     }
@@ -11732,7 +11732,9 @@ impl<'db> FileHasher<'db> {
         // path-bound digest of an unchanged archive). v7 predates accepting
         // ELF members in BSD archives, and bundled v10 / linked v9 cut the
         // archive's own directory out of a COFF archive where v11 / v10 cut
-        // the one its members name. None may be served
+        // the one its members name, and v11 / v10 cut the archive's own
+        // directory out of one restored with members under several where
+        // v12 / v11 cut the one that built it. None may be served
         // after the final archive hardening. Bundled and linked uses get
         // separate rows because a DWARF archive hashes differently for each.
         let key = FileFingerprint {
