@@ -5638,6 +5638,44 @@ fn an_automatic_sweep_starts_at_88_percent_and_stops_at_78() {
     assert!(store.physical_size().unwrap() <= 780);
 }
 
+/// An automatic sweep is asked for by the store's size less what target
+/// directories held at the last sweep, a figure up to a sweep old. Once its
+/// probe has measured them again, a store whose own part is not over the
+/// trigger evicts nothing (2026-11-18: half the build machine's automatic
+/// sweeps were such, each evicting 8-34 GB down to the target); one whose own
+/// part is over it still goes down to the target.
+#[test]
+fn an_automatic_sweep_evicts_nothing_when_its_probe_finds_the_store_under_the_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 1000;
+    let store = Store::open(&config).unwrap();
+    for (key, size, idle) in [("a", 450, "-4 hours"), ("b", 350, "-3 hours")] {
+        put_idle_entry(&store, dir.path(), key, size);
+        store.set_last_accessed_for_test(key, idle);
+    }
+    let blob = put_idle_entry(&store, dir.path(), "linked", 200);
+    std::fs::hard_link(&blob, dir.path().join("target-copy.rlib")).unwrap();
+
+    // 1,000 bytes, 200 of them linked: 800 of its own, under the 880 trigger
+    // but over the 780 target.
+    let under = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert_eq!(under.entries_evicted, 0, "{under:?}");
+    assert_eq!(under.bytes_held, 200, "{under:?}");
+    assert!(store.contains("a") && store.contains("b"));
+
+    // 100 more of its own: 900, over the trigger, so down to the target.
+    put_idle_entry(&store, dir.path(), "c", 100);
+    let over = store
+        .evict_for_free_space(SweepOrigin::Automatic, || false)
+        .unwrap();
+    assert_eq!(over.entries_evicted, 1, "{over:?}");
+    assert!(!store.contains("a") && store.contains("b") && store.contains("c"));
+    assert_eq!(over.bytes_held, 200, "{over:?}");
+}
+
 /// An automatic sweep ranks a young entry slow to compile (used within the
 /// hours, 30 s or more to compile) with ten times its score: colder entries go
 /// before it, even when the plain ranking puts it first, and hotter ones still
