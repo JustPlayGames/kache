@@ -11564,13 +11564,15 @@ fn a_busy_index_delays_an_evicted_entry_s_file_cleanup_without_skipping_it() {
     assert!(!blob.exists(), "the blob only that entry held is removed");
 }
 
-/// kunobi-ninja/kache#510: directory-cleanup tolerance is for the
-/// lost-the-race case ONLY — a cleanup failure while the directory still
-/// exists (permissions, open handles) must surface as an error, not be
-/// swallowed as if the competitor had won.
+/// A directory the cleanup cannot remove (an unwritable folder inside it)
+/// no longer fails the removal: under the write lock the entry's directory
+/// only leaves the store's names, into the trash, and its removal after the
+/// lock fails there, logged, for the next sweep to try again. The logical
+/// removal stays committed (#670) and the store keeps no residue under the
+/// entry's name.
 #[cfg(unix)]
 #[test]
-fn persistent_directory_cleanup_failure_is_an_error() {
+fn persistent_directory_cleanup_failure_stays_in_the_trash() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -11592,49 +11594,32 @@ fn persistent_directory_cleanup_failure_is_an_error() {
             "",
         )
         .unwrap();
-
-    // An unwritable directory with a file inside makes remove_dir_all
-    // fail with a persistent, non-race error. Nested one level down:
-    // cleanup's readonly-clearing pass covers entry_dir's immediate
-    // children, so a top-level readonly dir would simply be repaired.
     let entry_dir = store.entry_dir("stuck");
     let inner = entry_dir.join("legacy").join("inner");
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(inner.join("artifact"), b"x").unwrap();
     std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Stash the blob hash BEFORE the removal: remove_dir_all deletes
-    // children in unspecified order, so meta.json may or may not survive
-    // the failed cleanup.
-    let stashed_hash = {
-        let meta: EntryMeta =
-            serde_json::from_str(&std::fs::read_to_string(entry_dir.join("meta.json")).unwrap())
-                .unwrap();
-        meta.files[0].hash.clone()
-    };
+    let removed = store.remove_entry("stuck");
 
-    let err = store.remove_entry("stuck");
-    // Restore permissions so the tempdir can be dropped regardless.
-    std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        err.is_err(),
-        "a persistent cleanup failure must not be swallowed as a lost race"
-    );
-    // The failure direction matters (#670): the logical removal commits
-    // BEFORE cleanup, so a cleanup failure leaves a deleted row plus
-    // partially deleted, unindexed residue — recoverable. Rolling the row
-    // back after files were already deleted would manufacture a committed
-    // row without artifacts, which is the phantom this function must
-    // never produce.
-    assert!(
-        !store.contains("stuck"),
-        "the logical removal must stay committed across a cleanup failure"
-    );
-    assert!(
-        store.blob_path(&stashed_hash).is_file(),
-        "blob unlinks run only after directory cleanup succeeds; a failed \
-             cleanup leaves the file for the orphan sweep"
-    );
+    let trash = config.store_dir().join(EVICTED_TRASH_DIR);
+    let left: Vec<_> = std::fs::read_dir(&trash)
+        .unwrap()
+        .flatten()
+        .map(|item| item.path())
+        .collect();
+    for item in &left {
+        let stuck = item.join("legacy").join("inner");
+        if stuck.exists() {
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    removed.unwrap();
+    assert!(!store.contains("stuck"));
+    assert!(!entry_dir.exists(), "nothing stays under the entry's name");
+    assert_eq!(left.len(), 1, "the stuck directory waits in the trash: {left:?}");
+    EvictedTrash::new(&config.store_dir()).empty_leftovers();
+    assert_eq!(std::fs::read_dir(&trash).unwrap().count(), 0);
 }
 
 /// kunobi-ninja/kache#510: two removers racing on the SAME entry must not

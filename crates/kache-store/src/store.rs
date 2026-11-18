@@ -1599,8 +1599,8 @@ fn remove_trash_item(path: &Path) {
     if let Err(e) = result
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        tracing::debug!(
-            "gc: could not remove {} from the trash: {e}",
+        tracing::warn!(
+            "gc: could not remove {} from the trash, left for the next sweep: {e}",
             path.display()
         );
     }
