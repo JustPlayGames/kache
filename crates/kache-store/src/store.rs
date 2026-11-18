@@ -1326,6 +1326,15 @@ pub struct GcStats {
     /// write lock.
     #[serde(default)]
     pub evict_write_ms: u64,
+    /// The longest one removal of the run held the index's write lock in
+    /// one transaction: what a build's store waited for at most behind the
+    /// sweep, the busy handler's poll aside.
+    #[serde(default)]
+    pub evict_lock_max_ms: u64,
+    /// The removals' write-lock holds summed: of [`Self::evict_write_ms`],
+    /// the part other writers had to wait behind.
+    #[serde(default)]
+    pub evict_lock_ms: u64,
     /// Bytes a size-driven sweep found held by live files outside the store:
     /// last-reference blobs a target directory still clones or hardlinks.
     /// Evicting them frees nothing, so the sweep leaves them out of the bytes
@@ -1369,6 +1378,8 @@ impl GcStats {
             .entries_import_pinned
             .saturating_add(part.entries_import_pinned);
         self.evict_write_ms = self.evict_write_ms.saturating_add(part.evict_write_ms);
+        self.evict_lock_max_ms = self.evict_lock_max_ms.max(part.evict_lock_max_ms);
+        self.evict_lock_ms = self.evict_lock_ms.saturating_add(part.evict_lock_ms);
         // A measurement of the store, not work done: two sweeps probing the
         // same held bytes must not add up to twice as many.
         self.bytes_held = self.bytes_held.max(part.bytes_held);
@@ -1482,6 +1493,119 @@ fn record_eviction_failure(stats: &mut GcStats, error: &anyhow::Error) {
     }
 }
 
+/// Where an entry removal moves the names it takes out of the store while it
+/// holds the index's write lock, so the files are removed once the lock is
+/// free again. Under the lock a rename takes the name out of the store, as an
+/// unlink did, so no publisher can adopt a file being removed; the unlink
+/// that frees a blob's extents (a filesystem journal commit, with online
+/// discard on the build machine's ext4) runs outside it. A name that cannot
+/// be moved is removed under the lock as before.
+pub(crate) struct EvictedTrash {
+    dir: PathBuf,
+    made: bool,
+    taken: Vec<PathBuf>,
+}
+
+/// The trash's folder in `store/`: a name no cache key can have, which the
+/// entry-directory walks skip.
+pub(crate) const EVICTED_TRASH_DIR: &str = "evicted.trash";
+
+impl EvictedTrash {
+    pub(crate) fn new(store_dir: &Path) -> Self {
+        Self {
+            dir: store_dir.join(EVICTED_TRASH_DIR),
+            made: false,
+            taken: Vec::new(),
+        }
+    }
+
+    /// Take `path` out of the store's names. True when it is gone from
+    /// there (moved, or already absent); false when the caller must remove
+    /// it in place.
+    pub(crate) fn take(&mut self, path: &Path) -> bool {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        match fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+            Ok(_) => {}
+        }
+        if !self.made {
+            if fs::create_dir_all(&self.dir).is_err() {
+                return false;
+            }
+            self.made = true;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let to = self.dir.join(format!(
+            "{name}.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        if fs::rename(path, &to).is_err() {
+            return false;
+        }
+        self.taken.push(to);
+        true
+    }
+
+    /// Remove what this removal took. A file left behind (Windows may refuse
+    /// a delete-pending one) goes at the next sweep's [`Self::empty_leftovers`].
+    pub(crate) fn empty(&mut self) {
+        for path in self.taken.drain(..) {
+            remove_trash_item(&path);
+        }
+    }
+
+    /// Remove everything in the trash folder.
+    pub(crate) fn empty_leftovers(&self) {
+        let Ok(items) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for item in items.flatten() {
+            remove_trash_item(&item.path());
+        }
+    }
+}
+
+fn remove_trash_item(path: &Path) {
+    let result = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            #[cfg(windows)]
+            if let Ok(files) = fs::read_dir(path) {
+                for file in files.flatten() {
+                    if let Ok(meta) = fs::metadata(file.path()) {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(file.path(), perms);
+                    }
+                }
+            }
+            fs::remove_dir_all(path)
+        }
+        Ok(_meta) => {
+            #[cfg(windows)]
+            {
+                let mut perms = _meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+            fs::remove_file(path)
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            "gc: could not remove {} from the trash, left for the next sweep: {e}",
+            path.display()
+        );
+    }
+}
+
 /// Registered blob bytes and blob rows an entry removal released — blobs
 /// whose last reference went away, not the entry's logical size
 /// (kunobi-ninja/kache#608). Denominated in `blobs` TABLE bytes, the same
@@ -1493,6 +1617,11 @@ pub struct RemovalReclaim {
     pub freed_bytes: u64,
     pub blobs_unlinked: usize,
     pub disk_bytes_reclaimed: u64,
+    /// The longest the removal held the index's write lock in one of its
+    /// two transactions, from the lock taken to the commit.
+    pub lock_held: Duration,
+    /// Both transactions' holds together.
+    pub lock_held_total: Duration,
 }
 
 /// What a removal read at `meta.json` before taking the write lock. Under the
@@ -8107,6 +8236,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         short_of_space: &mut dyn FnMut() -> bool,
         rank_again: &mut bool,
     ) -> GcStats {
+        // What a removal cut short (a crash, a kill) left between taking a
+        // name out of the store and removing the file.
+        EvictedTrash::new(&self.config.store_dir()).empty_leftovers();
         let walk_started = std::time::Instant::now();
         let mut stats = GcStats::default();
         let mut eviction_writes = std::time::Duration::ZERO;
@@ -8250,6 +8382,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                     stats.bytes_freed += reclaim.freed_bytes;
                     stats.disk_bytes_reclaimed += reclaim.disk_bytes_reclaimed;
                     stats.blobs_removed += reclaim.blobs_unlinked;
+                    stats.evict_lock_max_ms = stats
+                        .evict_lock_max_ms
+                        .max(reclaim.lock_held.as_millis() as u64);
+                    stats.evict_lock_ms += reclaim.lock_held_total.as_millis() as u64;
                     current_size = current_size.saturating_sub(reclaim.freed_bytes);
                     // Telemetry, deliberately outside remove_entry_guarded so
                     // the removal mechanism stays free of it (#595). Recorded
@@ -9629,6 +9765,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let db = self.db();
         let tx =
             rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
+        let locked_at = std::time::Instant::now();
 
         // Active-pin guard (kunobi-ninja/kache#326, #182): bail out — under
         // the write lock, before any decrement or unlink — if the entry was
@@ -9752,6 +9889,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // rebuild reclaims it) or orphaned blob files (the orphan sweep
         // reclaims those), never a live row without its files.
         tx.commit()?;
+        let first_hold = locked_at.elapsed();
 
         if let Some(hook) = after_logical_commit {
             hook();
@@ -9778,6 +9916,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                      unreferenced blobs stay on disk"
                 )
             })?;
+        let cleanup_locked_at = std::time::Instant::now();
 
         if let Some(hook) = before_dir_cleanup {
             hook();
@@ -9793,7 +9932,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             |row| row.get(0),
         )?;
 
-        if republished == 0 {
+        // What the pass takes out of the store's names, removed from disk once
+        // the lock is free again (see [`EvictedTrash`]).
+        let mut trash = EvictedTrash::new(&self.config.store_dir());
+        if republished == 0 && !trash.take(&entry_dir) {
             // Remove the entry directory (just meta.json in new format, may
             // have artifacts in legacy entries). Windows can surface external
             // interference as delete-pending errors (sharing violations from
@@ -9851,13 +9993,19 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 let blob = self.blob_path(&hash);
                 let disk =
                     crate::filesystem::blob_reclaimable_bytes(&blob).unwrap_or(size.max(0) as u64);
-                unlink_blob(&blob);
+                if !trash.take(&blob) {
+                    unlink_blob(&blob);
+                }
                 reclaim.freed_bytes += size.max(0) as u64;
                 reclaim.disk_bytes_reclaimed += disk;
                 reclaim.blobs_unlinked += 1;
             }
         }
         cleanup_tx.commit()?;
+        let cleanup_hold = cleanup_locked_at.elapsed();
+        reclaim.lock_held = first_hold.max(cleanup_hold);
+        reclaim.lock_held_total = first_hold + cleanup_hold;
+        trash.empty();
 
         // The key's lock file outlives its entry: nothing but the full GC's
         // capped sweep removed it, and evicted keys left nearly all of a
