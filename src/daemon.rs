@@ -7333,6 +7333,7 @@ impl Daemon {
 
     /// One shard's size-pressure sweep, under that shard's `gc.lock`.
     fn sweep_shard_under_size_pressure(&self, shard: &Config) -> Result<()> {
+        let asked = Instant::now();
         crate::disk_recovery::run(shard);
         let store = Store::open(shard)?;
         let Some(_gc_lock) = store.try_gc_lock()? else {
@@ -7343,13 +7344,14 @@ impl Daemon {
             return Ok(());
         };
         let size = store.physical_size()?;
-        self.size_pressure_sweep_if_due(shard, size)
+        self.size_pressure_sweep_if_due(shard, size, asked)
     }
 
     /// The main store's size-pressure sweep. Skips when another driver holds
     /// `gc.lock`, the store is under the trigger, or the backoff holds; each
     /// costs a lock attempt and one size query.
     fn sweep_main_under_size_pressure(&self) -> Result<()> {
+        let asked = Instant::now();
         crate::disk_recovery::run(&self.config);
         let Some((_gc_lock, size)) = self.with_store(|store| {
             let Some(lock) = store.try_gc_lock()? else {
@@ -7363,18 +7365,24 @@ impl Daemon {
             tracing::debug!("gc.lock held by another GC; skipping size-pressure eviction");
             return Ok(());
         };
-        self.size_pressure_sweep_if_due(&self.config, size)
+        self.size_pressure_sweep_if_due(&self.config, size, asked)
     }
 
     /// Sweep the store of `config`, now at `size`, if the shared trigger
-    /// says a sweep is due. Caller holds that store's `gc.lock`.
-    fn size_pressure_sweep_if_due(&self, config: &Config, size: u64) -> Result<()> {
+    /// says a sweep is due. Caller holds that store's `gc.lock`; `asked` is
+    /// when its check began.
+    fn size_pressure_sweep_if_due(
+        &self,
+        config: &Config,
+        size: u64,
+        asked: Instant,
+    ) -> Result<()> {
         if !crate::wrapper::auto_gc_sweep_due(config, size) {
             return Ok(());
         }
         // Under gc.lock like every driver, so the totals cannot race.
         let store = self.open_sweep_store(config)?;
-        let stats = self.automatic_size_pass(config, &store, size);
+        let stats = self.automatic_size_pass(config, &store, size, Some(asked));
         drop(store);
         // The ranking of a large store takes hundreds of megabytes.
         crate::platform::release_free_heap();
@@ -7398,17 +7406,21 @@ impl Daemon {
         config: &Config,
         store: &Store,
         size: u64,
+        asked: Option<Instant>,
     ) -> Result<crate::store::GcStats> {
         // The size is every blob's, the shared ones too: say how much of it
         // the last sweep found held by target directories, which the
-        // trigger leaves out and no eviction frees.
+        // trigger leaves out and no eviction frees. The check before it
+        // (disk recovery, the size query, the stamp flush, the store's
+        // open) logs nothing, so the line says when the sweep was asked for.
         tracing::info!(
             "store {} size {} over the automatic trigger (max {}; {} of it held by target \
-             directories at the last sweep), running LRU eviction",
+             directories at the last sweep), running LRU eviction (asked {} ms ago)",
             config.cache_dir.display(),
             size,
             config.max_size,
-            crate::wrapper::recent_auto_gc_held(&config.cache_dir)
+            crate::wrapper::recent_auto_gc_held(&config.cache_dir),
+            asked.map_or(0, |asked| asked.elapsed().as_millis())
         );
         let started = Instant::now();
         // Builds keep writing while it runs: it goes on past its byte
@@ -7451,7 +7463,7 @@ impl Daemon {
             tracing::info!("periodic GC: size pass not due (under the trigger or backing off)");
             return Ok(crate::store::GcStats::default());
         }
-        self.automatic_size_pass(config, store, size)
+        self.automatic_size_pass(config, store, size, None)
     }
 
     /// Sweep the main store, then each `[cache.volumes]` shard with its own
