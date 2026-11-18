@@ -878,6 +878,8 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
         entries_recent_prefiltered: 0,
         entries_import_pinned: 12,
         evict_write_ms: 11,
+        evict_lock_max_ms: 14,
+        evict_lock_ms: 15,
         bytes_held: 13,
         cut_short: false,
         // Set once by the driver, never summed over policies.
@@ -898,6 +900,8 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
         entries_recent_prefiltered: 0,
         entries_import_pinned: 120,
         evict_write_ms: 110,
+        evict_lock_max_ms: 4,
+        evict_lock_ms: 16,
         bytes_held: 7,
         cut_short: true,
         // Set once by the driver, never summed over policies.
@@ -905,6 +909,8 @@ fn daemon_gc_breakdown_sums_every_policy_field() {
     };
     add_gc_stats(&mut accumulated, &part);
     assert_eq!(accumulated.bytes_held, 13, "the larger probe, not a sum");
+    assert_eq!(accumulated.evict_lock_max_ms, 14, "the longer hold, not a sum");
+    assert_eq!(accumulated.evict_lock_ms, 31);
     assert_eq!(accumulated.entries_evicted, 11);
     assert_eq!(accumulated.bytes_freed, 22);
     assert_eq!(accumulated.entries_pinned, 33);

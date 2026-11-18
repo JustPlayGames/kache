@@ -173,7 +173,7 @@ fn main() -> Result<()> {
             let started = Instant::now();
             while !done.load(Ordering::Relaxed) {
                 // Ring over 256 MiB, so the file stays bounded.
-                if written % (256 << 20) == 0 {
+                if written.is_multiple_of(256 << 20) {
                     file = std::fs::File::create(&path)?;
                 }
                 file.write_all(&chunk)?;
