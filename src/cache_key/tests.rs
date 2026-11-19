@@ -7092,6 +7092,76 @@ fn a_checkout_on_another_tree_keys_without_waiting_for_the_owner() {
     });
 }
 
+/// A process that waited on a discovery flight keys before it compiles,
+/// even for a unit the store has never held: the peer let the flight go
+/// once it had its key and compiles under that key's flight, which this
+/// process then waits on if its key is the same. Compiling first would build
+/// the unit a second time beside the peer.
+#[test]
+fn a_flight_waiter_keys_before_it_compiles() {
+    let _lock = key_test_lock();
+    if get_rustc_version(Path::new("rustc")).is_err() {
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let db = base.path().join("index.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE entries (cache_key TEXT PRIMARY KEY, crate_name TEXT NOT NULL);",
+        )
+        .unwrap();
+    let cache = base.path().join("cache");
+    let (root, args) = workspace_invocation(base.path(), "w", "kt");
+    write_file(&root.join("kt/src/lib.rs"), "pub fn a() {}\n");
+    let manifest = root.join("kt");
+    let env = client_invocation(
+        &root,
+        &[
+            ("CARGO_MANIFEST_DIR", Some(manifest.as_os_str())),
+            ("OUT_DIR", None),
+        ],
+    );
+    let args = reparse_for_client(&args, &env);
+    let hasher = FileHasher::persistent(&db)
+        .with_invocation_env(&env)
+        .with_input_predictions(true)
+        .with_prediction_flights(Some(cache.clone()));
+    let mut tree = None;
+    assert!(predicted_key_inputs(&args, &hasher, &mut tree).is_err());
+    let identity = discovery_flight_identity(&args, &hasher).unwrap();
+    let digest = tree.as_ref().map(|guard| guard.digest.clone());
+    let peer =
+        crate::scheduler::join_discovery_flight_of_tree(&cache, &identity, digest.as_deref())
+            .lock
+            .expect("the peer takes the flight");
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(peer);
+    });
+    let started = std::time::Instant::now();
+    set_defer_discovery(true);
+    let outcome = resolve_key_inputs(
+        &args,
+        &hasher,
+        "kt",
+        &KeyEnv::default(),
+        &mut KeyOutputs::default(),
+    );
+    set_defer_discovery(false);
+    release.join().unwrap();
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "the waiter waited for the peer"
+    );
+    assert!(
+        !outcome
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<DeferredDiscovery>().is_some()),
+        "a waiter does not compile before its key"
+    );
+}
+
 /// This checkout's rows keep the guard while it covers the closure. They are
 /// never relocated, so a generated file naming the checkout costs nothing
 /// here, though it keeps the row for other checkouts out.
