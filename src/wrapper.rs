@@ -4735,6 +4735,7 @@ fn run_parsed_rustc(
             key_record,
             key_ms,
             key_hash_stats,
+            None,
         );
     }
     if let Some(lease) = deferred_seed.take() {
@@ -4825,6 +4826,9 @@ fn run_parsed_rustc(
     let may_defer = deferral_allowed(config, args, false, extra_inputs);
     // `Some(stop_on_hit)` once the miss is to compile before its key.
     let mut compile_then_key = None;
+    // A predicted miss that compiles under its predicted key's flight and
+    // keys from what rustc emitted ([`compiles_in_predicted_flight`]).
+    let mut in_predicted_flight = false;
     // A key another process is storing is waited for once per invocation.
     let mut waited_for_store = false;
     while precompiled.is_none() {
@@ -4972,7 +4976,9 @@ fn run_parsed_rustc(
         let owes = owes_rederivation(predicted, rederived);
         compile_then_key =
             compile_before_key_after_miss(may_defer, stop_on_hit_allowed(args), owes, keyed_first);
-        if compile_then_key.is_some() || !owes {
+        in_predicted_flight =
+            compiles_in_predicted_flight(may_defer, stop_on_hit_allowed(args), owes, keyed_first);
+        if compile_then_key.is_some() || !owes || in_predicted_flight {
             break;
         }
         rederived = true;
@@ -5046,6 +5052,7 @@ fn run_parsed_rustc(
             key_record,
             key_ms,
             key_hash_stats,
+            None,
         );
     }
 
@@ -5058,9 +5065,13 @@ fn run_parsed_rustc(
     drop(discovery_flight);
 
     // 3. Cache miss — join the machine-wide flight, take a permit, then
-    // claim the key and re-check under the build lock.
-    let (miss_guard, scheduled_hit) = if precompiled.is_none() {
-        admit_scheduler_miss(
+    // claim the key and re-check under the build lock. A compile that ran
+    // under this key's flight already holds it; any other re-entered compile
+    // ran under a keyless slot and is not admitted again.
+    let held = precompiled.as_mut().and_then(|pre| pre.flight.take());
+    let (miss_guard, scheduled_hit) = match held_flight_for(held, &cache_key) {
+        Some(guard) => (guard, None),
+        None if precompiled.is_none() => admit_scheduler_miss(
             config,
             &store,
             &cache_key,
@@ -5068,10 +5079,26 @@ fn run_parsed_rustc(
             crate_name,
             args.invokes_linker(),
             cache_entry_has_files,
-        )
-    } else {
-        (MissGuard::empty(), None)
+        ),
+        None => (MissGuard::empty(), None),
     };
+    if in_predicted_flight && scheduled_hit.is_none() {
+        // The predicted key missed and the compile cannot stop on a hit:
+        // compile now under the predicted key's flight, then key from the
+        // dep-info rustc emitted and store under that key, instead of a
+        // dep-info pre-pass first. Same-key peers wait on this flight.
+        tracing::debug!("{crate_name}: predicted miss; compiling under its flight before keying");
+        return compile_before_key(
+            &compile_first,
+            false,
+            key_outputs.tree_guard,
+            guard_inputs,
+            key_record,
+            key_ms,
+            key_hash_stats,
+            Some((cache_key, miss_guard)),
+        );
+    }
     let (lock, committed) = if let Some(meta) = scheduled_hit {
         (None, Some(meta))
     } else {
@@ -7158,6 +7185,10 @@ struct Precompiled {
     /// What the deferred key recorded for the event. The keyed flow the
     /// compile re-enters continues this record.
     key_record: KeyEventRecord,
+    /// The compile flight and permit the compile ran under, with the key it
+    /// was taken for ([`compiles_in_predicted_flight`]): kept until the entry
+    /// is stored, so peers with that key wait for it and then hit.
+    flight: Option<(String, MissGuard)>,
 }
 
 /// What a compile that starts before its key needs from the invocation.
@@ -7426,6 +7457,7 @@ fn adaptive_compile_before_key(
 /// result). With `stop_on_hit`, key as soon as rustc reports that dep-info
 /// and stop the compile if the key is stored. `tree_guard` is the guard
 /// taken before the compile.
+#[allow(clippy::too_many_arguments)]
 fn compile_before_key(
     ctx: &CompileFirst<'_>,
     stop_on_hit: bool,
@@ -7434,6 +7466,7 @@ fn compile_before_key(
     key_record: KeyEventRecord,
     key_ms: u64,
     key_hash_stats: FileHashStats,
+    flight: Option<(String, MissGuard)>,
 ) -> Result<i32> {
     let CompileFirst {
         config,
@@ -7451,14 +7484,22 @@ fn compile_before_key(
     // Cargo starts pipelined consumers on the rmeta, before this key.
     crate::out_dir_alias::register_before_compile();
     // No key yet, but the compile still takes a slot in the scheduler's
-    // pool, as every other compile does.
-    let mut miss_guard = Some(scheduler::begin_keyless_compile(
-        &config.cache_dir,
-        config.scheduler,
-        crate_name,
-        args.invokes_linker(),
-        config.test_lease.as_deref(),
-    ));
+    // pool, as every other compile does; a compile under a predicted key
+    // already holds that key's flight and permit.
+    let (flight_key, guard) = match flight {
+        Some((key, guard)) => (Some(key), guard),
+        None => (
+            None,
+            scheduler::begin_keyless_compile(
+                &config.cache_dir,
+                config.scheduler,
+                crate_name,
+                args.invokes_linker(),
+                config.test_lease.as_deref(),
+            ),
+        ),
+    };
+    let mut miss_guard = Some(guard);
     let compile_start = std::time::Instant::now();
     // An entry could exist: key from the dep-info rustc writes right
     // after expansion, and stop the compile if that key is stored. This
@@ -7510,7 +7551,9 @@ fn compile_before_key(
     {
         guard.record_compile_rss(crate_name);
     }
-    drop(miss_guard);
+    // A predicted key's flight stays held until the entry is stored; a
+    // keyless slot is given back now.
+    let flight = flight_key.zip(miss_guard);
     let _key_flight = key_flight;
     if let Some((dep_info, tree)) = hit_closure {
         return resume_after_compile(executed, |_| {
@@ -7621,6 +7664,7 @@ fn compile_before_key(
             dep_info: Some(dep_info),
             tree_guard,
             key_record,
+            flight,
         }),
     );
     PRECOMPILED_EXIT.with(|cell| cell.set(None));
@@ -8369,6 +8413,34 @@ fn compile_before_key_after_miss(
         return stop_on_hit_allowed.then_some(true);
     }
     keyed_first.then_some(stop_on_hit_allowed)
+}
+
+/// Does a predicted miss compile under its predicted key's compile flight
+/// and key from the dep-info rustc emits, instead of re-deriving its key
+/// through the dep-info pre-pass first?
+///
+/// Only where the compile cannot stop on a hit (the parallel frontend: its
+/// threads hold jobserver tokens a stopped compile never returns), so the
+/// pre-pass is a second rustc run to its dep-info before every such miss,
+/// 11-13 s on a large crate. On the build server it found a different key in
+/// none of 16,500 re-derivations in six hours (kache's
+/// `prediction_mismatches`); the few that hit afterwards hit a key a peer
+/// stored meanwhile, which a peer now waits for on the flight instead. The
+/// store still takes its key from the closure the compile wrote, so a wrong
+/// prediction costs only the coalescing, never the entry.
+fn compiles_in_predicted_flight(
+    deferral_allowed: bool,
+    stop_on_hit_allowed: bool,
+    owes_rederivation: bool,
+    keyed_first: bool,
+) -> bool {
+    deferral_allowed && owes_rederivation && !stop_on_hit_allowed && !keyed_first
+}
+
+/// The flight a re-entered compile ran under, when it was taken for this
+/// key; one taken for another key is let go, and the store admits anew.
+fn held_flight_for<G>(held: Option<(String, G)>, cache_key: &str) -> Option<G> {
+    held.and_then(|(key, guard)| (key == cache_key).then_some(guard))
 }
 
 /// Should this invocation write what it discovered back to the record?

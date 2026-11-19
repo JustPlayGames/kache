@@ -145,6 +145,53 @@ fn a_miss_no_lane_took_compiles_before_its_key_unless_that_key_must_stay() {
     }
 }
 
+/// A guess whose compile cannot stop on a hit (the parallel frontend keeps
+/// jobserver tokens a stopped compile never returns) compiles under the
+/// predicted key's flight and keys from the dep-info it emits, instead of a
+/// dep-info pre-pass first; every other miss keeps its route, and the two
+/// routes never both apply.
+#[test]
+fn a_guess_that_cannot_stop_compiles_under_its_flight_instead_of_the_pre_pass() {
+    for deferral in [true, false] {
+        for stop in [true, false] {
+            for owes in [true, false] {
+                for keyed_first in [true, false] {
+                    let expected = deferral && !stop && owes && !keyed_first;
+                    let case = format!(
+                        "deferral {deferral}, stop on hit {stop}, owes {owes}, keyed first {keyed_first}"
+                    );
+                    assert_eq!(
+                        compiles_in_predicted_flight(deferral, stop, owes, keyed_first),
+                        expected,
+                        "{case}"
+                    );
+                    if expected {
+                        assert_eq!(
+                            compile_before_key_after_miss(deferral, stop, owes, keyed_first),
+                            None,
+                            "{case}: the compile-first route does not take it too"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A compile that ran under a predicted key's flight hands that flight to its
+/// store only when the key it emitted is the predicted one; under another key
+/// the flight is let go (its peers recheck and miss) and the store admits
+/// anew.
+#[test]
+fn a_flight_held_for_the_stored_key_is_kept_and_any_other_let_go() {
+    assert_eq!(
+        held_flight_for(Some(("k1".to_string(), 7_u8)), "k1"),
+        Some(7)
+    );
+    assert_eq!(held_flight_for(Some(("k1".to_string(), 7_u8)), "k2"), None);
+    assert_eq!(held_flight_for::<u8>(None, "k1"), None);
+}
+
 #[test]
 fn only_a_fresh_closure_is_worth_recording() {
     assert!(
