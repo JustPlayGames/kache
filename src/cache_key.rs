@@ -4634,9 +4634,14 @@ fn resolve_key_inputs(
             }
             // A missing prediction only describes this checkout. Another
             // checkout may have stored a portable entry, so compile first
-            // only when the store has never held this unit.
+            // only when the store has never held this unit. Not after a
+            // wait: the peer let the flight go once it had its key and went
+            // on to compile under it (the keyed miss path), so this process
+            // keys too and waits on that compile's flight if its key is the
+            // same, instead of compiling the unit a second time.
             Err(Rejection::NoRecord | Rejection::Disabled | Rejection::NotEligible)
                 if owns_flight
+                    && !followed_a_peer
                     && DEFER_DISCOVERY.with(std::cell::Cell::get)
                     && file_hasher.store_lacks_unit(
                         crate_name,
