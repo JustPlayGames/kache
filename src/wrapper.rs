@@ -5049,6 +5049,14 @@ fn run_parsed_rustc(
         );
     }
 
+    // The key is known now, and the compile flight below coalesces peers
+    // with the same key. Holding the discovery flight through this compile
+    // only kept peers with another key (other dependencies of the same
+    // package) waiting for it, in turn: one convoy took 1,072 s. A peer it
+    // wakes keys from its own pre-pass and, with the same key, waits on that
+    // flight instead.
+    drop(discovery_flight);
+
     // 3. Cache miss — join the machine-wide flight, take a permit, then
     // claim the key and re-check under the build lock.
     let (miss_guard, scheduled_hit) = if precompiled.is_none() {
