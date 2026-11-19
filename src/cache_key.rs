@@ -1376,6 +1376,9 @@ struct TreeRoot<'a> {
     /// Cargo tagged it as a build directory: a stale `target`, or the target
     /// directory of another build.
     skips_build_dirs: bool,
+    /// Fold a Rust source (`*.rs`) by its name alone, not its content
+    /// ([`TreeRoot::rust_sources_by_name`]).
+    rust_by_name: bool,
     /// Kache's own directories, and what Cargo writes in its home, below the
     /// root ([`own_dirs_within`]), left out wherever they lie.
     own: Vec<PathBuf>,
@@ -1391,6 +1394,7 @@ impl<'a> TreeRoot<'a> {
             role,
             skipped,
             skips_build_dirs: false,
+            rust_by_name: false,
             own: Vec::new(),
             excluded_dirs: Vec::new(),
         }
@@ -1406,6 +1410,21 @@ impl<'a> TreeRoot<'a> {
     fn excluding_dirs(self, names: &[std::ffi::OsString]) -> Self {
         Self {
             excluded_dirs: names.to_vec(),
+            ..self
+        }
+    }
+
+    /// Fold each Rust source by its name and kind only. The record's closure
+    /// already holds every source the unit compiles, each checked by its own
+    /// fingerprint, so what the guard adds for a Rust source is whether it
+    /// is there: a module file that appears, goes or moves. A Rust source
+    /// outside the closure (another target's, a test module the unit leaves
+    /// out) is not read by rustc for this unit, and a proc macro that read
+    /// one without telling rustc was invisible to the dep-info re-read the
+    /// guard falls back to as well. Every other file still counts by content.
+    fn rust_sources_by_name(self) -> Self {
+        Self {
+            rust_by_name: true,
             ..self
         }
     }
@@ -1842,6 +1861,7 @@ fn root_digest(
             &GuardFileHashes {
                 hasher: file_hasher,
                 memoised,
+                rust_by_name: root.rust_by_name,
             },
             &mut hasher,
             &mut budget,
@@ -1945,6 +1965,9 @@ fn tree_digest_memo(memo_dir: &Path, root: &TreeRoot<'_>) -> PathBuf {
         b"build_dirs:",
         if root.skips_build_dirs { b"1" } else { b"0" },
     );
+    if root.rust_by_name {
+        fold_field(&mut hasher, b"rust_by_name:", b"1");
+    }
     memo_dir
         .join(crate::probe_memo::TREE_DIGESTS_DIR)
         .join(&hasher.finalize().to_hex()[..32])
@@ -1998,6 +2021,14 @@ fn registry_src_root(manifest_dir: &Path) -> Option<&Path> {
 struct GuardFileHashes<'a, 'db> {
     hasher: &'a FileHasher<'db>,
     memoised: HashMap<FileFingerprint, String>,
+    /// Fold a Rust source by name, not content ([`TreeRoot::rust_sources_by_name`]).
+    rust_by_name: bool,
+}
+
+/// Is `path` a Rust source, which [`TreeRoot::rust_sources_by_name`] folds
+/// by name?
+fn is_rust_source(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rs")
 }
 
 /// What a content fold of a tree could not read.
@@ -2085,6 +2116,8 @@ fn crate_tree_fold(
             )?;
             unread.entries += below.entries;
             unread.files += below.files;
+        } else if metadata.is_file() && files.rust_by_name && is_rust_source(&path) {
+            fold_field(hasher, b"rust_source:", b"");
         } else if metadata.is_file() {
             match files.hasher.guard_file_hash_from_metadata(
                 &path,
@@ -4646,13 +4679,16 @@ fn scoped_package_digest(
                 b"scoped_package",
                 MANIFEST_DIR_SKIPPED,
             )
-            .skipping_build_dirs(),
+            .skipping_build_dirs()
+            .rust_sources_by_name(),
         ];
         if let Some(out_dir) = &workspace.out_dir {
             roots.push(TreeRoot::new(out_dir.clone(), b"out_dir", &[]));
         }
         let package_digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES)?;
-        hasher.update(b"kache-scoped-guard-v1\n");
+        // v2: the package's Rust sources count by name
+        // ([`TreeRoot::rust_sources_by_name`]).
+        hasher.update(b"kache-scoped-guard-v2\n");
         fold_field(&mut hasher, b"package:", package_digest.as_bytes());
     }
     // The inputs guard counts the workspace manifest less the registry
@@ -5292,9 +5328,15 @@ fn resolve_key_inputs(
             && let Some(cache_dir) = &file_hasher.prediction_flight_dir
             && let Some(identity) = discovery_flight_identity(args, file_hasher)
         {
-            let tree = out.tree_guard.as_ref().map(|guard| guard.digest.as_str());
-            let flight =
-                crate::scheduler::join_discovery_flight_of_tree(cache_dir, &identity, tree);
+            let tree = out
+                .tree_guard
+                .as_ref()
+                .map(|guard| discovery_flight_tree(args, file_hasher, guard));
+            let flight = crate::scheduler::join_discovery_flight_of_tree(
+                cache_dir,
+                &identity,
+                tree.as_deref(),
+            );
             followed_a_peer = flight.waited;
             let mut lock = flight.lock;
             // The previous owner may have published while this process
@@ -5402,6 +5444,38 @@ fn resolve_key_inputs(
         }
     }
     dep_info_pre_pass_for(args, &file_hasher.invocation_env)
+}
+
+/// What a discovery flight's holder notes about its tree, and a waiter
+/// compares: the guard's digest and, for a member under the scoped guard,
+/// its package's digest by content as well. The scoped guard counts Rust
+/// sources by name ([`TreeRoot::rust_sources_by_name`]), so checkouts of
+/// other commits often share it; the owner's entry is of no use to a waiter
+/// whose sources differ, which then stops waiting after the grace as before.
+/// Walked only on the way into a flight, once the record was refused.
+fn discovery_flight_tree(
+    args: &RustcArgs,
+    file_hasher: &FileHasher<'_>,
+    guard: &TreeGuard,
+) -> String {
+    let vars: Vec<_> = file_hasher.invocation_env.vars_os().collect();
+    let content = workspace_roots(args, &vars)
+        .and_then(|workspace| workspace.scoped_package)
+        .filter(|_| !inputs_workspace_guard(&file_hasher.invocation_env))
+        .and_then(|package| {
+            let roots = vec![
+                TreeRoot::new(package, b"scoped_package", MANIFEST_DIR_SKIPPED)
+                    .skipping_build_dirs(),
+            ];
+            let digest = tree_digest(roots, file_hasher, CRATE_TREE_MAX_ENTRIES);
+            // Not this guard's walks: the guard was taken already.
+            file_hasher.take_tree_walks();
+            digest
+        });
+    match content {
+        Some(content) => format!("{}+{content}", guard.digest),
+        None => guard.digest.clone(),
+    }
 }
 
 /// Note how the input closure was decided, in the phase trace and in this

@@ -18843,6 +18843,7 @@ fn a_root_the_tree_fold_cannot_list_gives_no_digest() {
             &GuardFileHashes {
                 hasher: &hasher,
                 memoised: HashMap::new(),
+                rust_by_name: false,
             },
             &mut digest,
             &mut budget,
@@ -23581,6 +23582,50 @@ fn the_inputs_guard_names_the_closures_directories_in_the_package() {
     let before = guard(true);
     write_file(&root.join("crates/kt/macro.cfg"), "edited");
     assert_ne!(guard(true), before, "a top file counts by content");
+}
+
+/// The scoped guard counts the package's Rust sources by name: an edit to
+/// one, in the closure or not (a test module, another target's source),
+/// keeps it, as the closure's own fingerprints check what the unit reads. A
+/// Rust source that appears or goes moves it, and any other file counts by
+/// content as before.
+#[test]
+fn the_scoped_guard_counts_rust_sources_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("w");
+    let roots = member_workspace(&root);
+    let sources = [
+        PathBuf::from("crates/kt/src/lib.rs"),
+        PathBuf::from("crates/kt/src/a.rs"),
+        PathBuf::from("crates/kt/src/a/b.rs"),
+    ];
+    let hasher = FileHasher::new();
+    let _mode = WorkspaceGuardForTest::scoped();
+    let guard = || {
+        let tree = workspace_tree_digest(&roots, &hasher).unwrap();
+        expected_tree(&tree, &sources, Some(&roots)).unwrap()
+    };
+    let before = guard();
+    write_file(&root.join("crates/kt/tests/t.rs"), "#[test]\nfn t() {}\n");
+    write_file(&root.join("crates/kt/benches/b.rs"), "fn main() {}\n");
+    write_file(&root.join("crates/kt/src/a/b.rs"), "pub fn edited() {}\n");
+    assert_eq!(guard(), before, "edits to Rust sources keep the guard");
+
+    for (what, path) in [
+        ("a new file in tests/", "crates/kt/tests/new.rs"),
+        ("a module file beside a.rs", "crates/kt/src/c.rs"),
+        ("a file a macro could read", "crates/kt/assets/a.txt"),
+    ] {
+        let before = guard();
+        write_file(&root.join(path), "");
+        assert_ne!(guard(), before, "{what}");
+    }
+    let before = guard();
+    std::fs::remove_file(root.join("crates/kt/tests/new.rs")).unwrap();
+    assert_ne!(guard(), before, "a Rust source that goes");
+    let before = guard();
+    write_file(&root.join("crates/kt/assets/a.txt"), "edited");
+    assert_ne!(guard(), before, "another file counts by content");
 }
 
 /// The inputs guard tells which directories beside the closure's hold no

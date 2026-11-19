@@ -2525,18 +2525,26 @@ fn inputs_an_edit_outside_the_closure_inside_the_package_keeps_the_record() {
     }
 }
 
-/// The same edit under the scoped guard (the default) refuses the record:
-/// the inputs guard is what keeps it.
+/// The same edit under the scoped guard (the default) keeps the record too:
+/// it counts the package's Rust sources by name. An edit to another file in
+/// `tests/` refuses it, as any file but a Rust source counts by content.
 #[test]
-fn scoped_an_edit_in_tests_refuses_the_record() {
+fn scoped_an_edit_in_tests_keeps_the_record_unless_it_is_not_rust() {
     build_kache();
-    let unit = module_tree_unit(true).scoped();
+    let unit = module_tree_unit(true)
+        .scoped()
+        .with_file("kt/tests/fixture.txt", "a\n");
     let a = unit.checkout("a");
     assert_eq!(unit.build(&a, true, None).result, "miss");
     std::fs::write(a.join("kt/tests/t.rs"), "#[test]\nfn t2() {}\n").unwrap();
     let warm = unit.build(&a, true, None);
     assert_eq!(warm.result, "local_hit");
-    assert_eq!(warm.dep_info_runs, 1);
+    assert_eq!(warm.dep_info_runs, 0, "a Rust source counts by name");
+    std::fs::write(a.join("kt/tests/fixture.txt"), "b\n").unwrap();
+    let edited = unit.build(&a, true, None);
+    assert_eq!(edited.result, "local_hit");
+    assert_eq!(edited.dep_info_runs, 1, "another file counts by content");
+    assert_eq!(edited.cache_key, warm.cache_key);
 }
 
 /// A name that comes, goes or moves in a directory of the closure, or in a
