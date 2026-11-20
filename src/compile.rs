@@ -403,6 +403,18 @@ pub(crate) fn run_rustc(
     let stdout = String::from_utf8_lossy(&stdout).to_string();
     let stderr = String::from_utf8_lossy(&captured_stderr.verbatim);
 
+    if exit_code != 0
+        && let Some(refused) = not_writeable_output(&stderr)
+    {
+        log_refused_output(
+            &cwd.join(&refused),
+            output_path,
+            out_dir,
+            crate_name,
+            extra_filename,
+        );
+    }
+
     // Detect incremental-related failures and log diagnostics
     if exit_code != 0
         && (stderr.contains("failed to move dependency graph")
@@ -1181,9 +1193,12 @@ pub(crate) fn pre_clean_outputs(
                 remove_if_readonly(&dir.join(fname));
             });
         }
-    } else {
+    } else if out_dir.is_some() {
         // Incomplete identity: refuse a mass sweep of out-dir (rio-build#51 / kache#242).
-        tracing::debug!(
+        // Said at warn: a read-only output a restore left here then stops
+        // rustc with "output file ... is not writeable", and this line is
+        // the only trace of why.
+        tracing::warn!(
             "pre_clean_outputs: nothing to identify outputs by \
              (out_dir={out_dir:?}, crate_name={crate_name:?}); skipping read-only pre-clean — \
              a warm restore in this directory may block this compile"
@@ -1226,6 +1241,52 @@ pub(crate) fn remove_outputs_except_metadata(
     removed
 }
 
+/// The output rustc refused because it is read-only, from its error
+/// "output file <path> is not writeable -- check its permissions" (plain or
+/// in a JSON diagnostic's rendered text), as rustc wrote the path.
+fn not_writeable_output(stderr: &str) -> Option<PathBuf> {
+    const LEAD: &str = "output file ";
+    const TAIL: &str = " is not writeable";
+    let end = stderr.find(TAIL)?;
+    let start = stderr[..end].rfind(LEAD)? + LEAD.len();
+    let path = &stderr[start..end];
+    (!path.is_empty() && !path.contains('\n')).then(|| PathBuf::from(path))
+}
+
+/// Say at warn what rustc refused to write over, so that the writer of a
+/// read-only output can be found: a restore's link to a store blob (links
+/// above one) that this unit's pre-clean did not remove, with the identity
+/// the pre-clean went by.
+fn log_refused_output(
+    refused: &Path,
+    output_path: Option<&Path>,
+    out_dir: Option<&Path>,
+    crate_name: Option<&str>,
+    extra_filename: Option<&str>,
+) {
+    let facts = std::fs::metadata(refused).map(|meta| {
+        #[cfg(unix)]
+        let links = std::os::unix::fs::MetadataExt::nlink(&meta);
+        #[cfg(not(unix))]
+        let links = 0u64;
+        (meta.permissions().readonly(), links)
+    });
+    let (readonly, links) = match facts {
+        Ok((readonly, links)) => (Some(readonly), Some(links)),
+        Err(_) => (None, None),
+    };
+    tracing::warn!(
+        refused = %refused.display(),
+        readonly,
+        links,
+        output = ?output_path,
+        out_dir = ?out_dir,
+        crate_name,
+        extra_filename,
+        "rustc refused a read-only output that the pre-clean left in place"
+    );
+}
+
 /// Remove a file if it exists and is read-only (likely a kache hardlink).
 fn remove_if_readonly(path: &Path) {
     let Ok(entry) = std::fs::symlink_metadata(path) else {
@@ -1251,7 +1312,13 @@ fn remove_if_readonly(path: &Path) {
     if !std::fs::symlink_metadata(path).is_ok_and(|current| current.file_type().is_file()) {
         return;
     }
-    let _ = std::fs::remove_file(path);
+    if let Err(error) = std::fs::remove_file(path) {
+        // rustc refuses to write over the read-only file that stays.
+        tracing::warn!(
+            "pre_clean_outputs: could not remove the read-only {}: {error}",
+            path.display()
+        );
+    }
 }
 
 // NOTE: ad-hoc codesign logic used to live here behind
@@ -2581,6 +2648,103 @@ fi
             fs::metadata(&blob).unwrap().permissions().readonly(),
             "removing the output must not make the shared blob writable"
         );
+    }
+
+    /// A capped unit's restore links its `.rlib` and `.rmeta` to read-only
+    /// store blobs. A rustc nothing pre-cleaned for refuses the `.rmeta`;
+    /// with only the `.rmeta` writable it refuses the `.rlib` (so a
+    /// writable copy of the metadata alone does not fix a build-mode
+    /// writer); the unit's pre-clean lets it compile and leaves the blobs
+    /// as they were. The refusal names its file in plain and JSON errors.
+    #[cfg(unix)]
+    #[test]
+    fn rustc_refuses_a_restores_read_only_outputs_until_the_pre_clean() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipped: no rustc");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, out) = (dir.path().join("blobs"), dir.path().join("out"));
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let lib = dir.path().join("lib.rs");
+        std::fs::write(&lib, "pub fn f() -> u32 { 1 }\n").unwrap();
+        let rustc = |json: bool| {
+            let mut command = std::process::Command::new("rustc");
+            command
+                .args([
+                    "--crate-name",
+                    "capped",
+                    "--edition",
+                    "2021",
+                    "--crate-type",
+                    "lib",
+                ])
+                .args(["--emit=dep-info,metadata,link", "-C", "extra-filename=-abc"])
+                .arg("--out-dir")
+                .arg(&out)
+                .arg(&lib);
+            if json {
+                command.arg("--error-format=json");
+            }
+            command.output().unwrap()
+        };
+        assert!(rustc(false).status.success(), "the first build");
+        let read_only = std::fs::Permissions::from_mode(0o444);
+        for name in ["libcapped-abc.rlib", "libcapped-abc.rmeta"] {
+            std::fs::rename(out.join(name), blobs.join(name)).unwrap();
+            std::fs::set_permissions(blobs.join(name), read_only.clone()).unwrap();
+            std::fs::hard_link(blobs.join(name), out.join(name)).unwrap();
+        }
+        for json in [false, true] {
+            let refused = rustc(json);
+            assert!(!refused.status.success(), "a read-only output stops rustc");
+            assert_eq!(
+                not_writeable_output(&String::from_utf8_lossy(&refused.stderr)),
+                Some(out.join("libcapped-abc.rmeta")),
+                "json {json}"
+            );
+        }
+        std::fs::remove_file(out.join("libcapped-abc.rmeta")).unwrap();
+        std::fs::copy(
+            blobs.join("libcapped-abc.rmeta"),
+            out.join("libcapped-abc.rmeta"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            out.join("libcapped-abc.rmeta"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let refused = rustc(false);
+        assert_eq!(
+            not_writeable_output(&String::from_utf8_lossy(&refused.stderr)),
+            Some(out.join("libcapped-abc.rlib")),
+            "a writable metadata copy moves the refusal to the rlib"
+        );
+        let blob_bytes = std::fs::read(blobs.join("libcapped-abc.rlib")).unwrap();
+        pre_clean_outputs(None, Some(&out), Some("capped"), Some("-abc"), &[]);
+        assert!(
+            rustc(false).status.success(),
+            "compiles after the pre-clean"
+        );
+        assert_eq!(
+            std::fs::read(blobs.join("libcapped-abc.rlib")).unwrap(),
+            blob_bytes
+        );
+        assert!(
+            std::fs::metadata(blobs.join("libcapped-abc.rlib"))
+                .unwrap()
+                .permissions()
+                .readonly(),
+            "the blob stays read-only"
+        );
+        assert_eq!(not_writeable_output("error: aborting\n"), None);
     }
 
     /// A proc-macro dylib or build-script binary restored as a link to a
