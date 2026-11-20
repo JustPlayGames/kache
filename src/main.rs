@@ -460,6 +460,13 @@ pub(crate) fn log_file_path_for(env: &invocation::InvocationEnv) -> Option<PathB
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
 
+/// Target of the rare warnings a compile must leave in the log file even
+/// when its file logging is off (a wrapper's, and every compile the daemon
+/// runs for one): cargo keeps a wrapper's stderr from the user, so a build
+/// that fails on what they say would leave no trace of why. The file opens
+/// only when such a line is written.
+pub(crate) const ALWAYS_LOGGED: &str = "kache::always_logged";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogMode {
     Wrapper,
@@ -552,32 +559,34 @@ fn logging_dispatch(mode: LogMode, env: &invocation::InvocationEnv) -> tracing::
     // a per-phase wrapper.log so each cold/warm phase has a clean log).
     let file_layer = {
         let wrapper_opted_in = mode == LogMode::Wrapper && env.var_os("KACHE_LOG_FILE").is_some();
-        let enable_file_layer = mode != LogMode::Wrapper || wrapper_opted_in;
+        // A wrapper that did not opt in still writes the warnings of
+        // [`ALWAYS_LOGGED`]; with none, its file is never opened.
+        let only_always_logged = mode == LogMode::Wrapper && !wrapper_opted_in;
 
-        if !enable_file_layer {
-            None
-        } else {
-            (|| -> Option<_> {
-                let path = log_file_path_for(env)?;
-                // Rotation is skipped for a custom path: the caller owns the
-                // file lifecycle (e.g. the bench wipes it per phase).
-                let rotate = env.var_os("KACHE_LOG_FILE_PATH").is_none();
-                let file = LazyLogFile::new(path, rotate);
+        (|| -> Option<_> {
+            let path = log_file_path_for(env)?;
+            // Rotation is skipped for a custom path: the caller owns the
+            // file lifecycle (e.g. the bench wipes it per phase).
+            let rotate = env.var_os("KACHE_LOG_FILE_PATH").is_none();
+            let file = LazyLogFile::new(path, rotate);
 
-                let file_filter = env
-                    .var("KACHE_LOG_FILE")
+            let file_filter = if only_always_logged {
+                EnvFilter::try_new(format!("off,{ALWAYS_LOGGED}=warn"))
+                    .expect("a fixed, valid filter")
+            } else {
+                env.var("KACHE_LOG_FILE")
                     .ok()
                     .and_then(|filter| EnvFilter::try_new(filter).ok())
-                    .unwrap_or_else(|| "kache=info".parse().unwrap());
+                    .unwrap_or_else(|| "kache=info".parse().unwrap())
+            };
 
-                Some(
-                    fmt::layer()
-                        .with_ansi(false)
-                        .with_writer(Mutex::new(file))
-                        .with_filter(file_filter),
-                )
-            })()
-        }
+            Some(
+                fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(Mutex::new(file))
+                    .with_filter(file_filter),
+            )
+        })()
     };
 
     tracing::Dispatch::new(
@@ -2191,6 +2200,27 @@ mod tests {
         let logged = std::fs::read_to_string(root.path().join("wrapper.log")).unwrap();
         assert!(logged.contains("with-file-opt-in"));
         assert!(!logged.contains("without-file-opt-in"));
+    }
+
+    #[test]
+    fn a_wrapper_without_file_logging_still_writes_what_is_always_logged() {
+        let root = tempfile::tempdir().unwrap();
+        let env = invocation::InvocationEnv::from_parts(
+            [("KACHE_LOG", "off"), ("KACHE_LOG_FILE_PATH", "wrapper.log")],
+            Some(root.path().to_owned()),
+            None,
+            root.path().to_owned(),
+        );
+        let logging = logging_dispatch(LogMode::Wrapper, &env);
+        let _logging = tracing::dispatcher::set_default(&logging);
+        tracing::warn!(target: "kache::compile", "an-ordinary-warning");
+        tracing::info!(target: ALWAYS_LOGGED, "an-info-line");
+        assert!(!root.path().join("wrapper.log").exists());
+        tracing::warn!(target: ALWAYS_LOGGED, "a-refused-output");
+        let logged = std::fs::read_to_string(root.path().join("wrapper.log")).unwrap();
+        assert!(logged.contains("a-refused-output"));
+        assert!(!logged.contains("an-ordinary-warning"));
+        assert!(!logged.contains("an-info-line"));
     }
 
     #[test]

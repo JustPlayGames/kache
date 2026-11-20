@@ -1199,6 +1199,7 @@ pub(crate) fn pre_clean_outputs(
         // rustc with "output file ... is not writeable", and this line is
         // the only trace of why.
         tracing::warn!(
+            target: crate::ALWAYS_LOGGED,
             "pre_clean_outputs: nothing to identify outputs by \
              (out_dir={out_dir:?}, crate_name={crate_name:?}); skipping read-only pre-clean — \
              a warm restore in this directory may block this compile"
@@ -1276,6 +1277,7 @@ fn log_refused_output(
         Err(_) => (None, None),
     };
     tracing::warn!(
+        target: crate::ALWAYS_LOGGED,
         refused = %refused.display(),
         readonly,
         links,
@@ -1315,6 +1317,7 @@ fn remove_if_readonly(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
         // rustc refuses to write over the read-only file that stays.
         tracing::warn!(
+            target: crate::ALWAYS_LOGGED,
             "pre_clean_outputs: could not remove the read-only {}: {error}",
             path.display()
         );
