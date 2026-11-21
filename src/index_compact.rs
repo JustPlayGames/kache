@@ -246,6 +246,9 @@ impl Outcome {
                             "index compaction ({mode}) found the index busy after {ms} ms; will retry"
                         )
                     }
+                    IndexCompaction::Vacuumed { before } => format!(
+                        "index compacted ({mode}) in {ms} ms; a reader held the WAL, so the {before}-byte file shrinks at the next checkpoint"
+                    ),
                     IndexCompaction::InsufficientSpace { needed, free } => format!(
                         "index compaction ({mode}) needs {needed} bytes of free disk, found {free}; will retry"
                     ),
@@ -308,7 +311,9 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
     let result = index.compact_index()?;
     if matches!(
         result,
-        IndexCompaction::Compacted { .. } | IndexCompaction::NotNeeded
+        IndexCompaction::Compacted { .. }
+            | IndexCompaction::Vacuumed { .. }
+            | IndexCompaction::NotNeeded
     ) {
         clear_state(cache_dir);
     }
@@ -816,6 +821,13 @@ mod tests {
     fn contended_index_yields_and_keeps_the_record() {
         let dir = tempfile::tempdir().unwrap();
         let config = sparse_store(dir.path());
+        // A reader whose snapshot reaches into the WAL blocks the checkpoint
+        // before the VACUUM. One that began on an empty WAL would not: the
+        // VACUUM would commit and only the file's shrink wait (`Vacuumed`).
+        let writer = rusqlite::Connection::open(config.cache_dir.join("index.db")).unwrap();
+        writer
+            .execute_batch("CREATE TABLE pending(x); INSERT INTO pending VALUES (1);")
+            .unwrap();
         let reader = rusqlite::Connection::open(config.cache_dir.join("index.db")).unwrap();
         reader.execute_batch("BEGIN").unwrap();
         let _: i64 = reader

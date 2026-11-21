@@ -63,6 +63,10 @@ pub enum IndexCompaction {
     InsufficientSpace { needed: u64, free: u64 },
     /// File size in bytes before and after.
     Compacted { before: u64, after: u64 },
+    /// The VACUUM committed, but a reader kept its pages in the WAL, so the
+    /// file (`before` bytes) shrinks only at a later checkpoint. Nothing to
+    /// retry: the free pages are gone.
+    Vacuumed { before: u64 },
 }
 
 /// Page accounting for any connection to the index, including read-only ones.
@@ -84,12 +88,15 @@ fn is_busy(err: &rusqlite::Error) -> bool {
     )
 }
 
-/// Where a compaction attempt stopped. The two busy stages differ only in
-/// the message `compact_sparse_index` shows.
+/// Where a compaction attempt stopped.
 enum Attempt {
     Done(IndexCompaction),
     BusyBeforeVacuum,
-    BusyAfterVacuum,
+    /// The VACUUM committed; the checkpoint that shrinks the file was
+    /// blocked. `before` is the file's size in bytes.
+    BusyAfterVacuum {
+        before: u64,
+    },
 }
 
 const BUSY_BEFORE_VACUUM: &str = "index is busy; retry compaction after builds finish";
@@ -138,7 +145,7 @@ fn attempt(db: &Connection) -> anyhow::Result<Attempt> {
     }
     // The file shrinks only once the vacuumed pages leave the WAL.
     if !checkpoint(db)? {
-        return Ok(Attempt::BusyAfterVacuum);
+        return Ok(Attempt::BusyAfterVacuum { before });
     }
     let after = std::fs::metadata(path)?.len();
     Ok(Attempt::Done(IndexCompaction::Compacted { before, after }))
@@ -155,7 +162,8 @@ impl FileHashCache<'_> {
     pub fn compact_index(&self) -> anyhow::Result<IndexCompaction> {
         Ok(match attempt(&self.db())? {
             Attempt::Done(outcome) => outcome,
-            Attempt::BusyBeforeVacuum | Attempt::BusyAfterVacuum => IndexCompaction::Busy,
+            Attempt::BusyBeforeVacuum => IndexCompaction::Busy,
+            Attempt::BusyAfterVacuum { before } => IndexCompaction::Vacuumed { before },
         })
     }
 
@@ -171,7 +179,9 @@ impl FileHashCache<'_> {
             Attempt::Done(IndexCompaction::Busy) | Attempt::BusyBeforeVacuum => {
                 anyhow::bail!(BUSY_BEFORE_VACUUM)
             }
-            Attempt::BusyAfterVacuum => anyhow::bail!(BUSY_AFTER_VACUUM),
+            Attempt::Done(IndexCompaction::Vacuumed { .. }) | Attempt::BusyAfterVacuum { .. } => {
+                anyhow::bail!(BUSY_AFTER_VACUUM)
+            }
         }
     }
 }
@@ -331,5 +341,34 @@ mod tests {
             cache.compact_index().unwrap(),
             IndexCompaction::Compacted { .. }
         ));
+    }
+
+    /// A reader that began on an empty WAL lets the VACUUM commit but keeps
+    /// its pages out of the file: that is a compaction, not a busy index.
+    #[test]
+    #[cfg(unix)]
+    fn a_reader_on_the_file_keeps_a_committed_vacuum_in_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let cache = sparse_index(&path);
+        cache.db().pragma_update(None, "busy_timeout", "0").unwrap();
+        assert!(checkpoint(&cache.db()).unwrap(), "the WAL starts empty");
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: String = reader
+            .query_row("SELECT value FROM kept", [], |row| row.get(0))
+            .unwrap();
+
+        let before = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            cache.compact_index().unwrap(),
+            IndexCompaction::Vacuumed { before }
+        );
+        assert_eq!(cache.index_page_stats().unwrap().free_pages, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+
+        reader.execute_batch("COMMIT").unwrap();
+        assert!(checkpoint(&cache.db()).unwrap());
+        assert!(std::fs::metadata(&path).unwrap().len() < 1 << 20);
     }
 }
