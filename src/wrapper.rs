@@ -4652,7 +4652,7 @@ fn run_parsed_rustc(
                 hash_stats: inputs_hash_stats,
                 too_new: inputs_too_new,
                 key_ms: inputs_key_ms,
-                guard_inputs: extra_inputs_guard_inputs,
+                guard_inputs: extra_inputs_guard_inputs.clone(),
             },
             // The flight this invocation holds stays held: no second join.
             KeyDiscovery::Rederived,
@@ -4663,6 +4663,59 @@ fn run_parsed_rustc(
                 ..again
             },
             _ => keyed,
+        }
+    } else {
+        keyed
+    };
+    // A compile that may stop on a hit takes its permit before rustc reaches
+    // the dep-info that says whether it is one, so on a full pool a hit
+    // would wait for compile capacity it never uses. Take the permit only if
+    // the pool admits it now; otherwise key with the dep-info pre-pass, which
+    // takes none: a hit restores at once, and a miss waits for its flight and
+    // permit in `begin_miss` as every keyed miss does.
+    let mut early_permit = None;
+    let keyed = if keyed.deferred && keyed.stop_on_hit && deferred_seed.is_none() {
+        match scheduler::try_keyless_compile(
+            &config.cache_dir,
+            config.scheduler,
+            crate_name,
+            args.invokes_linker(),
+            config.test_lease.as_deref(),
+        ) {
+            scheduler::TryCompile::Admitted(guard) => {
+                early_permit = Some(guard);
+                keyed
+            }
+            scheduler::TryCompile::Busy => {
+                tracing::debug!("{crate_name}: the pool is busy; keying with the pre-pass");
+                match compute_rustc_cache_key(
+                    config,
+                    compiler,
+                    args,
+                    workspace_root.as_deref(),
+                    invocation_start_ns,
+                    Some(&store),
+                    &key_env,
+                    ExtraInputsKey {
+                        digest: extra_inputs
+                            .and_then(crate::extra_inputs::ExtraInputsSnapshot::digest),
+                        build_script_inputs: build_script_inputs.digest(),
+                        hash_stats: inputs_hash_stats,
+                        too_new: inputs_too_new,
+                        key_ms: inputs_key_ms,
+                        guard_inputs: extra_inputs_guard_inputs.clone(),
+                    },
+                    // The flight this invocation holds stays held: no second join.
+                    KeyDiscovery::Rederived,
+                    &mut key_record,
+                ) {
+                    Ok(again) if !again.deferred => ComputedKey {
+                        discovery_flight: keyed.discovery_flight,
+                        ..again
+                    },
+                    _ => keyed,
+                }
+            }
         }
     } else {
         keyed
@@ -4730,6 +4783,7 @@ fn run_parsed_rustc(
         return compile_before_key(
             &compile_first,
             stop_on_hit,
+            early_permit,
             key_outputs.tree_guard,
             guard_inputs,
             key_record,
@@ -5047,6 +5101,7 @@ fn run_parsed_rustc(
         return compile_before_key(
             &compile_first,
             stop_on_hit,
+            None,
             key_outputs.tree_guard,
             guard_inputs,
             key_record,
@@ -5091,6 +5146,7 @@ fn run_parsed_rustc(
         return compile_before_key(
             &compile_first,
             false,
+            None,
             key_outputs.tree_guard,
             guard_inputs,
             key_record,
@@ -7455,12 +7511,16 @@ fn adaptive_compile_before_key(
 /// Compile before the key is known, then key from the dep-info the compile
 /// wrote and store as usual (re-entering [`run_parsed_rustc`] with the
 /// result). With `stop_on_hit`, key as soon as rustc reports that dep-info
-/// and stop the compile if the key is stored. `tree_guard` is the guard
-/// taken before the compile.
+/// and stop the compile if the key is stored. `permit` is the compile's
+/// permit when the caller took it, else this takes one; `flight` is the
+/// predicted key's compile flight and permit when the compile runs under them
+/// ([`compiles_in_predicted_flight`]), and then `permit` is `None`.
+/// `tree_guard` is the guard taken before the compile.
 #[allow(clippy::too_many_arguments)]
 fn compile_before_key(
     ctx: &CompileFirst<'_>,
     stop_on_hit: bool,
+    permit: Option<MissGuard>,
     tree_guard: Option<crate::cache_key::TreeGuard>,
     guard_inputs: crate::cache_key::GuardedInputs,
     key_record: KeyEventRecord,
@@ -7484,19 +7544,22 @@ fn compile_before_key(
     // Cargo starts pipelined consumers on the rmeta, before this key.
     crate::out_dir_alias::register_before_compile();
     // No key yet, but the compile still takes a slot in the scheduler's
-    // pool, as every other compile does; a compile under a predicted key
-    // already holds that key's flight and permit.
+    // pool, as every other compile does: the one `permit` holds, when the
+    // caller took it already ([`scheduler::try_keyless_compile`]). A compile
+    // under a predicted key already holds that key's flight and permit.
     let (flight_key, guard) = match flight {
         Some((key, guard)) => (Some(key), guard),
         None => (
             None,
-            scheduler::begin_keyless_compile(
-                &config.cache_dir,
-                config.scheduler,
-                crate_name,
-                args.invokes_linker(),
-                config.test_lease.as_deref(),
-            ),
+            permit.unwrap_or_else(|| {
+                scheduler::begin_keyless_compile(
+                    &config.cache_dir,
+                    config.scheduler,
+                    crate_name,
+                    args.invokes_linker(),
+                    config.test_lease.as_deref(),
+                )
+            }),
         ),
     };
     let mut miss_guard = Some(guard);

@@ -3,7 +3,9 @@
 //! After a local and remote miss, the wrapper joins a flight for the
 //! invocation's cache key, then takes a memory-weighted permit, then the
 //! per-key [`crate::store::Store::claim_build`] lock. Hits and passthroughs
-//! never consult this module.
+//! never consult this module, and a compile that starts before its key and
+//! may stop there on a hit takes a permit only when the pool admits it at
+//! once ([`try_keyless_compile`]): else it keys with the pre-pass first.
 //!
 //! Lease files live under `<cache>/scheduler/`. Each admitted compile holds
 //! an OS file lock; the kernel releases it if the wrapper dies — the same
@@ -126,6 +128,9 @@ pub const RSS_BYTES_PER_SLOT: u64 = 512 * 1024 * 1024;
 pub use kache_config::TEST_LEASE_ENV;
 
 pub(crate) const WAIT_TIMEOUT: Duration = Duration::from_secs(1800);
+/// Longest [`try_keyless_compile`] waits for the queue's lock, which other
+/// wrappers hold only while they scan: past it the pool counts as busy.
+const TRY_QUEUE_WAIT: Duration = Duration::from_millis(100);
 /// How long a test lease waits for its marker, never longer than its wait
 /// for slots.
 const MARKER_WAIT: Duration = Duration::from_secs(1);
@@ -698,6 +703,64 @@ pub fn begin_keyless_compile(
     }
 }
 
+/// What [`try_keyless_compile`] found.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum TryCompile {
+    /// The compile may start now: with a permit, or with none to take (the
+    /// scheduler is off or unusable, or a test's lease covers it).
+    Admitted(MissGuard),
+    /// The pool cannot admit it without a wait: it is full, the memory
+    /// pressure ceiling or the memory gate holds compiles back, or other
+    /// requests are queued ahead.
+    Busy,
+}
+
+/// A permit for a compile that starts before its key and may still stop on a
+/// hit, taken only when the pool admits it at once.
+///
+/// A hit takes no permit ([`begin_miss`] is for misses), but such a compile
+/// learns it is a hit only at its dep-info, after its permit: on a full pool
+/// a hit would wait for compile capacity it never uses (30 minutes on a
+/// Windows machine whose pressure ceiling made every compile ask for the
+/// whole pool). On [`TryCompile::Busy`] the caller keys with the dep-info
+/// pre-pass instead, which takes no permit, and a miss then waits in
+/// [`begin_miss`] as every keyed miss does. Never waits, never takes recovery
+/// capacity and never queues: a request queued ahead keeps its turn.
+pub(crate) fn try_keyless_compile(
+    cache_dir: &Path,
+    enabled: bool,
+    crate_name: &str,
+    is_link: bool,
+    lease: Option<&Path>,
+) -> TryCompile {
+    if !enabled {
+        return TryCompile::Admitted(MissGuard::empty());
+    }
+    let scheduler = match Scheduler::open(cache_dir) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::debug!("scheduler unusable ({error:#}); compiling without a permit");
+            record_decision(
+                SchedulerPhase::Capacity,
+                unavailable_outcome(),
+                Duration::ZERO,
+            );
+            return TryCompile::Admitted(MissGuard::empty());
+        }
+    };
+    if lease_covers(lease, &scheduler.root) {
+        return TryCompile::Admitted(scheduler.keyless_compile(crate_name, is_link, lease));
+    }
+    match scheduler.try_compile_permit(crate_name, is_link) {
+        Some(permit) => TryCompile::Admitted(MissGuard {
+            _permit: Some(permit),
+            _flight: None,
+            weights_dir: Some(scheduler.weights_dir()),
+        }),
+        None => TryCompile::Busy,
+    }
+}
+
 /// Longest a compile that reached its dep-info waits, frozen, for a peer that
 /// holds its key's flight (see [`join_flight_at_dep_info`]). The peer started
 /// first and does the same work, so it is usually done well within this; past
@@ -954,6 +1017,43 @@ impl Scheduler {
             self.expected_bytes(crate_name, is_link),
             read_weight(&self.weights_dir(), crate_name).is_some(),
         )
+    }
+
+    /// The slots [`Self::acquire_compile_permit`] would take, when the pool
+    /// gives them at once: the memory gate admits, no other request is queued
+    /// (a waiter keeps its turn), and the free slots meet the compile's need
+    /// under the pressure ceiling. `None` otherwise, having waited for
+    /// nothing but the queue's lock (at most [`TRY_QUEUE_WAIT`]).
+    fn try_compile_permit(&self, crate_name: &str, is_link: bool) -> Option<Permit> {
+        let measured = read_weight(&self.weights_dir(), crate_name).is_some();
+        let weight = self.weight_for(crate_name, is_link);
+        let expected = self.expected_bytes(crate_name, is_link);
+        let gate = MemoryGate::new(&self.root, expected, measured);
+        if !gate.admits() {
+            return None;
+        }
+        let request = Request::new(queue::Kind::Compile, false);
+        let need = self.observed_need(&request, weight, false, 0).max(1);
+        let started = Instant::now();
+        let _queue = queue::lock(&self.root, TRY_QUEUE_WAIT).ok().flatten()?;
+        let now = SystemTime::now();
+        let waiting = queue::list(&self.root)
+            .ok()?
+            .iter()
+            .any(|entry| queue::ready(&self.root, entry, now));
+        if waiting {
+            return None;
+        }
+        let Ok(Collect::Ready(slots)) = self.collect_unordered(&request, need) else {
+            return None;
+        };
+        let elapsed = request.finish(SchedulerOutcome::Admitted, started);
+        crate::opcounts::record_permit_wait(elapsed);
+        let mut permit = self.keep(slots, weight);
+        permit._admission = pressure::enabled()
+            .then(|| Admission::record(&self.root, expected, measured))
+            .flatten();
+        Some(permit)
     }
 
     /// [`Self::acquire_permit_expecting`] an unmeasured compile's peak.
