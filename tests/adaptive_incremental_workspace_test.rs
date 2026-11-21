@@ -839,7 +839,10 @@ fn a_seed_releases_the_discovery_flight_before_it_compiles() {
     assert_eq!(held, "0", "the seed released the flight");
 
     // With no lane to seed and no compile before the key, the library
-    // compiles after both lookups miss, and stores the result.
+    // compiles after both lookups miss, and stores the result. Once it has
+    // its key it lets the discovery flight go: the key's compile flight
+    // holds same-key peers, and peers with another key no longer queue
+    // behind this compile (a9086f78).
     let (lib, held) = build(
         Some(future + 1),
         3,
@@ -850,5 +853,5 @@ fn a_seed_releases_the_discovery_flight_before_it_compiles() {
     );
     assert_eq!(lib["result"], "miss", "event: {lib:#}");
     assert_eq!(lib["dep_info_runs"], 1, "event: {lib:#}");
-    assert_eq!(held, "1", "a keyed miss holds the flight");
+    assert_eq!(held, "0", "a keyed miss lets the discovery flight go");
 }

@@ -1826,8 +1826,10 @@ fn rebuild_facade(root: &Path, scan: &Path, target: &Path) {
     .unwrap();
 }
 
-/// A predicted key that misses because a linked rlib changed is re-derived
-/// with the pre-pass. The record that re-derivation writes keeps the tree
+/// A predicted key that misses because a linked rlib changed is re-derived.
+/// This compile cannot stop on a hit, so it compiles under the predicted
+/// key's flight and keys from the dep-info it emits instead of a pre-pass
+/// first (dc4dca2d). The record that re-derivation writes keeps the tree
 /// guard the first key took, so the next build predicts again.
 #[test]
 fn a_re_derived_record_keeps_the_tree_guard() {
@@ -1842,7 +1844,10 @@ fn a_re_derived_record_keeps_the_tree_guard() {
     rebuild_facade(unit.root.path(), &unit.facade[0], &unit.target(&a));
     let changed = unit.build(&a, true, None);
     assert_eq!(changed.result, "miss");
-    assert_eq!(changed.dep_info_runs, 1, "the predicted key is re-derived");
+    assert_eq!(
+        changed.dep_info_runs, 0,
+        "the predicted key is re-derived from the compile's own dep-info"
+    );
     let next = unit.build(&a, true, None);
     assert_eq!(next.result, "local_hit");
     assert_eq!(
