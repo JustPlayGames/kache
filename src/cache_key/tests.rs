@@ -18897,6 +18897,7 @@ fn the_tree_fold_counts_what_it_cannot_read_as_the_stamp_walk_does() {
         &GuardFileHashes {
             hasher: &hasher,
             memoised: HashMap::new(),
+            rust_by_name: false,
         },
         &mut blake3::Hasher::new(),
         &mut budget,
