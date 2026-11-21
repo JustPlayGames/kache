@@ -30,10 +30,12 @@
 //! - Windows: no stall measure exists, so the memory the machine has left:
 //!   physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
 //!   total, or commit (physical memory and page file) under
-//!   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit, or commit charged past the
-//!   physical memory. Past any of them, Windows pages the desktop out for
-//!   the compiles and the machine stops responding, so it reads as critical:
-//!   compiles run one after another, as they did before the ceiling.
+//!   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit. Past either, Windows pages
+//!   the desktop out for the compiles and the machine stops responding, so
+//!   it reads as critical: compiles run one after another, as they did
+//!   before the ceiling. Commit charged past the physical memory alone is a
+//!   warning, which moves the ceiling as Linux's stalls do (see
+//!   [`windows_level`]).
 //! - Elsewhere, and when nothing can be read: unknown, which leaves the
 //!   ceiling where it is.
 //!
@@ -458,12 +460,15 @@ pub(crate) fn ceiling_observed(root: &Path, pool: u32) -> (u32, Option<Level>) {
     let level = now();
     let ceiling = match level {
         Some(level) => {
-            let moved_by = if cfg!(target_os = "linux")
-                && matches!(level, Level::Warning | Level::Critical)
-            {
-                ceiling_level(level, memory_now())
-            } else {
-                level
+            let moved_by = match level {
+                Level::Warning | Level::Critical if cfg!(target_os = "linux") => {
+                    ceiling_level(level, memory_now())
+                }
+                // Windows' warning is commit charged past the physical memory
+                // (see [`windows_level`]); its critical is memory or commit
+                // short, which no reading of physical memory makes roomy.
+                Level::Warning if cfg!(windows) => ceiling_level(level, memory_now()),
+                _ => level,
             };
             shared(
                 root,
@@ -613,18 +618,28 @@ pub(crate) fn level_from(cgroup: Option<&Path>, host: &Path) -> Level {
         .unwrap_or(Level::Unknown)
 }
 
-/// Whether Windows' memory figures (`GlobalMemoryStatusEx`) are pressure:
-/// physical memory available under [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the
-/// total, commit left under [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit, or
-/// more commit charged than there is physical memory.
-/// Totals of zero are no reading, not pressure.
+/// The level Windows' memory figures (`GlobalMemoryStatusEx`) give.
+///
+/// - Critical: physical memory available under
+///   [`WINDOWS_MIN_AVAILABLE_PERCENT`] of the total, or commit left under
+///   [`WINDOWS_MIN_COMMIT_PERCENT`] of its limit. Windows then pages or
+///   refuses allocations: compiles run one after another.
+/// - Warning: more commit charged than there is physical memory, with both
+///   of those still clear. Commit is charged when memory is reserved, long
+///   before it is touched (a page file, a WSL VM, a browser, a 64-job build
+///   all charge it), so on a desktop it can last a whole build. As critical
+///   it cut the ceiling to one slot for that long: every compile asked for
+///   the whole pool, and on a 64-thread machine a hit waited 30 minutes. As
+///   a warning it moves the ceiling as Linux's stalls do (see
+///   [`ceiling_level`]): nothing while physical memory is roomy, else half.
+/// - Calm otherwise. Totals of zero are no reading, not pressure.
 #[cfg(any(test, windows))]
-pub(crate) fn windows_pressured(
+pub(crate) fn windows_level(
     available_physical: u64,
     total_physical: u64,
     available_commit: u64,
     total_commit: u64,
-) -> bool {
+) -> Level {
     let short = |available: u64, total: u64, percent: u64| {
         total > 0 && u128::from(available) * 100 < u128::from(total) * u128::from(percent)
     };
@@ -633,9 +648,15 @@ pub(crate) fn windows_pressured(
     // system-managed page file, so the share of it left says little.
     let committed_past_memory = total_physical > 0
         && total_commit.saturating_sub(available_commit) > total_physical;
-    short(available_physical, total_physical, WINDOWS_MIN_AVAILABLE_PERCENT)
+    if short(available_physical, total_physical, WINDOWS_MIN_AVAILABLE_PERCENT)
         || short(available_commit, total_commit, WINDOWS_MIN_COMMIT_PERCENT)
-        || committed_past_memory
+    {
+        Level::Critical
+    } else if committed_past_memory {
+        Level::Warning
+    } else {
+        Level::Calm
+    }
 }
 
 #[cfg(windows)]
@@ -648,16 +669,12 @@ fn read_level() -> Level {
     if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
         return Level::Unknown;
     }
-    if windows_pressured(
+    windows_level(
         status.ullAvailPhys,
         status.ullTotalPhys,
         status.ullAvailPageFile,
         status.ullTotalPageFile,
-    ) {
-        Level::Critical
-    } else {
-        Level::Calm
-    }
+    )
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -1263,17 +1280,20 @@ mod tests {
     fn reads_windows_memory_figures() {
         const GIB: u64 = 1 << 30;
         // 64 GiB of RAM, 96 GiB of commit: plenty left of both.
-        assert!(!windows_pressured(20 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
+        assert_eq!(windows_level(20 * GIB, 64 * GIB, 50 * GIB, 96 * GIB), Level::Calm);
         // Physical memory under a tenth of the total.
-        assert!(windows_pressured(6 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
-        assert!(!windows_pressured(7 * GIB, 64 * GIB, 50 * GIB, 96 * GIB));
+        assert_eq!(windows_level(6 * GIB, 64 * GIB, 50 * GIB, 96 * GIB), Level::Critical);
+        assert_eq!(windows_level(7 * GIB, 64 * GIB, 50 * GIB, 96 * GIB), Level::Calm);
         // Commit nearly spent while physical memory still looks free (a
         // small page file: what is charged is still under the RAM).
-        assert!(windows_pressured(20 * GIB, 64 * GIB, 3 * GIB, 66 * GIB));
-        assert!(!windows_pressured(20 * GIB, 64 * GIB, 4 * GIB, 66 * GIB));
+        assert_eq!(windows_level(20 * GIB, 64 * GIB, 3 * GIB, 66 * GIB), Level::Critical);
+        assert_eq!(windows_level(20 * GIB, 64 * GIB, 4 * GIB, 66 * GIB), Level::Calm);
         // No reading is no pressure; figures past 2^64 / 100 do not overflow.
-        assert!(!windows_pressured(0, 0, 0, 0));
-        assert!(!windows_pressured(u64::MAX / 2, u64::MAX, u64::MAX / 2, u64::MAX));
+        assert_eq!(windows_level(0, 0, 0, 0), Level::Calm);
+        assert_eq!(
+            windows_level(u64::MAX / 2, u64::MAX, u64::MAX / 2, u64::MAX),
+            Level::Calm
+        );
     }
 
     #[test]
@@ -1343,9 +1363,20 @@ mod tests {
     fn windows_commit_above_physical_memory_is_pressure() {
         const GIB: u64 = 1 << 30;
         // 64 GiB of RAM, 30 available, but 70 of a 90 GiB commit limit
-        // committed: touching it all would page.
-        assert!(windows_pressured(30 * GIB, 64 * GIB, 20 * GIB, 90 * GIB));
-        assert!(!windows_pressured(30 * GIB, 64 * GIB, 26 * GIB, 90 * GIB));
+        // committed: touching it all would page, so a warning.
+        let committed = windows_level(30 * GIB, 64 * GIB, 20 * GIB, 90 * GIB);
+        assert_eq!(committed, Level::Warning);
+        assert_eq!(windows_level(30 * GIB, 64 * GIB, 26 * GIB, 90 * GIB), Level::Calm);
+        // The warning moves the ceiling as Linux's stalls do: not at all
+        // while physical memory is roomy (30 of 64 GiB is two reserves of
+        // 12.8), by half once it is not, never to one slot.
+        let reading = |available| MemoryReading {
+            available,
+            total: 64 * GIB,
+            reclaimable: None,
+        };
+        assert_eq!(ceiling_level(committed, Some(reading(30 * GIB))), Level::Calm);
+        assert_eq!(ceiling_level(committed, Some(reading(20 * GIB))), Level::Warning);
     }
 
     #[test]
