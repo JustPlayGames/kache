@@ -10272,61 +10272,6 @@ fn plain_spelling(_path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Whether a hash read as `first` vouches for the same file seen again as
-/// `now` under another spelling. The file may have been written since, so
-/// only a settled first read and the same strong stamp (size, times, file
-/// index) carry it over, as a memo row would. The same spelling is the
-/// memo's question, not this one.
-fn may_carry_over(
-    first: &ObservedFingerprint,
-    now: &FileFingerprint,
-    requires_identity: bool,
-) -> bool {
-    let was = &first.fingerprint;
-    was.path != now.path
-        && first.settled()
-        && file_hash_memo_eligible(now.inode, requires_identity)
-        && (now.size, now.mtime_ns, now.ctime_ns, now.inode)
-            == (was.size, was.mtime_ns, was.ctime_ns, was.inode)
-}
-
-/// The Win32 spelling of an absolute `path` on a drive: `\\?\C:\a\b`,
-/// `C:\a/b` and `c:\a\b` all give `C:\a\b`, the one file they name. `None`
-/// for any other path, and for one whose two spellings could name different
-/// files: a `.` or `..` (resolved by Win32, literal after `\\?\`), a name
-/// ending in a dot or a space (stripped by Win32 only), a `/` inside a
-/// verbatim name, a UNC or device path. Always `None` off Windows.
-#[cfg(windows)]
-fn plain_spelling(path: &Path) -> Option<PathBuf> {
-    use std::path::{Component, Prefix};
-    let mut plain = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => match prefix.kind() {
-                Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
-                    plain.push(format!("{}:", char::from(disk.to_ascii_uppercase())));
-                }
-                _ => return None,
-            },
-            Component::RootDir => plain.push("\\"),
-            Component::Normal(name) => {
-                let name = name.to_str()?;
-                if name.ends_with(['.', ' ']) || name.contains('/') {
-                    return None;
-                }
-                plain.push(name);
-            }
-            Component::CurDir | Component::ParentDir => return None,
-        }
-    }
-    plain.is_absolute().then_some(plain)
-}
-
-#[cfg(not(windows))]
-fn plain_spelling(_path: &Path) -> Option<PathBuf> {
-    None
-}
-
 /// [`hash_file`], for a read that follows a stat of the same file.
 fn read_file_hash(path: &Path) -> Result<String> {
     #[cfg(test)]
