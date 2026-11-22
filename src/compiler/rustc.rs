@@ -356,6 +356,7 @@ impl RustcCompiler {
             Some(sink) => Some(compile::MetadataSink::immediate(sink)),
             None => None,
         };
+        let host_neutral = crate::cache_key::take_execute_remaps(parsed, skip_remap);
         let result = compile::run_rustc(
             &self.invocation_env,
             &parsed.rustc,
@@ -374,6 +375,7 @@ impl RustcCompiler {
             metadata_sink.as_mut(),
             on_dep_info,
             compile::StopRule::for_compile(parsed.invokes_linker()),
+            host_neutral.as_deref(),
         );
         let result = result.map(|mut result| {
             if !skip_remap

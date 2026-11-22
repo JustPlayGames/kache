@@ -1535,13 +1535,14 @@ mod tests {
 
         let out = PostRestoreAction::ExpandDepInfoPaths.transform(blob, anchor);
         let content = String::from_utf8(out).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
 
         assert!(
-            content.contains("/restored/worktree/target/debug/foo"),
+            content.contains(&format!("/restored/worktree/target{sep}debug{sep}foo")),
             "expected anchor-rooted target path, got: {content}"
         );
         assert!(
-            content.contains("/restored/worktree/src/lib.rs"),
+            content.contains(&format!("/restored/worktree/src{sep}lib.rs")),
             "expected anchor-rooted source path, got: {content}"
         );
         assert!(
@@ -1567,8 +1568,9 @@ mod tests {
             content.contains("../include/foo.h"),
             "compiler-emitted parent-relative header paths must survive: {content}"
         );
+        let sep = std::path::MAIN_SEPARATOR;
         assert!(
-            content.contains("/restored/worktree/obj/generated/header.h"),
+            content.contains(&format!("/restored/worktree/obj/generated{sep}header.h")),
             "kache sentinel paths should still expand: {content}"
         );
     }
