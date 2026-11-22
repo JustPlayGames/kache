@@ -13,6 +13,7 @@ mod gone_dirs;
 mod index_compaction;
 mod index_pool;
 pub mod link;
+mod lock_hold;
 pub mod markers;
 pub mod opcounts;
 pub mod prediction_codec;

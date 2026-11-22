@@ -3318,8 +3318,10 @@ fn try_open_index_db(db_path: &Path, mode: IndexMode) -> std::result::Result<Con
     let mut last_error: Option<SqlError> = None;
 
     for attempt in 1..=STORE_OPEN_MAX_ATTEMPTS {
-        match Connection::open(db_path).and_then(|db| {
+        match Connection::open(db_path).and_then(|mut db| {
             initialize_db(&db, mode)?;
+            // Each long hold of the write lock gets a line saying who held it.
+            crate::lock_hold::watch(&mut db)?;
             if DEFER_WAL_CHECKPOINTS.load(Ordering::Relaxed) {
                 db.pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
             }
