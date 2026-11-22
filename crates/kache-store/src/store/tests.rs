@@ -17396,7 +17396,9 @@ fn a_test_binary_is_stored_by_hardlink_and_keeps_its_execute_bits() {
     fs::set_permissions(&output, fs::Permissions::from_mode(0o755)).unwrap();
 
     let _force = ForceStoreHardlink::enable();
-    let copied = crate::opcounts::store_copied_bytes();
+    // This test's own byte counts: the process totals move with every other
+    // test thread that stores a copy meanwhile.
+    let _bytes = crate::opcounts::InvocationByteScope::enter();
     put_executable(&store, "tbin-entry", &output, &[]);
 
     let meta = store.get("tbin-entry").unwrap().unwrap();
@@ -17407,7 +17409,12 @@ fn a_test_binary_is_stored_by_hardlink_and_keeps_its_execute_bits() {
         fs::metadata(&output).unwrap().ino(),
         "a test binary must be stored by hardlink, not copied"
     );
-    assert_eq!(crate::opcounts::store_copied_bytes(), copied);
+    assert_eq!(crate::opcounts::store_copied_bytes(), 0);
+    assert_eq!(
+        crate::opcounts::store_hardlinked_bytes(),
+        fs::metadata(&output).unwrap().len(),
+        "the scope must see the put's own ingest"
+    );
     let mode = fs::metadata(&output).unwrap().permissions().mode() & 0o777;
     assert_eq!(
         mode & 0o222,
