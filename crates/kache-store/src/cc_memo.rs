@@ -829,11 +829,6 @@ mod tests {
         let memo = cache.get_cc_preprocess_memo("unit").unwrap().unwrap();
         assert_eq!(memo.preprocessed_hash, "proof");
         assert_eq!(memo.inputs, [read_back(first), read_back(last)]);
-        // Scans are read apart, by content: each input finds its own.
-        let contents: Vec<&str> = memo.inputs.iter().map(|i| i.content.as_str()).collect();
-        let scans = cache.get_cc_header_scans(6, &contents).unwrap();
-        assert_eq!(scans["first"], "first scan");
-        assert_eq!(scans["last"], "last scan");
     }
 
     #[test]

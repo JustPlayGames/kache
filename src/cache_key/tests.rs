@@ -8243,7 +8243,12 @@ fn guard_exclude_leaves_named_directories_out_of_the_workspace_guard() {
     let roots_of = |root: &Path| {
         let name = root.file_name().unwrap().to_str().unwrap();
         let (_, args) = workspace_invocation(dir.path(), name, "kt");
-        workspace_roots_in(&args, &manifest_vars(&root.join("kt")), root).unwrap()
+        let mut roots =
+            workspace_roots_in(&args, &manifest_vars(&root.join("kt")), root).unwrap();
+        // The names narrow the whole-workspace guard; the scoped guard never
+        // walks an unrelated directory in the first place.
+        roots.scoped_package = None;
+        roots
     };
     let hasher = FileHasher::new();
     let digest = |root: &Path| workspace_tree_digest(&roots_of(root), &hasher).unwrap();
@@ -23986,8 +23991,9 @@ mod build_script_target_paths {
         );
     }
 
-    /// The key trace shows the profile-relative OUT_DIR an rlib's own native
-    /// search path folds as, in place of its `link_search:` line.
+    /// The key trace shows the OUT_DIR an rlib's own native search path folds
+    /// as, by its path below the target directory, in place of its
+    /// `link_search:` line.
     #[cfg(unix)]
     #[test]
     fn own_out_dir_native_search_is_traced_as_folded() {
@@ -24008,7 +24014,7 @@ mod build_script_target_paths {
         });
         assert!(
             log.contains(
-                "[key:mylib] link_search_native_out_dir:build/foo-sys-0123456789abcdef/out"
+                "[key:mylib] link_search_native_out_dir:debug/build/foo-sys-0123456789abcdef/out"
             ),
             "{log}"
         );
