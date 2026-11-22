@@ -7475,16 +7475,18 @@ fn event_result_for_store_put_maps_dup_vs_miss() {
         output_blobs: 2,
         duplicate_blobs: 2,
         new_blobs: 0,
+        ..Default::default()
     };
-    assert!(matches!(event_result_for_store_put(dup), EventResult::Dup));
+    assert!(matches!(event_result_for_store_put(&dup), EventResult::Dup));
     // At least one new blob -> Miss.
     let partial = StorePutResult {
         output_blobs: 2,
         duplicate_blobs: 1,
         new_blobs: 1,
+        ..Default::default()
     };
     assert!(matches!(
-        event_result_for_store_put(partial),
+        event_result_for_store_put(&partial),
         EventResult::Miss
     ));
     // No output blobs -> not a full dup -> Miss.
@@ -7492,9 +7494,10 @@ fn event_result_for_store_put_maps_dup_vs_miss() {
         output_blobs: 0,
         duplicate_blobs: 0,
         new_blobs: 0,
+        ..Default::default()
     };
     assert!(matches!(
-        event_result_for_store_put(empty),
+        event_result_for_store_put(&empty),
         EventResult::Miss
     ));
 }
@@ -7565,11 +7568,11 @@ fn disabled_store_admission_accepts_every_compile() {
 fn cc_admission_skip_is_reported_only_for_cacheable_outputs() {
     let put = StorePutResult::default();
     assert!(matches!(
-        event_result_for_store_admission(true, false, put),
+        event_result_for_store_admission(true, false, &put),
         EventResult::Skipped
     ));
     assert!(matches!(
-        event_result_for_store_admission(false, false, put),
+        event_result_for_store_admission(false, false, &put),
         EventResult::Miss
     ));
 }
@@ -10026,6 +10029,20 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
         output_blobs: 3,
         duplicate_blobs: 1,
         new_blobs: 2,
+        outputs: vec![
+            crate::store::StoredOutput {
+                name: "libfoo-0123.rmeta".to_string(),
+                size: 4096,
+                hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_string(),
+            },
+            crate::store::StoredOutput {
+                name: "foo-0123.d".to_string(),
+                size: 7,
+                hash: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                    .to_string(),
+            },
+        ],
     };
     let hash_stats = FileHashStats {
         cache_hits: 4,
@@ -10066,6 +10083,19 @@ fn log_event_with_store_stats_persists_timing_hash_and_store_fields() {
     assert_eq!(event.store_output_blobs, 3);
     assert_eq!(event.store_duplicate_blobs, 1);
     assert_eq!(event.store_new_blobs, 2);
+    let digest = |name: &str, digest: &str, size| crate::events::OutputDigest {
+        name: name.to_string(),
+        digest: digest.to_string(),
+        size,
+    };
+    assert_eq!(
+        event.output_digests,
+        [
+            digest("libfoo-0123.rmeta", "0123456789abcdef", 4096),
+            digest("foo-0123.d", "fedcba9876543210", 7),
+        ],
+        "each stored file, by the first 16 hex digits of its blob"
+    );
     assert!(
         event.store_error.is_empty(),
         "a successful store records no failure reason"
@@ -10299,6 +10329,7 @@ fn log_event_persists_same_key_lookup_rejection() {
                 output_blobs: 2,
                 duplicate_blobs: 0,
                 new_blobs: 2,
+                ..Default::default()
             })
             .lookup_rejection(
                 "matching entry lacks dep-info required by this invocation".to_string(),
@@ -10336,6 +10367,7 @@ fn daemon_publications_are_counted_only_for_the_request_that_stored_outputs() {
         output_blobs: 1,
         duplicate_blobs: 0,
         new_blobs: 1,
+        ..Default::default()
     };
     let write = |result, put| {
         log_event(
@@ -10344,10 +10376,10 @@ fn daemon_publications_are_counted_only_for_the_request_that_stored_outputs() {
         );
     };
     let _standalone = InvocationWrapperScope::enter_for(&env, None);
-    write(EventResult::Miss, stored);
+    write(EventResult::Miss, stored.clone());
     {
         let _delegated = InvocationWrapperScope::enter_for(&env, Some(daemon));
-        write(EventResult::Miss, stored);
+        write(EventResult::Miss, stored.clone());
         write(EventResult::LocalHit, StorePutResult::default());
         write(EventResult::Miss, StorePutResult::default());
     }

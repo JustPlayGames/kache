@@ -13,11 +13,24 @@ use std::time::Duration;
 
 use crate::config::{Config, IndexMode};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorePutResult {
     pub output_blobs: u32,
     pub duplicate_blobs: u32,
     pub new_blobs: u32,
+    /// Each file of the entry with the digest and size of its blob, in the
+    /// entry's order: the digests staging already read, never read again.
+    /// They let the event log tell which earlier put stored the same bytes.
+    pub outputs: Vec<StoredOutput>,
+}
+
+/// One file a put stored: its name in the entry, its size and the digest of
+/// its blob.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoredOutput {
+    pub name: String,
+    pub size: u64,
+    pub hash: String,
 }
 
 /// An entry whose remote bytes and declared artifact hashes were verified in
@@ -31,7 +44,7 @@ pub struct VerifiedRestoredEntry {
 }
 
 impl StorePutResult {
-    pub fn is_full_dup(self) -> bool {
+    pub fn is_full_dup(&self) -> bool {
         self.output_blobs > 0 && self.duplicate_blobs == self.output_blobs
     }
 }
@@ -400,7 +413,7 @@ impl StagedPut {
 
     /// What Phase 1 found: how many blobs were new and how many existed.
     pub fn result(&self) -> StorePutResult {
-        self.result
+        self.result.clone()
     }
 }
 
@@ -5246,7 +5259,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 });
             match outcome {
                 Ok(()) => {
-                    results.push(Ok(staged.result));
+                    results.push(Ok(staged.result.clone()));
                     registered.push((results.len() - 1, staged));
                 }
                 Err(error) => results.push(Err(error)),
@@ -5612,6 +5625,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         } = fields;
         let total_size = cached_files.iter().map(|file| file.size).sum();
         let content_hash = compute_content_hash(&cached_files);
+        let result = StorePutResult {
+            outputs: cached_files
+                .iter()
+                .map(|file| StoredOutput {
+                    name: file.name.clone(),
+                    size: file.size,
+                    hash: file.hash.clone(),
+                })
+                .collect(),
+            ..result
+        };
 
         // Record which rustc `--emit` kinds this entry actually contains, derived
         // from the stored output files (kunobi-ninja/kache#325). Lookup rejects an
@@ -5680,7 +5704,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         tx.commit()?;
         self.finish_strict_durability(&staged.meta.cache_key)?;
         self.seed_registered(staged);
-        Ok(Some(staged.result))
+        Ok(Some(staged.result.clone()))
     }
 
     /// Register a staged entry and its blob references on `conn`, which

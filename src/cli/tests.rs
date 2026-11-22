@@ -6449,6 +6449,7 @@ fn build_event(
         miss_reason: crate::events::MissReason::None,
         object_output: String::new(),
         package: String::new(),
+        output_digests: Vec::new(),
         rebuilt_package: None,
         rebuilt_fingerprint: None,
         rebuilt_path: None,

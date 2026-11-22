@@ -901,12 +901,20 @@ fn flush_or_hand_off_durability(config: &Config, store: &Store, cache_key: &str)
     }
 }
 
-fn event_result_for_store_put(put: StorePutResult) -> EventResult {
+fn event_result_for_store_put(put: &StorePutResult) -> EventResult {
     if put.is_full_dup() {
         EventResult::Dup
     } else {
         EventResult::Miss
     }
+}
+
+/// The event's record of the files a put stored (`BuildEvent::output_digests`).
+pub(crate) fn output_digests(put: &StorePutResult) -> Vec<events::OutputDigest> {
+    put.outputs
+        .iter()
+        .map(|output| events::OutputDigest::new(&output.name, output.size, &output.hash))
+        .collect()
 }
 
 /// A compile that ran without the key's lock cannot publish its result.
@@ -934,7 +942,7 @@ fn cc_store_decision(store_candidate: bool, admitted: bool) -> CcStoreDecision {
 fn event_result_for_store_admission(
     store_candidate: bool,
     admitted: bool,
-    put: StorePutResult,
+    put: &StorePutResult,
 ) -> EventResult {
     if cc_store_decision(store_candidate, admitted).admission_skipped {
         EventResult::Skipped
@@ -1903,7 +1911,7 @@ pub(crate) fn run_nvcc_for(
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
-    let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
+    let event_result = event_result_for_store_admission(store_candidate, admitted, &store_put);
     log_event(
         config,
         EventInputs::new(&event_root, &crate_name, event_result, elapsed)
@@ -2972,7 +2980,7 @@ fn run_cc_with_store(
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
-    let event_result = event_result_for_store_admission(store_candidate, admitted, store_put);
+    let event_result = event_result_for_store_admission(store_candidate, admitted, &store_put);
     log_event(
         config,
         EventInputs::new(event_root, crate_name, event_result, elapsed)
@@ -5802,7 +5810,7 @@ fn run_parsed_rustc(
 
     let elapsed = start.elapsed().as_millis() as u64;
     let size = result.artifacts.total_size();
-    let event_result = event_result_for_store_put(store_put);
+    let event_result = event_result_for_store_put(&store_put);
     log_event(
         config,
         EventInputs::new(&event_root, crate_name, event_result, elapsed)
@@ -11066,6 +11074,7 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
         store_output_blobs: store_put.output_blobs,
         store_duplicate_blobs: store_put.duplicate_blobs,
         store_new_blobs: store_put.new_blobs,
+        output_digests: output_digests(&store_put),
         // Read the process-global op-counters: this `kache` process
         // handled exactly this one compile, so the counts are its own.
         compiler_runs: crate::opcounts::compiler_runs(),

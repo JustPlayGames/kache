@@ -429,6 +429,43 @@ pub struct BuildEvent {
     /// schema 28 omit it, so their source is unknown.
     #[serde(default, skip_serializing_if = "is_false")]
     pub readonly_store: bool,
+    /// Each file a compile stored, with the digest and size of its blob, in
+    /// the entry's order: the digests the store read to address the blobs.
+    ///
+    /// A dup says only that every blob existed; these say which, so a
+    /// compile can be joined with the earlier one that stored the same bytes
+    /// under another key, and the two keys' fields compared. Diagnostic only.
+    /// Empty on hits, passthroughs, failed or skipped stores and older logs.
+    /// `serde(default)`, no schema bump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_digests: Vec<OutputDigest>,
+}
+
+/// One stored file of a compile ([`BuildEvent::output_digests`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDigest {
+    /// The file's name in the entry.
+    pub name: String,
+    /// The first 16 hex digits of its blob's digest, as `key_externs` keeps
+    /// them.
+    pub digest: String,
+    /// Its size in bytes.
+    pub size: u64,
+}
+
+impl OutputDigest {
+    /// Hex digits of a blob digest an event keeps.
+    pub const DIGEST_HEX: usize = 16;
+
+    /// The record of a stored file named `name`, of `size` bytes, whose blob
+    /// is `hash`.
+    pub fn new(name: &str, size: u64, hash: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            digest: hash.chars().take(Self::DIGEST_HEX).collect(),
+            size,
+        }
+    }
 }
 
 impl BuildEvent {
@@ -673,6 +710,7 @@ impl BuildEvent {
             object_output: String::new(),
             package: String::new(),
             readonly_store: false,
+            output_digests: Vec::new(),
         }
     }
 }

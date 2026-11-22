@@ -8,7 +8,7 @@ mod build_path;
 use build_path::LogLock;
 pub(crate) use build_path::{lock_for_build, recent_events_for_build};
 
-pub use kache_protocol::{BuildEvent, BuildSummaryEvent, EventResult, MissReason};
+pub use kache_protocol::{BuildEvent, BuildSummaryEvent, EventResult, MissReason, OutputDigest};
 
 /// A liveness ping for an in-flight compile (kunobi-ninja/kache#131),
 /// appended to the same `events.jsonl` stream by the wrapper's monitor thread
@@ -1687,6 +1687,7 @@ mod tests {
             object_output: String::new(),
             package: String::new(),
             readonly_store: false,
+            output_digests: Vec::new(),
         };
 
         log_event(&log_path, &event).unwrap();

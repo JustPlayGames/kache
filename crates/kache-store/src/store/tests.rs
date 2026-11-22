@@ -18246,6 +18246,90 @@ fn put_staged_links(
     )
 }
 
+/// A put's result names each file it stored with its blob's digest and
+/// size, as the entry records them: for bytes that were new, for bytes
+/// already a blob, and for a staged put another process registers from a
+/// request that carries no names.
+#[cfg(unix)]
+#[test]
+fn a_put_names_the_blob_of_each_file_it_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let recorded = |key: &str| -> Vec<StoredOutput> {
+        let meta = store.get(key).unwrap().expect("registered");
+        meta.files
+            .iter()
+            .map(|file| StoredOutput {
+                name: file.name.clone(),
+                size: file.size,
+                hash: file.hash.clone(),
+            })
+            .collect()
+    };
+    let put = |key: &str, dep_info: &[u8]| {
+        let own = dir.path().join(key);
+        fs::create_dir_all(&own).unwrap();
+        fs::write(own.join("libout.rmeta"), b"the same metadata").unwrap();
+        fs::write(own.join("out.d"), dep_info).unwrap();
+        store
+            .put(
+                key,
+                "out",
+                &["lib".to_string()],
+                &[],
+                "x86_64-unknown-linux-gnu",
+                "dev",
+                &[
+                    (own.join("libout.rmeta"), "libout.rmeta".to_string()),
+                    (own.join("out.d"), "out.d".to_string()),
+                ],
+                "",
+                "",
+            )
+            .unwrap()
+    };
+
+    let first = put("first_key", b"first.d: first.rs\n");
+    assert_eq!(first.outputs, recorded("first_key"));
+    assert_eq!(first.outputs.len(), 2);
+    let second = put("second_key", b"second.d: second.rs\n");
+    assert_eq!(second.outputs, recorded("second_key"));
+    assert_eq!((second.duplicate_blobs, second.new_blobs), (1, 1));
+    assert_eq!(
+        second.outputs[0].hash, first.outputs[0].hash,
+        "the metadata both compiles wrote is one blob"
+    );
+    assert_ne!(second.outputs[1].hash, first.outputs[1].hash);
+
+    let files = [staged_put_output(dir.path(), 9)];
+    let staged = put_while_the_index_is_busy(&store, &config, "named_staged", &files);
+    let links = link_staged_blobs(&store, &staged, &dir.path().join("handoff"));
+    let daemon = Store::open(config).unwrap();
+    let handed = daemon
+        .put_staged_handed_off(
+            staged.cache_key(),
+            "staged",
+            &["lib".to_string()],
+            &[],
+            "x86_64-unknown-linux-gnu",
+            "dev",
+            &links,
+            staged.files(),
+            StorePutResult {
+                outputs: Vec::new(),
+                ..staged.result()
+            },
+            "",
+            "",
+            3,
+            None,
+        )
+        .unwrap();
+    assert_eq!(handed.outputs, recorded("named_staged"));
+    assert_eq!(handed.outputs.len(), 1);
+}
+
 /// Another process registers a busy put from links to its blobs, without
 /// staging anything again: the entry is the one the put staged, and the
 /// output still shares its read-only blob.

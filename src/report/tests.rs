@@ -587,6 +587,7 @@ fn test_event(
         object_output: String::new(),
         package: String::new(),
         readonly_store: false,
+        output_digests: Vec::new(),
     }
 }
 

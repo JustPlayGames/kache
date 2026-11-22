@@ -75,6 +75,8 @@ fn staged_result(staged: &StagedPublish) -> crate::store::StorePutResult {
         output_blobs: staged.output_blobs,
         duplicate_blobs: staged.duplicate_blobs,
         new_blobs: staged.new_blobs,
+        // The registration names the entry's files.
+        outputs: Vec::new(),
     }
 }
 
@@ -933,6 +935,7 @@ fn record_put(
             event.store_output_blobs = put.output_blobs;
             event.store_duplicate_blobs = put.duplicate_blobs;
             event.store_new_blobs = put.new_blobs;
+            event.output_digests = crate::wrapper::output_digests(&put);
             // A staged entry's bytes were moved by the wrapper, whose event
             // already counts them.
             if !job.is_staged() {
@@ -1776,6 +1779,15 @@ mod tests {
         assert_eq!(event.rebuilt_paths, request.event.rebuilt_paths);
         assert_eq!(event.result, EventResult::Miss);
         assert_eq!(event.store_new_blobs, 1);
+        assert_eq!(
+            event.output_digests,
+            [crate::events::OutputDigest::new(
+                "a.o",
+                meta.files[0].size,
+                &meta.files[0].hash
+            )],
+            "the daemon's event names the blob its put stored"
+        );
         assert!(event.store_error.is_empty());
         // The put's bytes are charged to the event, however they landed.
         assert!(
