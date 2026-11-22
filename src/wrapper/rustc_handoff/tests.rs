@@ -468,6 +468,15 @@ async fn store_now(
     compiled: &Compiled,
     busy: Option<Duration>,
 ) -> (RustcStore, Option<KeyLock>, bool) {
+    store_now_within(compiled, busy, Duration::from_secs(10)).await
+}
+
+/// [`store_now`] with the wrapper's wait for the daemon's answer supplied.
+async fn store_now_within(
+    compiled: &Compiled,
+    busy: Option<Duration>,
+    budget: Duration,
+) -> (RustcStore, Option<KeyLock>, bool) {
     tokio::task::block_in_place(|| {
         let store = Store::open(&compiled.config).unwrap();
         let compiler = RustcCompiler::new();
@@ -481,7 +490,7 @@ async fn store_now(
             &store,
             &mut lock,
             handoff(compiled, &compiler, std::time::Instant::now()),
-            Duration::from_secs(10),
+            budget,
             true,
         );
         let while_held = held.is_some_and(|(released, thread)| {
@@ -491,6 +500,60 @@ async fn store_now(
         });
         (outcome, lock, while_held)
     })
+}
+
+/// A daemon handler that claims the key, then stalls past the wrapper's
+/// budget and its wait for the holder (seconds, under a burst of hand-offs),
+/// never stores the staged entry: the wrapper cancelled its receipt, and the
+/// handler drops the claim once it gets that far. The wrapper registers the
+/// entry itself before it returns, so a peer that waited on the key's
+/// flight and looks again finds it instead of compiling the unit again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_stalled_on_the_key_does_not_cost_the_entry() {
+    use interprocess::local_socket::traits::tokio::Listener as _;
+    let compiled = compiled("stalled-holder");
+    let held_for = super::super::HANDOFF_HOLDER_WAIT + Duration::from_secs(3);
+    let socket = compiled.config.socket_path();
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = crate::transport::ListenerOptions::new()
+        .name(crate::transport::socket_name(&socket).unwrap())
+        .create_tokio()
+        .unwrap();
+    let (store_dir, key) = (compiled.config.store_dir(), compiled.key.clone());
+    let server = tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let Ok(stream) = listener.accept().await else {
+            return;
+        };
+        let mut line = String::new();
+        let _ = tokio::io::BufReader::new(&stream)
+            .read_line(&mut line)
+            .await;
+        // The handler's claim, then a stall, then the claim dropped
+        // without an answer or a store: the receipt is gone by then.
+        let claim = crate::store::try_lock_key_in(&store_dir, &key)
+            .unwrap()
+            .expect("the wrapper let go of the key before it asked");
+        tokio::time::sleep(held_for).await;
+        drop(claim);
+        drop(stream);
+    });
+
+    let (outcome, lock, _) = store_now_within(
+        &compiled,
+        Some(Duration::from_millis(1500)),
+        Duration::from_millis(300),
+    )
+    .await;
+    let store = Store::open(&compiled.config).unwrap();
+    let found = store.get(&compiled.key).unwrap();
+    server.abort();
+    assert!(
+        matches!(outcome, RustcStore::Stored(Ok(_))),
+        "the wrapper stores the entry itself"
+    );
+    assert!(lock.is_none(), "the stalled handler still held the key");
+    assert!(found.is_some(), "a peer looking now finds the entry");
 }
 
 /// With a daemon running and the index free, a miss stores as it always

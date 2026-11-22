@@ -5946,14 +5946,33 @@ fn hand_off_cc_store(
                 handoff.crate_name,
                 handoff.start,
                 handoff.size,
+                DeclinedHolder::Publishes,
             )
         }
     }
 }
 
+/// Who stores a declined hand-off's compile when its key is still held
+/// after the wrapper waited for the holder ([`HANDOFF_HOLDER_WAIT`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeclinedHolder {
+    /// The holder stores it: a peer compiling the same key, or the daemon,
+    /// which keeps the claim of a C/C++ hand-off whose receipt the wrapper
+    /// cancelled and publishes it from its own snapshots.
+    Publishes,
+    /// A held key proves nobody will: the daemon drops the claim of a
+    /// staged rustc hand-off whose receipt the wrapper cancelled, and a
+    /// handler stalled past the wait (seconds, under a burst of hand-offs)
+    /// still holds the claim it is about to drop. The wrapper registers the
+    /// entry itself, without the key's lock, before it returns, so a peer
+    /// that waited on the key's flight finds it.
+    Unproven,
+}
+
 /// After the daemon declined a hand-off: take the key back and publish
 /// here, or, when a peer holds or stored the key in the gap, write the
-/// compile's `event` and leave the entry to that peer.
+/// compile's `event` and leave the entry to that peer (`holder`: whether a
+/// key still held proves one).
 #[allow(clippy::too_many_arguments)]
 fn resolve_declined_handoff(
     config: &Config,
@@ -5964,10 +5983,17 @@ fn resolve_declined_handoff(
     crate_name: &str,
     start: std::time::Instant,
     size: u64,
+    holder: DeclinedHolder,
 ) -> CcHandoffOutcome {
     match reclaim_after_declined_handoff(store, cache_key, HANDOFF_HOLDER_WAIT) {
         Ok(BuildClaim::Acquired(lock)) => {
             *build_lock = Some(lock);
+            CcHandoffOutcome::Publish
+        }
+        Ok(BuildClaim::Contended) if holder == DeclinedHolder::Unproven => {
+            tracing::debug!(
+                "{crate_name}: its key is still held after a declined hand-off; storing it here without the lock",
+            );
             CcHandoffOutcome::Publish
         }
         Ok(BuildClaim::Committed(_)) | Ok(BuildClaim::Contended) => {
@@ -6003,7 +6029,8 @@ const HANDOFF_HOLDER_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// key held. A quick refusal drops that claim; a handler that already
 /// snapshotted publishes instead. Wait, then claim again: an entry means the
 /// holder stored it, a free key means it gave up. A claim still held when the
-/// wait ends belongs to whoever publishes that compile.
+/// wait ends belongs to whoever publishes that compile, when one does
+/// ([`DeclinedHolder`]).
 fn reclaim_after_declined_handoff(
     store: &Store,
     cache_key: &str,

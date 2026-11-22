@@ -28,7 +28,11 @@
 //! - Anything that keeps the daemon from accepting (no daemon, an older
 //!   daemon, a full queue, a busy daemon past the hand-off budget) leaves
 //!   the registration to the wrapper, which then waits for the lock as a put
-//!   does, with the key lock taken back. A daemon that dies with the entry
+//!   does, with the key lock taken back. A key still held once the wrapper
+//!   waited for it proves no publisher here (the daemon drops a staged
+//!   claim whose receipt the wrapper cancelled, however late its handler
+//!   gets to it), so the wrapper registers the entry without the lock
+//!   rather than leave it to nobody. A daemon that dies with the entry
 //!   queued commits nothing: its blobs are orphans for the orphan sweep and
 //!   its request directory is the handoff sweep's.
 //!
@@ -284,6 +288,7 @@ fn hand_off_staged(
                 handoff.crate_name,
                 handoff.start,
                 handoff.size,
+                super::DeclinedHolder::Unproven,
             )
         }
     }
