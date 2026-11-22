@@ -1130,7 +1130,6 @@ fn guard_file_memo_eligible(size: i64, inode: i64) -> bool {
 fn stamp_roots(
     roots: &[WalkedRoot],
     max_entries: usize,
-    collect_small_files: bool,
 ) -> std::result::Result<Vec<StampedRoot>, StampRefusal> {
     let mut stamps = Vec::with_capacity(roots.len());
     for (index, root) in roots.iter().enumerate() {
@@ -1140,7 +1139,7 @@ fn stamp_roots(
                 hook(&root.path);
             }
         });
-        match stamp_one_root(root, max_entries, collect_small_files) {
+        match stamp_one_root(root, max_entries) {
             Ok(stamped) => stamps.push(stamped),
             Err(crate::tree_stamp::WalkOutcome::TooLarge) => {
                 return Err(StampRefusal::TooLarge(index));
@@ -1156,28 +1155,29 @@ fn stamp_roots(
     Ok(stamps)
 }
 
-/// Concurrent walks of one root, as units of one workspace stamp it.
+/// Concurrent walks of one root, as units of one workspace stamp it and
+/// check the stamp a guard took ([`GuardWalk::holds`]).
 static STAMP_WALKS: std::sync::LazyLock<
-    crate::walk_flight::NextFlight<(WalkedRoot, usize, bool), StampOutcome>,
+    crate::walk_flight::NextFlight<(WalkedRoot, usize), StampOutcome>,
 > = std::sync::LazyLock::new(crate::walk_flight::NextFlight::new);
 
 type StampOutcome = std::result::Result<StampedRoot, crate::tree_stamp::WalkOutcome>;
 
 /// The stamp of `root` from a walk that started after this call, shared with
 /// the units that asked for the same walk meanwhile ([`crate::walk_flight`]).
-fn stamp_one_root(
-    root: &WalkedRoot,
-    max_entries: usize,
-    collect_small_files: bool,
-) -> StampOutcome {
+fn stamp_one_root(root: &WalkedRoot, max_entries: usize) -> StampOutcome {
     let _trace = crate::phase_trace::phase("stamp_flight");
-    STAMP_WALKS.run(&(root.clone(), max_entries, collect_small_files), || {
+    STAMP_WALKS.run(&(root.clone(), max_entries), || {
         let _trace = crate::phase_trace::phase("stamp_walk");
-        walk_one_root(root, max_entries, collect_small_files)
+        walk_one_root(root, max_entries)
     })
 }
 
-fn walk_one_root(root: &WalkedRoot, max_entries: usize, collect_small_files: bool) -> StampOutcome {
+/// One walk of `root`: its stamp, and the small files a content fold looks
+/// up in the file-hash memo. Every walk lists them, though only a fold uses
+/// them: a guard's check then asks for the walk a unit stamping the root
+/// asks for, and the two share one.
+fn walk_one_root(root: &WalkedRoot, max_entries: usize) -> StampOutcome {
     let mut stamper = crate::tree_stamp::Stamper::new();
     let mut budget = max_entries;
     stamper.label(&root.role);
@@ -1185,7 +1185,7 @@ fn walk_one_root(root: &WalkedRoot, max_entries: usize, collect_small_files: boo
     let mut observe = |path: PathBuf, metadata: &std::fs::Metadata| {
         let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
         let inode = metadata_inode(metadata);
-        if collect_small_files && metadata.is_file() && guard_file_memo_eligible(size, inode) {
+        if metadata.is_file() && guard_file_memo_eligible(size, inode) {
             // The memo stores UTF-8 paths. Lossy spellings could merge
             // distinct names in the path-keyed batch result.
             if !path.is_absolute() {
@@ -1225,7 +1225,7 @@ fn walk_one_root(root: &WalkedRoot, max_entries: usize, collect_small_files: boo
 
 /// [`stamp_roots`] for one root.
 fn stamp_root(root: &WalkedRoot, max_entries: usize) -> Option<crate::tree_stamp::TreeStamp> {
-    let stamped = stamp_roots(std::slice::from_ref(root), max_entries, false)
+    let stamped = stamp_roots(std::slice::from_ref(root), max_entries)
         .ok()?
         .pop()?;
     Some(stamped.stamp)
@@ -1581,7 +1581,7 @@ fn tree_digest_memoised(
             now,
         );
     }
-    let stamps = match stamp_roots(&walked, max_entries, file_hasher.cache.is_some()) {
+    let stamps = match stamp_roots(&walked, max_entries) {
         Ok(stamps) => stamps,
         Err(StampRefusal::TooLarge(index)) => {
             write_marker(&oversized_tree_marker(
@@ -1675,11 +1675,7 @@ fn shared_workspace_digest(
         memo_dir,
         &session_root_key(&workspace, max_entries),
         || {
-            let stamped = match stamp_roots(
-                std::slice::from_ref(&workspace),
-                max_entries,
-                file_hasher.cache.is_some(),
-            ) {
+            let stamped = match stamp_roots(std::slice::from_ref(&workspace), max_entries) {
                 Ok(mut stamps) => stamps.pop()?,
                 Err(StampRefusal::TooLarge(_)) => {
                     write_marker(&oversized_tree_marker(
@@ -1719,7 +1715,7 @@ fn shared_workspace_digest(
         .filter(|(at, _)| *at != index)
         .map(|(_, root)| root.clone())
         .collect();
-    let mut other_stamps = match stamp_roots(&others, max_entries, file_hasher.cache.is_some()) {
+    let mut other_stamps = match stamp_roots(&others, max_entries) {
         Ok(stamps) => stamps.into_iter(),
         Err(StampRefusal::TooLarge(at)) => {
             write_marker(&oversized_tree_marker(
