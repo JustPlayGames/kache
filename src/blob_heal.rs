@@ -795,6 +795,10 @@ mod tests {
     #[cfg(unix)]
     fn a_pass_that_could_not_repair_reads_nothing() {
         use std::os::unix::fs::PermissionsExt;
+        // SAFETY: plain libc call with no arguments.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let drifted = drifted_store(dir.path());
         // An index nobody can open: a pass that touched it would fail.
