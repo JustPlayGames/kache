@@ -133,6 +133,16 @@ impl PendingDaemon {
     /// and dropped unanswered, as a daemon stalled past the wrapper's budget
     /// leaves them.
     fn listen_declining_first(config: &Config, capacity: usize, declined: usize) -> Self {
+        Self::listen_with(config, capacity, declined, Duration::ZERO)
+    }
+
+    /// [`Self::listen`] whose handler takes each request `late` after it
+    /// arrives, as a daemon stalled in an index storm does.
+    fn listen_answering_after(config: &Config, late: Duration) -> Self {
+        Self::listen_with(config, 8, 0, late)
+    }
+
+    fn listen_with(config: &Config, capacity: usize, declined: usize, late: Duration) -> Self {
         use interprocess::local_socket::traits::tokio::Listener as _;
         let daemon = Arc::new(Daemon::new(config.clone()));
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
@@ -160,6 +170,7 @@ impl PendingDaemon {
                     }
                     let (daemon, lifecycle) = (Arc::clone(&daemon), Arc::clone(&lifecycle));
                     tokio::spawn(async move {
+                        tokio::time::sleep(late).await;
                         let _ = crate::daemon::handle_connection(stream, &daemon, &lifecycle).await;
                     });
                 }
@@ -739,6 +750,37 @@ async fn on_a_busy_index_the_wrapper_returns_and_the_daemon_commits_after() {
         events[0].store_error
     );
     assert_eq!(handoff_requests(&compiled.config), 0, "no snapshot is left");
+}
+
+/// In an index storm the daemon's handler answers late (p50 1.2 s on a
+/// shared build machine) while the index stays busy: the wrapper still
+/// hands the entry over within its budget rather than wait for the lock
+/// itself, seconds under the storm, or lose the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_answering_late_in_an_index_storm_still_takes_the_entry() {
+    let compiled = compiled("late-answer");
+    let mut daemon = PendingDaemon::listen_answering_after(
+        &compiled.config,
+        Duration::from_millis(1200),
+    );
+
+    let (outcome, lock, while_held) =
+        store_now_within(&compiled, Some(BUSY), super::BUSY_HANDOFF_BUDGET).await;
+    assert!(
+        matches!(outcome, RustcStore::HandedOff),
+        "the daemon took the entry it answered for late"
+    );
+    assert!(while_held, "the wrapper did not wait for the index");
+    assert!(lock.is_none(), "the daemon holds the key");
+    daemon.publish_all().await;
+    assert!(
+        Store::open(&compiled.config)
+            .unwrap()
+            .get(&compiled.key)
+            .unwrap()
+            .is_some(),
+        "registered by the daemon"
+    );
 }
 
 /// Store a compile as the wrapper does after a miss, with whatever the

@@ -94,12 +94,18 @@ pub(super) const INDEX_BUSY_WAIT: std::time::Duration = std::time::Duration::fro
 /// How long a wrapper whose index is busy waits for the daemon to take the
 /// staged entry. The daemon answers in a few milliseconds whatever its
 /// worker and the index are doing (its claims, each a lock file and a
-/// rename, run side by side), so the budget only bounds a stalled daemon,
-/// such as a claim whose lock-file write the filesystem held for 0.9 s
-/// under a burst. Running out costs the wrapper a wait for a lock another
-/// writer holds, seconds under a burst of stores, so the budget stays far
-/// above a C/C++ hand-off's.
-pub(super) const BUSY_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+/// rename, run side by side), so the budget only bounds a stalled daemon.
+/// It stalls in an index storm, when the machine's memory and disk are
+/// short too: on a shared build machine its late answers took p50 1.2 s,
+/// p90 3.1 s and at most 5.3 s in a storm's minutes (0.8 s and 1.8 s on
+/// quiet ones), so a 500 ms budget declined nearly all of them. Running out
+/// costs far more than waiting: the wrapper then waits for the lock itself
+/// (p50 9 s in those minutes) and a third of those waits lost the entry
+/// after a put's whole wait. 2.5 s takes about nine in ten late answers,
+/// and a quiet day has about one an hour, so waiting longer for one costs
+/// a quiet build nothing it would notice. The budget stays far above a
+/// C/C++ hand-off's.
+pub(super) const BUSY_HANDOFF_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// Whether a busy index may hand this compile's registration to the daemon:
 /// the setting is on, the entry goes to the main store (a `[cache.volumes]`
