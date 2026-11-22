@@ -147,7 +147,8 @@ pub(crate) struct PublishJob {
 }
 
 /// The daemon's publish queue: a bounded channel drained by one blocking
-/// worker with its own store connection.
+/// worker with its own store connection, which hands the jobs stored one
+/// put at a time to a second thread ([`SideLane`]).
 pub(crate) struct PublishQueue {
     tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<PublishJob>>>,
     progress: Arc<PublishProgress>,
@@ -529,6 +530,7 @@ pub(crate) fn run_publish_worker(
             return;
         }
     };
+    let side = SideLane::spawn(&daemon);
     let mut next = None;
     loop {
         let job = match next.take() {
@@ -540,9 +542,93 @@ pub(crate) fn run_publish_worker(
         };
         if job.is_staged() {
             next = publish_staged_batch(&daemon, &config, &store, &mut rx, job);
-        } else {
+            continue;
+        }
+        let job = match &side {
+            Some(side) => side.offer(job),
+            None => Some(job),
+        };
+        if let Some(job) = job {
             publish_one(&daemon, &config, &store, job);
         }
+    }
+    if let Some(side) = side {
+        side.finish();
+    }
+}
+
+/// Most jobs waiting for the [`SideLane`]; past it the worker publishes a
+/// job itself, as before the lane.
+const SIDE_QUEUE_CAPACITY: usize = PUBLISH_QUEUE_CAPACITY;
+
+/// The publish worker's second thread, for the jobs stored one put at a
+/// time: C/C++ objects and unstaged rustc entries. Each such put waits for
+/// the index on its own (the patient put, then its memo row), and on a busy
+/// index that took up to 25 s. On the one worker, staged rustc entries sat
+/// behind them: on 11-21 it spent 86 s on 27 C/C++ puts while staged entries
+/// queued for up to two minutes, the queue filled, and 202 hand-offs were
+/// refused into the wrappers' own lock waits. On a thread of its own, with
+/// its own store connection, a slow put holds back only the puts behind it;
+/// the staged entries keep their one-transaction batches on the worker.
+struct SideLane {
+    tx: std::sync::mpsc::SyncSender<PublishJob>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl SideLane {
+    /// Start the lane once its store is open; `None` (the worker publishes
+    /// every job itself) when the thread or the store cannot be had.
+    fn spawn(daemon: &Arc<Daemon>) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PublishJob>(SIDE_QUEUE_CAPACITY);
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        // Uploads are queued through the runtime (see `enqueue_upload`).
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let daemon = Arc::clone(daemon);
+        let thread = std::thread::Builder::new()
+            .name("kache-publish-side".to_string())
+            .spawn(move || {
+                let _runtime = runtime.as_ref().map(tokio::runtime::Handle::enter);
+                let config = daemon.config().clone();
+                let store = match Store::open(&config) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        tracing::warn!(
+                            "publish side lane could not open the store: {error:#}; \
+                             the worker publishes every hand-off"
+                        );
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(());
+                while let Ok(job) = rx.recv() {
+                    publish_one(&daemon, &config, &store, job);
+                }
+            })
+            .ok()?;
+        match ready.recv() {
+            Ok(()) => Some(Self { tx, thread }),
+            Err(_) => {
+                let _ = thread.join();
+                None
+            }
+        }
+    }
+
+    /// Hand `job` to the lane, or give it back when the lane is full or gone.
+    fn offer(&self, job: PublishJob) -> Option<PublishJob> {
+        match self.tx.try_send(job) {
+            Ok(()) => None,
+            Err(
+                std::sync::mpsc::TrySendError::Full(job)
+                | std::sync::mpsc::TrySendError::Disconnected(job),
+            ) => Some(job),
+        }
+    }
+
+    /// Let the lane publish what it holds, and wait for it.
+    fn finish(self) {
+        drop(self.tx);
+        let _ = self.thread.join();
     }
 }
 
@@ -2077,6 +2163,149 @@ mod tests {
         let _invalid_receipt = HandoffReceipt::new(&invalid).unwrap();
         invalid.cache_key = "nope".to_string();
         assert!(!daemon.handle_publish_cc(invalid).await.ok);
+    }
+
+    /// A C/C++ put that takes long does not hold back the staged rustc
+    /// entries queued behind it: they are registered while it still runs.
+    /// On 11-21 the one worker spent 86 s on 27 C/C++ puts (each waiting
+    /// for a busy index) while staged rustc jobs sat queued for up to two
+    /// minutes and the queue filled. Here the C/C++ object is a FIFO, so its
+    /// put blocks reading it until the test writes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_cc_put_does_not_hold_back_staged_rustc_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::test_support::test_config(dir.path().join("cache"));
+        let daemon = Arc::new(Daemon::new(config.clone()));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        daemon.publish_queue().set_sender(tx.clone());
+        let worker = spawn_publish_worker(Arc::clone(&daemon), rx).unwrap();
+        let store = Store::open(&config).unwrap();
+        let claim = |key: &str| match store.claim_build(key).unwrap() {
+            BuildClaim::Acquired(lock) => lock,
+            _ => panic!("fresh key"),
+        };
+
+        let fifo = dir.path().join("slow.o");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated string that outlives the
+        // call; mkfifo only reads it.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut slow = handoff_request(&config, &key("slow cc"), dir.path());
+        remove_handoff_files(&slow.files);
+        slow.files = snapshot_for_handoff(&config, &[(fifo.clone(), "a.o".to_string())]).unwrap();
+        tx.send(PublishJob {
+            _lock: claim(&slow.cache_key),
+            request: slow,
+            owns_event: true,
+            _unit: None,
+        })
+        .await
+        .unwrap();
+
+        let hash = blake3::hash(b"object bytes").to_hex().to_string();
+        let mut staged = handoff_request(&config, &key("staged rustc"), dir.path());
+        staged.rustc = Some(RustcPublish {
+            crate_types: vec!["lib".to_string()],
+            features: Vec::new(),
+            profile: "dev".to_string(),
+            outputs: vec![RustcOutput {
+                hash: hash.clone(),
+                output: None,
+                redated: false,
+            }],
+            unit: None,
+            rustc_version: None,
+            prestage: Vec::new(),
+            staged: Some(StagedPublish {
+                files: vec![crate::store::CachedFile {
+                    name: "a.o".to_string(),
+                    size: 12,
+                    hash,
+                    executable: false,
+                }],
+                output_blobs: 1,
+                duplicate_blobs: 0,
+                new_blobs: 1,
+            }),
+        });
+        let staged_key = staged.cache_key.clone();
+        tx.send(PublishJob {
+            _lock: claim(&staged_key),
+            request: staged,
+            owns_event: true,
+            _unit: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut registered = false;
+        while std::time::Instant::now() < deadline {
+            if store.get(&staged_key).unwrap().is_some() {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let events = |config: &Config| -> Vec<BuildEvent> {
+            std::fs::read_to_string(config.event_log_path())
+                .unwrap_or_default()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        // The C/C++ job logs its event once its put is done (here, refused:
+        // a FIFO is no regular file to keep).
+        let cc_still_running = events(&config)
+            .iter()
+            .all(|event| event.store_error.is_empty());
+        // Let the C/C++ put finish either way, so the worker can exit: feed
+        // every open of the FIFO (the put may read it more than once) until
+        // the worker is done.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (fifo, stop) = (fifo.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    // Without a reader the open fails at once (ENXIO).
+                    if let Ok(mut pipe) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&fifo)
+                    {
+                        let _ = pipe.write_all(b"object bytes");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        assert!(cc_still_running, "the C/C++ put was still blocked");
+        assert!(
+            registered,
+            "the staged rustc entry waited for the C/C++ put ahead of it"
+        );
+        daemon.publish_queue().close();
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("the worker drains and exits once the C/C++ put can finish")
+            .unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        writer.join().unwrap();
+        // Both jobs are done, each with its event.
+        let events = events(&config);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.store_error.contains("neither a regular file"))
+                .count(),
+            1,
+            "{events:?}"
+        );
     }
 
     /// The progress a queue hands out is the one its jobs update, so the
