@@ -18548,3 +18548,43 @@ fn a_quick_tombstone_prune_deletes_its_rows_in_one_transaction() {
     );
     assert_eq!(store.tombstone_stats().unwrap().0, 0);
 }
+
+/// The current schema stamp does not prove `cc_header_macros` exists. An
+/// open that skips the table check leaves it missing, and header-macro
+/// reads fail on that store.
+#[test]
+fn a_current_index_missing_header_macros_gains_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    let generation: i64 = db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(generation, INDEX_SCHEMA_GENERATION);
+    db.execute_batch("DROP TABLE cc_header_macros").unwrap();
+    drop(db);
+
+    let db = open_index_db(&path).unwrap();
+    let tables: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'cc_header_macros'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1, "cc_header_macros was not created");
+}
+
+/// A current stamp does not vouch for `cc_header_macros`: a release from
+/// before it may have stamped this generation back over an index that
+/// lacks the table.
+#[test]
+fn a_current_index_without_the_macro_table_gains_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    let db = open_index_db(&path).unwrap();
+    db.execute_batch("DROP TABLE cc_header_macros").unwrap();
+    drop(db);
+    let db = open_index_db(&path).unwrap();
+    assert!(crate::cc_memo::has_header_macros_table(&db).unwrap());
+}

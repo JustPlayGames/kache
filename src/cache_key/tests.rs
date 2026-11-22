@@ -16484,7 +16484,10 @@ fn assembler_scans_are_memoised_by_content() {
     let inputs = hasher
         .cc_preprocess_fingerprints(&[name(&clean), name(&twin)], "", &no_mapping)
         .unwrap();
-    assert_eq!(hasher.cc_inputs_hide_assembler_input(&inputs, &scan), None);
+    assert_eq!(
+        hasher.cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false),
+        None
+    );
     assert_eq!(scans.get(), 1, "twins share one scan");
     let later = FileHasher::persistent(&db);
     let inputs = later
@@ -16492,7 +16495,7 @@ fn assembler_scans_are_memoised_by_content() {
         .unwrap();
     assert_eq!(
         later
-            .cc_inputs_hide_assembler_input(&inputs, &scan)
+            .cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false)
             .as_deref(),
         Some(".incbin")
     );
@@ -16503,7 +16506,7 @@ fn assembler_scans_are_memoised_by_content() {
     );
     assert_eq!(
         later
-            .cc_inputs_hide_assembler_input(&inputs, &scan)
+            .cc_inputs_hide_assembler_input(&inputs, &scan, &|_| false)
             .as_deref(),
         Some(".incbin"),
         "the construct verdict is memoised too"
@@ -16514,11 +16517,11 @@ fn assembler_scans_are_memoised_by_content() {
     gone[0].fingerprint.path = dir.path().join("absent.h").to_string_lossy().into_owned();
     gone[0].content = "c".repeat(64);
     assert_eq!(
-        later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+        later.cc_inputs_hide_assembler_input(&gone[..1], &scan, &|_| false),
         None
     );
     assert_eq!(
-        later.cc_inputs_hide_assembler_input(&gone[..1], &scan),
+        later.cc_inputs_hide_assembler_input(&gone[..1], &scan, &|_| false),
         None
     );
     assert_eq!(
@@ -17105,7 +17108,7 @@ fn an_assembler_verdict_on_other_bytes_is_never_learned() {
 
     assert_eq!(
         hasher
-            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save)
+            .cc_inputs_hide_assembler_input(&inputs, &scanned_after_a_save, &|_| false)
             .as_deref(),
         Some(CC_INPUT_CHANGED_WHILE_SCANNED)
     );
@@ -23853,4 +23856,95 @@ fn a_second_spelling_carries_a_hash_only_on_the_same_settled_strong_stamp() {
         "no file index where one is required"
     );
     assert!(may_carry_over(&anonymous, &anonymous_other, false));
+}
+
+#[test]
+fn a_units_own_source_is_scanned_but_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let paths: Vec<_> = ["unit.c", "shared.h"]
+        .iter()
+        .map(|name| dir.path().join(name))
+        .collect();
+    std::fs::write(&paths[0], "int unit;\n").unwrap();
+    std::fs::write(&paths[1], "int shared;\n").unwrap();
+    let scan = |path: &Path| -> anyhow::Result<CcScannedHeader> {
+        let bytes = std::fs::read(path)?;
+        Ok((
+            blake3::hash(&bytes).to_hex().to_string(),
+            "scan".into(),
+            Vec::new(),
+        ))
+    };
+    let hasher = FileHasher::persistent(&db);
+    let scanned = hasher
+        .cc_header_scans_except(&paths, 1, &mut |_| false, &scan, &|path| path == paths[0])
+        .unwrap();
+    assert!(
+        scanned
+            .iter()
+            .all(|(_, scan)| scan.as_deref() == Some("scan"))
+    );
+    let cache = kache_store::file_hash::FileHashCache::open(&db).unwrap();
+    let contents: Vec<&str> = scanned
+        .iter()
+        .map(|(content, _)| content.as_str())
+        .collect();
+    let stored = cache.get_cc_header_scans(1, &contents).unwrap();
+    assert!(
+        !stored.contains_key(contents[0]),
+        "the source is not stored"
+    );
+    assert!(stored.contains_key(contents[1]), "a header is");
+}
+
+/// Keying a compile-first unit selects the hashes its capture took, which
+/// the read-set digest names, instead of reading the inputs again.
+#[test]
+fn keying_selects_the_hashes_the_capture_observed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.h");
+    std::fs::write(&path, "int a;\n").unwrap();
+    let observed = ObservedFingerprint::from_path(&path).unwrap();
+    let hasher = FileHasher::persistent(&dir.path().join("idx.sqlite"));
+    hasher.adopt_observed(&[CcPreprocessMemoInput {
+        name: "a.h".into(),
+        fingerprint: observed.fingerprint,
+        content: "captured".into(),
+        mapped: String::new(),
+        observed_ns: observed.observed_ns,
+    }]);
+    assert_eq!(
+        hasher
+            .cc_input_contents(std::slice::from_ref(&path))
+            .unwrap(),
+        ["captured"]
+    );
+    assert_eq!(hasher.stats().cache_misses, 0, "nothing was read");
+}
+
+#[test]
+fn a_forgotten_memo_row_is_not_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idx.sqlite");
+    let source = dir.path().join("unit.c");
+    let header = dir.path().join("shared.h");
+    std::fs::write(&source, vec![b'a'; 70_000]).unwrap();
+    std::fs::write(&header, vec![b'b'; 70_000]).unwrap();
+    let first = FileHasher::persistent(&db);
+    let named =
+        [source.clone(), header.clone()].map(|path| (path.to_string_lossy().into_owned(), path));
+    first
+        .cc_preprocess_fingerprints(&named, "", &|path| {
+            let bytes = std::fs::read(path).ok()?;
+            Some(content_hashes(&bytes, &bytes))
+        })
+        .unwrap();
+    first.forget_pending_memo(&|path| path == source);
+    first.flush_memo_as_if_settled();
+    let next = FileHasher::persistent(&db);
+    next.hash(&header).unwrap();
+    assert_eq!(next.stats().cache_hits, 1, "the header's row was written");
+    next.hash(&source).unwrap();
+    assert_eq!(next.stats().cache_hits, 1, "the source's row was not");
 }

@@ -2728,6 +2728,7 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     if generation >= INDEX_SCHEMA_GENERATION
         && crate::file_hash::has_rule_columns(db)?
         && crate::cc_memo::has_shadowing_column(db)?
+        && crate::cc_memo::has_header_macros_table(db)?
     {
         return Ok(());
     }
@@ -2927,11 +2928,12 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 /// 14: partial index for pending durability counts and ordered flush batches.
 /// 15: `cc_preprocess_memos.shadowing`. An older release stamps 14 back, so
 ///    the open also checks for the column.
+/// 16: `cc_header_macros`, checked for the same reason.
 ///
 /// A release that finds a higher number leaves it (and skips the DDL): the
 /// stamp only ever goes up. Releases before this rule stamp their own number
 /// back, so a newer one runs its DDL once more after such an open.
-const INDEX_SCHEMA_GENERATION: i64 = 15;
+const INDEX_SCHEMA_GENERATION: i64 = 16;
 
 /// What [`ArtifactStore::adopt_legacy_entry`] did for one entry.
 #[derive(Debug, Default, Clone, PartialEq)]
