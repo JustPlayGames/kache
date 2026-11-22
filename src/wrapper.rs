@@ -973,7 +973,7 @@ fn test_binary_over_store_bound(
 /// GCC/Clang objects (and clang-cl without CodeView debug) use the rustc
 /// remote pipeline. clang-cl debug objects embed un-remapped paths.
 fn cc_publishes_to_remote(parsed: &crate::compiler::cc::CcArgs) -> bool {
-    !parsed.embeds_codeview_debug()
+    parsed.family != crate::compiler::cc::ToolFamily::Msvc && !parsed.embeds_codeview_debug()
 }
 
 fn should_store_cc_result(exit_code: i32, has_artifacts: bool) -> bool {
@@ -2326,7 +2326,9 @@ fn run_cc_inner(
             reasons.join("; ")
         );
         let reason = refuse_reason_string(&refuse);
-        return if parsed.requires_compiler_output_semantics() {
+        return if parsed.family == crate::compiler::cc::ToolFamily::Msvc
+            || parsed.requires_compiler_output_semantics()
+        {
             cc_direct_passthrough_with_event(
                 config,
                 &parsed,
@@ -2475,7 +2477,8 @@ fn run_cc_with_store(
         // entry, and no fallback wrapper is waiting to be asked.
         None if precompiled.is_none()
             && config.deferred_discovery
-            && config.remote.is_none()
+            && (config.remote.is_none()
+                || parsed.family == crate::compiler::cc::ToolFamily::Msvc)
             && config.fallback.is_none()
             && config.readonly_store.is_none()
             && crate::compiler::cc::cc_direct_key_eligible(parsed) =>
