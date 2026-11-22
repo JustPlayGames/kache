@@ -8400,6 +8400,12 @@ async fn server_main(
         }
     });
 
+    // The index's pages, back in the page cache while the machine has room
+    // for them (`index_residency`): a hit reads them before anything else,
+    // and an evicted page waits for a busy disk.
+    #[cfg(target_os = "linux")]
+    crate::index_residency::spawn(&daemon.config.index_db_path());
+
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
