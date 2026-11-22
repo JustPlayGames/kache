@@ -32,9 +32,15 @@
 //!   waited for it proves no publisher here (the daemon drops a staged
 //!   claim whose receipt the wrapper cancelled, however late its handler
 //!   gets to it), so the wrapper registers the entry without the lock
-//!   rather than leave it to nobody. A daemon that dies with the entry
-//!   queued commits nothing: its blobs are orphans for the orphan sweep and
-//!   its request directory is the handoff sweep's.
+//!   rather than leave it to nobody.
+//! - A registration the index refuses for that whole wait (an index storm,
+//!   where a busy-timeout poll keeps losing the lock to writers that ask
+//!   more often) goes to the daemon once more ([`REOFFER_BUDGET`]) before
+//!   the wrapper gives the entry up: the daemon's batch asks for the lock in
+//!   short tries and registers it when it frees.
+//! - A daemon that dies with the entry queued commits nothing: its blobs are
+//!   orphans for the orphan sweep and its request directory is the handoff
+//!   sweep's.
 //!
 //! Windows keeps the synchronous store; the hand-off has not been tried
 //! there.
@@ -55,6 +61,7 @@ use super::{CcHandoffOutcome, EventInputs};
 
 /// What the daemon needs to store a finished rustc compile and log its
 /// event.
+#[derive(Clone)]
 pub(super) struct RustcHandoff<'a> {
     pub(super) cache_key: &'a str,
     pub(super) crate_name: &'a str,
@@ -177,17 +184,84 @@ fn store_within(
         Ok(PutAttempt::Busy(staged)) => staged,
         Err(error) => return RustcStore::Stored(Err(error)),
     };
-    match hand_off_staged(config, store, build_lock, handoff, &staged, budget) {
-        CcHandoffOutcome::Accepted | CcHandoffOutcome::Done => RustcStore::HandedOff,
-        CcHandoffOutcome::Publish => RustcStore::Stored(store.register_staged_put(&staged)),
+    let declined = match hand_off_staged(
+        config,
+        store,
+        build_lock,
+        handoff.clone(),
+        &staged,
+        budget,
+        OnDecline::TakeBack,
+    ) {
+        CcHandoffOutcome::Accepted | CcHandoffOutcome::Done => return RustcStore::HandedOff,
+        CcHandoffOutcome::Publish => handoff,
+    };
+    match store.register_staged_put(&staged) {
+        Err(error) if crate::store::is_sqlite_contention(&error) => {
+            offer_again(config, store, build_lock, declined, &staged, error)
+        }
+        put => RustcStore::Stored(put),
     }
+}
+
+/// How long a wrapper whose own registration the index refused waits for
+/// the daemon to take the staged entry after all. That registration already
+/// waited a put's whole wait for the write lock (about 20 s), so the entry
+/// is otherwise lost; the daemon, stalled when it declined the first offer,
+/// has had that long to catch up, and answers in milliseconds once it has.
+pub(super) const REOFFER_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The index kept its write lock from the wrapper for a put's whole wait
+/// (an index storm: a busy-timeout poll loses the lock to writers that ask
+/// more often, such as the daemon's batch, which takes it in 20 ms tries).
+/// Offer the staged entry to the daemon once more, whose batch registers it
+/// when the lock frees: its blobs are published and stay unreferenced until
+/// then, so nothing is staged or hashed again. Taken, the entry and its
+/// event are the daemon's; declined, the wrapper's failed put stands, with
+/// no second wait for the lock.
+fn offer_again(
+    config: &Config,
+    store: &Store,
+    build_lock: &mut Option<KeyLock>,
+    handoff: RustcHandoff<'_>,
+    staged: &StagedPut,
+    error: anyhow::Error,
+) -> RustcStore {
+    tracing::debug!(
+        "{}: the index refused the registration ({error:#}); offering it to the daemon again",
+        handoff.crate_name
+    );
+    match hand_off_staged(
+        config,
+        store,
+        build_lock,
+        handoff,
+        staged,
+        REOFFER_BUDGET,
+        OnDecline::GiveUp,
+    ) {
+        CcHandoffOutcome::Accepted => RustcStore::HandedOff,
+        CcHandoffOutcome::Done | CcHandoffOutcome::Publish => RustcStore::Stored(Err(error)),
+    }
+}
+
+/// What a declined offer of a staged entry does next.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnDecline {
+    /// Take the key back and leave the registration to the wrapper
+    /// ([`super::resolve_declined_handoff`]).
+    TakeBack,
+    /// Nothing more: the caller's failed registration stands
+    /// ([`offer_again`]).
+    GiveUp,
 }
 
 /// Offer a staged entry the index was too busy to register to the daemon.
 /// `Accepted`: the daemon holds the key and registers the entry and its
 /// event. `Done`: a peer took the key after the daemon declined; its entry
 /// counts and the event is written. `Publish`: register it here, with the
-/// key lock back in `build_lock` when it could be taken.
+/// key lock back in `build_lock` when it could be taken; with
+/// [`OnDecline::GiveUp`], any refusal, the key lock not taken back.
 fn hand_off_staged(
     config: &Config,
     store: &Store,
@@ -195,6 +269,7 @@ fn hand_off_staged(
     handoff: RustcHandoff<'_>,
     staged: &StagedPut,
     budget: std::time::Duration,
+    on_decline: OnDecline,
 ) -> CcHandoffOutcome {
     let stored = staged.files();
     if handoff.artifacts.len() != handoff.files.len() || stored.len() != handoff.files.len() {
@@ -279,6 +354,9 @@ fn hand_off_staged(
                 handoff.crate_name
             );
             crate::daemon_publish::remove_handoff_files(&request.files);
+            if on_decline == OnDecline::GiveUp {
+                return CcHandoffOutcome::Publish;
+            }
             super::resolve_declined_handoff(
                 config,
                 store,

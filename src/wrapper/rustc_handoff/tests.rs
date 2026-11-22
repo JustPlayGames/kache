@@ -126,6 +126,13 @@ impl PendingDaemon {
 
     /// [`Self::listen`] with room for `capacity` accepted hand-offs.
     fn listen_queueing(config: &Config, capacity: usize) -> Self {
+        Self::listen_declining_first(config, capacity, 0)
+    }
+
+    /// [`Self::listen_queueing`] whose first `declined` connections are read
+    /// and dropped unanswered, as a daemon stalled past the wrapper's budget
+    /// leaves them.
+    fn listen_declining_first(config: &Config, capacity: usize, declined: usize) -> Self {
         use interprocess::local_socket::traits::tokio::Listener as _;
         let daemon = Arc::new(Daemon::new(config.clone()));
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
@@ -140,7 +147,17 @@ impl PendingDaemon {
         let server = {
             let daemon = Arc::clone(&daemon);
             tokio::spawn(async move {
+                let mut connections = 0;
                 while let Ok(stream) = listener.accept().await {
+                    connections += 1;
+                    if connections <= declined {
+                        use tokio::io::AsyncBufReadExt;
+                        let mut line = String::new();
+                        let _ = tokio::io::BufReader::new(&stream)
+                            .read_line(&mut line)
+                            .await;
+                        continue;
+                    }
                     let (daemon, lifecycle) = (Arc::clone(&daemon), Arc::clone(&lifecycle));
                     tokio::spawn(async move {
                         let _ = crate::daemon::handle_connection(stream, &daemon, &lifecycle).await;
@@ -554,6 +571,56 @@ async fn a_daemon_stalled_on_the_key_does_not_cost_the_entry() {
     );
     assert!(lock.is_none(), "the stalled handler still held the key");
     assert!(found.is_some(), "a peer looking now finds the entry");
+}
+
+/// An index storm: the daemon, stalled, declines the wrapper's offer, and
+/// the index keeps its write lock from the wrapper's own registration for a
+/// put's whole wait. The wrapper offers the staged entry to the daemon again
+/// rather than lose it (its blobs published, its compile done): the daemon
+/// takes the key and registers the entry once the lock frees, with the bytes
+/// the compiler wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_the_index_refuses_goes_to_the_daemon() {
+    let compiled = compiled("refused-registration");
+    let mut daemon = PendingDaemon::listen_declining_first(&compiled.config, 8, 1);
+    let written = std::fs::read(&compiled.rlib).unwrap();
+    let (let_go, _, holder) = hold_index_lock_until_let_go(&compiled.config);
+    let (outcome, lock) = tokio::task::block_in_place(|| {
+        let store = Store::open(&compiled.config).unwrap();
+        // A put's four waits for the lock in about a second, not 20 s.
+        store.set_busy_timeout_for_test(Duration::from_millis(250));
+        let compiler = RustcCompiler::new();
+        let mut lock = match store.claim_build(&compiled.key).unwrap() {
+            BuildClaim::Acquired(lock) => Some(lock),
+            _ => panic!("a fresh key"),
+        };
+        let outcome = store_within(
+            &compiled.config,
+            &store,
+            &mut lock,
+            handoff(&compiled, &compiler, std::time::Instant::now()),
+            Duration::from_millis(300),
+            true,
+        );
+        (outcome, lock)
+    });
+    let_go.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(
+        matches!(outcome, RustcStore::HandedOff),
+        "the daemon took the entry the index refused the wrapper"
+    );
+    assert!(lock.is_none(), "the daemon holds the key");
+    daemon.publish_all().await;
+    let store = Store::open(&compiled.config).unwrap();
+    let meta = store
+        .get(&compiled.key)
+        .unwrap()
+        .expect("registered by the daemon once the lock was free");
+    assert_eq!(
+        std::fs::read(store.blob_path(&meta.files[0].hash)).unwrap(),
+        written
+    );
 }
 
 /// With a daemon running and the index free, a miss stores as it always

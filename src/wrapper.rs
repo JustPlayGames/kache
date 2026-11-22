@@ -10568,6 +10568,7 @@ impl RebuiltArtifacts {
 /// process's counters. Start from [`EventInputs::new`] and set what the
 /// invocation measured. A value left unset is written as zero or empty, the
 /// event log's "not measured here".
+#[derive(Clone)]
 pub(crate) struct EventInputs<'a> {
     root: &'a str,
     crate_name: &'a str,
