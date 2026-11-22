@@ -26113,3 +26113,43 @@ fn a_compile_record_belongs_to_one_crate_and_source() {
     assert_eq!(compiled_remaps(&other_crate), None);
     assert_eq!(compiled_remaps(&args), Some(Some(vec!["x".to_string()])));
 }
+
+/// A memo write whose COMMIT the index refuses leaves no transaction open:
+/// one left open keeps the index's write lock on the connection, which in
+/// the daemon lives on (upstream #2014). A reader's shared lock on an index
+/// in rollback-journal mode refuses the COMMIT; the inserts were let in.
+#[test]
+fn a_refused_memo_commit_leaves_no_transaction_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("index.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    ensure_file_hash_cache_schema(&db).unwrap();
+    let file = dir.path().join("a.rs");
+    std::fs::write(&file, "pub fn a() {}\n").unwrap();
+    let rows = vec![(
+        ObservedFingerprint::from_path(&file).unwrap(),
+        "0".repeat(64),
+    )];
+
+    let reader = rusqlite::Connection::open(&db_path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM file_hashes", [], |row| row.get(0))
+        .unwrap();
+    let refused = super::write_memo_rows(
+        &FileHashCache::Borrowed(&db),
+        &rows,
+        std::time::Duration::from_millis(20),
+    );
+    assert!(refused.is_err(), "the reader's lock refuses the COMMIT");
+    assert!(db.is_autocommit(), "the refused COMMIT was rolled back");
+    reader.execute_batch("COMMIT").unwrap();
+
+    super::write_memo_rows(
+        &FileHashCache::Borrowed(&db),
+        &rows,
+        std::time::Duration::from_millis(20),
+    )
+    .unwrap();
+    assert!(db.is_autocommit());
+}

@@ -10624,6 +10624,12 @@ fn write_memo_rows(
         }
         db.execute_batch("COMMIT")
     })();
+    // A COMMIT the index refused (busy past the wait, a full disk) leaves its
+    // transaction open, and with it the index's write lock on a connection a
+    // daemon keeps (upstream #2014).
+    if written.is_err() && !db.is_autocommit() {
+        let _ = db.execute_batch("ROLLBACK");
+    }
     let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
     written
 }
