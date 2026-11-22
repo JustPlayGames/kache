@@ -2725,7 +2725,10 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
     // until the script is rebuilt, so two releases open one store for a
     // while, and a downward stamp makes the newer one run its DDL again.
     let generation: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if generation >= INDEX_SCHEMA_GENERATION && crate::file_hash::has_rule_columns(db)? {
+    if generation >= INDEX_SCHEMA_GENERATION
+        && crate::file_hash::has_rule_columns(db)?
+        && crate::cc_memo::has_shadowing_column(db)?
+    {
         return Ok(());
     }
 
@@ -2922,11 +2925,13 @@ fn initialize_db(db: &Connection, mode: IndexMode) -> rusqlite::Result<()> {
 ///    payload schema. Compiled cache entries are retained.
 /// 13: `entries.rustc_version`, for explicit compiler-version cleanup.
 /// 14: partial index for pending durability counts and ordered flush batches.
+/// 15: `cc_preprocess_memos.shadowing`. An older release stamps 14 back, so
+///    the open also checks for the column.
 ///
 /// A release that finds a higher number leaves it (and skips the DDL): the
 /// stamp only ever goes up. Releases before this rule stamp their own number
 /// back, so a newer one runs its DDL once more after such an open.
-const INDEX_SCHEMA_GENERATION: i64 = 14;
+const INDEX_SCHEMA_GENERATION: i64 = 15;
 
 /// What [`ArtifactStore::adopt_legacy_entry`] did for one entry.
 #[derive(Debug, Default, Clone, PartialEq)]
