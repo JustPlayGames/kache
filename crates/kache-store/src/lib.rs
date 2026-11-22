@@ -12,6 +12,7 @@ pub mod filesystem;
 mod gone_dirs;
 mod index_compaction;
 mod index_pool;
+mod index_turns;
 pub mod link;
 mod lock_hold;
 pub mod markers;
@@ -29,6 +30,7 @@ pub use index_pool::{
     IndexGuard, IndexPoolStats, close_idle_index_connections, index_pool_stats, index_pool_used,
     pool_index_connections,
 };
+pub use index_turns::{IndexPlace, hold_index_place, set_index_busy_wait};
 pub use store::*;
 
 /// Compiler-owned rules applied when publishing an entry. Implementations must

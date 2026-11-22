@@ -45,9 +45,29 @@ pub struct LongHold {
     pub statements: u32,
 }
 
-/// Log each hold of the write lock on `db` that lasts [`LONG_LOCK_HOLD`].
-pub(crate) fn watch(db: &mut Connection) -> rusqlite::Result<()> {
-    watch_with(db, LONG_LOCK_HOLD, log)
+/// Log each hold of the write lock on `db` that lasts [`LONG_LOCK_HOLD`],
+/// and tell the connection's turn at the lock (when it has one) each time a
+/// statement ends.
+pub(crate) fn watch(
+    db: &mut Connection,
+    turn: Option<std::sync::Arc<crate::index_turns::ConnTurn>>,
+) -> rusqlite::Result<()> {
+    watch_with(db, LONG_LOCK_HOLD, move |event| match event {
+        Event::Statement { holds_write_lock } => {
+            if let Some(turn) = &turn {
+                turn.statement_done(holds_write_lock);
+            }
+        }
+        Event::LongHold(hold) => log(hold),
+    })
+}
+
+/// What [`watch_with`] reports.
+pub(crate) enum Event<'a> {
+    /// A statement ended, the connection holding the write lock or not.
+    Statement { holds_write_lock: bool },
+    /// A hold of the write lock of the threshold or more ended.
+    LongHold(&'a LongHold),
 }
 
 fn log(hold: &LongHold) {
@@ -62,11 +82,11 @@ fn log(hold: &LongHold) {
     );
 }
 
-/// [`watch`] with its threshold and what a long hold is reported to.
+/// [`watch`] with its threshold and what it reports to.
 pub(crate) fn watch_with(
     db: &mut Connection,
     threshold: Duration,
-    report: impl Fn(&LongHold) + Send + 'static,
+    report: impl Fn(Event<'_>) + Send + 'static,
 ) -> rusqlite::Result<()> {
     // SAFETY: the handle is only read, by the trace callback below, which
     // the connection owns: SQLite calls it from inside this connection's own
@@ -81,7 +101,9 @@ pub(crate) fn watch_with(
             let TraceEvent::Profile(statement, _) = event else {
                 return;
             };
-            match (hold.as_mut(), handle.holds_write_lock()) {
+            let holds_write_lock = handle.holds_write_lock();
+            report(Event::Statement { holds_write_lock });
+            match (hold.as_mut(), holds_write_lock) {
                 (None, true) => {
                     let mut started = Hold {
                         since: Instant::now(),
@@ -97,7 +119,7 @@ pub(crate) fn watch_with(
                     let Some(held) = hold.take() else { return };
                     let lasted = held.since.elapsed();
                     if lasted >= threshold {
-                        report(&LongHold {
+                        report(Event::LongHold(&LongHold {
                             held: lasted,
                             thread: std::thread::current()
                                 .name()
@@ -105,7 +127,7 @@ pub(crate) fn watch_with(
                                 .to_owned(),
                             first_write: held.first_write.or(held.first).unwrap_or_default(),
                             statements: held.statements,
-                        });
+                        }));
                     }
                 }
                 (None, false) => {}
@@ -195,8 +217,10 @@ mod tests {
             .unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        watch_with(&mut db, threshold, move |hold| {
-            sink.lock().unwrap().push(hold.clone())
+        watch_with(&mut db, threshold, move |event| {
+            if let Event::LongHold(hold) = event {
+                sink.lock().unwrap().push(hold.clone());
+            }
         })
         .unwrap();
         (db, seen)

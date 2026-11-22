@@ -75,7 +75,7 @@ fn a_connection_waiting_with_another_timeout_stays_until_it_is_given_back() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
-    store.db().busy_timeout(Duration::ZERO).unwrap();
+    crate::index_turns::set_index_busy_wait(&store.db(), Duration::ZERO).unwrap();
     assert!(store.db.holds());
     store.give_back_busy_timeout();
     assert!(!store.db.holds());

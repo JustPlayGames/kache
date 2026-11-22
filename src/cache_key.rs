@@ -10613,7 +10613,10 @@ fn write_memo_rows(
     wait: std::time::Duration,
 ) -> rusqlite::Result<()> {
     let db = cache.db();
-    let _ = db.busy_timeout(bookkeeping_lock_wait(BookkeepingWrite::MemoRows, wait));
+    let _ = kache_store::set_index_busy_wait(
+        &db,
+        bookkeeping_lock_wait(BookkeepingWrite::MemoRows, wait),
+    );
     let written = (|| -> rusqlite::Result<()> {
         db.execute_batch("BEGIN IMMEDIATE")?;
         for (observed, hash) in rows {
@@ -10630,7 +10633,7 @@ fn write_memo_rows(
     if written.is_err() && !db.is_autocommit() {
         let _ = db.execute_batch("ROLLBACK");
     }
-    let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
+    let _ = kache_store::set_index_busy_wait(&db, std::time::Duration::from_millis(5000));
     written
 }
 
@@ -11105,10 +11108,13 @@ impl<'db> FileHasher<'db> {
             return;
         }
         let db = cache.db();
-        let _ = db.busy_timeout(bookkeeping_lock_wait(
-            BookkeepingWrite::Prediction,
-            crate::store::bookkeeping_wait(PREDICTION_RECORD_WAIT),
-        ));
+        let _ = kache_store::set_index_busy_wait(
+            &db,
+            bookkeeping_lock_wait(
+                BookkeepingWrite::Prediction,
+                crate::store::bookkeeping_wait(PREDICTION_RECORD_WAIT),
+            ),
+        );
         let written = match &row.keep_under {
             Some((prefix, keep)) => cache.put_input_prediction_keeping(
                 prefix,
@@ -11125,7 +11131,7 @@ impl<'db> FileHasher<'db> {
                 &row.json,
             ),
         };
-        let _ = db.busy_timeout(std::time::Duration::from_millis(5000));
+        let _ = kache_store::set_index_busy_wait(&db, std::time::Duration::from_millis(5000));
         match written {
             Ok(()) => {}
             Err(error) if sqlite_busy(&error) => self.busy_predictions.borrow_mut().push(row),

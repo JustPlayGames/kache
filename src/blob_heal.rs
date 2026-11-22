@@ -273,10 +273,7 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
         return Ok(Outcome::Skipped(reason));
     }
     // Yield to the first contender instead of queueing behind it.
-    store
-        .file_hash_cache()
-        .db()
-        .pragma_update(None, "busy_timeout", 0)?;
+    kache_store::set_index_busy_wait(&store.file_hash_cache().db(), std::time::Duration::ZERO)?;
     // An entry whose metadata or blobs no longer check out would make a
     // strict rebuild refuse the whole store on every retry. A lookup evicts
     // such an entry anyway, so the rebuild drops it.

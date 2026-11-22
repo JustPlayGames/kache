@@ -1444,6 +1444,13 @@ pub fn is_sqlite_contention(err: &anyhow::Error) -> bool {
     })
 }
 
+/// A store's index connection kept, with its place in line for the write
+/// lock ([`ArtifactStore::hold_index_place`]). The place goes first.
+pub struct StoreIndexPlace<'a> {
+    _place: crate::index_turns::IndexPlace,
+    _db: crate::index_pool::IndexGuard<'a>,
+}
+
 /// How many times [`Store::begin_entry_registration`] waits out the busy
 /// timeout for the write lock before the store fails: about 20 s with the
 /// 5 s timeout every store connection sets.
@@ -1469,6 +1476,8 @@ pub(crate) fn begin_write_waiting<'db>(
     db: &'db rusqlite::Connection,
     doing: &str,
 ) -> rusqlite::Result<rusqlite::Transaction<'db>> {
+    // One wait in line, not a new place at its end for each attempt.
+    let _place = crate::index_turns::hold_index_place(db);
     let mut attempt = 1;
     loop {
         match rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate) {
@@ -3320,8 +3329,11 @@ fn try_open_index_db(db_path: &Path, mode: IndexMode) -> std::result::Result<Con
     for attempt in 1..=STORE_OPEN_MAX_ATTEMPTS {
         match Connection::open(db_path).and_then(|mut db| {
             initialize_db(&db, mode)?;
-            // Each long hold of the write lock gets a line saying who held it.
-            crate::lock_hold::watch(&mut db)?;
+            // Waiters for the write lock take turns in the order they came.
+            let turn = crate::index_turns::install(&db, db_path, INDEX_BUSY_WAIT);
+            // Each long hold of the write lock gets a line saying who held
+            // it; each statement's end passes a turn that is over on.
+            crate::lock_hold::watch(&mut db, turn)?;
             if DEFER_WAL_CHECKPOINTS.load(Ordering::Relaxed) {
                 db.pragma_update(None, "wal_autocheckpoint", DEFERRED_AUTOCHECKPOINT_PAGES)?;
             }
@@ -3560,7 +3572,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         );
         let (db, recovered) = match pool.as_ref().and_then(crate::index_pool::Pool::take) {
             Some(pooled) => {
-                pooled.db.busy_timeout(INDEX_BUSY_WAIT)?;
+                crate::index_turns::set_index_busy_wait(&pooled.db, INDEX_BUSY_WAIT)?;
                 (pooled, false)
             }
             None => {
@@ -3973,10 +3985,21 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             && self.file_hash_at(&current).is_none()
     }
 
+    /// Keep this store's index connection, and its place in line for the
+    /// index's write lock, between waits that give up (a batch's short
+    /// tries), until the guard drops.
+    pub fn hold_index_place(&self) -> StoreIndexPlace<'_> {
+        let db = self.db();
+        StoreIndexPlace {
+            _place: crate::index_turns::hold_index_place(&db),
+            _db: db,
+        }
+    }
+
     /// Give the connection back its own busy timeout after a call that
     /// waited with another.
     fn give_back_busy_timeout(&self) {
-        let _ = self.db().busy_timeout(self.busy_wait.get());
+        let _ = crate::index_turns::set_index_busy_wait(&self.db(), self.busy_wait.get());
     }
 
     /// `rows` in transactions that each hold the index's write lock for at
@@ -3996,7 +4019,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if written > 0 {
                 std::thread::sleep(WRITE_LOCK_YIELD);
             }
-            let _ = self.db().busy_timeout(wait);
+            let _ = crate::index_turns::set_index_busy_wait(&self.db(), wait);
             let started = std::time::Instant::now();
             let mut taken = 0;
             let committed = (|| -> rusqlite::Result<()> {
@@ -4234,7 +4257,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             || age_seconds.is_none_or(|age| age >= HIT_STAMP_INTERVAL.as_secs() as i64))
             && !self.hit_stamps.as_ref().is_some_and(|sink| sink(cache_key))
         {
-            let _ = self.db().busy_timeout(HIT_STAMP_BUSY_WAIT);
+            let _ = crate::index_turns::set_index_busy_wait(&self.db(), HIT_STAMP_BUSY_WAIT);
             // A hit proves the entry is one this release's keys reach: it is
             // no longer an earlier key version's, whatever version stored it
             // (a component whose key version did not move hits as before).
@@ -5776,7 +5799,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         db: &'db Connection,
         wait: Duration,
     ) -> rusqlite::Result<rusqlite::Transaction<'db>> {
-        let _ = db.busy_timeout(wait);
+        let _ = crate::index_turns::set_index_busy_wait(db, wait);
         let started =
             rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate);
         self.give_back_busy_timeout();
@@ -7762,7 +7785,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let in_transaction = !self.db().is_autocommit();
         if !in_transaction {
             if let Some(wait) = wait {
-                let _ = self.db().busy_timeout(wait);
+                let _ = crate::index_turns::set_index_busy_wait(&self.db(), wait);
             }
             let begun = self.db().execute_batch("BEGIN IMMEDIATE");
             if wait.is_some() {
@@ -10122,7 +10145,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn set_busy_timeout_for_test(&self, wait: Duration) {
-        self.db().busy_timeout(wait).unwrap();
+        crate::index_turns::set_index_busy_wait(&self.db(), wait).unwrap();
         self.busy_wait.set(wait);
     }
 

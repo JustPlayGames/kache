@@ -374,7 +374,7 @@ impl IndexConn {
                 .as_ref()
                 .expect("only a pooled store ever gives its connection back");
             let pooled = pool.take().unwrap_or_else(|| open(&pool.key));
-            let _ = pooled.db.busy_timeout(busy_wait);
+            let _ = crate::index_turns::set_index_busy_wait(&pooled.db, busy_wait);
             *self.slot.borrow_mut() = Some(pooled);
         }
         IndexGuard {
@@ -416,21 +416,13 @@ impl IndexConn {
         let idle = slot.as_ref().is_some_and(|pooled| {
             pooled.db.is_autocommit()
                 && busy_wait
-                    .is_none_or(|wait| busy_timeout_ms(&pooled.db) == Some(wait.as_millis()))
+                    .is_none_or(|wait| crate::index_turns::busy_wait(&pooled.db) == Some(wait))
         });
         if idle && let Some(pooled) = slot.take() {
             drop(slot);
             pool.give_back(pooled);
         }
     }
-}
-
-/// The connection's busy timeout in milliseconds.
-fn busy_timeout_ms(db: &Connection) -> Option<u128> {
-    db.prepare_cached("PRAGMA busy_timeout")
-        .and_then(|mut statement| statement.query_row([], |row| row.get::<_, i64>(0)))
-        .ok()
-        .and_then(|ms| u128::try_from(ms).ok())
 }
 
 impl Drop for IndexConn {

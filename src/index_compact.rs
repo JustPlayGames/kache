@@ -305,9 +305,10 @@ fn attempt(config: &Config, trigger: Trigger<'_>, now: u64) -> anyhow::Result<Ou
         Ok(mode) => mode,
         Err(outcome) => return Ok(outcome),
     };
-    index
-        .db()
-        .pragma_update(None, "busy_timeout", mode.busy_timeout_ms())?;
+    kache_store::set_index_busy_wait(
+        &index.db(),
+        std::time::Duration::from_millis(mode.busy_timeout_ms().into()),
+    )?;
     let result = index.compact_index()?;
     if matches!(
         result,

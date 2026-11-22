@@ -18530,11 +18530,10 @@ fn store_calls_give_back_the_connections_own_busy_timeout() {
     let config = test_config(dir.path());
     let store = Store::open(&config).unwrap();
     store.set_busy_timeout_for_test(Duration::from_secs(60));
-    let busy_ms = |store: &Store| -> i64 {
-        store
-            .db()
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap()
+    let busy_ms = |store: &Store| -> u128 {
+        crate::index_turns::busy_wait(&store.db())
+            .expect("the connection's wait")
+            .as_millis()
     };
 
     let src = dir.path().join("out.rlib");

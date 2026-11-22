@@ -712,6 +712,8 @@ fn publish_staged_batch(
     let mut batch = Vec::new();
     let mut held_back = None;
     take_staged(store, first, &mut jobs, &mut batch);
+    // The batch's short tries wait in one place in line for the lock.
+    let place = store.hold_index_place();
     let results = loop {
         while held_back.is_none() && jobs.len() < PUBLISH_BATCH_MAX {
             match rx.try_recv() {
@@ -737,6 +739,7 @@ fn publish_staged_batch(
             }
         }
     };
+    drop(place);
     let registered = results.iter().filter(|result| result.is_ok()).count();
     if registered > 0 {
         crate::wrapper::after_store(config, store, None);
