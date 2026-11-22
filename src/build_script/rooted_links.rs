@@ -406,7 +406,12 @@ mod tests {
         std::fs::write(env.out_dir.join("generated.h"), "generated").unwrap();
         symlink("generated.h", env.out_dir.join("relative.h")).unwrap();
         symlink(&env.manifest_dir, env.out_dir.join("package")).unwrap();
-        let contents = super::super::collect_out_dir_with_environment(&env, 3).unwrap();
+        let contents = super::super::collect_out_dir_with_environment(
+            &env,
+            kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
+            3,
+        )
+        .unwrap();
         assert_eq!(contents.files.len(), 1);
         assert_eq!(contents.symlinks.len(), 1);
         assert_eq!(contents.rooted_symlinks.len(), 1);
@@ -414,8 +419,22 @@ mod tests {
             contents.directories.is_empty(),
             "the package link was not walked"
         );
-        assert!(super::super::collect_out_dir_with_environment(&env, 2).is_err());
-        assert!(super::super::collect_out_dir_with_environment(&env, 0).is_err());
+        assert!(
+            super::super::collect_out_dir_with_environment(
+                &env,
+                kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::collect_out_dir_with_environment(
+                &env,
+                kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
+                0
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -432,7 +451,12 @@ mod tests {
             symlink(target, &link).unwrap();
             assert!(!relative_target_is_internal(&env, &link, Path::new(target)).unwrap());
             assert!(
-                super::super::collect_out_dir_with_environment(&env, 10).is_err(),
+                super::super::collect_out_dir_with_environment(
+                    &env,
+                    kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
+                    10
+                )
+                .is_err(),
                 "{target}"
             );
             std::fs::remove_file(&link).unwrap();
@@ -442,7 +466,12 @@ mod tests {
             relative_target_is_internal(&env, &link, Path::new("not-created/nested/header"))
                 .unwrap()
         );
-        let contents = super::super::collect_out_dir_with_environment(&env, 2).unwrap();
+        let contents = super::super::collect_out_dir_with_environment(
+            &env,
+            kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
+            2,
+        )
+        .unwrap();
         assert_eq!(
             contents.symlinks.len(),
             1,
@@ -461,7 +490,14 @@ mod tests {
         let target = Path::new("regular-file/child");
         symlink(target, &path).unwrap();
         assert!(relative_target_is_internal(&env, &path, target).is_err());
-        assert!(super::super::collect_out_dir_with_environment(&env, 2).is_err());
+        assert!(
+            super::super::collect_out_dir_with_environment(
+                &env,
+                kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
+                2
+            )
+            .is_err()
+        );
     }
 
     #[test]
