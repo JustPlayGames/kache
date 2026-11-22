@@ -11791,8 +11791,9 @@ exit 1
         root.clone(),
     );
     let cache = FileHashCache::open(&root.join("index.db")).unwrap();
+    let db = cache.db();
     let hasher =
-        || crate::cache_key::FileHasher::from_cache_for(FileHashCache::Borrowed(cache.db()), &env);
+        || crate::cache_key::FileHasher::from_cache_for(FileHashCache::Borrowed(&db), &env);
     let parse = |dirs: &[&str]| {
         let mut argv = vec![program.to_string_lossy().into_owned(), "-c".into()];
         argv.extend(dirs.iter().map(|dir| format!("-I{dir}")));
