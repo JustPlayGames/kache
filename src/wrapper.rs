@@ -225,6 +225,22 @@ where
     Some(unit)
 }
 
+/// Whether `cache_executables = false` sends this compile through uncached:
+/// it links a binary or a test. A check or clippy of one emits metadata only,
+/// no executable, so it is cached whatever `cache_executables` says.
+///
+/// A Cargo build script built without debug info is cached all the same:
+/// Cargo runs it, nobody debugs it, and rustc names its `.pdb` by file name
+/// alone (`/PDBALTPATH:%_PDB%`), which the store keeps and restores with it.
+/// Kept out, every new target directory compiled each build script again (92
+/// in a Windows build of five app crates, 2026-10-18).
+fn skips_uncached_executable(args: &RustcArgs, cache_executables: bool) -> bool {
+    args.is_user_facing_executable()
+        && args.emits_link()
+        && !cache_executables
+        && !(crate::build_script::build_script_output(args).is_some() && !args.debuginfo_enabled())
+}
+
 /// Whether the pre-key incremental lanes may run. Never on a re-entry after a
 /// deferred compile: that compile already ran, and with a result it already
 /// reached Cargo, so no lane may start a second one.
@@ -4290,7 +4306,7 @@ fn run_parsed_rustc(
         &args.all_args,
         args.invocation_env(),
     );
-    let skip_user_facing = skips_cache_as_user_facing(args, config.cache_executables);
+    let skip_user_facing = skips_uncached_executable(args, config.cache_executables);
     // Read before the key takes the closure a stopped compile left.
     let reentered = reentered_after_deferred_compile(
         precompiled.is_some(),
@@ -7880,20 +7896,6 @@ fn private_link_extern(args: &RustcArgs) -> Option<&str> {
                 .is_some_and(|path| crate::incremental_policy::private_outputs::is_private(&path))
         })
         .map(|dependency| dependency.name.as_str())
-}
-
-/// Whether `args` compiles an executable kept out of the cache because
-/// `cache_executables` is off (by configuration: it is on by default where a
-/// restored executable debugs like a linked one). A Cargo build script built
-/// without debug info is cached all the same: Cargo runs it, nobody debugs
-/// it, and rustc names its `.pdb` by file name alone (`/PDBALTPATH:%_PDB%`),
-/// which the store keeps and restores with it. Kept out, every new target
-/// directory compiled each build script again (92 in a Windows build of five
-/// app crates, 2026-10-18).
-fn skips_cache_as_user_facing(args: &RustcArgs, cache_executables: bool) -> bool {
-    args.is_user_facing_executable()
-        && !cache_executables
-        && !(crate::build_script::build_script_output(args).is_some() && !args.debuginfo_enabled())
 }
 
 /// Compile-before-key needs a miss the local store can prove, or a compile it

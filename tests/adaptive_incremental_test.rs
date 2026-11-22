@@ -759,11 +759,12 @@ fn local_failed_cold_seed_keeps_the_next_fix_on_the_seed_lane() {
     assert_eq!(active["dep_info_runs"], 0, "event: {active:#}");
 }
 
-/// `cargo check` of a binary emits metadata only: no executable, so it is
-/// cached even where executables are not (`cache_executables` off, the
-/// Windows default). A second target directory restores it.
+/// `cargo check` of a binary and of its tests emits metadata only, no
+/// executable, so both are cached even where executables are not
+/// (`cache_executables` off, the Windows default): a second target directory
+/// restores them.
 #[test]
-fn a_check_of_an_executable_is_cached_when_executables_are_not() {
+fn checks_of_executables_are_cached_when_executables_are_not() {
     let project = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
@@ -775,7 +776,7 @@ fn a_check_of_an_executable_is_cached_when_executables_are_not() {
     .unwrap();
     fs::write(
         project.path().join("src/main.rs"),
-        "fn main() { print!(\"checked executable\"); }\n",
+        "fn main() { print!(\"checked\"); }\n\n#[test]\nfn checked() {}\n",
     )
     .unwrap();
     let check = |target: &str| {
@@ -784,7 +785,7 @@ fn a_check_of_an_executable_is_cached_when_executables_are_not() {
             cache.path(),
             Some(&project.path().join("missing-kache.toml")),
         )
-        .args(["check", "--offline", "--quiet", "--bin", "adaptive-fixture"])
+        .args(["check", "--offline", "--quiet", "--all-targets"])
         .current_dir(project.path())
         .env("RUSTC_WRAPPER", kache_binary())
         .env("CARGO_TARGET_DIR", project.path().join(target))
@@ -806,11 +807,16 @@ fn a_check_of_an_executable_is_cached_when_executables_are_not() {
     check("first");
     check("second");
     let events = fixture_events(cache.path());
-    let results: Vec<&str> = events
+    let mut results: Vec<&str> = events
         .iter()
         .map(|event| event["result"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(results, ["miss", "local_hit"], "events: {events:#?}");
+    results.sort_unstable();
+    assert_eq!(
+        results,
+        ["local_hit", "local_hit", "miss", "miss"],
+        "events: {events:#?}"
+    );
 }
 
 #[test]

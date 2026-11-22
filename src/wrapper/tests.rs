@@ -13937,16 +13937,16 @@ fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
         args.extend(extra.iter().map(|arg| arg.to_string()));
         RustcArgs::parse(&args).unwrap()
     };
-    assert!(!skips_cache_as_user_facing(&args(&[]), false));
-    assert!(!skips_cache_as_user_facing(
+    assert!(!skips_uncached_executable(&args(&[]), false));
+    assert!(!skips_uncached_executable(
         &args(&["-C", "debuginfo=0"]),
         false
     ));
-    assert!(skips_cache_as_user_facing(
+    assert!(skips_uncached_executable(
         &args(&["-C", "debuginfo=2"]),
         false
     ));
-    assert!(!skips_cache_as_user_facing(
+    assert!(!skips_uncached_executable(
         &args(&["-C", "debuginfo=2"]),
         true
     ));
@@ -13965,8 +13965,8 @@ fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
         .map(String::from),
     )
     .unwrap();
-    assert!(skips_cache_as_user_facing(&bin, false));
-    assert!(!skips_cache_as_user_facing(&bin, true));
+    assert!(skips_uncached_executable(&bin, false));
+    assert!(!skips_uncached_executable(&bin, true));
     let named_like_a_script = RustcArgs::parse(
         &[
             "rustc",
@@ -13982,7 +13982,7 @@ fn a_build_script_without_debug_info_is_cached_where_executables_are_not() {
         .map(String::from),
     )
     .unwrap();
-    assert!(skips_cache_as_user_facing(&named_like_a_script, false));
+    assert!(skips_uncached_executable(&named_like_a_script, false));
 }
 
 
@@ -15363,5 +15363,28 @@ fn preparation_records_whether_a_fresh_unit_looked_for_a_donor() {
             attempt, expected,
             "automatic={automatic} explicit={explicit} unstable={unstable}"
         );
+    }
+}
+
+#[test]
+fn only_a_linking_executable_skips_the_cache_when_executables_are_off() {
+    let rustc = |extra: &[&str]| {
+        let mut argv = vec!["rustc", "--crate-name", "app", "src/main.rs"];
+        argv.extend_from_slice(extra);
+        RustcArgs::parse(&argv.iter().map(|a| (*a).to_string()).collect::<Vec<_>>()).unwrap()
+    };
+    let check_bin = rustc(&["--crate-type", "bin", "--emit=dep-info,metadata"]);
+    let check_test = rustc(&["--test", "--emit=dep-info,metadata"]);
+    let build_bin = rustc(&["--crate-type", "bin", "--emit=dep-info,link"]);
+    let build_test = rustc(&["--test", "--emit=link=target/app"]);
+    let default_emit = rustc(&["--crate-type", "bin"]);
+    let check_lib = rustc(&["--crate-type", "lib", "--emit=dep-info,metadata"]);
+
+    for args in [&build_bin, &build_test, &default_emit] {
+        assert!(skips_uncached_executable(args, false), "{:?}", args.emit);
+        assert!(!skips_uncached_executable(args, true), "{:?}", args.emit);
+    }
+    for args in [&check_bin, &check_test, &check_lib] {
+        assert!(!skips_uncached_executable(args, false), "{:?}", args.emit);
     }
 }
