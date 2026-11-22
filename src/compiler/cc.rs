@@ -5777,21 +5777,19 @@ fn cc_shadowing_names(
         .iter()
         .map(|path| absolutize_path(cwd, path))
         .collect::<Vec<_>>();
-    let scans = CC_HEADER_SCANS.scans(
-        file_hasher,
-        &read_inputs,
-        6,
-        &|path| {
-            let bytes = fs::read(path)
-                .with_context(|| format!("reading header availability input {}", path.display()))?;
-            let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
-            Ok((
-                blake3::hash(&bytes).to_hex().to_string(),
-                serde_json::to_string(&probes)?,
-            ))
-        },
-        &|json| Ok(serde_json::from_str::<Option<CcHeaderProbeScan>>(json)?),
-    )?;
+    let scans = file_hasher.cc_header_scans(&read_inputs, 6, &|path| {
+        let bytes = fs::read(path)
+            .with_context(|| format!("reading header availability input {}", path.display()))?;
+        let probes = cc_header_probe_scan(&cc_splice_lines(&bytes));
+        Ok((
+            blake3::hash(&bytes).to_hex().to_string(),
+            serde_json::to_string(&probes)?,
+        ))
+    })?;
+    let scans = scans
+        .iter()
+        .map(|scan| serde_json::from_str::<Option<CcHeaderProbeScan>>(scan))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let definitions = parsed
         .defines
         .iter()
@@ -5802,7 +5800,7 @@ fn cc_shadowing_names(
     let all_scans = || {
         scans
             .iter()
-            .filter_map(|scan| scan.as_ref().as_ref())
+            .flatten()
             .chain(std::iter::once(&argument_scan))
     };
     let aliases = cc_header_probe_aliases(all_scans());
@@ -5827,10 +5825,7 @@ fn cc_shadowing_names(
         if let Some(file_name) = absolute.file_name() {
             result.names.insert(PathBuf::from(file_name));
         }
-        let probes = scan
-            .as_ref()
-            .as_ref()
-            .and_then(|scan| cc_resolve_header_probes(scan, &aliases));
+        let probes = scan.and_then(|scan| cc_resolve_header_probes(&scan, &aliases));
         let Some(probes) = probes else {
             anyhow::bail!(
                 "cc: a header availability probe (__has_include) in {} cannot be resolved \
@@ -5854,17 +5849,6 @@ fn cc_shadowing_names(
     }
     Ok(result)
 }
-
-/// JSON bytes of header scans a process keeps parsed for its C/C++ compiles
-/// ([`crate::cache_key::SharedHeaderScans`]). The build machine's whole index
-/// held 18 MB of them; one build's C crates read a few.
-const CC_HEADER_SCAN_SHARE_BYTES: usize = 16 << 20;
-
-static CC_HEADER_SCANS: std::sync::LazyLock<
-    crate::cache_key::SharedHeaderScans<Option<CcHeaderProbeScan>>,
-> = std::sync::LazyLock::new(|| {
-    crate::cache_key::SharedHeaderScans::new(CC_HEADER_SCAN_SHARE_BYTES)
-});
 
 /// A header name an availability probe tests for.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
