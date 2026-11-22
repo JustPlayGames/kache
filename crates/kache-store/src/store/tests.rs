@@ -18136,7 +18136,20 @@ fn put_unless_busy(store: &Store, key: &str, files: &[(PathBuf, String)]) -> Put
         .unwrap()
 }
 
+/// The store's own busy timeout while [`put_while_the_index_is_busy`]
+/// stages: a put that waited for the lock with it instead of its short try
+/// takes this long, far longer than the try's flushes on a loaded disk.
+const OWN_WAIT_WHILE_BUSY: Duration = Duration::from_secs(30);
+
 /// Stage `files` while another connection holds the index's write lock.
+///
+/// The put flushes the blob it stages and the blob's folder (`test_config`
+/// writes durably), and on a loaded disk those two fsyncs alone can take
+/// seconds (5.0 s in two tests at once beside a cargo build, at load 300): a
+/// bound near the store's 5 s busy timeout cannot tell such a put from one
+/// that waited for the lock. The store's own timeout is made
+/// [`OWN_WAIT_WHILE_BUSY`] for the call, so only a put that waited for the
+/// lock comes near it.
 fn put_while_the_index_is_busy(
     store: &Store,
     config: &Config,
@@ -18145,17 +18158,18 @@ fn put_while_the_index_is_busy(
 ) -> Box<StagedPut> {
     let writer = Connection::open(config.index_db_path()).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    store.set_busy_timeout_for_test(OWN_WAIT_WHILE_BUSY);
     let started = std::time::Instant::now();
     let attempt = put_unless_busy(store, key, files);
     let waited = started.elapsed();
+    store.set_busy_timeout_for_test(INDEX_BUSY_WAIT);
     writer.execute_batch("ROLLBACK").unwrap();
     let PutAttempt::Busy(staged) = attempt else {
         panic!("a busy index registers nothing: {attempt:?}");
     };
-    // A put waits up to four busy timeouts of 5 s for the lock.
     assert!(
-        waited < Duration::from_secs(4),
-        "the put did not wait out the lock ({waited:?})"
+        waited < OWN_WAIT_WHILE_BUSY / 2,
+        "the put waited for the lock ({waited:?}) instead of trying once"
     );
     staged
 }
