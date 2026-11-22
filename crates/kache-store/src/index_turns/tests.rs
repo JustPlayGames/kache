@@ -31,25 +31,25 @@ fn tickets_taken(path: &Path, n: u64) {
 }
 
 /// A writer on a thread of its own: waits `wait` for the lock, writes its
-/// id, commits; `got` lists who got the lock, in order.
+/// id, commits; `got` lists who got the lock, in order. It returns when it
+/// got the lock (None: it gave up), which its commit's disk flushes, slow
+/// on a loaded disk, come after.
 fn writer(
     path: &Path,
     id: i64,
     wait: Duration,
     got: &Arc<Mutex<Vec<i64>>>,
-) -> std::thread::JoinHandle<bool> {
+) -> std::thread::JoinHandle<Option<Instant>> {
     let (path, got) = (path.to_path_buf(), Arc::clone(got));
     std::thread::spawn(move || {
         let db = crate::open_index_db(&path).unwrap();
         set_index_busy_wait(&db, wait).unwrap();
-        let Ok(tx) = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate)
-        else {
-            return false;
-        };
+        let tx = rusqlite::Transaction::new_unchecked(&db, TransactionBehavior::Immediate).ok()?;
+        let locked = Instant::now();
         got.lock().unwrap().push(id);
         tx.execute("INSERT INTO t (who) VALUES (?1)", [id]).unwrap();
         tx.commit().unwrap();
-        true
+        Some(locked)
     })
 }
 
@@ -73,7 +73,7 @@ fn waiters_get_the_lock_in_the_order_they_asked() {
     drop(held);
     for writer in writers {
         assert!(
-            writer.join().unwrap(),
+            writer.join().unwrap().is_some(),
             "every writer gets the lock in its wait"
         );
     }
@@ -96,7 +96,7 @@ fn a_waiter_that_gives_up_hands_its_turn_on_at_once() {
     let patient = writer(&path, 2, Duration::from_secs(20), &got);
     tickets_taken(&path, 2);
     assert!(
-        !quitter.join().unwrap(),
+        quitter.join().unwrap().is_none(),
         "the short wait gives up while the lock is held"
     );
     assert_eq!(
@@ -105,7 +105,7 @@ fn a_waiter_that_gives_up_hands_its_turn_on_at_once() {
         "the quitter's leaving serves the patient writer's ticket"
     );
     drop(held);
-    assert!(patient.join().unwrap());
+    assert!(patient.join().unwrap().is_some());
     assert_eq!(*got.lock().unwrap(), vec![2]);
 }
 
@@ -144,7 +144,7 @@ fn a_held_place_survives_short_tries() {
     std::thread::sleep(Duration::from_millis(60));
     drop(held);
     batch.join().unwrap();
-    assert!(other.join().unwrap());
+    assert!(other.join().unwrap().is_some());
     assert_eq!(*got.lock().unwrap(), vec![0, 1], "the batch asked first");
     let (next, serving) = Queue::of(&path).unwrap().counters();
     assert_eq!(next, 2, "the batch kept one ticket through its tries");
@@ -153,6 +153,9 @@ fn a_held_place_survives_short_tries() {
 
 /// A turn whose writer went silent (gone, or holding a ticket it never
 /// gives back) is passed over after a short while, not waited on forever.
+/// The while is up to when the writer behind it holds the lock: its commit
+/// flushes the disk twice, which took seconds on the build machine's busy
+/// disk (2026-11-22, load 199) and is no part of the turns.
 #[test]
 fn a_silent_head_is_passed_over() {
     let dir = tempfile::tempdir().unwrap();
@@ -169,11 +172,15 @@ fn a_silent_head_is_passed_over() {
     tickets_taken(&path, 2);
     let freed = Instant::now();
     drop(held);
+    let locked = patient
+        .join()
+        .unwrap()
+        .expect("the writer behind a silent head still gets the lock");
+    let waited = locked.duration_since(freed);
     assert!(
-        patient.join().unwrap(),
-        "the writer behind a silent head still gets the lock"
+        waited < Duration::from_secs(2),
+        "a silent head is passed over in a stale head's wait, not the patient's ({waited:?})"
     );
-    assert!(freed.elapsed() < Duration::from_secs(2));
     drop(place);
 }
 
