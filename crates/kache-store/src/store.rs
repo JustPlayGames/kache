@@ -1497,9 +1497,9 @@ fn record_eviction_failure(stats: &mut GcStats, error: &anyhow::Error) {
 /// holds the index's write lock, so the files are removed once the lock is
 /// free again. Under the lock a rename takes the name out of the store, as an
 /// unlink did, so no publisher can adopt a file being removed; the unlink
-/// that frees a blob's extents (a filesystem journal commit, with online
-/// discard on the build machine's ext4) runs outside it. A name that cannot
-/// be moved is removed under the lock as before.
+/// that frees a blob's extents (a filesystem journal commit, longer with
+/// online discard) runs outside it. A name that cannot be moved is removed
+/// under the lock as before.
 pub(crate) struct EvictedTrash {
     dir: PathBuf,
     made: bool,
@@ -1570,7 +1570,9 @@ impl EvictedTrash {
     }
 }
 
-fn remove_trash_item(path: &Path) {
+/// Remove one trash item. True when it is gone, including when something
+/// else removed it first.
+fn remove_trash_item(path: &Path) -> bool {
     let result = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
             #[cfg(windows)]
@@ -1596,13 +1598,15 @@ fn remove_trash_item(path: &Path) {
         }
         Err(e) => Err(e),
     };
-    if let Err(e) = result
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            "gc: could not remove {} from the trash, left for the next sweep: {e}",
-            path.display()
-        );
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "gc: could not remove {} from the trash, left for the next sweep: {e}",
+                path.display()
+            );
+            false
+        }
+        _ => true,
     }
 }
 

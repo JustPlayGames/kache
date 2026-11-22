@@ -11679,6 +11679,12 @@ fn persistent_directory_cleanup_failure_stays_in_the_trash() {
     std::fs::create_dir_all(&inner).unwrap();
     std::fs::write(inner.join("artifact"), b"x").unwrap();
     std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let hash = {
+        let meta: EntryMeta =
+            serde_json::from_str(&std::fs::read_to_string(entry_dir.join("meta.json")).unwrap())
+                .unwrap();
+        meta.files[0].hash.clone()
+    };
 
     let removed = store.remove_entry("stuck");
 
@@ -11697,7 +11703,15 @@ fn persistent_directory_cleanup_failure_stays_in_the_trash() {
     removed.unwrap();
     assert!(!store.contains("stuck"));
     assert!(!entry_dir.exists(), "nothing stays under the entry's name");
-    assert_eq!(left.len(), 1, "the stuck directory waits in the trash: {left:?}");
+    assert!(
+        !store.blob_path(&hash).exists(),
+        "the blob only that entry held is freed"
+    );
+    assert_eq!(
+        left.len(),
+        1,
+        "the stuck directory waits in the trash: {left:?}"
+    );
     EvictedTrash::new(&config.store_dir()).empty_leftovers();
     assert_eq!(std::fs::read_dir(&trash).unwrap().count(), 0);
 }
@@ -11889,6 +11903,102 @@ fn evict_frees_files_through_the_trash_and_empties_its_leftovers() {
     assert!(blobs.is_empty(), "the blob's file stayed: {blobs:?}");
     let left: Vec<_> = std::fs::read_dir(&trash).unwrap().flatten().collect();
     assert!(left.is_empty(), "the trash kept {left:?}");
+}
+
+/// With no trash to move them into, an evicted entry's directory and its
+/// last blob are removed under the lock, as before the trash.
+#[test]
+fn evict_removes_files_in_place_when_the_trash_cannot_be_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path());
+    config.max_size = 100 * 1024;
+    let store = Store::open(&config).unwrap();
+    let src = dir.path().join("gone.rlib");
+    std::fs::write(&src, vec![b'g'; 300 * 1024]).unwrap();
+    store
+        .put(
+            "gone",
+            "c",
+            &["lib".into()],
+            &[],
+            "",
+            "dev",
+            &[(src.clone(), "lib.rlib".into())],
+            "",
+            "",
+        )
+        .unwrap();
+    store.remove_clone_for_test(&src);
+    store
+        .db()
+        .execute(
+            "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
+            [],
+        )
+        .unwrap();
+    // A file where the trash folder goes: the folder cannot be made.
+    std::fs::write(config.store_dir().join(EVICTED_TRASH_DIR), b"").unwrap();
+
+    let stats = store.evict().unwrap();
+
+    assert_eq!(stats.entries_evicted, 1);
+    assert!(!store.entry_dir("gone").exists());
+    let blobs: Vec<_> = walkdir_files(&config.store_dir().join("blobs"));
+    assert!(blobs.is_empty(), "the blob's file stayed: {blobs:?}");
+}
+
+/// `take` reports a name that is already gone as taken without making the
+/// trash, moves an existing name into the trash, and leaves to the caller a
+/// name it cannot read.
+#[test]
+fn evicted_trash_takes_names_and_reports_what_it_cannot_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    let trash_dir = store_dir.join(EVICTED_TRASH_DIR);
+    let mut trash = EvictedTrash::new(&store_dir);
+
+    assert!(trash.take(&store_dir.join("missing")));
+    assert!(!trash_dir.exists(), "a missing name needs no trash");
+
+    let blob = store_dir.join("blob");
+    std::fs::write(&blob, b"x").unwrap();
+    #[cfg(unix)]
+    assert!(
+        !trash.take(&blob.join("child")),
+        "a path through a file cannot be read, so the caller removes it"
+    );
+    assert!(trash.take(&blob));
+    assert!(!blob.exists());
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 1);
+
+    trash.empty();
+    assert_eq!(std::fs::read_dir(&trash_dir).unwrap().count(), 0);
+}
+
+/// A trash item counts as removed when it is gone, also when something else
+/// removed it first, and not when the delete is refused.
+#[test]
+fn a_trash_item_is_removed_unless_the_delete_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(remove_trash_item(&dir.path().join("gone")));
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"x").unwrap();
+    assert!(remove_trash_item(&file));
+    assert!(!file.exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let stuck = dir.path().join("stuck");
+        let inner = stuck.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("artifact"), b"x").unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let removed = remove_trash_item(&stuck);
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!removed, "an unwritable folder inside refuses the delete");
+    }
 }
 
 fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
