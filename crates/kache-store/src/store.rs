@@ -51,6 +51,14 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once, just before a lookup reads an entry's durable flag: the
+    /// window in which another build can evict the entry the lookup found.
+    static DURABLE_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(all(test, windows))]
 type DurabilityOpenHook = Box<dyn FnOnce(bool)>;
 
@@ -7286,6 +7294,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// an index error reads as pending, so the lookup verifies the bytes: read
     /// as durable, only the size check stood between a bad blob and a hit.
     fn entry_is_durable(&self, cache_key: &str) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = DURABLE_READ_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         self.db()
             .query_row(
                 "SELECT durable FROM entries WHERE cache_key = ?1",
