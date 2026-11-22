@@ -8404,7 +8404,10 @@ async fn server_main(
     // for them (`index_residency`): a hit reads them before anything else,
     // and an evicted page waits for a busy disk.
     #[cfg(target_os = "linux")]
-    crate::index_residency::spawn(&daemon.config.index_db_path());
+    {
+        let clock = daemon.request_clock.clone();
+        crate::index_residency::spawn(&daemon.config.index_db_path(), move || clock.idle_for());
+    }
 
     let durability_daemon = daemon.clone();
     tokio::spawn(async move {

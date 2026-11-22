@@ -45,7 +45,13 @@
 //!
 //! When what one pass read back is missing again at the next (a host taking
 //! back an idle guest's memory), the keeper doubles its wait, up to
-//! [`MAX_INTERVAL`], until a pass gains ground again.
+//! [`MAX_INTERVAL`], until a pass gains ground again. And while no build has
+//! asked the daemon anything for [`QUIET_FOR`] it reads nothing back at all:
+//! the index is read only for hits, and on a quiet machine a missing page
+//! costs a quiet disk's read, not a busy one's. On the build machine a host
+//! that took an idle guest's page cache back (all but 1 GiB of it) took each
+//! pass's read-back again before the next, 7.5 GiB an hour at the longest
+//! wait, read for no hit. The first pass after a build asks again reads.
 
 use std::fs::File;
 use std::io;
@@ -74,6 +80,10 @@ const ROOM_FACTOR: u64 = 8;
 /// ...and at least this much.
 const ROOM_FLOOR_BYTES: u64 = 16 << 30;
 
+/// How long no build may have asked the daemon anything before a pass
+/// reads nothing back.
+pub(crate) const QUIET_FOR: Duration = Duration::from_secs(10 * 60);
+
 /// Missing pages closer than this are asked for in one request.
 const MERGE_GAP_BYTES: u64 = 256 << 10;
 
@@ -98,6 +108,8 @@ pub(crate) enum Skipped {
     Off,
     /// Available memory is under the room the index needs.
     NoRoom { available: u64, needed: u64 },
+    /// No build has asked the daemon anything for [`QUIET_FOR`].
+    Quiet,
     /// No index yet, or memory could not be read.
     Unknown,
 }
@@ -175,9 +187,10 @@ impl Keeper {
         }
     }
 
-    /// One pass, then how long to wait before the next.
-    pub(crate) fn tick(&mut self, available: Option<u64>) -> Duration {
-        let pass = self.keep_resident(available).ok();
+    /// One pass, then how long to wait before the next. `quiet` is how long
+    /// no build has asked the daemon anything.
+    pub(crate) fn tick(&mut self, available: Option<u64>, quiet: Duration) -> Duration {
+        let pass = self.keep_resident(available, quiet).ok();
         if let Some(pass) = &pass
             && worth_a_line(pass)
         {
@@ -233,10 +246,14 @@ impl Keeper {
     }
 
     /// One pass over the index's files, if `available` memory leaves room
-    /// for them.
-    fn keep_resident(&mut self, available: Option<u64>) -> Result<Pass, Skipped> {
+    /// for them and a build asked the daemon something less than
+    /// [`QUIET_FOR`] ago (`quiet`).
+    fn keep_resident(&mut self, available: Option<u64>, quiet: Duration) -> Result<Pass, Skipped> {
         if !enabled(std::env::var("KACHE_KEEP_INDEX_RESIDENT").ok().as_deref()) {
             return Err(Skipped::Off);
+        }
+        if quiet >= QUIET_FOR {
+            return Err(Skipped::Quiet);
         }
         let files = self.refresh();
         let total: u64 = files.iter().map(|(_, len)| len).sum();
@@ -305,10 +322,11 @@ pub(crate) fn worth_a_line(pass: &Pass) -> bool {
 const KEEPER_NICE: libc::c_int = 10;
 
 /// Start the keeper for the index at `db_path`: a thread of its own, at a
-/// lower priority, for the daemon's life. Only the waiting is here; each
-/// pass is [`Keeper::tick`], which the tests drive.
+/// lower priority, for the daemon's life. `quiet` says how long no build has
+/// asked the daemon anything. Only the waiting is here; each pass is
+/// [`Keeper::tick`], which the tests drive.
 #[mutants::skip]
-pub(crate) fn spawn(db_path: &Path) {
+pub(crate) fn spawn(db_path: &Path, quiet: impl Fn() -> Duration + Send + 'static) {
     // Never dropped, even if the thread unwinds: dropping it would close the
     // index's descriptors (module docs).
     let mut keeper = std::mem::ManuallyDrop::new(Keeper::new(db_path));
@@ -329,7 +347,7 @@ pub(crate) fn spawn(db_path: &Path) {
                 let available = std::fs::read_to_string("/proc/meminfo")
                     .ok()
                     .and_then(|text| mem_available(&text));
-                wait = keeper.tick(available);
+                wait = keeper.tick(available, quiet());
             }
         });
     if let Err(error) = started {
@@ -774,17 +792,23 @@ mod tests {
         let (_dir, path) = index_of(1 << 16);
         let mut keeper = Keeper::new(&path);
         assert_eq!(
-            keeper.keep_resident(Some((16 << 30) - 1)),
+            keeper.keep_resident(Some((16 << 30) - 1), Duration::ZERO),
             Err(Skipped::NoRoom {
                 available: (16 << 30) - 1,
                 needed: 16 << 30
             })
         );
-        assert!(keeper.keep_resident(Some(16 << 30)).is_ok(), "exactly room");
-        assert_eq!(keeper.keep_resident(None), Err(Skipped::Unknown));
+        assert!(
+            keeper.keep_resident(Some(16 << 30), Duration::ZERO).is_ok(),
+            "exactly room"
+        );
+        assert_eq!(
+            keeper.keep_resident(None, Duration::ZERO),
+            Err(Skipped::Unknown)
+        );
         std::fs::write(&path, b"").expect("an empty index");
         assert_eq!(
-            Keeper::new(&path).keep_resident(Some(64 << 30)),
+            Keeper::new(&path).keep_resident(Some(64 << 30), Duration::ZERO),
             Err(Skipped::Unknown)
         );
     }
@@ -793,9 +817,9 @@ mod tests {
     fn the_keeper_holds_its_descriptors_and_retires_replaced_ones() {
         let (dir, path) = index_of(1 << 16);
         let mut keeper = Keeper::new(&path);
-        assert_eq!(keeper.tick(Some(64 << 30)), CHECK_INTERVAL);
+        assert_eq!(keeper.tick(Some(64 << 30), Duration::ZERO), CHECK_INTERVAL);
         let first = keeper.held[0].as_ref().expect("the index is held").ino;
-        keeper.tick(Some(64 << 30));
+        keeper.tick(Some(64 << 30), Duration::ZERO);
         assert_eq!(keeper.held[0].as_ref().expect("still held").ino, first);
         assert!(
             keeper.retired.is_empty(),
@@ -804,18 +828,18 @@ mod tests {
         let next = dir.path().join("next.db");
         std::fs::write(&next, vec![9u8; 1 << 16]).expect("a new index");
         std::fs::rename(&next, &path).expect("it replaces the old one");
-        keeper.tick(Some(64 << 30));
+        keeper.tick(Some(64 << 30), Duration::ZERO);
         let now = keeper.held[0].as_ref().expect("the new index is held").ino;
         assert_ne!(now, first);
         assert_eq!(now, std::fs::metadata(&path).expect("the index").ino());
         assert_eq!(keeper.retired.len(), 1, "the old descriptor is kept open");
         let wal = index_files(&path)[1].clone();
         std::fs::write(&wal, vec![1u8; 1 << 14]).expect("a log");
-        keeper.tick(Some(64 << 30));
+        keeper.tick(Some(64 << 30), Duration::ZERO);
         let log = keeper.held[1].as_ref().expect("the log is held").ino;
         std::fs::write(&next, vec![2u8; 1 << 14]).expect("a new log");
         std::fs::rename(&next, &wal).expect("it replaces the old one");
-        keeper.tick(Some(64 << 30));
+        keeper.tick(Some(64 << 30), Duration::ZERO);
         assert_ne!(
             keeper.held[1].as_ref().expect("the new log is held").ino,
             log
@@ -827,12 +851,65 @@ mod tests {
         );
     }
 
+    /// The POSIX locks this process holds on `path` through its open
+    /// descriptors of it, from `/proc/self/fdinfo`: each descriptor's locks
+    /// come in one short read. `/proc/locks` lists every lock on the machine
+    /// over several reads, and a line can be skipped or repeated between
+    /// them while other processes lock and unlock (a parallel test run's),
+    /// so it can say 0 or 2 for a lock that stays held.
+    fn own_locks_on(path: &Path) -> usize {
+        let path = path.canonicalize().expect("the file");
+        let fds = Path::new("/proc/self/fd");
+        let mut locks = 0;
+        for entry in std::fs::read_dir(fds).expect("/proc/self/fd") {
+            let fd = entry.expect("a descriptor").file_name();
+            if std::fs::read_link(fds.join(&fd)).is_ok_and(|target| target == path) {
+                let info = std::fs::read_to_string(Path::new("/proc/self/fdinfo").join(&fd))
+                    .unwrap_or_default();
+                locks += info
+                    .lines()
+                    .filter(|line| line.starts_with("lock:"))
+                    .count();
+            }
+        }
+        locks
+    }
+
+    #[test]
+    fn a_pass_leaves_sqlites_lock_on_the_index() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("index.db");
+        let db = rusqlite::Connection::open(&path).expect("the index opens");
+        db.pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL mode");
+        db.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .expect("a row");
+        let read = || {
+            db.query_row("SELECT x FROM t", [], |row| row.get::<_, i64>(0))
+                .expect("the row")
+        };
+        read();
+        // In WAL mode a connection holds a shared lock on the index for as
+        // long as it is open; another process's last connection that can
+        // take the exclusive lock deletes the log under it on close.
+        assert_eq!(own_locks_on(&path), 1, "SQLite's shared lock");
+        let mut keeper = Keeper::new(&path);
+        keeper.tick(Some(64 << 30), Duration::ZERO);
+        keeper.tick(Some(64 << 30), Duration::ZERO);
+        read();
+        assert_eq!(
+            own_locks_on(&path),
+            1,
+            "a keeper pass closed a descriptor of the index"
+        );
+    }
+
     #[test]
     fn a_pass_looks_at_the_index_and_its_log() {
         let (_dir, path) = index_of(1 << 16);
         std::fs::write(index_files(&path)[1].clone(), vec![1u8; 1 << 14]).expect("its log");
         let pass = Keeper::new(&path)
-            .keep_resident(Some(64 << 30))
+            .keep_resident(Some(64 << 30), Duration::ZERO)
             .expect("room enough");
         assert_eq!(pass.file_bytes, (1 << 16) + (1 << 14));
         assert!(pass.read_bytes <= pass.missing_bytes);
@@ -876,8 +953,19 @@ mod tests {
         assert_eq!(rc, 0, "clean pages can be dropped");
         let before = missing_runs(&file, 1 << 20).expect("mincore answers");
         assert!(!before.is_empty(), "the dropped pages are missing");
-        let pass = Keeper::new(&path)
-            .keep_resident(Some(64 << 30))
+        let mut keeper = Keeper::new(&path);
+        assert_eq!(
+            keeper.keep_resident(Some(64 << 30), QUIET_FOR),
+            Err(Skipped::Quiet),
+            "no build asked for a while"
+        );
+        assert_eq!(
+            missing_runs(&file, 1 << 20).expect("mincore answers"),
+            before,
+            "a quiet pass reads nothing back"
+        );
+        let pass = keeper
+            .keep_resident(Some(64 << 30), QUIET_FOR - Duration::from_secs(1))
             .expect("room enough");
         assert_eq!(
             pass.read_bytes, pass.missing_bytes,
