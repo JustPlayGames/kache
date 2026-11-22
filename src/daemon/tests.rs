@@ -1177,6 +1177,7 @@ fn compile_started_wire_tags_and_stats_default() {
         entries: None,
         events: EventStatsResponse {
             local_hits: 0,
+            readonly_hits: 0,
             prefetch_hits: 0,
             remote_hits: 0,
             dups: 0,
@@ -4951,6 +4952,7 @@ fn test_stats_response_serde() {
         entries: None,
         events: EventStatsResponse {
             local_hits: 10,
+            readonly_hits: 0,
             prefetch_hits: 0,
             remote_hits: 2,
             dups: 1,
@@ -5040,6 +5042,7 @@ fn test_stats_response_with_entries() {
         ]),
         events: EventStatsResponse {
             local_hits: 0,
+            readonly_hits: 0,
             prefetch_hits: 0,
             remote_hits: 0,
             dups: 0,

@@ -297,6 +297,7 @@ pub(super) fn run(
         StorePutResult::default(),
         0,
         0,
+        false,
     );
     Ok(Some(0))
 }
@@ -320,6 +321,7 @@ fn restore(run: &Run, sandbox: &Sandbox, record: &Record, key: &str, key_ms: u64
         StorePutResult::default(),
         0,
         0,
+        false,
     );
     Ok(())
 }
