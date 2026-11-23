@@ -2200,7 +2200,7 @@ pub type KeyLock = StoreLock;
 /// [`ArtifactStore::try_lock`] in the store directory `store_dir`, without
 /// opening its index: the key's lock is a file of its own.
 pub fn try_lock_key_in(store_dir: &Path, cache_key: &str) -> Result<Option<KeyLock>> {
-    StoreLock::try_acquire(&store_dir.join(cache_key).with_extension("lock"))
+    StoreLock::try_acquire(&entry_path_in_store_dir(store_dir, cache_key).with_extension("lock"))
 }
 
 /// The storing mark beside a lock file: `<key>.storing` beside
@@ -2230,7 +2230,7 @@ fn note_path(lock_path: &Path) -> PathBuf {
 /// its holder otherwise (a reused process id) costs at most one bounded
 /// wait. A key with no mark answers `false` without creating a lock file.
 pub fn key_store_in_flight(store_dir: &Path, cache_key: &str) -> bool {
-    let path = store_dir.join(cache_key).with_extension("lock");
+    let path = entry_path_in_store_dir(store_dir, cache_key).with_extension("lock");
     let Ok(content) = fs::read_to_string(storing_mark_path(&path)) else {
         return false;
     };
@@ -2374,7 +2374,9 @@ pub fn unit_in_flight_in(store_dir: &Path, crate_name: &str, unit: &str) -> bool
 /// the index says ([`ArtifactStore::contains`]); with one, only the index
 /// can tell.
 pub fn entry_meta_exists_in(store_dir: &Path, cache_key: &str) -> bool {
-    store_dir.join(cache_key).join("meta.json").exists()
+    entry_path_in_store_dir(store_dir, cache_key)
+        .join("meta.json")
+        .exists()
 }
 
 /// Lock guard for store-wide GC. Dropping it releases the OS lock.
@@ -10278,11 +10280,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // only if it is still the file at the path. A claimant that opened
         // it before the unlink finds the path changed and reopens.
         if republished == 0 {
-            let lock_path = self
-                .config
-                .store_dir()
-                .join(cache_key)
-                .with_extension("lock");
+            let lock_path = self.entry_dir(cache_key).with_extension("lock");
             remove_stale_lock_file(
                 &lock_path,
                 KEY_LOCK_SWEEP_GRACE,
