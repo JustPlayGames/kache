@@ -38,9 +38,13 @@ fn probe() -> Result<()> {
 }
 
 /// `kache daemon stop` for the probe's configuration, within a deadline;
-/// nothing to do when no daemon holds the probe's run lock.
+/// nothing to do when no daemon holds the probe's run lock. The probe's
+/// store is its own runtime dir, so its daemon binds where
+/// `default_daemon_socket` says (`ipc/d.sock` since #2041).
 fn stop_daemon(root: &Path, config: &Path) {
-    let run_lock = root.join("cache").join("daemon.run.lock");
+    let cache = root.join("cache");
+    let run_lock =
+        crate::config::default_daemon_socket(&cache, &cache, None).with_extension("run.lock");
     let held = fs::OpenOptions::new()
         .write(true)
         .open(&run_lock)
