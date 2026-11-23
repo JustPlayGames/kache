@@ -265,7 +265,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = repository(dir.path());
         let words = repo.join("assets/words.txt");
-        assert!(at_merge_base(&repo, "top", &[words.clone()]));
+        assert!(at_merge_base(&repo, "top", std::slice::from_ref(&words)));
         std::fs::write(&words, "two\n").unwrap();
         assert!(!at_merge_base(&repo, "top", &[words]));
         assert!(at_merge_base(&repo, "top", &[]));
