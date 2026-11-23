@@ -3527,6 +3527,7 @@ fn test_file_config_roundtrip() {
             adaptive_incremental: Some(false),
             seed_incremental: None,
             incremental_seed_from: None,
+            shared_ref: None,
             unstable: Default::default(),
             exclude: Some(vec!["vendor/problem/**".to_string()]),
             event_log_max_size: Some("10MiB".to_string()),
@@ -3780,6 +3781,55 @@ fn test_incremental_seed_from_is_explicit_and_respects_ignore_env() {
         Config::load().unwrap().incremental_seed_from,
         Some(dir.path().join("file/target/debug"))
     );
+}
+
+#[test]
+fn the_shared_ref_defaults_to_the_upstream_branch_and_an_off_word_turns_it_off() {
+    let _guard = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _cfg_guard = set_kache_config_for_test(&path);
+    std::fs::write(&path, "[cache]\n").unwrap();
+    {
+        let _unset = NamedEnvGuard::remove("KACHE_SHARED_REF");
+        assert_eq!(
+            Config::load().unwrap().shared_ref.as_deref(),
+            Some(DEFAULT_SHARED_REF)
+        );
+        std::fs::write(&path, "[cache]\nshared_ref = \"origin/trunk\"\n").unwrap();
+        assert_eq!(
+            Config::load().unwrap().shared_ref.as_deref(),
+            Some("origin/trunk")
+        );
+        std::fs::write(&path, "[cache]\nshared_ref = \"\"\n").unwrap();
+        assert_eq!(Config::load().unwrap().shared_ref, None);
+    }
+    std::fs::write(&path, "[cache]\nshared_ref = \"origin/trunk\"\n").unwrap();
+    // An empty value, an off word and what Git would read as an option all
+    // turn it off; anything else names the ref.
+    for off in ["", " ", "0", "off", "OFF", "false", "--output=x"] {
+        let _env = NamedEnvGuard::set("KACHE_SHARED_REF", off);
+        assert_eq!(Config::load().unwrap().shared_ref, None, "{off:?}");
+    }
+    let _env = NamedEnvGuard::set("KACHE_SHARED_REF", "upstream/main");
+    assert_eq!(
+        Config::load().unwrap().shared_ref.as_deref(),
+        Some("upstream/main")
+    );
+    assert_eq!(
+        env_override_for(&["cache".into(), "shared_ref".into()], false),
+        Some("KACHE_SHARED_REF")
+    );
+    std::fs::write(
+        &path,
+        "[cache]\nignore_env = true\nshared_ref = \"origin/trunk\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        Config::load().unwrap().shared_ref.as_deref(),
+        Some("origin/trunk")
+    );
+    assert!(IGNORE_ENV_GATED_VARS.contains(&"KACHE_SHARED_REF"));
 }
 
 #[test]
@@ -4209,6 +4259,7 @@ fn test_config_store_dir() {
         adaptive_incremental: true,
         seed_incremental: true,
         incremental_seed_from: None,
+        shared_ref: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
@@ -4316,6 +4367,7 @@ fn test_config_index_db_path() {
         adaptive_incremental: true,
         seed_incremental: true,
         incremental_seed_from: None,
+        shared_ref: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
@@ -4419,6 +4471,7 @@ fn test_config_event_log_path() {
         adaptive_incremental: true,
         seed_incremental: true,
         incremental_seed_from: None,
+        shared_ref: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
@@ -4541,6 +4594,7 @@ fn test_config_socket_path() {
         adaptive_incremental: true,
         seed_incremental: true,
         incremental_seed_from: None,
+        shared_ref: None,
         unstable: Default::default(),
         event_log_max_size: 1024,
         event_log_keep_lines: 100,
@@ -5296,6 +5350,7 @@ fn test_save_and_load_file_config() {
             adaptive_incremental: None,
             seed_incremental: None,
             incremental_seed_from: None,
+            shared_ref: None,
             unstable: Default::default(),
             exclude: None,
             event_log_max_size: None,

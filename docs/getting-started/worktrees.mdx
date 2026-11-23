@@ -51,6 +51,23 @@ documented in
 `kache explain --all` and `kache report` name the Cargo profile directory
 each seeded compile imported from.
 
+### Units of the shared tree
+
+An edit is private to its checkout, but a pull or a rebase is not: every other
+checkout builds the same sources, and one of them, or the store, may hold them
+already. `cache.shared_ref` (default `origin/HEAD`, the upstream's default
+branch) names the tree the checkouts share. A workspace unit whose package
+holds what the merge base of `HEAD` and that ref holds, and none of whose
+dependencies was compiled incrementally, keeps to the cache in a target with
+incremental history too: Kache looks it up and restores it, or compiles it
+whole and stores it while other checkouts that need it wait for that compile.
+The unit's private incremental state is left as it is for the next edit.
+
+A unit the branch changed, and everything built on it, compiles incrementally
+as before. Git only picks the lane, never a cache key: when Git is missing,
+slow or cannot resolve the ref, every unit keeps today's behavior. Set
+`KACHE_SHARED_REF=off` or `[cache] shared_ref = ""` to turn it off.
+
 These settings have separate purposes. Disabling `seed_incremental` stops donor
 imports but keeps target-local adaptive compilation. Disabling
 `adaptive_incremental` changes the edited-unit policy. Neither setting enables

@@ -80,6 +80,7 @@ mod scheduler;
 mod service;
 mod session_tree;
 mod shards;
+mod shared_tree;
 mod shim_diagnostics;
 mod since;
 mod windows_manifest;

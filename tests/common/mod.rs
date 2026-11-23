@@ -357,6 +357,7 @@ pub fn hermetic_command(
         .env_remove("KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE")
         .env_remove("KACHE_OUT_DIR_ALIAS_ROOT")
         .env_remove("KACHE_INCREMENTAL_SEED_FROM")
+        .env_remove("KACHE_SHARED_REF")
         .env_remove("KACHE_S3_BUCKET")
         .env_remove("KACHE_S3_ENDPOINT")
         .env_remove("KACHE_S3_REGION")

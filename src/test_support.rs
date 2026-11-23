@@ -170,6 +170,7 @@ pub(crate) fn test_config(cache_dir: PathBuf) -> crate::config::Config {
         adaptive_incremental: true,
         seed_incremental: true,
         incremental_seed_from: None,
+        shared_ref: None,
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,

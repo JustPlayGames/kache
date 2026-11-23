@@ -245,6 +245,14 @@ pub struct Config {
     pub seed_incremental: bool,
     /// Optional explicit donor profile for worktree incremental seeds.
     pub incremental_seed_from: Option<PathBuf>,
+    /// The Git ref whose tree the checkouts on this machine share, such as
+    /// `origin/main`. A workspace unit whose package holds what the merge
+    /// base of `HEAD` and this ref holds keeps to the cache in a folder with
+    /// incremental history too: it is restored, or compiled once for the
+    /// store, never on a private incremental lane. `None` turns that off.
+    /// `KACHE_SHARED_REF` / `[cache] shared_ref`; [`DEFAULT_SHARED_REF`]
+    /// when neither is set, and empty, `0`, `off` or `false` for none.
+    pub shared_ref: Option<String>,
     /// Enable all current and future experiments before they become defaults.
     /// `KACHE_UNSTABLE=1` / `[cache] unstable = true`. Off by default.
     pub unstable: bool,
@@ -1165,6 +1173,7 @@ pub struct CacheFileConfig {
     pub adaptive_incremental: Option<bool>,
     pub seed_incremental: Option<bool>,
     pub incremental_seed_from: Option<String>,
+    pub shared_ref: Option<String>,
     pub unstable: Option<bool>,
     pub exclude: Option<Vec<String>>,
     /// Declarative bypass rules (kunobi-ninja/kache#222). Siblings of
@@ -1545,6 +1554,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_ADAPTIVE_INCREMENTAL",
     "KACHE_SEED_INCREMENTAL",
     "KACHE_INCREMENTAL_SEED_FROM",
+    "KACHE_SHARED_REF",
     "KACHE_UNSTABLE",
     "KACHE_COMPRESSION_LEVEL",
     "KACHE_S3_CONCURRENCY",
@@ -1648,6 +1658,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_ADAPTIVE_INCREMENTAL", "cache.adaptive_incremental"),
     ("KACHE_SEED_INCREMENTAL", "cache.seed_incremental"),
     ("KACHE_INCREMENTAL_SEED_FROM", "cache.incremental_seed_from"),
+    ("KACHE_SHARED_REF", "cache.shared_ref"),
     ("KACHE_UNSTABLE", "cache.unstable"),
     ("KACHE_COMPRESSION_LEVEL", "cache.compression_level"),
     ("KACHE_S3_CONCURRENCY", "cache.s3_concurrency"),
@@ -2096,6 +2107,12 @@ impl Config {
                     .and_then(|c| c.seed_incremental)
                     .unwrap_or(true)
             });
+
+        let shared_ref = shared_ref_setting(
+            env_or_ignored_for(invocation, "KACHE_SHARED_REF", ignore_env)
+                .ok()
+                .or_else(|| file_config.as_ref().ok()?.cache.as_ref()?.shared_ref.clone()),
+        );
 
         let event_log_max_size = file_config
             .as_ref()
@@ -2864,6 +2881,7 @@ impl Config {
             .filter(|value| !value.is_empty())
             .map(|path| resolve_invocation_path(invocation, Path::new(&path)))
             .transpose()?,
+            shared_ref,
             event_log_max_size,
             event_log_keep_lines,
             event_archive_days,
@@ -4586,6 +4604,24 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
     patterns
         .iter()
         .any(|pattern| exclude_pattern_matches(pattern, &candidates))
+}
+
+/// The upstream's default branch, as `git clone` records it: what
+/// `[cache] shared_ref` names when nothing sets it.
+pub const DEFAULT_SHARED_REF: &str = "origin/HEAD";
+
+/// `[cache] shared_ref` as configured: the default when unset, none for an
+/// empty value or an off word, and none for a value Git would read as an
+/// option.
+fn shared_ref_setting(configured: Option<String>) -> Option<String> {
+    let value = configured.unwrap_or_else(|| DEFAULT_SHARED_REF.to_string());
+    let value = value.trim();
+    let off = value.is_empty()
+        || value.starts_with('-')
+        || ["0", "off", "false"]
+            .iter()
+            .any(|word| value.eq_ignore_ascii_case(word));
+    (!off).then(|| value.to_string())
 }
 
 /// Whether user-facing executables (`bin` crates, `--test` harnesses) are
