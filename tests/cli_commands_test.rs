@@ -86,6 +86,10 @@ impl Drop for Env {
 }
 
 impl Env {
+    fn socket(&self) -> std::path::PathBuf {
+        kache_config::config::default_daemon_socket(&self.cache, &self.cache, None)
+    }
+
     fn cmd(&self) -> Command {
         kache(&self.home, &self.cache)
     }
@@ -495,7 +499,7 @@ fn stop_stops_a_daemon_that_answers_late() {
     let e = env();
     let start = e.cmd().args(["daemon", "start"]).output().unwrap();
     assert!(start.status.success(), "{start:?}");
-    let state = std::fs::read_to_string(e.cache.join("daemon.state.json")).unwrap();
+    let state = std::fs::read_to_string(e.socket().with_extension("state.json")).unwrap();
     let pid = serde_json::from_str::<serde_json::Value>(&state).unwrap()["pid"]
         .as_u64()
         .unwrap()
@@ -770,7 +774,7 @@ fn stats_names_a_busy_daemon_instead_of_starting_one() {
     let e = env();
     e.cmd().arg("stats").assert().success();
     let state: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(e.cache.join("daemon.state.json")).unwrap())
+        serde_json::from_slice(&std::fs::read(e.socket().with_extension("state.json")).unwrap())
             .unwrap();
     let pid = libc::pid_t::try_from(state["pid"].as_u64().unwrap()).unwrap();
     // SAFETY: kill(2) on the PID this test's own daemon recorded; it only
@@ -851,7 +855,7 @@ fn stats_announces_auto_start_and_warns_on_daemon_config_mismatch() {
     e.cmd()
         .env("KACHE_CONFIG", &other)
         .env("KACHE_CACHE_DIR", &unusable_store)
-        .env("KACHE_SOCKET_PATH", e.cache.join("daemon.sock"))
+        .env("KACHE_SOCKET_PATH", e.socket())
         .arg("stats")
         .assert()
         .success()
@@ -2109,7 +2113,7 @@ fn json_init_previews_without_writes_and_applies_without_prompts() {
     );
     let service_installed = body["service_installed"].clone();
     assert!(!e.home.join(".cargo/config.toml").exists());
-    assert!(!e.cache.join("daemon.sock").exists());
+    assert!(!e.socket().exists());
     let applied = e.cmd().args(args).arg("--yes").output().unwrap();
     assert!(applied.status.success(), "{applied:?}");
     let body: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
@@ -2829,7 +2833,7 @@ fn init_check_is_a_dry_run() {
     assert!(!e.home.join(".bashrc").exists());
     assert!(!e.home.join(".bash_profile").exists());
     assert!(!e.home.join(".local/lib/kache/shims").exists());
-    assert!(!e.cache.join("daemon.sock").exists());
+    assert!(!e.socket().exists());
 }
 
 #[test]
@@ -2852,7 +2856,7 @@ fn init_eof_does_not_accept_changes() {
     assert!(!e.home.join(".cargo/config.toml").exists());
     assert!(!e.home.join(".bashrc").exists());
     assert!(!e.home.join(".local/lib/kache/shims").exists());
-    assert!(!e.cache.join("daemon.sock").exists());
+    assert!(!e.socket().exists());
 }
 
 /// A retiring daemon answers once, then keeps its run lock without a socket.
@@ -2863,9 +2867,15 @@ fn init_rejects_unavailable_daemon_replacement() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     let e = env();
-    let socket = e.cache.join("daemon.sock");
+    let socket = e.socket();
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(socket.parent().unwrap())
+        .unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
-    let run_lock = std::fs::File::create(e.cache.join("daemon.run.lock")).unwrap();
+    let run_lock = std::fs::File::create(e.socket().with_extension("run.lock")).unwrap();
     run_lock.lock().unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -3039,7 +3049,13 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
     let e = env();
-    let socket = e.cache.join("daemon.sock");
+    let socket = e.socket();
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(socket.parent().unwrap())
+        .unwrap();
     let listener = UnixListener::bind(&socket).unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -3115,7 +3131,7 @@ fn init_upgrade_keeps_the_service_manager_in_charge() {
         .unwrap();
     drop(std::os::unix::net::UnixStream::connect(&socket));
     server.join().unwrap();
-    let state = std::fs::read(e.cache.join("daemon.state.json"));
+    let state = std::fs::read(e.socket().with_extension("state.json"));
     e.cmd().args(["daemon", "stop"]).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("Background cache: running"));
@@ -3180,7 +3196,7 @@ fn a_private_xdg_config_starts_its_own_daemon_beside_the_login_service() {
         .timeout(std::time::Duration::from_secs(60))
         .output()
         .unwrap();
-    let state = std::fs::read(e.cache.join("daemon.state.json"));
+    let state = std::fs::read(e.socket().with_extension("state.json"));
     e.cmd().args(["daemon", "stop"]).output().unwrap();
     assert!(output.status.success(), "{output:?}");
     let calls = std::fs::read_to_string(&calls).unwrap_or_default();
@@ -3199,19 +3215,20 @@ fn daemon_restart_preserves_another_cache_daemon() {
     let a = env();
     let b = env();
     b.cmd().args(["daemon", "start"]).assert().success();
-    let before = std::fs::read(b.cache.join("daemon.state.json")).unwrap();
+    let before = std::fs::read(b.socket().with_extension("state.json")).unwrap();
     let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
     a.cmd().args(["daemon", "start"]).assert().success();
     let own_before: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(a.cache.join("daemon.state.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(a.socket().with_extension("state.json")).unwrap())
+            .unwrap();
     let restart = a.cmd().args(["daemon", "restart"]).output().unwrap();
     let other = b
         .cmd()
         .args(["daemon", "status", "--json"])
         .output()
         .unwrap();
-    let after = std::fs::read(b.cache.join("daemon.state.json"));
-    let own_after = std::fs::read(a.cache.join("daemon.state.json"));
+    let after = std::fs::read(b.socket().with_extension("state.json"));
+    let own_after = std::fs::read(a.socket().with_extension("state.json"));
     // Clean both fixtures before assertions so failures leave no background work.
     a.cmd().args(["daemon", "stop"]).output().unwrap();
     b.cmd().args(["daemon", "stop"]).output().unwrap();
@@ -3241,7 +3258,7 @@ fn a_failing_test_still_stops_its_daemon() {
         e.cmd().args(["daemon", "start"]).assert().success();
         let run_lock = std::fs::OpenOptions::new()
             .write(true)
-            .open(e.cache.join("daemon.run.lock"))
+            .open(e.socket().with_extension("run.lock"))
             .expect("opening the live daemon's lifetime lock");
         assert!(
             matches!(run_lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
@@ -3371,7 +3388,8 @@ exit 0
                 .env("KACHE_RUNTIME_DIR", &requested);
         }
         let output = start.output().unwrap();
-        let state = std::fs::read(requested.join("daemon.state.json"));
+        let socket = kache_config::config::default_daemon_socket(&requested, &requested, None);
+        let state = std::fs::read(socket.with_extension("state.json"));
         // Both possible instances are task-owned; clean them even on failure.
         for store in [&requested, &manager_store] {
             e.cmd()
@@ -5422,7 +5440,9 @@ fn daemon_start_refuses_a_socket_path_too_long_for_a_unix_socket() {
     assert!(stderr.contains("KACHE_SOCKET_PATH"), "{stderr}");
     assert!(!stderr.contains("exited before readiness"), "{stderr}");
     assert!(
-        !deep.join("daemon.state.json").exists(),
+        !kache_config::config::default_daemon_socket(&deep, &deep, None)
+            .with_extension("state.json")
+            .exists(),
         "no daemon may have started"
     );
 }
@@ -5456,25 +5476,27 @@ fn daemon_start_needs_no_more_path_than_its_own_socket() {
     let home = TempDir::new().unwrap();
     let root = TempDir::new().unwrap();
     let limit = longest_bindable_socket_path(root.path());
-    let name = limit - root.path().as_os_str().len() - 1 - "/daemon.sock".len();
-    let runtime = root.path().join("d".repeat(name));
-    std::fs::create_dir_all(&runtime).unwrap();
-    assert_eq!(runtime.join("daemon.sock").as_os_str().len(), limit);
+    for suffix in ["daemon.sock", "ipc/d.sock"] {
+        let name = limit - root.path().as_os_str().len() - 2 - suffix.len();
+        let runtime = root.path().join("d".repeat(name));
+        std::fs::create_dir_all(&runtime).unwrap();
+        assert_eq!(runtime.join(suffix).as_os_str().len(), limit);
+        let socket = runtime.join("ipc/d.sock");
 
-    let start = kache(home.path(), &runtime)
-        .args(["daemon", "start"])
-        .output()
-        .unwrap();
-    // Read before stopping: the daemon removes its record on a clean exit.
-    let bound = runtime.join("daemon.sock").exists();
-    // Stop before asserting, so a failure leaves no daemon behind.
-    kache(home.path(), &runtime)
-        .args(["daemon", "stop"])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&start.stderr);
-    assert!(start.status.success(), "{stderr}");
-    assert!(bound, "the daemon must have bound its socket: {stderr}");
+        let start = kache(home.path(), &runtime)
+            .args(["daemon", "start"])
+            .output()
+            .unwrap();
+        // Read before stopping: the daemon removes both sockets on a clean exit.
+        let bound = socket.exists() && socket.with_extension("ctl").exists();
+        kache(home.path(), &runtime)
+            .args(["daemon", "stop"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&start.stderr);
+        assert!(start.status.success(), "{stderr}");
+        assert!(bound, "the daemon must have bound both endpoints: {stderr}");
+    }
 }
 
 /// `cargo clippy` runs each workspace unit as `kache clippy-driver <rustc>`,

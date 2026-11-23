@@ -696,7 +696,7 @@ mod tests {
         // Windows: every pipe instance busy). A plain start must wait for
         // it; draining it cost each racing wrapper the 35 s drain budget.
         let root = tempfile::tempdir().unwrap();
-        let config = super::super::tests::test_config(root.path());
+        let config = fixture_config(root.path());
         let _lock = ProcessLock::try_acquire(daemon_run_lock_path(&config.socket_path()))
             .unwrap()
             .unwrap();

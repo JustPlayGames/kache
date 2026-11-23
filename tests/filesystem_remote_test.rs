@@ -776,8 +776,14 @@ fn checkout_naming_rust_output_is_declined_and_never_uploaded() {
             !stderr.contains("failed to send upload job to daemon"),
             "{stderr}"
         );
-        let report = client.report();
-        crate_event(&report, "kt").clone()
+        // The report's crate rows carry no skip reason: read the last event
+        // the wrapper logged for the unit.
+        common::settled_events(&client.cache_dir)
+            .lines()
+            .rev()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["crate_name"] == "kt")
+            .expect("an event for kt")
     };
     for checkout in [a.path(), a.path(), b.path()] {
         let event = compile(checkout);
