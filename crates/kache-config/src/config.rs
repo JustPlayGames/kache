@@ -253,6 +253,12 @@ pub struct Config {
     /// `KACHE_SHARED_REF` / `[cache] shared_ref`; [`DEFAULT_SHARED_REF`]
     /// when neither is set, and empty, `0`, `off` or `false` for none.
     pub shared_ref: Option<String>,
+    /// Which managed units keep their private incremental state for good:
+    /// compiled from it at every later compile, with no run of edits that
+    /// ends, never dropped at a cache hit, and started from a compatible
+    /// donor's state when they have none. `KACHE_KEEP_INCREMENTAL` /
+    /// `[cache] keep_incremental`: `private` (the default), `all` or `off`.
+    pub keep_incremental: KeepIncremental,
     /// Enable all current and future experiments before they become defaults.
     /// `KACHE_UNSTABLE=1` / `[cache] unstable = true`. Off by default.
     pub unstable: bool,
@@ -1176,6 +1182,7 @@ pub struct CacheFileConfig {
     pub seed_incremental: Option<bool>,
     pub incremental_seed_from: Option<String>,
     pub shared_ref: Option<String>,
+    pub keep_incremental: Option<String>,
     pub unstable: Option<bool>,
     pub exclude: Option<Vec<String>>,
     /// Declarative bypass rules (kunobi-ninja/kache#222). Siblings of
@@ -1557,6 +1564,7 @@ const IGNORE_ENV_GATED_VARS: &[&str] = &[
     "KACHE_SEED_INCREMENTAL",
     "KACHE_INCREMENTAL_SEED_FROM",
     "KACHE_SHARED_REF",
+    "KACHE_KEEP_INCREMENTAL",
     "KACHE_UNSTABLE",
     "KACHE_COMPRESSION_LEVEL",
     "KACHE_S3_CONCURRENCY",
@@ -1661,6 +1669,7 @@ const ENV_FILE_KEYS: &[(&str, &str)] = &[
     ("KACHE_SEED_INCREMENTAL", "cache.seed_incremental"),
     ("KACHE_INCREMENTAL_SEED_FROM", "cache.incremental_seed_from"),
     ("KACHE_SHARED_REF", "cache.shared_ref"),
+    ("KACHE_KEEP_INCREMENTAL", "cache.keep_incremental"),
     ("KACHE_UNSTABLE", "cache.unstable"),
     ("KACHE_COMPRESSION_LEVEL", "cache.compression_level"),
     ("KACHE_S3_CONCURRENCY", "cache.s3_concurrency"),
@@ -2115,6 +2124,20 @@ impl Config {
             env_or_ignored_for(invocation, "KACHE_SHARED_REF", ignore_env)
                 .ok()
                 .or_else(|| file_config.as_ref().ok()?.cache.as_ref()?.shared_ref.clone()),
+        );
+        let keep_incremental = KeepIncremental::from_setting(
+            env_or_ignored_for(invocation, "KACHE_KEEP_INCREMENTAL", ignore_env)
+                .ok()
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .ok()?
+                        .cache
+                        .as_ref()?
+                        .keep_incremental
+                        .clone()
+                })
+                .as_deref(),
         );
 
         let event_log_max_size = file_config
@@ -2883,6 +2906,7 @@ impl Config {
             .map(|path| resolve_invocation_path(invocation, Path::new(&path)))
             .transpose()?,
             shared_ref,
+            keep_incremental,
             event_log_max_size,
             event_log_keep_lines,
             event_archive_days,
@@ -4631,6 +4655,47 @@ fn source_excluded_by_patterns(patterns: &[String], source_path: &Path, roots: &
     patterns
         .iter()
         .any(|pattern| exclude_pattern_matches(pattern, &candidates))
+}
+
+/// Which managed units keep their private incremental state for good
+/// ([`Config::keep_incremental`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeepIncremental {
+    /// Kache's adaptive policy alone: a run of edits keeps a unit's state for
+    /// a few compiles, and a cache hit drops it.
+    Off,
+    /// A unit the shared tree does not hold ([`Config::shared_ref`]), or one
+    /// built on a privately compiled unit: what a checkout itself changed.
+    /// Without a shared ref, the same as [`KeepIncremental::Off`].
+    #[default]
+    Private,
+    /// Every managed unit, shared or not, with no lookup and no store: a
+    /// folder kept at the shared tree for the others to start from, such as
+    /// a build machine's checkout that follows the main branch. Its graphs
+    /// are seed donors before any other folder's, and the idle clean-ups
+    /// leave them to whoever keeps that folder.
+    All,
+}
+
+impl KeepIncremental {
+    /// `private` when unset or unrecognized; `all`; or off for an empty
+    /// value, `0`, `off`, `false` or `no`.
+    pub fn from_setting(value: Option<&str>) -> Self {
+        let Some(value) = value.map(str::trim) else {
+            return Self::default();
+        };
+        if value.eq_ignore_ascii_case("all") {
+            Self::All
+        } else if value.is_empty()
+            || ["0", "off", "false", "no"]
+                .iter()
+                .any(|word| value.eq_ignore_ascii_case(word))
+        {
+            Self::Off
+        } else {
+            Self::default()
+        }
+    }
 }
 
 /// The upstream's default branch, as `git clone` records it: what

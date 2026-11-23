@@ -1292,8 +1292,10 @@ fn flag_target_for(key_sentinel: &str) -> String {
 /// hits transfer). Elsewhere (`/proc` absent) we use a fixed `/kache/workspace`
 /// sentinel that debuggers can `substitute-path` / `source-map` back to the real
 /// checkout. Per-OS divergence is safe: artifacts are already per-host (the full
-/// `rustc -vV`, including `host:`, is hashed into the key).
-fn workspace_flag_target() -> &'static str {
+/// `rustc -vV`, including `host:`, is hashed into the key). A private
+/// compile's cwd goes to the same place off Windows, so that what it builds
+/// reads like a stored build of the same sources (`worktree_seed`).
+pub(crate) fn workspace_flag_target() -> &'static str {
     if cfg!(target_os = "linux") {
         "/proc/self/cwd"
     } else {

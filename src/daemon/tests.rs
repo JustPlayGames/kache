@@ -1917,6 +1917,7 @@ pub(super) fn test_config(dir: &Path) -> Config {
         seed_incremental: true,
         incremental_seed_from: None,
         shared_ref: None,
+        keep_incremental: Default::default(),
         unstable: Default::default(),
         event_log_max_size: 10 * 1024 * 1024,
         event_log_keep_lines: 1000,

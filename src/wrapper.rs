@@ -15,7 +15,7 @@ use crate::compiler::rustc::RustcCompiler;
 use crate::compiler::{
     ArtifactKind, ArtifactSet, Compiler, KeyCtx, classify_by_filename, plan_post_restore, platform,
 };
-use crate::config::Config;
+use crate::config::{Config, KeepIncremental};
 use crate::events::{self, BuildEvent, EventResult};
 use crate::incremental_policy::{AdaptiveUnit, CompileOutcome, Lease, compile_outcome};
 use crate::key_env::KeyEnv;
@@ -224,10 +224,143 @@ fn keeps_to_the_cache(config: &Config, args: &RustcArgs, unit: &AdaptiveUnit) ->
     shared
 }
 
+/// How long a kept lease waits for a unit another process holds: a
+/// receiver copying its graph, or a clean-up. Two builds of one target never
+/// compile a unit at once (Cargo locks the target).
+const KEPT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Which lanes a managed unit takes before its key ([`KeepIncremental`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UnitLane {
+    /// The kept lane, for the reason the event records.
+    Kept(String),
+    /// Off the incremental lanes: looked up, restored, or compiled whole and
+    /// stored ([`keeps_to_the_cache`]).
+    Cache,
+    /// Kache's adaptive lanes. With `decide_at_miss`, a unit without policy
+    /// state that misses asks Git and takes the kept lane if the checkout
+    /// changed it.
+    Adaptive { decide_at_miss: bool },
+}
+
+impl UnitLane {
+    /// The lane of a unit with declared extra inputs: the kept lane, or the
+    /// decision at a miss that leads only there, never an adaptive lane.
+    /// The kept lane always runs rustc, which expands every macro again, so
+    /// a macro reads its files anew; Cargo learns them from the dep-info
+    /// Kache completes after every compile. The adaptive lanes' learning and
+    /// seeds were never checked against such inputs.
+    fn kept_or_cache(self) -> Self {
+        match self {
+            Self::Kept(_)
+            | Self::Adaptive {
+                decide_at_miss: true,
+            } => self,
+            Self::Cache
+            | Self::Adaptive {
+                decide_at_miss: false,
+            } => Self::Cache,
+        }
+    }
+}
+
+/// Whether every managed unit of this invocation takes the kept lane.
+fn keeps_every_unit(config: &Config) -> bool {
+    config.keep_incremental == KeepIncremental::All && !config.preserve_incremental
+}
+
+/// The lanes of `unit` ([`UnitLane`]). A force-listed unit keeps its own
+/// lane, and a program that is never cached its immediate one, which keeps
+/// its graph too. With `keep_incremental = "all"` every other unit is kept.
+/// By default (`private`), with a shared ref: a unit built on a privately
+/// compiled one is kept at once; a unit with policy state asks Git, which
+/// sends a unit of the shared tree to the cache and one the checkout changed
+/// to the kept lane, and any other answer, or none, leaves a kept unit kept
+/// and the adaptive lanes deciding for the others (no repository, no such
+/// ref). A unit without state is looked up first and asks Git only if it
+/// misses, so a fresh checkout restores what it can without a Git process
+/// per unit.
+fn unit_lane(
+    config: &Config,
+    args: &RustcArgs,
+    unit: &AdaptiveUnit,
+    force_incremental: bool,
+    skip_user_facing: bool,
+) -> UnitLane {
+    const ADAPTIVE: UnitLane = UnitLane::Adaptive {
+        decide_at_miss: false,
+    };
+    if force_incremental || skip_user_facing {
+        return ADAPTIVE;
+    }
+    if keeps_every_unit(config) {
+        return UnitLane::Kept("incremental kept: every unit".into());
+    }
+    if config.keep_incremental == KeepIncremental::Off {
+        return if keeps_to_the_cache(config, args, unit) {
+            UnitLane::Cache
+        } else {
+            ADAPTIVE
+        };
+    }
+    let Some(reference) = config.shared_ref.as_deref() else {
+        return ADAPTIVE;
+    };
+    if let Some(name) = private_extern(args) {
+        return UnitLane::Kept(format!("incremental kept: builds on {name}"));
+    }
+    if !unit.has_policy_state() {
+        return UnitLane::Adaptive {
+            decide_at_miss: true,
+        };
+    }
+    match crate::shared_tree::classify(reference, args, unit.sources().as_deref()) {
+        crate::shared_tree::Tree::Shared => {
+            tracing::debug!(
+                "[kache] {}: of the shared tree at {reference}; keeping to the cache",
+                args.crate_name.as_deref().unwrap_or("unknown")
+            );
+            UnitLane::Cache
+        }
+        crate::shared_tree::Tree::Changed => {
+            UnitLane::Kept("incremental kept: changed here".into())
+        }
+        // Short of the shared tree holding it, a kept unit stays kept: an
+        // adaptive lane's miss or a hit would remove its graph, and a Git
+        // that did not answer this once is no reason to.
+        crate::shared_tree::Tree::Outside | crate::shared_tree::Tree::Unknown if unit.is_kept() => {
+            UnitLane::Kept("incremental kept".into())
+        }
+        crate::shared_tree::Tree::Outside | crate::shared_tree::Tree::Unknown => ADAPTIVE,
+    }
+}
+
+/// After a miss of a unit [`unit_lane`] left to decide there: whether the
+/// checkout changed it, so that it compiles on the kept lane rather than
+/// whole for the store.
+fn kept_after_miss(config: &Config, args: &RustcArgs, unit: &AdaptiveUnit) -> bool {
+    config.shared_ref.as_deref().is_some_and(|reference| {
+        crate::shared_tree::classify(reference, args, unit.sources().as_deref())
+            == crate::shared_tree::Tree::Changed
+    })
+}
+
+/// Whether a unit with declared extra inputs may take the kept lane
+/// ([`UnitLane::kept_or_cache`]): in `all` mode, and in `private` mode with
+/// a shared ref.
+fn keeps_units_with_declared_inputs(config: &Config) -> bool {
+    !config.preserve_incremental
+        && match config.keep_incremental {
+            KeepIncremental::All => true,
+            KeepIncremental::Private => config.shared_ref.is_some(),
+            KeepIncremental::Off => false,
+        }
+}
+
 /// Build the one safety-checked unit used by both adaptive and force-list
 /// incremental compiles. Declared inputs are checked only after the narrow
-/// Cargo layout is known to be eligible; rejecting them also clears any old
-/// private state for that unit.
+/// Cargo layout is known to be eligible; where the kept lane may not take
+/// the unit, rejecting them also clears any old private state for it.
 fn managed_incremental_unit<F>(
     config: &Config,
     args: &RustcArgs,
@@ -236,12 +369,15 @@ fn managed_incremental_unit<F>(
 where
     F: FnOnce() -> bool,
 {
-    if !adaptive_mode_enabled(config) && !force_incremental_requested(config, args) {
+    if !adaptive_mode_enabled(config)
+        && !force_incremental_requested(config, args)
+        && !keeps_every_unit(config)
+    {
         return None;
     }
     let guard = adaptive_policy_guard(config);
     let unit = AdaptiveUnit::eligible(args, &guard)?;
-    if extra_inputs_declared() {
+    if extra_inputs_declared() && !keeps_units_with_declared_inputs(config) {
         let _ = unit.reset();
         return None;
     }
@@ -287,8 +423,12 @@ fn reentered_after_deferred_compile(precompiled: bool, emitted_closure_waiting: 
 /// runs after a local and a remote miss, often as a full compile, so it waits
 /// for a slot like any other miss. The active and immediate lanes run before
 /// any key work, as passthroughs do.
-fn adaptive_lane_takes_permit(kind: crate::incremental_policy::LeaseKind) -> bool {
-    kind == crate::incremental_policy::LeaseKind::Seed
+fn adaptive_lane_takes_permit(
+    kind: crate::incremental_policy::LeaseKind,
+    starts_without_graph: bool,
+) -> bool {
+    use crate::incremental_policy::LeaseKind;
+    kind == LeaseKind::Seed || (kind == LeaseKind::Kept && starts_without_graph)
 }
 
 /// Whether this unit is refused caching outright: the compiler's own refusal
@@ -4321,7 +4461,8 @@ fn run_parsed_rustc(
     let force_incremental = force_incremental_requested(config, args);
     let adaptive_policy_for_invocation = adaptive_seed_allowed(config, args);
     let trace_adaptive = crate::phase_trace::phase("adaptive_unit");
-    let adaptive_unit = managed_incremental_unit(config, args, || extra_inputs.is_some());
+    let declared_inputs = extra_inputs.is_some();
+    let adaptive_unit = managed_incremental_unit(config, args, || declared_inputs);
     drop(trace_adaptive);
 
     // Evaluate every cheap cache-eligibility gate before the learned fast
@@ -4367,10 +4508,33 @@ fn run_parsed_rustc(
     // before the key and the seed after a miss alike, and is looked up,
     // restored or compiled for the store as in a target without history. A
     // force-listed unit stays on its lane, and so does a program that is not
-    // cached at all.
-    let adaptive_unit = adaptive_unit.filter(|unit| {
-        force_incremental || skip_user_facing || !keeps_to_the_cache(config, args, unit)
-    });
+    // cached at all. What the checkout changed, and what builds on it, is
+    // kept ([`unit_lane`]).
+    let lane = adaptive_unit.as_ref().map_or(
+        UnitLane::Adaptive {
+            decide_at_miss: false,
+        },
+        |unit| unit_lane(config, args, unit, force_incremental, skip_user_facing),
+    );
+    let lane = if declared_inputs {
+        lane.kept_or_cache()
+    } else {
+        lane
+    };
+    let mut adaptive_unit = adaptive_unit.filter(|_| lane != UnitLane::Cache);
+    let decide_at_miss = matches!(
+        lane,
+        UnitLane::Adaptive {
+            decide_at_miss: true
+        }
+    );
+    // A unit with declared inputs that decides at a miss reaches only that
+    // decision, which leads to the kept lane or to none.
+    let kept_at_miss_unit = if declared_inputs && decide_at_miss {
+        adaptive_unit.take()
+    } else {
+        None
+    };
 
     if incremental_fast_path_allowed(
         unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
@@ -4378,7 +4542,24 @@ fn run_parsed_rustc(
         skip_user_facing,
         reentered,
     ) {
-        if force_incremental {
+        if let UnitLane::Kept(reason) = &lane {
+            if let Some(lease) = adaptive_unit
+                .as_ref()
+                .and_then(|unit| unit.try_kept(KEPT_LOCK_WAIT))
+            {
+                return adaptive_incremental_with_event(
+                    config,
+                    args,
+                    crate_name,
+                    &event_root,
+                    start,
+                    lease,
+                    reason.clone(),
+                    None,
+                    key_record,
+                );
+            }
+        } else if force_incremental {
             if let Some(lease) = adaptive_unit.as_ref().and_then(AdaptiveUnit::try_immediate) {
                 return adaptive_incremental_with_event(
                     config,
@@ -4425,6 +4606,12 @@ fn run_parsed_rustc(
             // No compatible donor: preserve learning and use the usual key.
             let _ = lease.finish(CompileOutcome::CompileError);
         }
+    }
+    // A kept unit that did not compile on its lane (another process held it,
+    // or this invocation may not take one) goes through the cache without
+    // its graph, which stays as it is: no hit or miss on the way removes it.
+    if matches!(lane, UnitLane::Kept(_)) {
+        adaptive_unit = None;
     }
     if incremental_fast_path_allowed(
         unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
@@ -4849,6 +5036,27 @@ fn run_parsed_rustc(
                 key_hash_stats,
             );
         }
+        // A unit the checkout changed is its own: no record to key from, and
+        // no other checkout asks for it. It compiles on the kept lane.
+        if decide_at_miss
+            && let Some(unit) = kept_at_miss_unit.as_ref().or(adaptive_unit.as_ref())
+            && kept_after_miss(config, args, unit)
+            && let Some(lease) = unit.try_kept(KEPT_LOCK_WAIT)
+        {
+            drop(discovery_flight);
+            drop(early_permit);
+            return adaptive_incremental_with_event(
+                config,
+                args,
+                crate_name,
+                &event_root,
+                start,
+                lease,
+                "incremental kept: changed here",
+                None,
+                key_record,
+            );
+        }
         // No record and nowhere else the entry could be: compile now, then
         // key from what rustc emitted. `discovery_flight` stays held across
         // the recursion so peers wait for this compile.
@@ -4970,6 +5178,9 @@ fn run_parsed_rustc(
     let mut waited_for_store = false;
     // So is a peer compiling the predicted key, before rustc starts.
     let mut waited_for_peer = false;
+    // Git is asked once whether a missed unit without state is the
+    // checkout's own ([`kept_after_miss`]).
+    let mut decide_at_miss = decide_at_miss;
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
@@ -5091,6 +5302,26 @@ fn run_parsed_rustc(
         // Both lookups missed. Incremental compilation needs no artifact key
         // re-derivation: rustc reads the current inputs and this result is never
         // stored. Keep the ordinary lookup first so a hit still restores.
+        // A unit the checkout changed takes the kept lane: no other checkout
+        // asks for it, and the store would only hold it for this one.
+        if std::mem::take(&mut decide_at_miss)
+            && let Some(unit) = kept_at_miss_unit.as_ref().or(adaptive_unit.as_ref())
+            && kept_after_miss(config, args, unit)
+            && let Some(lease) = unit.try_kept(KEPT_LOCK_WAIT)
+        {
+            drop(discovery_flight);
+            return adaptive_incremental_with_event(
+                config,
+                args,
+                crate_name,
+                &event_root,
+                start,
+                lease,
+                "incremental kept: changed here",
+                Some((&cache_key, key_ms, key_hash_stats, lookup_ms)),
+                key_record,
+            );
+        }
         if let (Some(unit), Some(fields)) = (adaptive_unit.as_ref(), adaptive_key_fields.as_ref())
             && let Some(lease) = unit.try_seed(&cache_key, fields)
         {
@@ -10016,11 +10247,24 @@ fn automatic_worktree_donors(config: &Config, args: &RustcArgs) -> Vec<PathBuf> 
             crate::cache_key::rustc_version_text_for(&args.rustc, args.invocation_env()).as_deref(),
         );
     }
-    let Ok(targets) = store.tracked_target_roots(0) else {
-        return Vec::new();
-    };
-    worktree_donor_profiles(&target, suffix, targets)
+    let own = profile.to_path_buf();
+    let mut donors: Vec<PathBuf> = crate::incremental_policy::kept_donors(&config.cache_dir)
+        .into_iter()
+        .filter(|donor| *donor != own)
+        .collect();
+    if let Ok(targets) = store.tracked_target_roots(0) {
+        for donor in worktree_donor_profiles(&target, suffix, targets) {
+            if !donors.contains(&donor) {
+                donors.push(donor);
+            }
+        }
+    }
+    donors
 }
+
+/// The other targets, newest first, whose profile a seed may come from. A
+/// receiver looks a donor up in its seed index, one file each.
+const MAX_TRACKED_DONORS: usize = 32;
 
 fn worktree_donor_profiles(
     target: &Path,
@@ -10039,7 +10283,7 @@ fn worktree_donor_profiles(
                 && kache_store::filesystem::directory_identity(&entry.path) == Some(entry.identity)
         })
         .map(|entry| entry.path.join(suffix))
-        .take(8)
+        .take(MAX_TRACKED_DONORS)
         .collect()
 }
 
@@ -10094,9 +10338,12 @@ fn adaptive_incremental_with_event<R: Into<String>>(
 ) -> Result<i32> {
     let reason = reason.into();
     let kind = lease.kind();
+    // Read before the seed fills it: a kept unit without a graph compiles
+    // as long as a miss, from a donor's or whole.
+    let starts_without_graph = lease.needs_worktree_donor();
     let (mut compiler_args, seed_attempt) =
         prepare_worktree_compiler_args(config, args, &mut lease);
-    let permit = adaptive_lane_takes_permit(kind).then(|| {
+    let permit = adaptive_lane_takes_permit(kind, starts_without_graph).then(|| {
         scheduler::begin_keyless_compile(
             &config.cache_dir,
             config.scheduler,
@@ -10200,7 +10447,18 @@ fn adaptive_incremental_with_event<R: Into<String>>(
     after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
     let seeded_from = lease.worktree_seed_donor().map(Path::to_path_buf);
+    // A folder that keeps every unit is a donor for every other: mark it so
+    // the idle clean-ups leave it, and name it where receivers look first.
+    let keep_all_profile = (keeps_every_unit(config)
+        && lease.worktree_portable()
+        && outcome == CompileOutcome::Success)
+        .then(|| lease.profile().map(Path::to_path_buf))
+        .flatten();
     let kept = lease.finish(outcome);
+    if kept && let Some(profile) = keep_all_profile {
+        crate::incremental_policy::mark_keep_all(&profile);
+        crate::incremental_policy::register_kept_donor(&config.cache_dir, &profile);
+    }
     mark_private_outputs(result.exit_code, &result.artifacts);
     tracing::debug!(
         ?kind,

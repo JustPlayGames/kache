@@ -2171,8 +2171,12 @@ pub(crate) fn uncached_compile_words(event: &BuildEvent) -> String {
 
 /// A passthrough the adaptive incremental policy chose for a crate under edit.
 pub(crate) fn is_edit_rebuild(reason: &str) -> bool {
-    matches!(reason.trim(), "adaptive seed" | "adaptive active")
+    let reason = reason.trim();
+    matches!(reason, "adaptive seed" | "adaptive active") || reason.starts_with(KEPT_REASON)
 }
+
+/// What every kept-lane compile's reason starts with.
+const KEPT_REASON: &str = "incremental kept";
 
 /// Plain words for the passthrough reasons a reader would not recognize, the
 /// way probes read as compiler queries. `None` for a reason that already says
@@ -2187,6 +2191,9 @@ pub(crate) fn uncached_reason_label(reason: &str) -> Option<&'static str> {
         }
         "adaptive active" => Some(
             "edit rebuild: rustc rebuilt a crate still being edited incrementally (adaptive active)",
+        ),
+        reason if reason.starts_with(KEPT_REASON) => Some(
+            "edit rebuild: rustc rebuilt a crate from its kept incremental state (incremental kept)",
         ),
         _ => None,
     }

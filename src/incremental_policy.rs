@@ -11,6 +11,12 @@
 //! prepare a compatible donor before key discovery. Every decision is target-local and
 //! protected by a cross-process lock held for the complete compiler invocation.
 //!
+//! A unit on the kept lane ([`AdaptiveUnit::try_kept`]) skips all of that:
+//! what a checkout changed itself, or everything in a folder kept for others
+//! to start from, compiles from its own graph at every compile, with no run
+//! of edits that ends and no cache hit that drops it, and a unit without a
+//! graph starts from a compatible donor's.
+//!
 //! A compile error keeps the private state. rustc compiles in a copy of its
 //! newest finalized session and finalizes the copy after codegen succeeds.
 //! Cross-worktree imports keep independent files because codegen can rewrite
@@ -23,13 +29,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cleanup;
 pub(crate) mod private_outputs;
 mod worktree_seed;
 pub(crate) use cleanup::{IDLE_SWEEP_INTERVAL, preview_stale, prune_idle, prune_stale};
 pub(crate) use worktree_seed::compiler_supports_automatic_seed;
+pub(crate) use worktree_seed::{kept_donors, mark_keep_all, register_kept_donor};
 
 /// Sibling of Cargo's `<profile>/incremental` that holds every managed unit.
 const AUTO_ROOT: &str = "incremental.kache-auto";
@@ -44,6 +51,8 @@ const MAX_STATE_BYTES: u64 = 64 * 1024;
 const MAX_DEP_INFO_BYTES: u64 = 1 << 20;
 /// Sources an active lease may hash before it skips the cached-source check.
 const MAX_SOURCE_BYTES: u64 = 64 << 20;
+/// How often a kept lease looks again at a unit another process holds.
+const LOCK_POLL: Duration = Duration::from_millis(50);
 
 /// One standard Cargo unit that is safe to manage automatically.
 #[derive(Clone, Debug)]
@@ -71,6 +80,8 @@ pub(crate) enum LeaseKind {
     Seed,
     /// The wrapper chose an intentional or force-listed passthrough.
     Immediate,
+    /// A unit whose graph is kept for good ([`AdaptiveUnit::try_kept`]).
+    Kept,
 }
 
 /// Exclusive ownership of one unit's private incremental state.
@@ -130,6 +141,7 @@ enum Completion {
     Immediate {
         restore: Option<DiskState>,
     },
+    Kept,
 }
 
 /// How a compile under a lease ended, for its private rustc state.
@@ -214,6 +226,8 @@ enum Phase {
     Learning,
     Seed,
     Active,
+    /// On the kept lane: no lease count, no idle window, no cache hit ends it.
+    Kept,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -319,6 +333,77 @@ impl AdaptiveUnit {
     /// Try an intentional passthrough without teaching or activating policy.
     pub(crate) fn try_immediate(&self) -> Option<Lease> {
         self.try_immediate_at(now_secs())
+    }
+
+    /// Take the kept lane: compile from this unit's own graph or, without
+    /// one, from a donor's ([`Lease::worktree_compiler_args_from`]) or whole.
+    /// No count of leases and no idle window ends it, and a cache hit leaves
+    /// it ([`AdaptiveUnit::observe_build`]); only a compile that may have
+    /// damaged the graph removes it ([`Lease::finish`]). An interrupted
+    /// compile or a damaged record starts over from an empty graph. Waits up
+    /// to `wait` for a donor's copy or a clean-up that holds the unit.
+    pub(crate) fn try_kept(&self, wait: Duration) -> Option<Lease> {
+        let lock = self.lock_waiting(wait)?;
+        match self.load_state() {
+            LoadedState::Missing => {}
+            // Any phase's graph is this unit's own: the unit key covers the
+            // whole command line.
+            LoadedState::Valid(state) if !state.in_flight => {}
+            LoadedState::Unavailable => return None,
+            LoadedState::Valid(_) | LoadedState::Corrupt => {
+                if !reset_locked(self) {
+                    return None;
+                }
+            }
+        }
+        if !ensure_real_directory(&self.rustc_dir) {
+            return None;
+        }
+        let busy = DiskState {
+            in_flight: true,
+            ..self.kept_state(now_secs())
+        };
+        if !self.store_state(&busy, true) {
+            reset_locked(self);
+            return None;
+        }
+        Some(Lease {
+            unit: self.clone(),
+            kind: LeaseKind::Kept,
+            completion: Completion::Kept,
+            worktree_seed_key: None,
+            worktree_seed_donor: None,
+            worktree_bootstrap: false,
+            deferred_graph: None,
+            _lock: lock,
+        })
+    }
+
+    /// Whether the unit is on the kept lane: its last compile there ended
+    /// and left its graph.
+    pub(crate) fn is_kept(&self) -> bool {
+        matches!(
+            self.load_state(),
+            LoadedState::Valid(DiskState {
+                phase: Phase::Kept,
+                in_flight: false,
+                ..
+            })
+        )
+    }
+
+    fn kept_state(&self, now: u64) -> DiskState {
+        DiskState {
+            schema: STATE_SCHEMA,
+            unit_key: self.unit_key.clone(),
+            phase: Phase::Kept,
+            observation: None,
+            active_leases: 0,
+            last_used_secs: now,
+            in_flight: false,
+            cached_sources: None,
+            last_sources: None,
+        }
     }
 
     /// A changed primary source can select a private compile before dep-info
@@ -712,6 +797,19 @@ impl AdaptiveUnit {
         let Some(lock) = self.lock() else {
             return false;
         };
+        // A kept graph is not this build's to clear: the unit compiled
+        // through the cache this once (another process held it, or Git saw
+        // the shared tree), and its next private compile starts from it.
+        if matches!(
+            self.load_state(),
+            LoadedState::Valid(DiskState {
+                phase: Phase::Kept,
+                in_flight: false,
+                ..
+            })
+        ) {
+            return false;
+        }
 
         // A normal compile did not consume this private state. Clear it so a
         // future seed never starts from state associated with rejected stable
@@ -736,6 +834,12 @@ impl AdaptiveUnit {
     }
 
     fn lock(&self) -> Option<UnitLock> {
+        self.lock_waiting(Duration::ZERO)
+    }
+
+    /// The unit's lock, retried for up to `wait` while another process holds
+    /// it. Any other failure ends at once.
+    fn lock_waiting(&self, wait: Duration) -> Option<UnitLock> {
         if !self.ensure_layout() {
             return None;
         }
@@ -753,9 +857,17 @@ impl AdaptiveUnit {
         if !meta.is_file() {
             return None;
         }
-        match file.try_lock() {
-            Ok(()) => Some(UnitLock(file)),
-            Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => None,
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Some(UnitLock(file)),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(LOCK_POLL);
+                }
+                Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => {
+                    return None;
+                }
+            }
         }
     }
 
@@ -963,6 +1075,15 @@ impl Lease {
         self.kind
     }
 
+    /// The Cargo profile folder whose unit this lease holds (`target/debug`).
+    pub(crate) fn profile(&self) -> Option<&Path> {
+        self.unit
+            .unit_dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+    }
+
     /// Qualify a cold compile using its exact emitted-dep-info key, after the
     /// wrapper has proven a local cache miss. Other leases cannot qualify.
     pub(crate) fn qualify_deferred_seed(
@@ -1110,6 +1231,7 @@ impl Lease {
                 Some(state)
             }
             (Completion::Immediate { restore }, _) => restore,
+            (Completion::Kept, _) => Some(self.unit.kept_state(now)),
         };
 
         // The marker is durable now, so the graph may leave scratch.
@@ -1300,6 +1422,7 @@ fn valid_state(state: &DiskState, unit_key: &str) -> bool {
         Phase::Learning => state.observation.is_some() || state.in_flight,
         Phase::Seed => state.observation.is_some() && state.in_flight,
         Phase::Active => state.observation.is_some() && state.active_leases <= MAX_ACTIVE_LEASES,
+        Phase::Kept => state.observation.is_none() && state.active_leases == 0,
     }
 }
 
@@ -2131,7 +2254,12 @@ mod tests {
 
     #[test]
     fn ordinary_leases_cannot_be_qualified_as_deferred_seeds() {
-        for kind in [LeaseKind::Seed, LeaseKind::Active, LeaseKind::Immediate] {
+        for kind in [
+            LeaseKind::Seed,
+            LeaseKind::Active,
+            LeaseKind::Immediate,
+            LeaseKind::Kept,
+        ] {
             let (_temp, _args, unit) = fixture();
             teach(&unit, 100);
             let mut lease = match kind {
@@ -2147,6 +2275,7 @@ mod tests {
                     unit.try_active_at(103).unwrap()
                 }
                 LeaseKind::Immediate => unit.try_immediate_at(101).unwrap(),
+                LeaseKind::Kept => unit.try_kept(Duration::ZERO).unwrap(),
             };
             let before = fs::read(&unit.state_path).unwrap();
             assert!(!lease.qualify_deferred_seed(
@@ -3380,7 +3509,12 @@ mod tests {
 
     #[test]
     fn losing_a_completion_recovers_the_busy_marker_and_discards_the_graph() {
-        for kind in [LeaseKind::Seed, LeaseKind::Active, LeaseKind::Immediate] {
+        for kind in [
+            LeaseKind::Seed,
+            LeaseKind::Active,
+            LeaseKind::Immediate,
+            LeaseKind::Kept,
+        ] {
             for outcome in [CompileOutcome::Success, CompileOutcome::CompileError] {
                 let (_temp, _args, unit) = fixture();
                 let lease = match kind {
@@ -3397,6 +3531,7 @@ mod tests {
                         unit.try_active_at(13)
                     }
                     LeaseKind::Immediate => unit.try_immediate_at(13),
+                    LeaseKind::Kept => unit.try_kept(Duration::ZERO),
                 }
                 .unwrap();
                 let busy = fs::read(&unit.state_path).unwrap();
@@ -3706,7 +3841,12 @@ mod tests {
 
     #[test]
     fn abnormal_exit_resets_every_lane() {
-        for kind in [LeaseKind::Active, LeaseKind::Seed, LeaseKind::Immediate] {
+        for kind in [
+            LeaseKind::Active,
+            LeaseKind::Seed,
+            LeaseKind::Immediate,
+            LeaseKind::Kept,
+        ] {
             let (_temp, _args, unit) = fixture();
             activate(&unit, 10);
             let lease = match kind {
@@ -3717,6 +3857,7 @@ mod tests {
                     12,
                 ),
                 LeaseKind::Immediate => unit.try_immediate_at(12),
+                LeaseKind::Kept => unit.try_kept(Duration::ZERO),
             }
             .unwrap();
             assert_eq!(lease.kind(), kind);
@@ -3725,6 +3866,44 @@ mod tests {
             assert!(!unit.state_path.exists(), "{kind:?}");
             assert!(!unit.rustc_dir.exists(), "{kind:?}");
         }
+    }
+
+    /// The kept lane has no end of its own: a cache hit, more leases than
+    /// the active lane allows and an idle day leave the graph, and only an
+    /// interrupted compile sends the unit back to an empty one.
+    #[test]
+    fn a_kept_graph_outlives_hits_lease_counts_and_idle_time() {
+        let (_temp, _args, unit) = fixture();
+        teach(&unit, 10);
+        for compile in 0..=MAX_ACTIVE_LEASES {
+            let lease = unit.try_kept(Duration::ZERO).unwrap();
+            assert_eq!(lease.kind(), LeaseKind::Kept);
+            fs::write(lease.unit.rustc_dir.join("dep-graph.bin"), [compile]).unwrap();
+            assert!(lease.finish_at(CompileOutcome::Success, 20 + u64::from(compile)));
+            assert!(unit.is_kept());
+        }
+        assert!(!unit.observe_build_at(
+            &cache_key("hit"),
+            &fields("stable", "source-z", "extern-a"),
+            100,
+        ));
+        let mut idle = read_state(&unit);
+        idle.last_used_secs = 0;
+        write_state(&unit, &idle);
+        let lease = unit.try_kept(Duration::ZERO).unwrap();
+        assert_eq!(
+            fs::read(lease.unit.rustc_dir.join("dep-graph.bin")).unwrap(),
+            [MAX_ACTIVE_LEASES]
+        );
+
+        // A power loss mid-compile leaves the busy record: the next kept
+        // lease starts from an empty graph.
+        drop(lease);
+        assert!(read_state(&unit).in_flight);
+        let lease = unit.try_kept(Duration::ZERO).unwrap();
+        assert!(worktree_seed::empty_directory(&lease.unit.rustc_dir));
+        assert!(read_state(&unit).in_flight);
+        assert!(!unit.is_kept());
     }
 
     #[test]

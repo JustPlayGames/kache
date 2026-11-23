@@ -218,8 +218,8 @@ fn build_unselected(
 
 /// A library the command does not select is a unit someone edits, like a
 /// selected one: `cargo build -p adaptive-app` seeds it after an edit and then
-/// compiles it on the active lane. So does the unselected crate between it
-/// and the app, whose only change is the library it links.
+/// compiles it on the active lane. The unselected crate between it and the
+/// app, whose only change is the library it links, keeps its graph.
 #[test]
 fn unselected_workspace_crates_seed_then_stay_active() {
     let checkout = tempfile::tempdir().unwrap();
@@ -249,14 +249,16 @@ fn unselected_workspace_crates_seed_then_stay_active() {
     assert_eq!(mid["result"], "miss", "event: {mid:#}");
 
     // Future, increasing mtimes make Cargo rebuild without sleeping.
+    // The crate above it builds on what that compile wrote, which no store
+    // holds: it keeps its graph for good.
     let (lib, mid) = build(Some(future), 2);
     assert_passthrough(&lib, "adaptive seed");
-    assert_passthrough(&mid, "adaptive seed");
+    assert_passthrough(&mid, "incremental kept: builds on adaptive_lib");
 
     let (lib, mid) = build(Some(future + 1), 3);
     assert_passthrough(&lib, "adaptive active");
     assert_eq!(lib["key_ms"], 0, "event: {lib:#}");
-    assert_passthrough(&mid, "adaptive active");
+    assert_passthrough(&mid, "incremental kept: builds on adaptive_lib");
 
     // With the policy state gone, the unit cannot seed. Its record from the
     // first build no longer applies, because the workspace changed since, so
@@ -285,12 +287,11 @@ fn unselected_workspace_crates_seed_then_stay_active() {
 }
 
 /// The middle crate also builds a `staticlib` and `cdylib`, so Cargo gives it
-/// no extra filename. Edits to the library below it still put it in adaptive
-/// incremental mode. It links, and on this line a link of an incrementally
-/// compiled library is private (`a_link_of_incrementally_compiled_libraries_is_not_stored`):
-/// it compiles with its own incremental state, no key and no entry, an
-/// adaptive passthrough that only a unit with an id (here its `-C metadata`)
-/// takes.
+/// no extra filename. Edits to the library below it still put it in
+/// incremental mode. It links what an incremental compile wrote, so no store
+/// holds it (`a_link_of_incrementally_compiled_libraries_is_not_stored`): it
+/// keeps its graph, with no key and no entry, a lane that only a unit with an
+/// id (here its `-C metadata`) takes.
 #[test]
 fn an_unselected_cdylib_crate_seeds_then_stays_active() {
     let checkout = tempfile::tempdir().unwrap();
@@ -317,14 +318,14 @@ fn an_unselected_cdylib_crate_seeds_then_stays_active() {
 
     for (mtime, answer) in [(future, 2), (future + 1, 3)] {
         let (_lib, mid) = build(Some(mtime), answer);
-        assert_passthrough(&mid, "adaptive passthrough: private link: adaptive_lib");
+        assert_passthrough(&mid, "incremental kept: builds on adaptive_lib");
     }
 }
 
 /// A link that takes an rlib an incremental compile wrote keys on bytes no
-/// other build writes, so it compiles with no key and no entry. An example
-/// shows it: examples never take an incremental lane of their own, so each
-/// edit used to store a new one. A fresh target builds the same sources
+/// other build writes, so it compiles with no key and no entry, from a graph
+/// it keeps. An example shows it: examples never take an incremental lane of
+/// their own, so each edit used to store a new one. A fresh target builds the same sources
 /// without incremental state and keys and stores the link as before, and the
 /// next fresh target hits it.
 #[test]
@@ -385,17 +386,17 @@ fn a_link_of_incrementally_compiled_libraries_is_not_stored() {
     let events = build("target", None, 1);
     assert_eq!(events[2]["result"], "miss", "event: {:#}", events[2]);
 
-    // The edit loop: the libraries seed, then stay active, and the example
-    // links what they wrote.
+    // The edit loop: the library seeds, then stays active, the crate above it
+    // keeps its graph, and the example links what they wrote.
     for (mtime, answer, lane) in [
         (future, 2, "adaptive seed"),
         (future + 1, 3, "adaptive active"),
     ] {
         let events = build("target", Some(mtime), answer);
         assert_passthrough(&events[0], lane);
-        assert_passthrough(&events[1], lane);
+        assert_passthrough(&events[1], "incremental kept: builds on adaptive_lib");
         let demo = &events[2];
-        assert_passthrough(demo, "private link: adaptive_mid");
+        assert_passthrough(demo, "incremental kept: builds on adaptive_mid");
         assert_eq!(demo["key_ms"], 0, "event: {demo:#}");
         assert_eq!(demo["dep_info_runs"], 0, "event: {demo:#}");
     }
@@ -881,14 +882,13 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-/// A pull is no edit. A checkout that edited its library compiles it on the
-/// active lane, before any key; when it then moves to a commit another
-/// checkout built, it used to compile that commit there too, and the crate
-/// above it with it. With `shared_ref` naming the branch the checkouts share,
-/// the units of that commit are looked up and restored, the unit's private
-/// state stays, and the next edit is back on its lane.
+/// A checkout keeps warm what it changed, and restores what the shared tree
+/// holds. Its first private compile of a unit starts from the graph a folder
+/// kept for others (`keep_incremental = "all"`, a build machine's) holds, and
+/// each later one from its own, which a restore of the shared tree leaves in
+/// place: after a pull, the next edit is warm again.
 #[test]
-fn a_unit_of_the_shared_tree_is_restored_in_a_checkout_with_history() {
+fn a_checkout_keeps_its_own_edits_warm_and_restores_the_shared_tree() {
     if Command::new("git")
         .arg("--version")
         .output()
@@ -898,7 +898,11 @@ fn a_unit_of_the_shared_tree_is_restored_in_a_checkout_with_history() {
     }
     let checkouts = tempfile::tempdir().unwrap();
     let root = checkout_path(checkouts.path());
-    let (first, second) = (root.join("first"), root.join("second"));
+    let (station, first, second) = (
+        root.join("station"),
+        root.join("first"),
+        root.join("second"),
+    );
     let cache = tempfile::tempdir().unwrap();
     let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
     let future = SystemTime::now()
@@ -914,12 +918,14 @@ fn a_unit_of_the_shared_tree_is_restored_in_a_checkout_with_history() {
         }
     };
     // This build's events for the library and the crate above it.
-    let build = |project: &Path, target: &str, shared_ref: &str, answer: u64| {
+    let build = |project: &Path, target: &str, keep: &str, answer: u64| {
         settle_writes(&[project]);
-        let before = ["adaptive_lib", "adaptive_mid"].map(|name| crate_events(cache.path(), name).len());
+        let before =
+            ["adaptive_lib", "adaptive_mid"].map(|name| crate_events(cache.path(), name).len());
         let target = project.join(target);
         let output = build_command(project, cache.path(), &target, "adaptive-app")
-            .env("KACHE_SHARED_REF", shared_ref)
+            .env("KACHE_SHARED_REF", "shared")
+            .env("KACHE_KEEP_INCREMENTAL", keep)
             .output()
             .expect("failed to build the workspace fixture");
         assert!(
@@ -944,8 +950,16 @@ fn a_unit_of_the_shared_tree_is_restored_in_a_checkout_with_history() {
             })
             .collect::<Vec<_>>()
     };
+    let assert_kept = |event: &Value, seed: &str| {
+        assert_passthrough(event, "incremental kept");
+        assert_eq!(
+            event["incremental_seed_attempt"].as_str().unwrap_or(""),
+            seed,
+            "event: {event:#}"
+        );
+    };
 
-    for project in [&first, &second] {
+    for project in [&station, &first, &second] {
         create_workspace(project);
         write(project, None, 1);
     }
@@ -955,43 +969,46 @@ fn a_unit_of_the_shared_tree_is_restored_in_a_checkout_with_history() {
     git(&first, &["commit", "-q", "-m", "one"]);
     git(&first, &["branch", "shared"]);
 
-    // The first checkout gets its history: two edits nobody committed.
-    let events = build(&first, "target", "shared", 1);
+    // The build machine keeps every graph; it stores none of them.
+    for event in build(&station, "target", "all", 1) {
+        assert_kept(&event, "no-donor");
+    }
+    // The checkout at the shared tree compiles it for the store.
+    let events = build(&first, "target", "private", 1);
     assert_eq!(events[0]["result"], "miss", "event: {:#}", events[0]);
-    for (step, lane) in [(1, "adaptive seed"), (2, "adaptive active")] {
-        write(&first, Some(future + step), 1 + step as u64);
-        let events = build(&first, "target", "shared", 1 + step as u64);
-        assert_passthrough(&events[0], lane);
-        assert_passthrough(&events[1], lane);
+
+    // Its first edit starts from the build machine's graphs, and every later
+    // one from its own.
+    write(&first, Some(future + 1), 2);
+    for event in build(&first, "target", "private", 2) {
+        assert_kept(&event, "imported");
+        assert!(
+            event["incremental_seed"]
+                .as_str()
+                .is_some_and(|donor| Path::new(donor).starts_with(&station)),
+            "event: {event:#}"
+        );
+    }
+    write(&first, Some(future + 2), 3);
+    for event in build(&first, "target", "private", 3) {
+        assert_kept(&event, "");
     }
 
-    // With the setting off, a commit the other checkout stored is compiled
-    // again on the lane, as it always was. The other checkout builds each
-    // commit in a target of its own, without history, so it stores it.
+    // A commit another checkout stored, which the shared ref moved to, is
+    // restored, and what is built on it.
     write(&second, None, 7);
-    let events = build(&second, "target-7", "off", 7);
+    let events = build(&second, "target-7", "private", 7);
     assert_eq!(events[0]["result"], "miss", "event: {:#}", events[0]);
     write(&first, Some(future + 3), 7);
     git(&first, &["commit", "-q", "-a", "-m", "seven"]);
     git(&first, &["branch", "-f", "shared", "HEAD"]);
-    let events = build(&first, "target", "off", 7);
-    assert_passthrough(&events[0], "adaptive active");
-
-    // With it on, the next such commit is restored, and what is built on it.
-    write(&second, None, 8);
-    let events = build(&second, "target-8", "off", 8);
-    assert_eq!(events[0]["result"], "miss", "event: {:#}", events[0]);
-    write(&first, Some(future + 4), 8);
-    git(&first, &["commit", "-q", "-a", "-m", "eight"]);
-    git(&first, &["branch", "-f", "shared", "HEAD"]);
-    let events = build(&first, "target", "shared", 8);
+    let events = build(&first, "target", "private", 7);
     assert_eq!(events[0]["result"], "local_hit", "event: {:#}", events[0]);
     assert_eq!(events[1]["result"], "local_hit", "event: {:#}", events[1]);
 
-    // The checkout's own next edit is not of the shared tree: it compiles on
-    // the lane it was on, from the state the restore left alone.
-    write(&first, Some(future + 5), 9);
-    let events = build(&first, "target", "shared", 9);
-    assert_passthrough(&events[0], "adaptive active");
-    assert_passthrough(&events[1], "adaptive");
+    // The restore left the checkout's graphs: its next edit needs no donor.
+    write(&first, Some(future + 4), 8);
+    for event in build(&first, "target", "private", 8) {
+        assert_kept(&event, "");
+    }
 }

@@ -3458,7 +3458,8 @@ fn automatic_donors_require_built_live_targets_and_keep_the_recent_limit() {
         discovered,
     };
     let mut targets = Vec::new();
-    for index in 0..10 {
+    let built = MAX_TRACKED_DONORS + 2;
+    for index in 0..built {
         let path = temp.path().join(format!("target-{index}"));
         std::fs::create_dir(&path).unwrap();
         targets.push(entry(path, false));
@@ -3474,9 +3475,15 @@ fn automatic_donors_require_built_live_targets_and_keep_the_recent_limit() {
     targets.push(entry(current.clone(), false));
     targets.push(entry(current.join("."), false));
     let chosen = worktree_donor_profiles(&current, Path::new("debug"), targets.clone());
-    assert_eq!(chosen.len(), 8);
-    assert_eq!(chosen[0], temp.path().join("target-9/debug"));
-    assert_eq!(chosen[7], temp.path().join("target-2/debug"));
+    assert_eq!(chosen.len(), MAX_TRACKED_DONORS);
+    assert_eq!(
+        chosen[0],
+        temp.path().join(format!("target-{}/debug", built - 1))
+    );
+    assert_eq!(
+        chosen[MAX_TRACKED_DONORS - 1],
+        temp.path().join("target-2/debug")
+    );
     assert!(
         worktree_donor_profiles(&temp.path().join("missing"), Path::new("debug"), targets)
             .is_empty()
@@ -7283,16 +7290,62 @@ printf 'state' > "$incremental/state.bin"
     assert!(unit.try_active().is_none());
 }
 
+/// Short of the shared tree holding it, a kept unit stays kept: with no ref
+/// to compare (here none resolves), the adaptive lanes, whose miss or hit
+/// would remove its graph, decide only for units that are not kept.
+#[test]
+fn a_kept_unit_stays_kept_where_git_has_no_shared_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(dir.path().join("cache"));
+    config.shared_ref = Some("kache-test/no-such-ref".into());
+    let temp = tempfile::tempdir().unwrap();
+    let args = eligible_incremental_args(&temp, "kept_lib");
+    let unit = managed_incremental_unit(&config, &args, || false).unwrap();
+    assert_eq!(
+        unit_lane(&config, &args, &unit, false, false),
+        UnitLane::Adaptive {
+            decide_at_miss: true
+        }
+    );
+    let lease = unit.try_kept(std::time::Duration::ZERO).unwrap();
+    assert!(lease.finish(CompileOutcome::CompileError));
+    assert_eq!(
+        unit_lane(&config, &args, &unit, false, false),
+        UnitLane::Kept("incremental kept".into())
+    );
+    config.keep_incremental = KeepIncremental::Off;
+    assert_eq!(
+        unit_lane(&config, &args, &unit, false, false),
+        UnitLane::Adaptive {
+            decide_at_miss: false
+        }
+    );
+}
+
 /// A seed runs after both lookups missed, so it takes a scheduler slot and
-/// records the crate's weight like any miss. The immediate and active lanes
-/// run before any key work and take no slot.
+/// records the crate's weight like any miss, and so does a kept unit that
+/// starts without a graph. The immediate and active lanes, and a kept unit
+/// with its graph, run before any key work and take no slot.
 #[cfg(unix)]
 #[test]
 fn only_an_adaptive_seed_takes_a_scheduler_slot() {
     use crate::incremental_policy::LeaseKind;
-    assert!(adaptive_lane_takes_permit(LeaseKind::Seed));
-    assert!(!adaptive_lane_takes_permit(LeaseKind::Active));
-    assert!(!adaptive_lane_takes_permit(LeaseKind::Immediate));
+    for starts_without_graph in [false, true] {
+        assert!(adaptive_lane_takes_permit(
+            LeaseKind::Seed,
+            starts_without_graph
+        ));
+        assert!(!adaptive_lane_takes_permit(
+            LeaseKind::Active,
+            starts_without_graph
+        ));
+        assert!(!adaptive_lane_takes_permit(
+            LeaseKind::Immediate,
+            starts_without_graph
+        ));
+    }
+    assert!(adaptive_lane_takes_permit(LeaseKind::Kept, true));
+    assert!(!adaptive_lane_takes_permit(LeaseKind::Kept, false));
 
     let dir = tempfile::tempdir().unwrap();
     let deps = dir.path().join("target/debug/deps");
