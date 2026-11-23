@@ -8490,25 +8490,37 @@ async fn server_main(
         loop {
             interval.tick().await;
             tracing::info!("periodic GC sweep starting");
-            // Offload the blocking sweep so it never stalls an async worker —
-            // the accept loop and in-flight RemoteCheck stay responsive (#281).
-            let gc = gc_daemon.clone();
-            match tokio::task::spawn_blocking(move || {
-                crate::platform::below_normal(|| {
-                    gc.run_gc(
-                        GcPolicy::Automatic {
-                            max_age_hours: gc.config.gc_max_age_hours,
-                        },
-                        GcDriver::Periodic,
-                    )
-                })
-            })
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => tracing::warn!("periodic GC failed: {e}"),
-                Err(e) => tracing::warn!("periodic GC task panicked: {e}"),
-            }
+            let sweep = || {
+                // Offload the blocking sweep so it never stalls an async worker —
+                // the accept loop and in-flight RemoteCheck stay responsive (#281).
+                let gc = gc_daemon.clone();
+                async move {
+                    match tokio::task::spawn_blocking(move || {
+                        crate::platform::below_normal(|| {
+                            gc.run_gc(
+                                GcPolicy::Automatic {
+                                    max_age_hours: gc.config.gc_max_age_hours,
+                                },
+                                GcDriver::Periodic,
+                            )
+                        })
+                    })
+                    .await
+                    {
+                        Ok(Ok(report)) => PeriodicGcRun::from_report(&report),
+                        Ok(Err(e)) => {
+                            tracing::warn!("periodic GC failed: {e}");
+                            PeriodicGcRun::Ended
+                        }
+                        Err(e) => {
+                            tracing::warn!("periodic GC task panicked: {e}");
+                            PeriodicGcRun::Ended
+                        }
+                    }
+                }
+            };
+            run_periodic_gc(sweep, tokio::time::sleep, PERIODIC_GC_RETRY, PERIODIC_GC_RETRIES)
+                .await;
         }
     });
 
@@ -9094,6 +9106,70 @@ const INDEX_CONNECTIONS_IDLE: usize = 4;
 
 /// How often the daemon sweeps the store (age, housekeeping, size).
 const PERIODIC_GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// How long a periodic sweep that found `gc.lock` held waits before it asks
+/// again. The holder is mostly an automatic size sweep, which ranks and
+/// removes for minutes and does none of the periodic sweep's age pass or
+/// housekeeping (tombstones, memos, session markers).
+const PERIODIC_GC_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// How many times a skipped periodic sweep asks again, [`PERIODIC_GC_RETRY`]
+/// apart: an hour, well inside [`PERIODIC_GC_INTERVAL`]. On the build
+/// machine 5 of 39 periodic sweeps (2026-11-13 to 11-23) found the lock held
+/// and skipped, each putting the age pass off by a whole interval.
+const PERIODIC_GC_RETRIES: u32 = 6;
+
+/// How one periodic sweep ended, for [`run_periodic_gc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeriodicGcRun {
+    /// It ran, or failed in a way asking again soon would not mend.
+    Ended,
+    /// Another GC held this store's `gc.lock`, so it did nothing.
+    Skipped,
+}
+
+impl PeriodicGcRun {
+    fn from_report(report: &GcRunReport) -> Self {
+        if report.total.skipped {
+            Self::Skipped
+        } else {
+            Self::Ended
+        }
+    }
+}
+
+/// One periodic sweep: `sweep`, and while another GC holds the lock, again
+/// after `retry`, at most `retries` more times. Returns how many sweeps it
+/// started.
+async fn run_periodic_gc<S, SF, P, PF>(
+    mut sweep: S,
+    mut pause: P,
+    retry: Duration,
+    retries: u32,
+) -> u32
+where
+    S: FnMut() -> SF,
+    SF: std::future::Future<Output = PeriodicGcRun>,
+    P: FnMut(Duration) -> PF,
+    PF: std::future::Future<Output = ()>,
+{
+    let mut started = 1;
+    while sweep().await == PeriodicGcRun::Skipped {
+        if started > retries {
+            tracing::info!(
+                "periodic GC: gc.lock still held after {retries} more tries; the next sweep is on the timer"
+            );
+            break;
+        }
+        tracing::info!(
+            "periodic GC: trying again in {} min ({started}/{retries})",
+            retry.as_secs() / 60
+        );
+        pause(retry).await;
+        started += 1;
+    }
+    started
+}
 /// How often the daemon reads its resident memory to see whether a heap
 /// trim is due (`HeapTrimGate`): one small `/proc` read.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]

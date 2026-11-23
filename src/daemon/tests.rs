@@ -19939,6 +19939,73 @@ fn a_started_daemon_sweeps_when_the_last_sweep_is_due_and_never_at_once() {
     );
 }
 
+/// A periodic sweep that finds `gc.lock` held (an automatic size sweep
+/// ranking for minutes) asks again after a pause instead of leaving its age
+/// pass and housekeeping to the next interval, six hours on; one that keeps
+/// finding it held stops after its retries.
+#[tokio::test]
+async fn a_periodic_sweep_that_found_the_lock_held_runs_once_it_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    std::fs::create_dir_all(config.store_dir()).unwrap();
+    // A stale key lock with no entry: what the sweep's housekeeping removes.
+    let stale = config
+        .store_dir()
+        .join(format!("{}.lock", blake3::hash(b"stale").to_hex()));
+    std::fs::write(&stale, b"1").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+        .unwrap();
+    let store = Store::open(&config).unwrap();
+    let daemon = Daemon::new(config);
+    let sweep = || {
+        let report = daemon
+            .run_gc(GcPolicy::Automatic { max_age_hours: 0 }, GcDriver::Periodic)
+            .unwrap();
+        std::future::ready(PeriodicGcRun::from_report(&report))
+    };
+
+    // Held through every try: three sweeps, two pauses, nothing done.
+    let held = store.try_gc_lock().unwrap().expect("gc lock");
+    let mut pauses = Vec::new();
+    let started = run_periodic_gc(
+        sweep,
+        |pause| {
+            pauses.push(pause);
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        2,
+    )
+    .await;
+    assert_eq!((started, pauses.len()), (3, 2));
+    assert!(stale.exists(), "no sweep ran while the lock was held");
+
+    // Let go during the first pause: the second sweep runs.
+    let held = std::cell::Cell::new(Some(held));
+    let mut pauses = Vec::new();
+    let started = run_periodic_gc(
+        sweep,
+        |pause| {
+            pauses.push(pause);
+            held.take();
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        PERIODIC_GC_RETRIES,
+    )
+    .await;
+    assert_eq!(started, 2);
+    assert_eq!(pauses, [PERIODIC_GC_RETRY]);
+    assert!(
+        !stale.exists(),
+        "the sweep after the pause ran its housekeeping"
+    );
+}
+
 /// Cargo waits for the target-info probe until a seeding has memoised what
 /// it placed. On a busy journal the index's commit took 0.3-0.6 s of that
 /// wait, so a store that can hand rows to the daemon hands them over at
@@ -20028,39 +20095,42 @@ async fn a_fresh_daemon_defers_a_hinted_sweep_to_the_end_of_its_startup_delay() 
     let mut config = test_config(dir.path());
     config.max_size = 100;
     let store = Store::open(&config).unwrap();
-    let swept = |daemon: Daemon, key: &'static str| {
+    // The entry first, then the daemon's age: a put under a slow disk
+    // (two fsyncs, seconds on a loaded machine) must not eat into the
+    // delay the test gives it.
+    let swept = |into_delay: Duration, key: &'static str| {
         put_upload_evict_entry(&store, dir.path(), key, 200, false);
+        let mut daemon = Daemon::new(config.clone());
+        daemon.started = Instant::now() - into_delay;
+        let deadline = daemon.started + STARTUP_GC_DELAY;
         let daemon = Arc::new(daemon);
+        let hinted = Instant::now();
         daemon.handle_gc_hint();
         let store = &store;
         async move {
-            let start = Instant::now();
-            while store.contains(key) && start.elapsed() < Duration::from_secs(10) {
+            while store.contains(key) && hinted.elapsed() < Duration::from_secs(10) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            (!store.contains(key), start.elapsed())
+            let gone = Instant::now();
+            (
+                !store.contains(key),
+                gone.saturating_duration_since(hinted),
+                gone >= deadline,
+            )
         }
     };
 
-    let mut fresh = Daemon::new(config.clone());
-    fresh.started = Instant::now();
-    let (gone, _) = tokio::time::timeout(Duration::from_secs(1), swept(fresh, "fresh"))
+    let (gone, ..) = tokio::time::timeout(Duration::from_secs(1), swept(Duration::ZERO, "fresh"))
         .await
-        .unwrap_or((false, Duration::ZERO));
+        .unwrap_or((false, Duration::ZERO, false));
     assert!(!gone, "no sweep in the first second of a daemon");
 
-    let mut ending = Daemon::new(config.clone());
-    ending.started = Instant::now() - STARTUP_GC_DELAY + Duration::from_millis(1500);
-    let (gone, after) = swept(ending, "ending").await;
+    let (gone, after, past_deadline) =
+        swept(STARTUP_GC_DELAY - Duration::from_millis(1500), "ending").await;
     assert!(gone, "the deferred sweep runs once the delay is over");
-    assert!(
-        after >= Duration::from_millis(1000),
-        "not before: {after:?}"
-    );
+    assert!(past_deadline, "not before the delay is over: {after:?}");
 
-    let mut settled = Daemon::new(config);
-    settled.started = Instant::now() - STARTUP_GC_DELAY;
-    let (gone, after) = swept(settled, "settled").await;
+    let (gone, after, _) = swept(STARTUP_GC_DELAY, "settled").await;
     assert!(gone && after < Duration::from_secs(5), "{after:?}");
 }
 
