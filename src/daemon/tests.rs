@@ -20095,39 +20095,42 @@ async fn a_fresh_daemon_defers_a_hinted_sweep_to_the_end_of_its_startup_delay() 
     let mut config = test_config(dir.path());
     config.max_size = 100;
     let store = Store::open(&config).unwrap();
-    let swept = |daemon: Daemon, key: &'static str| {
+    // The entry first, then the daemon's age: a put under a slow disk
+    // (two fsyncs, seconds on a loaded machine) must not eat into the
+    // delay the test gives it.
+    let swept = |into_delay: Duration, key: &'static str| {
         put_upload_evict_entry(&store, dir.path(), key, 200, false);
+        let mut daemon = Daemon::new(config.clone());
+        daemon.started = Instant::now() - into_delay;
+        let deadline = daemon.started + STARTUP_GC_DELAY;
         let daemon = Arc::new(daemon);
+        let hinted = Instant::now();
         daemon.handle_gc_hint();
         let store = &store;
         async move {
-            let start = Instant::now();
-            while store.contains(key) && start.elapsed() < Duration::from_secs(10) {
+            while store.contains(key) && hinted.elapsed() < Duration::from_secs(10) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            (!store.contains(key), start.elapsed())
+            let gone = Instant::now();
+            (
+                !store.contains(key),
+                gone.saturating_duration_since(hinted),
+                gone >= deadline,
+            )
         }
     };
 
-    let mut fresh = Daemon::new(config.clone());
-    fresh.started = Instant::now();
-    let (gone, _) = tokio::time::timeout(Duration::from_secs(1), swept(fresh, "fresh"))
+    let (gone, ..) = tokio::time::timeout(Duration::from_secs(1), swept(Duration::ZERO, "fresh"))
         .await
-        .unwrap_or((false, Duration::ZERO));
+        .unwrap_or((false, Duration::ZERO, false));
     assert!(!gone, "no sweep in the first second of a daemon");
 
-    let mut ending = Daemon::new(config.clone());
-    ending.started = Instant::now() - STARTUP_GC_DELAY + Duration::from_millis(1500);
-    let (gone, after) = swept(ending, "ending").await;
+    let (gone, after, past_deadline) =
+        swept(STARTUP_GC_DELAY - Duration::from_millis(1500), "ending").await;
     assert!(gone, "the deferred sweep runs once the delay is over");
-    assert!(
-        after >= Duration::from_millis(1000),
-        "not before: {after:?}"
-    );
+    assert!(past_deadline, "not before the delay is over: {after:?}");
 
-    let mut settled = Daemon::new(config);
-    settled.started = Instant::now() - STARTUP_GC_DELAY;
-    let (gone, after) = swept(settled, "settled").await;
+    let (gone, after, _) = swept(STARTUP_GC_DELAY, "settled").await;
     assert!(gone && after < Duration::from_secs(5), "{after:?}");
 }
 
