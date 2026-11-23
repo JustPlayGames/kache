@@ -178,6 +178,31 @@ fn a_guess_that_cannot_stop_compiles_under_its_flight_instead_of_the_pre_pass() 
     }
 }
 
+/// Only a guess that missed looks for a peer compiling its key before rustc
+/// runs to its dep-info, and once: a discovered key has nothing to derive
+/// again, and a compile under the predicted key's flight waits on joining it.
+#[test]
+fn only_a_guess_about_to_derive_its_key_again_waits_for_a_peer_first_and_once() {
+    // (owes a re-derivation, under the predicted key's flight, waited already)
+    let cases = [
+        ((true, false, false), true),
+        ((true, false, true), false),
+        ((true, true, false), false),
+        ((true, true, true), false),
+        ((false, false, false), false),
+        ((false, false, true), false),
+        ((false, true, false), false),
+        ((false, true, true), false),
+    ];
+    for ((owes, in_flight, waited), expected) in cases {
+        assert_eq!(
+            waits_for_peer_before_rederiving(owes, in_flight, waited),
+            expected,
+            "owes {owes}, under the predicted flight {in_flight}, waited {waited}"
+        );
+    }
+}
+
 /// A compile that ran under a predicted key's flight hands that flight to its
 /// store only when the key it emitted is the predicted one; under another key
 /// the flight is let go (its peers recheck and miss) and the store admits

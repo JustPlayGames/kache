@@ -8,6 +8,12 @@
 //! 1.5 k compile-seconds). At its dep-info a compile knows its key: the first
 //! to get there takes the key's compile flight, and the second waits for it,
 //! then restores the entry instead of compiling on.
+//!
+//! A checkout whose predicted key misses while another checkout already
+//! compiles that key (it holds the key's compile flight) waits for it before
+//! it starts rustc at all, and restores the entry: no rustc run to its
+//! dep-info, no permit (about 0.5 compile-hours a day on the build machine,
+//! where 630 of 2,606 such hits found the peer already compiling).
 
 #![cfg(target_os = "linux")]
 
@@ -23,6 +29,14 @@ use common::{build_kache, hermetic_command, isolated_config_path, kache_binary};
 /// What the wrapper logs when a compile reaches its dep-info while a peer
 /// compiles the same key.
 const WAITING: &str = "a peer compiles its key; waiting for it";
+
+/// What the wrapper logs when its predicted key missed while a peer compiles
+/// that key, before it starts rustc.
+const WAITING_BEFORE_RUSTC: &str = "a peer compiles its predicted key; waiting for it before rustc";
+
+/// What a compile logs once it keyed at its dep-info and holds its key's
+/// flight.
+const OWNS_FLIGHT: &str = "keyed at its dep-info; compiling under its key's flight";
 
 fn write(path: &Path, body: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -119,8 +133,26 @@ fn read(log: &Path) -> String {
     std::fs::read_to_string(log).unwrap_or_default()
 }
 
+/// One of `slow`'s events: its checkout, result, dep-info runs and how its
+/// closure was decided.
+#[derive(Debug)]
+struct SlowEvent {
+    checkout: String,
+    result: String,
+    dep_info_runs: u64,
+    prediction: String,
+}
+
 /// `slow`'s results in the event log since line `from`, by checkout.
 fn slow_results(cache: &Path, from: usize, base: &Path) -> Vec<(String, String)> {
+    slow_events(cache, from, base)
+        .into_iter()
+        .map(|event| (event.checkout, event.result))
+        .collect()
+}
+
+/// `slow`'s events in the event log since line `from`.
+fn slow_events(cache: &Path, from: usize, base: &Path) -> Vec<SlowEvent> {
     std::fs::read_to_string(cache.join("events.jsonl"))
         .unwrap_or_default()
         .lines()
@@ -133,10 +165,12 @@ fn slow_results(cache: &Path, from: usize, base: &Path) -> Vec<(String, String)>
                 .strip_prefix(base)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| root.to_string());
-            (
+            SlowEvent {
                 checkout,
-                event["result"].as_str().unwrap_or_default().to_string(),
-            )
+                result: event["result"].as_str().unwrap_or_default().to_string(),
+                dep_info_runs: event["dep_info_runs"].as_u64().unwrap_or(u64::MAX),
+                prediction: event["prediction"].as_str().unwrap_or_default().to_string(),
+            }
         })
         .collect()
 }
@@ -151,15 +185,20 @@ fn event_lines(cache: &Path) -> usize {
 struct Race {
     /// `slow`'s results while both checkouts built it after `dep` changed.
     results: Vec<(String, String)>,
-    /// Whether either checkout's `slow` waited at its dep-info for the other.
+    /// `slow`'s events in `c` while both checkouts built it.
+    c_events: Vec<SlowEvent>,
+    /// Whether either checkout's `slow` waited for the other, at its
+    /// dep-info or before its rustc.
     waited: bool,
+    /// Whether `c`'s `slow` waited for `b` before it started rustc.
+    c_waited_before_rustc: bool,
     logs: String,
 }
 
 /// Build `b` and `c` once, one after the other, so each records `slow`'s
 /// closure; then change `dep` in both and build them together, starting `c`
-/// once `b`'s `slow` is compiling before its key.
-fn race() -> Race {
+/// once `b`'s log has `b_reached`.
+fn race(b_reached: &str) -> Race {
     let tmp = TempDir::new().unwrap();
     let base = std::fs::canonicalize(tmp.path()).unwrap();
     let cache = base.join("cache");
@@ -181,11 +220,7 @@ fn race() -> Race {
         .spawn()
         .unwrap();
     let started = Instant::now();
-    while !log_has(
-        &b_log,
-        "slow: no lane took the miss; compiling before keying",
-    ) && started.elapsed() < Duration::from_secs(120)
-    {
+    while !log_has(&b_log, b_reached) && started.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(Duration::from_millis(10));
     }
     let c = cargo_build(&base.join("c"), &cache, &c_log)
@@ -194,10 +229,18 @@ fn race() -> Race {
     assert_built(&b.wait_with_output().unwrap(), "b");
     assert_built(&c.wait_with_output().unwrap(), "c");
     common::wait_for_daemon_publishes(&cache);
+    let waited_in = |log: &Path| {
+        log_has(log, &format!("slow: {WAITING}"))
+            || log_has(log, &format!("slow: {WAITING_BEFORE_RUSTC}"))
+    };
     Race {
         results: slow_results(&cache, from, &base),
-        waited: log_has(&b_log, &format!("slow: {WAITING}"))
-            || log_has(&c_log, &format!("slow: {WAITING}")),
+        c_events: slow_events(&cache, from, &base)
+            .into_iter()
+            .filter(|event| event.checkout.starts_with('c'))
+            .collect(),
+        waited: waited_in(&b_log) || waited_in(&c_log),
+        c_waited_before_rustc: log_has(&c_log, &format!("slow: {WAITING_BEFORE_RUSTC}")),
         logs: format!("b:\n{}\nc:\n{}", read(&b_log), read(&c_log)),
     }
 }
@@ -212,7 +255,7 @@ fn two_checkouts_compiling_one_key_before_it_is_known_compile_it_once() {
     build_kache();
     let mut tries = Vec::new();
     for _ in 0..ATTEMPTS {
-        let race = race();
+        let race = race("slow: no lane took the miss; compiling before keying");
         let compiled: Vec<&(String, String)> = race
             .results
             .iter()
@@ -238,6 +281,55 @@ fn two_checkouts_compiling_one_key_before_it_is_known_compile_it_once() {
     }
     panic!(
         "slow never reached its dep-info while the other checkout compiled it: {}",
+        tries.join("; ")
+    );
+}
+
+/// `c`'s predicted key misses while `b` compiles that very key under its
+/// flight: `c` waits for `b` before it starts rustc, and restores `b`'s entry
+/// without a dep-info run of its own. Before, it started rustc, ran it to its
+/// dep-info, and only then found `b`'s flight and waited.
+#[test]
+fn a_predicted_miss_waits_for_a_peer_compiling_its_key_before_it_starts_rustc() {
+    build_kache();
+    let mut tries = Vec::new();
+    for _ in 0..ATTEMPTS {
+        let race = race(&format!("slow: {OWNS_FLIGHT}"));
+        let compiled = race
+            .results
+            .iter()
+            .filter(|(_, result)| matches!(result.as_str(), "miss" | "dup" | "skipped"))
+            .count();
+        assert_eq!(
+            compiled, 1,
+            "slow was compiled {compiled} times: {:?}\n{}",
+            race.results, race.logs
+        );
+        if !race.waited {
+            // `b` stored slow before `c` looked: nothing to wait for.
+            tries.push(format!("{:?}", race.c_events));
+            continue;
+        }
+        assert!(
+            race.c_waited_before_rustc,
+            "c waited for b only after it had started rustc: {:?}\n{}",
+            race.c_events, race.logs
+        );
+        let [hit] = race.c_events.as_slice() else {
+            panic!("c built slow more than once: {:?}", race.c_events);
+        };
+        assert_eq!(hit.result, "local_hit", "{hit:?}\n{}", race.logs);
+        assert_eq!(hit.dep_info_runs, 0, "c ran rustc to its dep-info: {hit:?}");
+        assert!(
+            hit.prediction
+                .split(',')
+                .any(|outcome| outcome == "peer-flight"),
+            "c's event does not say it waited for a peer: {hit:?}"
+        );
+        return;
+    }
+    panic!(
+        "b always stored slow before c looked it up: {}",
         tries.join("; ")
     );
 }

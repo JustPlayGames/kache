@@ -4968,6 +4968,8 @@ fn run_parsed_rustc(
     let mut in_predicted_flight = false;
     // A key another process is storing is waited for once per invocation.
     let mut waited_for_store = false;
+    // So is a peer compiling the predicted key, before rustc starts.
+    let mut waited_for_peer = false;
     while precompiled.is_none() {
         // 1. Check local store (volume shard, then main)
         let lookup_start = std::time::Instant::now();
@@ -5115,6 +5117,12 @@ fn run_parsed_rustc(
             compile_before_key_after_miss(may_defer, stop_on_hit_allowed(args), owes, keyed_first);
         in_predicted_flight =
             compiles_in_predicted_flight(may_defer, stop_on_hit_allowed(args), owes, keyed_first);
+        if waits_for_peer_before_rederiving(owes, in_predicted_flight, waited_for_peer) {
+            waited_for_peer = true;
+            if peer_compiled_predicted_key(config, args, &cache_key, crate_name) {
+                continue;
+            }
+        }
         if compile_then_key.is_some() || !owes || in_predicted_flight {
             break;
         }
@@ -7904,7 +7912,12 @@ fn stored_or_peer_compiled(
             *miss_guard = None;
         });
     let flight = match joined {
-        scheduler::DepInfoFlight::Owner(lock) => return AtDepInfo::Compile(Some(lock)),
+        scheduler::DepInfoFlight::Owner(lock) => {
+            tracing::debug!(
+                "{crate_name}: keyed at its dep-info; compiling under its key's flight"
+            );
+            return AtDepInfo::Compile(Some(lock));
+        }
         scheduler::DepInfoFlight::PeerDone => {
             if stored() {
                 tracing::debug!("{crate_name}: the peer stored its key; restoring it");
@@ -8610,6 +8623,49 @@ fn compiles_in_predicted_flight(
     keyed_first: bool,
 ) -> bool {
     deferral_allowed && owes_rederivation && !stop_on_hit_allowed && !keyed_first
+}
+
+/// Does a predicted key that missed first look for a peer compiling that very
+/// key, and wait for it ([`peer_compiled_predicted_key`]), before it is
+/// derived again by a rustc run to its dep-info (the compile-first route or
+/// the pre-pass)? Once per invocation. Not for a compile under the predicted
+/// key's flight: joining that flight waits for such a peer already.
+///
+/// A validated prediction's key is the key the closure gives (none of 2,606
+/// such hits on the build machine in a day had another), so the peer's entry
+/// is this unit's: the rustc run would only learn the same key and wait at
+/// its dep-info.
+fn waits_for_peer_before_rederiving(
+    owes_rederivation: bool,
+    in_predicted_flight: bool,
+    waited: bool,
+) -> bool {
+    owes_rederivation && !in_predicted_flight && !waited
+}
+
+/// Wait for a peer that compiles `cache_key` right now (it holds the key's
+/// compile flight), before rustc starts, and say whether it let the flight go
+/// within the wait, so that the store is looked at again: no rustc run to its
+/// dep-info and no permit for a unit whose entry is on the way. With nobody
+/// on the flight, or past the wait, the miss goes on as before.
+fn peer_compiled_predicted_key(
+    config: &Config,
+    args: &RustcArgs,
+    cache_key: &str,
+    crate_name: &str,
+) -> bool {
+    let identity =
+        FlightIdentity::rustc(crate_name, &args.crate_types, args.emits_link()).with_key(cache_key);
+    let done =
+        scheduler::wait_for_peer_compile(&config.cache_dir, config.scheduler, &identity, || {
+            tracing::debug!(
+                "{crate_name}: a peer compiles its predicted key; waiting for it before rustc"
+            );
+        });
+    if done {
+        crate::opcounts::record_prediction_outcome("peer-flight");
+    }
+    done
 }
 
 /// The flight a re-entered compile ran under, when it was taken for this

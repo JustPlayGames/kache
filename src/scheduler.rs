@@ -825,6 +825,37 @@ pub(crate) fn try_take_flight(
         .flatten()
 }
 
+/// Before a compile starts, wait for a peer that holds `identity`'s flight:
+/// a predicted key missed while another checkout compiles that very key, so
+/// its entry is on the way, and a compile started now would only run rustc
+/// to its dep-info to learn the same key and wait there
+/// ([`join_flight_at_dep_info`]). Takes nothing: when nobody holds the flight,
+/// or it cannot be probed, this returns `false` at once with no decision
+/// recorded, and the caller goes on as before. `before_wait` runs once a peer
+/// is found, before the wait, which is bounded as the dep-info's
+/// ([`DEP_INFO_FLIGHT_WAIT`], within the invocation's allowance). `true` when
+/// the peer let the flight go within it (stored, failed or died): look in the
+/// store again; `false` past it too, and the caller compiles as before.
+pub(crate) fn wait_for_peer_compile(
+    cache_dir: &Path,
+    enabled: bool,
+    identity: &FlightIdentity,
+    before_wait: impl FnOnce(),
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match Scheduler::open(cache_dir) {
+        Ok(scheduler) => {
+            scheduler.wait_for_peer_compile(identity, DEP_INFO_FLIGHT_WAIT, before_wait)
+        }
+        Err(error) => {
+            tracing::debug!("scheduler unusable ({error:#}); no wait for a peer's compile");
+            false
+        }
+    }
+}
+
 enum FlightJoin {
     Owner(StoreLock),
     Waited,
@@ -959,6 +990,36 @@ impl Scheduler {
         };
         record_decision(SchedulerPhase::Flight, outcome, started.elapsed());
         joined
+    }
+
+    fn wait_for_peer_compile(
+        &self,
+        identity: &FlightIdentity,
+        longest: Duration,
+        before_wait: impl FnOnce(),
+    ) -> bool {
+        let path = self.flight_path(identity);
+        // A shared probe that never makes the flight's file. It holds the
+        // file only for the instant of the probe, as every waiter's poll does.
+        if slot_is_held(&path) != Some(true) {
+            return false;
+        }
+        before_wait();
+        let _trace = crate::phase_trace::phase("flight_wait");
+        let started = Instant::now();
+        let wait = BudgetWait::start(longest);
+        let outcome = wait_for_lock(&path, wait.timeout, self.poll_interval);
+        crate::opcounts::record_flight_wait(started.elapsed());
+        let (done, outcome) = match outcome {
+            Ok(true) => (true, SchedulerOutcome::PeerCompleted),
+            Ok(false) => (false, SchedulerOutcome::TimeoutFallback),
+            Err(error) => {
+                tracing::debug!("peer compile wait failed ({error:#})");
+                (false, unavailable_outcome())
+            }
+        };
+        record_decision(SchedulerPhase::Flight, outcome, started.elapsed());
+        done
     }
 
     fn join_flight(&self, identity: &FlightIdentity) -> FlightJoin {
@@ -4604,6 +4665,61 @@ mod tests {
         );
         release.join().unwrap();
         assert!(let_go);
+    }
+
+    /// A compile about to start for a key a peer compiles waits for that
+    /// peer, never past its bound, and takes nothing: with nobody on the
+    /// flight it neither waits nor makes the flight's file, and while it
+    /// waits the peer keeps the flight.
+    #[test]
+    fn a_compile_waits_for_a_peer_on_its_key_and_takes_nothing() {
+        let dir = temp_cache();
+        let scheduler = test_scheduler(dir.path(), 2);
+        let identity = FlightIdentity::rustc("held", &["lib".into()], false).with_key("key");
+        let path = scheduler.flight_path(&identity);
+        let wait = |bound: Duration, found: &mut bool| {
+            scheduler.wait_for_peer_compile(&identity, bound, || *found = true)
+        };
+
+        let mut found = false;
+        assert!(!wait(Duration::from_secs(10), &mut found));
+        assert!(!found, "nobody held the flight, yet the compile waited");
+        assert!(!path.exists(), "a probe made the flight's file");
+
+        let DepInfoFlight::Owner(owner) =
+            scheduler.join_flight_at_dep_info(&identity, Duration::ZERO, || {})
+        else {
+            panic!("nobody held the flight");
+        };
+        let (bound, started, mut found) = (Duration::from_millis(80), Instant::now(), false);
+        assert!(
+            !wait(bound, &mut found),
+            "a peer still compiling is not done"
+        );
+        assert!(
+            found && started.elapsed() >= bound,
+            "the compile gave up before its bound"
+        );
+        assert_eq!(
+            slot_is_held(&path),
+            Some(true),
+            "the waiter took the peer's flight"
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(owner);
+        });
+        assert!(
+            wait(Duration::from_secs(10), &mut found),
+            "the compile did not wake when the peer let go"
+        );
+        release.join().unwrap();
+        assert_eq!(
+            slot_is_held(&path),
+            Some(false),
+            "the waiter kept the flight"
+        );
     }
 
     #[test]
