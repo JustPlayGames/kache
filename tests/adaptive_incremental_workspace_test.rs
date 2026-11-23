@@ -857,3 +857,141 @@ fn a_seed_releases_the_discovery_flight_before_it_compiles() {
     assert_eq!(lib["dep_info_runs"], 1, "event: {lib:#}");
     assert_eq!(held, "0", "a keyed miss lets the discovery flight go");
 }
+
+/// `git <args>` in `repo`, with the identity a commit needs.
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.name=Kache Test",
+            "-c",
+            "user.email=kache@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .expect("failed to run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A pull is no edit. A checkout that edited its library compiles it on the
+/// active lane, before any key; when it then moves to a commit another
+/// checkout built, it used to compile that commit there too, and the crate
+/// above it with it. With `shared_ref` naming the branch the checkouts share,
+/// the units of that commit are looked up and restored, the unit's private
+/// state stays, and the next edit is back on its lane.
+#[test]
+fn a_unit_of_the_shared_tree_is_restored_in_a_checkout_with_history() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return;
+    }
+    let checkouts = tempfile::tempdir().unwrap();
+    let root = checkout_path(checkouts.path());
+    let (first, second) = (root.join("first"), root.join("second"));
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let future = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600;
+    let write = |project: &Path, mtime: Option<i64>, answer: u64| {
+        let source = project.join("lib/src/lib.rs");
+        fs::write(&source, format!("pub fn answer() -> u64 {{ {answer} }}\n")).unwrap();
+        if let Some(mtime) = mtime {
+            filetime::set_file_mtime(&source, FileTime::from_unix_time(mtime, 0)).unwrap();
+        }
+    };
+    // This build's events for the library and the crate above it.
+    let build = |project: &Path, target: &str, shared_ref: &str, answer: u64| {
+        settle_writes(&[project]);
+        let before = ["adaptive_lib", "adaptive_mid"].map(|name| crate_events(cache.path(), name).len());
+        let target = project.join(target);
+        let output = build_command(project, cache.path(), &target, "adaptive-app")
+            .env("KACHE_SHARED_REF", shared_ref)
+            .output()
+            .expect("failed to build the workspace fixture");
+        assert!(
+            output.status.success(),
+            "build failed for variant {answer}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let run = Command::new(target.join(format!(
+            "debug/adaptive-app{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+        .output()
+        .expect("failed to run the workspace binary");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), answer.to_string());
+        ["adaptive_lib", "adaptive_mid"]
+            .into_iter()
+            .zip(before)
+            .map(|(name, before)| {
+                let events = crate_events(cache.path(), name);
+                assert_eq!(events.len(), before + 1, "{name} events: {events:#?}");
+                events.into_iter().nth(before).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for project in [&first, &second] {
+        create_workspace(project);
+        write(project, None, 1);
+    }
+    fs::write(first.join(".gitignore"), "/target*\n").unwrap();
+    git(&first, &["init", "-q"]);
+    git(&first, &["add", "-A"]);
+    git(&first, &["commit", "-q", "-m", "one"]);
+    git(&first, &["branch", "shared"]);
+
+    // The first checkout gets its history: two edits nobody committed.
+    let events = build(&first, "target", "shared", 1);
+    assert_eq!(events[0]["result"], "miss", "event: {:#}", events[0]);
+    for (step, lane) in [(1, "adaptive seed"), (2, "adaptive active")] {
+        write(&first, Some(future + step), 1 + step as u64);
+        let events = build(&first, "target", "shared", 1 + step as u64);
+        assert_passthrough(&events[0], lane);
+        assert_passthrough(&events[1], lane);
+    }
+
+    // With the setting off, a commit the other checkout stored is compiled
+    // again on the lane, as it always was. The other checkout builds each
+    // commit in a target of its own, without history, so it stores it.
+    write(&second, None, 7);
+    let events = build(&second, "target-7", "off", 7);
+    assert_eq!(events[0]["result"], "miss", "event: {:#}", events[0]);
+    write(&first, Some(future + 3), 7);
+    git(&first, &["commit", "-q", "-a", "-m", "seven"]);
+    git(&first, &["branch", "-f", "shared", "HEAD"]);
+    let events = build(&first, "target", "off", 7);
+    assert_passthrough(&events[0], "adaptive active");
+
+    // With it on, the next such commit is restored, and what is built on it.
+    write(&second, None, 8);
+    let events = build(&second, "target-8", "off", 8);
+    assert_eq!(events[0]["result"], "miss", "event: {:#}", events[0]);
+    write(&first, Some(future + 4), 8);
+    git(&first, &["commit", "-q", "-a", "-m", "eight"]);
+    git(&first, &["branch", "-f", "shared", "HEAD"]);
+    let events = build(&first, "target", "shared", 8);
+    assert_eq!(events[0]["result"], "local_hit", "event: {:#}", events[0]);
+    assert_eq!(events[1]["result"], "local_hit", "event: {:#}", events[1]);
+
+    // The checkout's own next edit is not of the shared tree: it compiles on
+    // the lane it was on, from the state the restore left alone.
+    write(&first, Some(future + 5), 9);
+    let events = build(&first, "target", "shared", 9);
+    assert_passthrough(&events[0], "adaptive active");
+    assert_passthrough(&events[1], "adaptive");
+}

@@ -2222,6 +2222,7 @@ mod tests {
                 adaptive_incremental: Some(false),
                 seed_incremental: None,
                 incremental_seed_from: None,
+                shared_ref: None,
                 unstable: Default::default(),
                 exclude: Some(vec![
                     "src/generated/**".to_string(),

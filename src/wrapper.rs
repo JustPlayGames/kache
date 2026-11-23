@@ -201,6 +201,29 @@ fn managed_unit_keys_first(managed: bool, force_listed: bool, policy_state: bool
     managed && (force_listed || policy_state)
 }
 
+/// Whether a unit with incremental history leaves the incremental lanes on
+/// this invocation, because it is of the tree the machine's checkouts share
+/// ([`crate::shared_tree`]). Its policy state and private rustc state stay as
+/// they are for the next edit: nothing observes this build. A unit without
+/// policy state has no lane to leave and learns from this build as before. A
+/// unit that takes a privately compiled dependency keys on bytes no other
+/// build writes, so no store holds it and no other checkout can ask for it.
+fn keeps_to_the_cache(config: &Config, args: &RustcArgs, unit: &AdaptiveUnit) -> bool {
+    let Some(reference) = config.shared_ref.as_deref() else {
+        return false;
+    };
+    let shared = unit.has_policy_state()
+        && private_extern(args).is_none()
+        && crate::shared_tree::holds(reference, args, unit.sources().as_deref());
+    if shared {
+        tracing::debug!(
+            "[kache] {}: of the shared tree at {reference}; keeping to the cache",
+            args.crate_name.as_deref().unwrap_or("unknown")
+        );
+    }
+    shared
+}
+
 /// Build the one safety-checked unit used by both adaptive and force-list
 /// incremental compiles. Declared inputs are checked only after the narrow
 /// Cargo layout is known to be eligible; rejecting them also clears any old
@@ -4339,6 +4362,15 @@ fn run_parsed_rustc(
         precompiled.is_some(),
         crate::cache_key::dep_info_provided(),
     );
+    // A unit of the shared tree is no edit: the store may hold it, and every
+    // other checkout needs it. It leaves the incremental lanes, the ones
+    // before the key and the seed after a miss alike, and is looked up,
+    // restored or compiled for the store as in a target without history. A
+    // force-listed unit stays on its lane, and so does a program that is not
+    // cached at all.
+    let adaptive_unit = adaptive_unit.filter(|unit| {
+        force_incremental || skip_user_facing || !keeps_to_the_cache(config, args, unit)
+    });
 
     if incremental_fast_path_allowed(
         unit_refuses_caching(!refuse.is_empty(), untrusted_codegen_backend.is_some()),
@@ -7472,6 +7504,7 @@ fn adaptive_compile_before_key(
     let portable = RustcCompiler::new_for(ctx.args.invocation_env())
         .with_base_dirs(ctx.config.base_dirs.clone())
         .with_incremental_bootstrap(bootstrap.get());
+    claim_private_outputs(ctx.args);
     let mut executed = if !ready {
         Err(anyhow::anyhow!("cannot prepare private bootstrap dep-info"))
     } else if lease.worktree_portable() {
@@ -7522,6 +7555,8 @@ fn adaptive_compile_before_key(
     }
     drop(permit);
     if let Some((dep_info, tree)) = hit_closure {
+        let outputs = linkable_output_candidates(ctx.args);
+        crate::incremental_policy::private_outputs::forget(outputs.iter().map(PathBuf::as_path));
         return finish_adaptive_attempt(lease, executed, |_| {
             crate::cache_key::provide_dep_info(dep_info, tree);
             run_parsed_rustc(
@@ -7940,6 +7975,11 @@ fn private_link_extern(args: &RustcArgs) -> Option<&str> {
     if !args.invokes_linker() {
         return None;
     }
+    private_extern(args)
+}
+
+/// The first dependency an incremental compile wrote, if this unit takes one.
+fn private_extern(args: &RustcArgs) -> Option<&str> {
     args.externs
         .iter()
         .find(|dependency| {
@@ -9944,6 +9984,32 @@ fn worktree_donor_profiles(
         .collect()
 }
 
+/// The linkable files a compile of this unit can write into its `--out-dir`.
+fn linkable_output_candidates(args: &RustcArgs) -> Vec<PathBuf> {
+    let (Some(out_dir), Some(crate_name)) = (
+        args.out_dir
+            .as_deref()
+            .and_then(|dir| args.resolve_invocation_path(dir)),
+        args.crate_name.as_deref(),
+    ) else {
+        return Vec::new();
+    };
+    let mut outputs = Vec::new();
+    crate::compile::for_each_out_dir_candidate(
+        crate_name,
+        args.extra_filename.as_deref().unwrap_or(""),
+        |name| outputs.push(out_dir.join(name)),
+    );
+    outputs
+}
+
+/// Before a compile under a private lease starts, claim what it will write
+/// ([`crate::incremental_policy::private_outputs::claim`]).
+fn claim_private_outputs(args: &RustcArgs) {
+    let outputs = linkable_output_candidates(args);
+    crate::incremental_policy::private_outputs::claim(outputs.iter().map(PathBuf::as_path));
+}
+
 /// After a compile under a private lease, mark what it wrote: a link that
 /// takes one of these files keys on bytes no other build writes.
 fn mark_private_outputs(exit_code: i32, artifacts: &ArtifactSet) {
@@ -9980,6 +10046,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
             config.test_lease.as_deref(),
         )
     });
+    claim_private_outputs(args);
     let compile_start = std::time::Instant::now();
     let mut compiler = RustcCompiler::new_for(args.invocation_env())
         .with_base_dirs(config.base_dirs.clone())

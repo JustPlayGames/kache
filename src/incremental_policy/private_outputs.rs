@@ -9,8 +9,8 @@
 //! can ever ask for it.
 //!
 //! An incremental compile marks what it wrote: one small file per output under
-//! the profile's policy root, holding the output's size, modification time and
-//! (on Unix) file identity. A mark whose file has since been replaced, by a
+//! the profile's policy root, holding the output's size and which file it is
+//! (its identity on Unix, its creation time on Windows). A mark whose file has since been replaced, by a
 //! cache hit or an ordinary compile, no longer matches and counts as absent.
 //! A mark is a hint only: a wrong one changes what is stored, never what is
 //! built.
@@ -20,31 +20,36 @@ use std::time::UNIX_EPOCH;
 
 /// Under `<profile>/incremental.kache-auto`, beside the units' state.
 const DIR: &str = "private";
-const VERSION: &str = "v1";
+const VERSION: &str = "v2";
 
-/// What a mark records of its output, read from the file's metadata.
+/// What a mark records of its output, read from the file's metadata: its
+/// size and which file it is. Not its modification time: Cargo redates what
+/// a unit wrote once the unit ends (a check's metadata, to the moment it
+/// invoked the compiler), and the units built on it are started after that.
 fn stamp(path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() {
         return None;
     }
-    let modified = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
     #[cfg(unix)]
     let identity = {
         use std::os::unix::fs::MetadataExt;
         format!("{}:{}", metadata.dev(), metadata.ino())
     };
-    #[cfg(not(unix))]
-    let identity = "-";
-    Some(format!(
-        "{VERSION} {} {modified} {identity}",
-        metadata.len()
-    ))
+    // A file written anew is created anew; redating leaves that time alone.
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::fs::MetadataExt;
+        metadata.creation_time()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let identity = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("{VERSION} {} {identity}", metadata.len()))
 }
 
 /// Where the mark for `output` lives: named by a digest of its path, so the
@@ -67,6 +72,43 @@ fn linkable(output: &Path) -> bool {
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| matches!(extension, "rlib" | "rmeta" | "so" | "dylib" | "dll"))
+}
+
+/// How long a claim on outputs a compile has yet to write holds. A compile
+/// that ends replaces or forgets its claim; one that died leaves it to lapse.
+const CLAIM_SECS: u64 = 30 * 60;
+const CLAIM: &str = "claimed ";
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |now| now.as_secs())
+}
+
+/// Claim the outputs an incremental compile is about to write. Cargo starts
+/// the units built on a library when its metadata is out, before the compile
+/// ends and marks what it wrote; without the claim they would take the
+/// metadata for a stored unit's.
+pub(crate) fn claim<'a>(outputs: impl IntoIterator<Item = &'a Path>) {
+    let claim = format!("{CLAIM}{}", now_secs());
+    for output in outputs.into_iter().filter(|output| linkable(output)) {
+        if let Some(path) = mark_path(output)
+            && let Some(dir) = path.parent()
+            && std::fs::create_dir_all(dir).is_ok()
+        {
+            let _ = crate::atomic::atomic_replace_deferrable(&path, claim.as_bytes(), false);
+        }
+    }
+}
+
+/// Drop the claims of a compile that wrote nothing of its own after all: a
+/// hit stopped it and restored the outputs.
+pub(crate) fn forget<'a>(outputs: impl IntoIterator<Item = &'a Path>) {
+    for path in outputs.into_iter().filter_map(mark_path) {
+        if std::fs::read_to_string(&path).is_ok_and(|recorded| recorded.starts_with(CLAIM)) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Mark the outputs an incremental compile just wrote. Best effort: a mark
@@ -93,7 +135,14 @@ pub(crate) fn is_private(output: &Path) -> bool {
     let Ok(recorded) = std::fs::read_to_string(&path) else {
         return false;
     };
-    if stamp(output).is_some_and(|current| current == recorded) {
+    if let Some(claimed) = recorded.strip_prefix(CLAIM) {
+        if claimed
+            .parse::<u64>()
+            .is_ok_and(|at| now_secs().saturating_sub(at) <= CLAIM_SECS)
+        {
+            return true;
+        }
+    } else if stamp(output).is_some_and(|current| current == recorded) {
         return true;
     }
     let _ = std::fs::remove_file(&path);
@@ -120,6 +169,11 @@ mod tests {
         mark([rlib.as_path()]);
         assert!(is_private(&rlib));
 
+        // Cargo redates a unit's outputs when the unit ends; the file is the
+        // same one.
+        filetime::set_file_mtime(&rlib, filetime::FileTime::from_unix_time(1_000_000, 0)).unwrap();
+        assert!(is_private(&rlib), "redated, not replaced");
+
         // A hit or an ordinary compile writes a new file in its place.
         std::fs::remove_file(&rlib).unwrap();
         std::fs::write(&rlib, b"from the cache, longer").unwrap();
@@ -128,6 +182,35 @@ mod tests {
             !mark_path(&rlib).unwrap().exists(),
             "a mark its file no longer matches is removed"
         );
+    }
+
+    #[test]
+    fn a_claimed_output_is_private_before_it_is_written_until_forgotten_or_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let rmeta = deps(dir.path()).join("libedited-0123456789abcdef.rmeta");
+        claim([rmeta.as_path()]);
+        assert!(is_private(&rmeta), "claimed before the compile wrote it");
+        std::fs::write(&rmeta, b"metadata").unwrap();
+        assert!(is_private(&rmeta), "and while the compile goes on");
+
+        // The compile's end replaces the claim with what it wrote.
+        mark([rmeta.as_path()]);
+        std::fs::remove_file(&rmeta).unwrap();
+        std::fs::write(&rmeta, b"from the cache, longer").unwrap();
+        assert!(!is_private(&rmeta));
+
+        // A hit that stopped the compile forgets the claim, and only a claim.
+        claim([rmeta.as_path()]);
+        forget([rmeta.as_path()]);
+        assert!(!is_private(&rmeta));
+        mark([rmeta.as_path()]);
+        forget([rmeta.as_path()]);
+        assert!(is_private(&rmeta), "a mark is not a claim");
+
+        // A claim nobody ended lapses.
+        let stale = format!("{CLAIM}{}", now_secs() - CLAIM_SECS - 1);
+        std::fs::write(mark_path(&rmeta).unwrap(), stale).unwrap();
+        assert!(!is_private(&rmeta));
     }
 
     #[test]

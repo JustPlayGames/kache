@@ -387,24 +387,35 @@ impl AdaptiveUnit {
         Some(hash.finalize().to_hex().to_string())
     }
 
-    /// Content digest of the sources the unit's dep-info names. It only
-    /// decides whether an active unit looks up the cache; it never keys one.
-    fn source_set_digest(&self) -> Option<String> {
+    /// The sources the unit's dep-info names, as its last compile or restore
+    /// left them, rooted in the invocation's directory. `None` without a
+    /// dep-info that can be read whole.
+    pub(crate) fn sources(&self) -> Option<Vec<PathBuf>> {
         let dep_info = File::open(self.dep_info.as_ref()?).ok()?;
         if dep_info.metadata().ok()?.len() > MAX_DEP_INFO_BYTES {
             return None;
         }
         let dep_info = std::io::read_to_string(dep_info).ok()?;
-        let sources = crate::cache_key::parse_dep_info(&dep_info);
+        crate::cache_key::parse_dep_info(&dep_info)
+            .into_iter()
+            .map(|source| {
+                if source.is_absolute() {
+                    Some(source)
+                } else {
+                    Some(self.invocation_cwd.as_ref()?.join(source))
+                }
+            })
+            .collect()
+    }
+
+    /// Content digest of the sources the unit's dep-info names. It only
+    /// decides whether an active unit looks up the cache; it never keys one.
+    fn source_set_digest(&self) -> Option<String> {
+        let sources = self.sources()?;
         // Contents only, sorted: a restore may spell the same paths differently.
         let mut contents = Vec::with_capacity(sources.len());
         let mut budget = MAX_SOURCE_BYTES;
-        for source in sources {
-            let path = if source.is_absolute() {
-                source
-            } else {
-                self.invocation_cwd.as_ref()?.join(source)
-            };
+        for path in sources {
             // The last compile's dep-info can name a module a branch switch
             // deleted; the files that remain still identify the return.
             let mut input = match File::open(&path) {
