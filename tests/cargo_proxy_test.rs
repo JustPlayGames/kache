@@ -2061,7 +2061,7 @@ fn stats_attribute_crate_compiles_to_the_cargo_launch() {
     let project = root.join("project");
     let cache = root.join("cache");
     let target = project.join("target");
-    let _daemon = common::DaemonGuard::new(KACHE_BIN, &cache);
+    let _daemon = common::DaemonGuard::new(KACHE_BIN.as_path(), &cache);
     std::fs::create_dir_all(project.join("src")).unwrap();
     std::fs::write(
         project.join("Cargo.toml"),
@@ -2070,9 +2070,9 @@ fn stats_attribute_crate_compiles_to_the_cargo_launch() {
     .unwrap();
     std::fs::write(project.join("src/lib.rs"), "pub const N: u32 = 1;").unwrap();
     let shim = root.join("cargo");
-    std::os::unix::fs::symlink(KACHE_BIN, &shim).unwrap();
+    std::os::unix::fs::symlink(KACHE_BIN.as_path(), &shim).unwrap();
     for (exe, prefix, verb) in [
-        (Path::new(KACHE_BIN), &["cargo", "--"][..], "check"),
+        (KACHE_BIN.as_path(), &["cargo", "--"][..], "check"),
         (shim.as_path(), &[][..], "build"),
     ] {
         let output = hermetic_command(exe, &cache, Some(&cache.join("config.toml")))
@@ -2084,7 +2084,7 @@ fn stats_attribute_crate_compiles_to_the_cargo_launch() {
                 "--config",
                 "env.FIXTURE_PRIVATE_VALUE='private-argument'",
             ])
-            .env("RUSTC_WRAPPER", KACHE_BIN)
+            .env("RUSTC_WRAPPER", KACHE_BIN.as_path())
             .env("KACHE_REAL_CARGO", env!("CARGO"))
             .env("CARGO_INCREMENTAL", "0")
             .env("CARGO_TARGET_DIR", &target)
@@ -2098,7 +2098,7 @@ fn stats_attribute_crate_compiles_to_the_cargo_launch() {
         );
     }
     for flags in [&["--last-build"][..], &["--since", "1h"][..]] {
-        let output = hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
+        let output = hermetic_command(KACHE_BIN.as_path(), &cache, Some(&cache.join("config.toml")))
             .current_dir(&project)
             .args(["stats", "--format", "json"])
             .args(flags)
@@ -2109,7 +2109,7 @@ fn stats_attribute_crate_compiles_to_the_cargo_launch() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let redacted = hermetic_command(KACHE_BIN, &cache, Some(&cache.join("config.toml")))
+        let redacted = hermetic_command(KACHE_BIN.as_path(), &cache, Some(&cache.join("config.toml")))
             .current_dir(&project)
             .args(["stats", "--format", "json", "--redact"])
             .args(flags)
