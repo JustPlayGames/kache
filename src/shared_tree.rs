@@ -15,9 +15,14 @@
 //! (the wrapper's `keeps_to_the_cache`): it is looked up and restored, or
 //! compiled whole under a flight and stored, as in a new target.
 //!
+//! A unit the shared tree does not hold is the checkout's own: its package
+//! differs from the merge base, or Git does not track it. With
+//! `[cache] keep_incremental` at its default such a unit compiles on the kept
+//! lane (`crate::incremental_policy`), from its own state or a donor's.
+//!
 //! Git's answer picks the lane, never a key. A wrong "shared" compiles a unit
-//! whole and stores it; a wrong "not shared" compiles it privately, as
-//! before. Git missing, failing or slow reads as "not shared".
+//! whole and stores it; a wrong "changed" compiles it privately, as
+//! before. Git missing, failing or slow reads as neither ([`Tree::Unknown`]).
 
 use crate::args::RustcArgs;
 use crate::invocation::InvocationEnv;
@@ -33,15 +38,36 @@ const GIT_POLL: Duration = Duration::from_millis(1);
 /// reads more keeps its lane.
 const MAX_OUTSIDE_SOURCES: usize = 64;
 
+/// What Git says of a unit's sources against the shared tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Tree {
+    /// The merge base of `HEAD` and the shared ref holds them.
+    Shared,
+    /// The checkout changed them, or Git does not track the package.
+    Changed,
+    /// No shared tree covers them: no package folder, no repository, no such
+    /// ref, or more sources outside the package than are compared.
+    Outside,
+    /// Git gave no answer: it did not start, was stopped or took too long.
+    Unknown,
+}
+
 /// Whether the unit `args` compiles is of the shared tree at `reference`.
 /// `sources` is what its last dep-info named, when one is at hand.
 pub(crate) fn holds(reference: &str, args: &RustcArgs, sources: Option<&[PathBuf]>) -> bool {
+    classify(reference, args, sources) == Tree::Shared
+}
+
+/// What Git says of the unit `args` compiles against the shared tree at
+/// `reference` ([`Tree`]). `sources` is what its last dep-info named, when
+/// one is at hand.
+pub(crate) fn classify(reference: &str, args: &RustcArgs, sources: Option<&[PathBuf]>) -> Tree {
     let env = args.invocation_env();
     let Some(package) = env
         .var_os("CARGO_MANIFEST_DIR")
         .and_then(|dir| env.resolve(Path::new(&dir)))
     else {
-        return false;
+        return Tree::Outside;
     };
     let Some(outside) = outside_sources(
         &package,
@@ -49,9 +75,9 @@ pub(crate) fn holds(reference: &str, args: &RustcArgs, sources: Option<&[PathBuf
         args.target_dir().as_deref(),
         sources.unwrap_or_default(),
     ) else {
-        return false;
+        return Tree::Outside;
     };
-    package_at_merge_base(env, reference, &package, &outside)
+    package_against_merge_base(env, reference, &package, &outside)
 }
 
 /// The sources Git must compare beside the package folder: those elsewhere in
@@ -101,12 +127,24 @@ fn lexical(path: &Path) -> PathBuf {
 
 /// Whether `package` and the `outside` files hold what the merge base of
 /// `HEAD` and `reference` holds, in a repository that tracks the package.
+#[cfg(test)]
 fn package_at_merge_base(
     env: &InvocationEnv,
     reference: &str,
     package: &Path,
     outside: &[PathBuf],
 ) -> bool {
+    package_against_merge_base(env, reference, package, outside) == Tree::Shared
+}
+
+/// What `package` and the `outside` files hold against the merge base of
+/// `HEAD` and `reference` ([`Tree`]).
+fn package_against_merge_base(
+    env: &InvocationEnv,
+    reference: &str,
+    package: &Path,
+    outside: &[PathBuf],
+) -> Tree {
     let deadline = Instant::now() + GIT_TIMEOUT;
     // The comparison first: an edited package ends here, in one process.
     let mut diff: Vec<OsString> = ["diff", "--quiet", "--merge-base", reference, "--", "."]
@@ -114,30 +152,41 @@ fn package_at_merge_base(
         .map(OsString::from)
         .collect();
     diff.extend(outside.iter().map(|path| path.clone().into_os_string()));
-    git_succeeds(env, package, &diff, deadline)
-        // Nothing differs in a folder Git does not track either, and a
-        // package there (a scratch crate in an ignored folder) is nobody
-        // else's.
-        && git_succeeds(
-            env,
-            package,
-            &["ls-files", "--error-unmatch", "--", "Cargo.toml"],
-            deadline,
-        )
+    match git_status(env, package, &diff, deadline) {
+        Some(0) => {}
+        // `--quiet`: 1 for a difference, anything else for an error: no
+        // repository, or no such ref or merge base.
+        Some(1) => return Tree::Changed,
+        Some(_) => return Tree::Outside,
+        None => return Tree::Unknown,
+    }
+    // Nothing differs in a folder Git does not track either, and a package
+    // there (a scratch crate in an ignored folder) is nobody else's.
+    match git_status(
+        env,
+        package,
+        &["ls-files", "--error-unmatch", "--", "Cargo.toml"],
+        deadline,
+    ) {
+        Some(0) => Tree::Shared,
+        Some(1) => Tree::Changed,
+        Some(_) => Tree::Outside,
+        None => Tree::Unknown,
+    }
 }
 
-/// Whether `git -C dir <args>` exits with success before `deadline`, run as
-/// the invocation would run it. The repository's filesystem monitor stays
-/// off (a configured one is a program Git would start), and Git takes no
-/// lock a concurrent Git command of the user's could trip over.
-fn git_succeeds<S: AsRef<OsStr>>(
+/// The exit code of `git -C dir <args>`, when it exits before `deadline`,
+/// run as the invocation would run it. The repository's filesystem monitor
+/// stays off (a configured one is a program Git would start), and Git takes
+/// no lock a concurrent Git command of the user's could trip over.
+fn git_status<S: AsRef<OsStr>>(
     env: &InvocationEnv,
     dir: &Path,
     args: &[S],
     deadline: Instant,
-) -> bool {
+) -> Option<i32> {
     let Ok(mut command) = env.command("git") else {
-        return false;
+        return None;
     };
     command
         .args(["-c", "core.fsmonitor=false", "-C"])
@@ -152,16 +201,16 @@ fn git_succeeds<S: AsRef<OsStr>>(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let Ok(mut child) = crate::platform::host_spawn(&mut command) else {
-        return false;
+        return None;
     };
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return status.code(),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_POLL),
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return None;
             }
         }
     }
@@ -265,14 +314,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = repository(dir.path());
         let words = repo.join("assets/words.txt");
-        assert!(at_merge_base(&repo, "top", &[words.clone()]));
+        assert!(at_merge_base(&repo, "top", std::slice::from_ref(&words)));
         std::fs::write(&words, "two\n").unwrap();
         assert!(!at_merge_base(&repo, "top", &[words]));
         assert!(at_merge_base(&repo, "top", &[]));
     }
 
+    /// An untracked package is the checkout's own; an unknown ref or no
+    /// repository at all is no answer, which keeps a unit on the lanes it
+    /// had without the shared ref.
     #[test]
-    fn an_untracked_package_an_unknown_ref_and_no_repository_are_not_shared() {
+    fn an_untracked_package_is_changed_and_an_unknown_ref_or_no_repository_outside() {
         if git_missing() {
             return;
         }
@@ -284,16 +336,30 @@ mod tests {
         assert!(!at_merge_base(&repo, "scratch", &[]), "ignored folder");
 
         let env = InvocationEnv::capture();
-        assert!(!package_at_merge_base(
-            &env,
-            "origin/missing",
-            &repo.join("low"),
-            &[]
-        ));
+        assert_eq!(
+            package_against_merge_base(&env, "shared", &repo.join("scratch"), &[]),
+            Tree::Changed
+        );
+        assert_eq!(
+            package_against_merge_base(&env, "shared", &repo.join("low"), &[]),
+            Tree::Shared
+        );
+        std::fs::write(repo.join("low/src/lib.rs"), "pub fn low() -> u8 { 1 }\n").unwrap();
+        assert_eq!(
+            package_against_merge_base(&env, "shared", &repo.join("low"), &[]),
+            Tree::Changed
+        );
+        assert_eq!(
+            package_against_merge_base(&env, "origin/missing", &repo.join("low"), &[]),
+            Tree::Outside
+        );
         let loose = dir.path().join("loose");
         std::fs::create_dir_all(&loose).unwrap();
         std::fs::write(loose.join("Cargo.toml"), "[package]\n").unwrap();
-        assert!(!package_at_merge_base(&env, "shared", &loose, &[]));
+        assert_eq!(
+            package_against_merge_base(&env, "shared", &loose, &[]),
+            Tree::Outside
+        );
     }
 
     #[test]

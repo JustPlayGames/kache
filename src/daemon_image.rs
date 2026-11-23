@@ -13,11 +13,33 @@ const IMAGE: &str = if cfg!(windows) {
     "kache-engine"
 };
 const LOCK: &str = "lock";
+/// A folder of its own for the images, in place of the user's: a test or a
+/// second installation whose daemons must not prune the images of the
+/// user's own (the per-user folder comes from the known-folder API, which no
+/// environment variable redirects).
+const ROOT_ENV: &str = "KACHE_DAEMON_IMAGES";
 
 /// Where daemon images live: one directory per user, so each engine is
-/// copied once however many caches its daemons serve. Pruning removes what
-/// else is there, so the directory must be one only Kache writes to.
+/// copied once however many caches its daemons serve, or what
+/// [`ROOT_ENV`] names. Pruning removes what else is there, so the directory
+/// must be one only Kache writes to.
+#[cfg(windows)]
 pub(super) fn root() -> Result<PathBuf> {
+    root_from(std::env::var_os(ROOT_ENV))
+}
+
+/// [`root`] for the value of [`ROOT_ENV`]. A relative one is refused, so the
+/// daemon runs its engine in place rather than images landing in whatever
+/// folder a build starts in, or in the user's.
+fn root_from(setting: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(dir) = setting.filter(|dir| !dir.is_empty()).map(PathBuf::from) {
+        anyhow::ensure!(
+            dir.is_absolute(),
+            "{ROOT_ENV} must name an absolute folder, not {}",
+            dir.display()
+        );
+        return Ok(dir);
+    }
     Ok(dirs::data_local_dir()
         .context("locating the local application data directory")?
         .join("kache")
@@ -229,12 +251,25 @@ mod tests {
 
     #[test]
     fn images_live_in_a_kache_directory_under_local_app_data() {
-        let root = root().unwrap();
+        let root = root_from(None).unwrap();
         assert!(
             root.starts_with(dirs::data_local_dir().unwrap()),
             "{root:?}"
         );
         assert!(root.ends_with(Path::new("kache").join("daemon-engines")));
+        assert_eq!(root_from(Some("".into())).unwrap(), root);
+    }
+
+    /// A folder of the caller's own keeps a test's daemons out of the user's
+    /// images; a relative one is refused rather than resolved anywhere.
+    #[test]
+    fn a_named_images_folder_replaces_the_users_and_must_be_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            root_from(Some(dir.path().as_os_str().to_owned())).unwrap(),
+            dir.path()
+        );
+        assert!(root_from(Some("engines".into())).is_err());
     }
 
     #[test]

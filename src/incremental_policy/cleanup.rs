@@ -136,6 +136,12 @@ fn sweep(
         if !real_directory(&auto_root) || !real_directory(&root) {
             continue;
         }
+        // A folder kept for others keeps every graph for as long as whoever
+        // keeps it says: other checkouts start from them however long ago
+        // this folder last compiled one.
+        if worktree_seed::keep_all_profile(&profile) {
+            continue;
+        }
         let _profile_locks = if mode == Sweep::WithCargoLocks {
             let Some(held) = crate::unit_prune::hold(&profile) else {
                 continue;
@@ -321,6 +327,30 @@ mod tests {
         assert!(compiling.join("rustc/graph.bin").is_file());
         assert!(recent.join("rustc/graph.bin").is_file());
         drop(cargo);
+    }
+
+    /// Other checkouts start from a folder kept for others however long ago
+    /// it last compiled a unit, so neither clean-up takes its graphs.
+    #[test]
+    fn a_folder_kept_for_others_keeps_its_idle_graphs() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("debug");
+        let unit = profile
+            .join(AUTO_ROOT)
+            .join(POLICY_VERSION)
+            .join("a".repeat(64));
+        fs::create_dir_all(unit.join("rustc")).unwrap();
+        fs::write(unit.join("rustc/graph.bin"), b"payload").unwrap();
+        fs::write(unit.join("unit.lock"), b"").unwrap();
+        filetime::set_file_mtime(&unit, filetime::FileTime::from_unix_time(100, 0)).unwrap();
+        worktree_seed::mark_keep_all(&profile);
+
+        let window = Duration::from_secs(10);
+        let at = UNIX_EPOCH + Duration::from_secs(110);
+        for mode in [Sweep::Preview, Sweep::WithCargoLocks, Sweep::UnitLockOnly] {
+            assert_eq!(sweep(dir.path(), window, at, mode, Some(true)).units, 0);
+        }
+        assert!(unit.join("rustc/graph.bin").is_file());
     }
 
     /// rustc reads only the newest finalized session, whose name's time is

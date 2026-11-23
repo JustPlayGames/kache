@@ -4,13 +4,44 @@ use super::*;
 use std::io;
 
 pub(super) const MARKER: &str = "worktree-seed-v1";
+/// Under a profile's policy root: one file per published seed, named by its
+/// key and holding its unit's key, so a receiver finds a donor's unit
+/// without reading every unit's marker.
+const SEEDS: &str = "seeds-v2";
+/// Under a profile's policy root: this folder keeps every unit's graph for
+/// others to start from (`[cache] keep_incremental = "all"`).
+const KEEP_ALL: &str = "keep-all";
+/// Under the cache folder: one file per profile kept for others, holding its
+/// path. Such folders are tried as donors before any other.
+const KEPT_DONORS: &str = "incremental-donors";
+/// Donors without a seed index (an older release's) whose units a receiver
+/// reads one by one.
+const MAX_SCANNED_DONORS: usize = 8;
 /// The fixed directory a private compile's cwd is remapped to, the same in
-/// every worktree. It must be an absolute path on the host: on Windows
-/// `/src` has no drive, so no invocation would ever qualify there.
-const REMAP_PREFIX: &str = if cfg!(windows) { r"C:\src" } else { "/src" };
+/// every worktree. It must be an absolute path on the host: on Windows a
+/// path without a drive never qualifies, so it is `C:\src` there.
+///
+/// Elsewhere it is where a stored compile puts the workspace
+/// ([`crate::path_normalizer::workspace_flag_target`]): a graph is only as
+/// good as its upstream crates' metadata. A private compile of a library
+/// differs from its stored compile in the crate hash alone when both name the
+/// workspace alike, so a unit whose graph was built on the private one (a
+/// folder that keeps every unit, above all) re-runs the queries on that
+/// crate and finds the same answers. With `/src` every span of that crate
+/// differed too, and an imported graph of a crate built on many of ours was
+/// worth no more than a cold compile.
+const REMAP_PREFIX: &str = if cfg!(windows) {
+    r"C:\src"
+} else if cfg!(target_os = "linux") {
+    "/proc/self/cwd"
+} else {
+    "/kache/workspace"
+};
 const MAX_DONORS: usize = 256;
-const MAX_COPY_FILES: usize = 65_536;
-const MAX_COPY_BYTES: u64 = 1 << 30;
+const MAX_COPY_FILES: usize = 262_144;
+/// A test program's graph of a large crate, with its object files, is
+/// several gigabytes.
+const MAX_COPY_BYTES: u64 = 16 << 30;
 
 impl Lease {
     /// Normalize only modeled path operands. An unsupported invocation keeps
@@ -101,21 +132,22 @@ impl Lease {
         else {
             return isolated;
         };
+        let target = args
+            .target_dir()
+            .and_then(|target| relative(target.to_str()?, &cwd));
         let key = portable_key(
             args,
             &normalized,
             &self.unit.policy_guard,
             bootstrap,
             &identity,
+            target.as_deref(),
         );
-        if empty_directory(&self.unit.rustc_dir) {
-            for donor_profile in donor_profiles {
-                if import(&self.unit, donor_profile, &key) {
-                    tracing::debug!(donor = %donor_profile.display(), "imported worktree incremental seed");
-                    self.worktree_seed_donor = Some(donor_profile.clone());
-                    break;
-                }
-            }
+        if empty_directory(&self.unit.rustc_dir)
+            && let Some(donor_profile) = import_from(&self.unit, donor_profiles, &key)
+        {
+            tracing::debug!(donor = %donor_profile.display(), "imported worktree incremental seed");
+            self.worktree_seed_donor = Some(donor_profile);
         }
         self.worktree_seed_key = Some(key);
         self.worktree_bootstrap = inject_bootstrap;
@@ -187,13 +219,155 @@ fn bootstrap_override_allowed(current: Option<&std::ffi::OsStr>, flags: &[String
 
 pub(super) fn publish(unit: &AdaptiveUnit, key: Option<&str>) {
     let Some(key) = key else { return };
-    let Ok(mut file) = tempfile::NamedTempFile::new_in(&unit.unit_dir) else {
+    if write_small_file(&unit.unit_dir, &unit.unit_dir.join(MARKER), key.as_bytes()) {
+        index_seed(unit, key);
+    }
+}
+
+/// Name the unit in its profile's seed index under `key`, unless it is
+/// named there already. The unit's marker stays what a receiver checks: an
+/// entry whose unit has since reset or changed is skipped.
+fn index_seed(unit: &AdaptiveUnit, key: &str) {
+    let Some(auto_root) = unit.unit_dir.parent().and_then(Path::parent) else {
         return;
     };
-    use std::io::Write;
-    if file.write_all(key.as_bytes()).is_ok() {
-        let _ = file.persist(unit.unit_dir.join(MARKER));
+    let index = auto_root.join(SEEDS);
+    let entry = index.join(key);
+    if fs::read(&entry).ok().as_deref() == Some(unit.unit_key.as_bytes()) {
+        return;
     }
+    if ensure_real_directory(&index) {
+        write_small_file(&index, &entry, unit.unit_key.as_bytes());
+    }
+}
+
+/// Replace `path` with `bytes` through a file staged in `dir`.
+fn write_small_file(dir: &Path, path: &Path, bytes: &[u8]) -> bool {
+    let Ok(mut file) = tempfile::NamedTempFile::new_in(dir) else {
+        return false;
+    };
+    use std::io::Write;
+    file.write_all(bytes).is_ok() && file.persist(path).is_ok()
+}
+
+/// Mark `profile` as kept for others: every unit's graph stays, and the
+/// idle clean-ups leave it to whoever keeps the folder.
+pub(crate) fn mark_keep_all(profile: &Path) {
+    let auto_root = profile.join(AUTO_ROOT);
+    let marker = auto_root.join(KEEP_ALL);
+    if !fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file()) && real_directory(&auto_root)
+    {
+        write_small_file(&auto_root, &marker, b"every unit's graph is kept here\n");
+    }
+}
+
+/// Whether `profile` is kept for others ([`mark_keep_all`]).
+pub(crate) fn keep_all_profile(profile: &Path) -> bool {
+    fs::symlink_metadata(profile.join(AUTO_ROOT).join(KEEP_ALL)).is_ok_and(|meta| meta.is_file())
+}
+
+/// Record `profile` among the folders kept for others under `cache_dir`,
+/// which every receiver on the machine tries first ([`kept_donors`]).
+pub(crate) fn register_kept_donor(cache_dir: &Path, profile: &Path) {
+    let Some(path) = profile.to_str() else { return };
+    let registry = cache_dir.join(KEPT_DONORS);
+    let entry = registry.join(&blake3::hash(path.as_bytes()).to_hex().as_str()[..32]);
+    if fs::read(&entry).ok().as_deref() == Some(path.as_bytes()) {
+        return;
+    }
+    if ensure_real_directory(&registry) {
+        write_small_file(&registry, &entry, path.as_bytes());
+    }
+}
+
+/// The profiles kept for others that [`register_kept_donor`] recorded under
+/// `cache_dir` and that are still there. An entry whose folder is gone is
+/// forgotten.
+pub(crate) fn kept_donors(cache_dir: &Path) -> Vec<PathBuf> {
+    let registry = cache_dir.join(KEPT_DONORS);
+    let Ok(entries) = fs::read_dir(&registry) else {
+        return Vec::new();
+    };
+    let mut donors = Vec::new();
+    for entry in entries.take(MAX_DONORS).flatten() {
+        let path = entry.path();
+        if !fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= 4096) {
+            continue;
+        }
+        let Ok(profile) = fs::read_to_string(&path).map(PathBuf::from) else {
+            continue;
+        };
+        if keep_all_profile(&profile) {
+            donors.push(profile);
+        } else if definitely_missing(&profile) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    donors
+}
+
+/// Copy the newest graph of a unit that published `key` in one of
+/// `profiles` into the receiver's empty graph. The profiles whose seed index
+/// names the key come first: a folder kept for others before any other,
+/// then the newest entry. Profiles without an index (an older release's)
+/// have their units read one by one after that. The donor profile, if one
+/// was copied.
+fn import_from(receiver: &AdaptiveUnit, profiles: &[PathBuf], key: &str) -> Option<PathBuf> {
+    let mut indexed = Vec::new();
+    let mut unindexed = Vec::new();
+    for profile in profiles {
+        let index = profile.join(AUTO_ROOT).join(SEEDS);
+        match fs::symlink_metadata(index.join(key)) {
+            Ok(meta) if meta.is_file() => {
+                indexed.push((keep_all_profile(profile), meta.modified().ok(), profile));
+            }
+            Ok(_) => {}
+            Err(_) if !real_directory(&index) => unindexed.push(profile),
+            Err(_) => {}
+        }
+    }
+    indexed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, _, profile) in indexed {
+        let entry = profile.join(AUTO_ROOT).join(SEEDS).join(key);
+        let Some(unit_key) = fs::read_to_string(entry)
+            .ok()
+            .filter(|name| valid_hex_digest(name))
+        else {
+            continue;
+        };
+        if import_unit(receiver, profile, &unit_key, key) {
+            return Some(profile.clone());
+        }
+    }
+    unindexed
+        .into_iter()
+        .take(MAX_SCANNED_DONORS)
+        .find(|profile| import(receiver, profile, key))
+        .cloned()
+}
+
+/// The arguments a seed's key folds, with the target folder named alike in
+/// every folder: rustc's graph does not depend on where the outputs and the
+/// libraries it reads live (`--out-dir`, `-L` and `--extern` are not among
+/// the options its graph records), so a folder of the build machine's own
+/// (`target/integrate-stack`) can seed a checkout's `target`. Only a whole
+/// leading path component is replaced, at the start of an argument or after
+/// an `=` (`dependency=target/...`), never inside a value like
+/// `target_os="linux"`.
+fn target_neutral<'a>(argument: &'a str, target: Option<&str>) -> std::borrow::Cow<'a, str> {
+    let Some(target) = target.filter(|target| !target.is_empty()) else {
+        return argument.into();
+    };
+    let starts = std::iter::once(0).chain(argument.match_indices('=').map(|(at, _)| at + 1));
+    for start in starts {
+        let Some(rest) = argument[start..].strip_prefix(target) else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with('/') || rest.starts_with(std::path::MAIN_SEPARATOR) {
+            return format!("{}\0target{rest}", &argument[..start]).into();
+        }
+    }
+    argument.into()
 }
 
 fn portable_key(
@@ -202,9 +376,10 @@ fn portable_key(
     guard: &[u8],
     bootstrap: Option<&std::ffi::OsStr>,
     identity: &str,
+    target: Option<&str>,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    fold(&mut hasher, b"kache-worktree-incremental-v2");
+    fold(&mut hasher, b"kache-worktree-incremental-v3");
     fold(&mut hasher, guard);
     fold(&mut hasher, identity.as_bytes());
     match bootstrap {
@@ -216,10 +391,50 @@ fn portable_key(
     }
     fold(&mut hasher, args.rustc.as_os_str().as_encoded_bytes());
     fold_compiler_stamp(&mut hasher, &args.rustc);
-    for arg in strip_incremental_refs(normalized) {
-        fold(&mut hasher, arg.as_bytes());
+    for arg in diagnostics_neutral(&strip_incremental_refs(normalized)) {
+        fold(&mut hasher, target_neutral(&arg, target).as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+/// `args` without what only shapes how rustc reports diagnostics, which its
+/// graph does not record either (`--color`, `--error-format`,
+/// `--diagnostic-width`, and of `--json` what renders a diagnostic): a
+/// terminal's width or a runner's colors do not decide which graph a unit
+/// can start from. `--json=artifacts` and `future-incompat` stay; rustc's
+/// graph records them.
+fn diagnostics_neutral(args: &[&String]) -> Vec<String> {
+    const REPORTING: [&str; 3] = ["--color", "--error-format", "--diagnostic-width"];
+    let mut kept = Vec::with_capacity(args.len());
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let (flag, attached) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+        if REPORTING.contains(&flag) {
+            if attached.is_none() {
+                iter.next();
+            }
+            continue;
+        }
+        if flag == "--json" {
+            let value = match attached {
+                Some(value) => value,
+                None => match iter.next() {
+                    Some(value) => value.as_str(),
+                    None => break,
+                },
+            };
+            let tracked: Vec<&str> = value
+                .split(',')
+                .filter(|part| !part.starts_with("diagnostic-"))
+                .collect();
+            kept.push(format!("--json={}", tracked.join(",")));
+            continue;
+        }
+        kept.push((*arg).clone());
+    }
+    kept
 }
 
 fn relative(value: &str, cwd: &Path) -> Option<String> {
@@ -357,94 +572,107 @@ pub(super) fn empty_directory(path: &Path) -> bool {
     real_directory(path) && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
+/// Whether `profile` may give a seed: an absolute path that is its own
+/// canonical spelling, so no symlinked ancestor leads elsewhere, with the
+/// policy's folders in place. Nothing is created in the donor tree.
+fn donor_profile(profile: &Path) -> bool {
+    safe_absolute_path(profile)
+        && canonical_spelling(profile)
+        && real_directory(&profile.join(AUTO_ROOT))
+        && real_directory(&profile.join(AUTO_ROOT).join(POLICY_VERSION))
+}
+
+/// Read the units of `profile` one by one for a seed published under `key`.
 fn import(receiver: &AdaptiveUnit, profile: &Path, key: &str) -> bool {
-    // Require canonical input to exclude symlinked ancestors in a supplied
-    // donor path. No directories or locks are created in the donor tree.
-    if !safe_absolute_path(profile) || !canonical_spelling(profile) {
+    if !donor_profile(profile) {
         return false;
     }
-    let root = profile.join(AUTO_ROOT).join(POLICY_VERSION);
-    if !real_directory(&profile.join(AUTO_ROOT)) || !real_directory(&root) {
-        return false;
-    }
-    let Ok(entries) = fs::read_dir(root) else {
+    let Ok(entries) = fs::read_dir(profile.join(AUTO_ROOT).join(POLICY_VERSION)) else {
         return false;
     };
-    for entry in entries.take(MAX_DONORS).flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if !valid_hex_digest(&name)
-            || !real_directory(&entry.path())
-            || entry.path() == receiver.unit_dir
-        {
-            continue;
-        }
-        let donor = AdaptiveUnit {
-            source_file: None,
-            dep_info: None,
-            invocation_cwd: None,
-            original_incremental: profile.join("incremental"),
-            unit_key: name,
-            unit_dir: entry.path(),
-            state_path: entry.path().join("state.json"),
-            lock_path: entry.path().join("unit.lock"),
-            rustc_dir: entry.path().join("rustc"),
-            policy_guard: receiver.policy_guard.clone(),
-        };
-        // Open only an existing regular lock; the owner always creates it
-        // before writing a marker. Never wait on a busy donor.
-        if unsafe_file(&donor.lock_path) {
-            continue;
-        }
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&donor.lock_path)
-        else {
-            continue;
-        };
-        if file.try_lock().is_err() {
-            continue;
-        }
-        let _lock = UnitLock(file);
-        let marker = donor.unit_dir.join(MARKER);
-        if !fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file() && meta.len() == 64)
-            || fs::read_to_string(marker).ok().as_deref() != Some(key)
-            || !matches!(
-                donor.load_state(),
-                LoadedState::Missing
-                    | LoadedState::Valid(DiskState {
-                        in_flight: false,
-                        ..
-                    })
-            )
-            || !real_directory(&donor.rustc_dir)
-        {
-            continue;
-        }
-        let Ok(stage) = tempfile::Builder::new()
-            .prefix("worktree-seed-")
-            .tempdir_in(&receiver.unit_dir)
-        else {
-            return false;
-        };
-        let mut budget = CopyBudget {
-            files: MAX_COPY_FILES,
-            bytes: MAX_COPY_BYTES,
-        };
-        if copy_tree(&donor.rustc_dir, stage.path(), &mut budget, 0).is_err()
-            || empty_directory(stage.path())
-        {
-            continue;
-        }
-        // The receiver's unit lock has been held since before this method.
-        // Rename replaces only its empty graph, never partially imports one.
-        if fs::rename(stage.path(), &receiver.rustc_dir).is_ok() {
-            return true;
-        }
+    entries.take(MAX_DONORS).flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| copy_unit(receiver, profile, name, key))
+    })
+}
+
+/// Copy the graph of the unit `unit_key` of `profile`, which the seed index
+/// named under `key`.
+fn import_unit(receiver: &AdaptiveUnit, profile: &Path, unit_key: &str, key: &str) -> bool {
+    donor_profile(profile) && copy_unit(receiver, profile, unit_key, key)
+}
+
+/// Copy the newest graph of the donor unit `name` of `profile` into the
+/// receiver's empty graph, if that unit published `key` and no compile holds
+/// it.
+fn copy_unit(receiver: &AdaptiveUnit, profile: &Path, name: &str, key: &str) -> bool {
+    let unit_dir = profile.join(AUTO_ROOT).join(POLICY_VERSION).join(name);
+    if !valid_hex_digest(name) || !real_directory(&unit_dir) || unit_dir == receiver.unit_dir {
+        return false;
     }
-    false
+    let donor = AdaptiveUnit {
+        source_file: None,
+        dep_info: None,
+        invocation_cwd: None,
+        original_incremental: profile.join("incremental"),
+        unit_key: name.to_owned(),
+        state_path: unit_dir.join("state.json"),
+        lock_path: unit_dir.join("unit.lock"),
+        rustc_dir: unit_dir.join("rustc"),
+        unit_dir,
+        policy_guard: receiver.policy_guard.clone(),
+    };
+    // Open only an existing regular lock; the owner always creates it
+    // before writing a marker. Never wait on a busy donor.
+    if unsafe_file(&donor.lock_path) {
+        return false;
+    }
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&donor.lock_path)
+    else {
+        return false;
+    };
+    if file.try_lock().is_err() {
+        return false;
+    }
+    let _lock = UnitLock(file);
+    let marker = donor.unit_dir.join(MARKER);
+    if !fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file() && meta.len() == 64)
+        || fs::read_to_string(marker).ok().as_deref() != Some(key)
+        || !matches!(
+            donor.load_state(),
+            LoadedState::Missing
+                | LoadedState::Valid(DiskState {
+                    in_flight: false,
+                    ..
+                })
+        )
+        || !real_directory(&donor.rustc_dir)
+    {
+        return false;
+    }
+    let Ok(stage) = tempfile::Builder::new()
+        .prefix("worktree-seed-")
+        .tempdir_in(&receiver.unit_dir)
+    else {
+        return false;
+    };
+    let mut budget = CopyBudget {
+        files: MAX_COPY_FILES,
+        bytes: MAX_COPY_BYTES,
+    };
+    if copy_tree(&donor.rustc_dir, stage.path(), &mut budget, 0).is_err()
+        || empty_directory(stage.path())
+    {
+        return false;
+    }
+    // The receiver's unit lock has been held since before this method.
+    // Rename replaces only its empty graph, never partially imports one.
+    fs::rename(stage.path(), &receiver.rustc_dir).is_ok()
 }
 
 struct CopyBudget {
@@ -554,10 +782,19 @@ mod tests {
     const VIRTUAL_PREFIX: &str = REMAP_PREFIX;
 
     /// The remap target names an absolute path on the host, or no Windows
-    /// invocation qualifies for a seed (`/src` has no drive there).
+    /// invocation qualifies for a seed (`/src` has no drive there). Off
+    /// Windows it is where a stored compile maps the workspace: a graph
+    /// built on privately compiled crates then fits a checkout that
+    /// restored them, but for their crate hash.
     #[test]
     fn the_remap_prefix_is_absolute_on_this_host() {
         assert!(Path::new(REMAP_PREFIX).is_absolute(), "{REMAP_PREFIX}");
+        if !cfg!(windows) {
+            assert_eq!(
+                REMAP_PREFIX,
+                crate::path_normalizer::workspace_flag_target()
+            );
+        }
     }
 
     /// A donor profile is accepted under its own canonical spelling; on
@@ -876,7 +1113,7 @@ mod tests {
             &temp.path().join("two/deeper"),
         )
         .unwrap();
-        let key = portable_key(&args_a, &a, b"guard", None, "compiler-v1");
+        let key = portable_key(&args_a, &a, b"guard", None, "compiler-v1", None);
         assert_ne!(
             key,
             portable_key(
@@ -884,38 +1121,60 @@ mod tests {
                 &a,
                 b"guard",
                 Some(std::ffi::OsStr::new("1")),
-                "compiler-v1"
+                "compiler-v1",
+                None,
             )
         );
         assert_ne!(
             key,
-            portable_key(&args_a, &a, b"guard", None, "compiler-v2")
+            portable_key(&args_a, &a, b"guard", None, "compiler-v2", None)
         );
         assert_eq!(
             key,
-            portable_key(&args_b, &b, b"guard", None, "compiler-v1")
+            portable_key(&args_b, &b, b"guard", None, "compiler-v1", None)
         );
         assert_ne!(
             key,
-            portable_key(&args_b, &b, b"other", None, "compiler-v1")
+            portable_key(&args_b, &b, b"other", None, "compiler-v1", None)
         );
         args_b.rustc = "/different/rustc".into();
         assert_ne!(
             key,
-            portable_key(&args_b, &b, b"guard", None, "compiler-v1")
+            portable_key(&args_b, &b, b"guard", None, "compiler-v1", None)
         );
         let mut flags = a.clone();
         flags.push("-Copt-level=2".into());
         assert_ne!(
             key,
-            portable_key(&args_a, &flags, b"guard", None, "compiler-v1")
+            portable_key(&args_a, &flags, b"guard", None, "compiler-v1", None)
         );
         let mut remap = a.clone();
         *remap.last_mut().unwrap() = "-Zremap-cwd-prefix=/different".into();
         assert_ne!(
             key,
-            portable_key(&args_a, &remap, b"guard", None, "compiler-v1")
+            portable_key(&args_a, &remap, b"guard", None, "compiler-v1", None)
         );
+
+        // How diagnostics are shown is no part of the graph; which JSON
+        // notices rustc emits is.
+        let with = |extra: &[&str]| {
+            let mut flags = a.clone();
+            flags.extend(extra.iter().map(|flag| flag.to_string()));
+            portable_key(&args_a, &flags, b"guard", None, "compiler-v1", None)
+        };
+        let json = with(&["--json=artifacts,future-incompat"]);
+        assert_ne!(key, json);
+        assert_eq!(
+            json,
+            with(&[
+                "--error-format=json",
+                "--json=diagnostic-rendered-ansi,artifacts,future-incompat",
+                "--diagnostic-width=211",
+                "--color",
+                "always",
+            ])
+        );
+        assert_ne!(json, with(&["--json=artifacts"]));
     }
 
     #[cfg(unix)]
@@ -954,6 +1213,114 @@ mod tests {
         assert_eq!(fs::read(&copied).unwrap(), b"complete");
         fs::write(&copied, b"changed").unwrap();
         assert_eq!(fs::read(graph.join("dep-graph.bin")).unwrap(), b"complete");
+    }
+
+    /// A receiver finds a donor's unit through the donor's seed index, a
+    /// folder kept for others before any other. An entry whose unit since
+    /// published another key is passed over, and a donor without an index
+    /// (an older release's) has its units read one by one.
+    #[cfg(unix)]
+    #[test]
+    fn the_seed_index_names_the_donor_unit_and_a_kept_folder_goes_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let key = "a".repeat(64);
+        let donor = |name: &str| {
+            let (_, unit) = fixture(&root.join(name));
+            let lease = unit.try_immediate().unwrap();
+            fs::write(unit.rustc_dir.join("graph"), name).unwrap();
+            publish(&unit, Some(&key));
+            assert!(lease.finish(CompileOutcome::Success));
+            (root.join(name).join("target/debug"), unit)
+        };
+        let receive = |name: &str, profiles: &[PathBuf]| {
+            let (_, unit) = fixture(&root.join(name));
+            let _lease = unit.try_immediate().unwrap();
+            let donor = import_from(&unit, profiles, &key)?;
+            assert_eq!(
+                fs::read_to_string(unit.rustc_dir.join("graph")).unwrap(),
+                donor.parent()?.parent()?.file_name()?.to_str()?
+            );
+            Some(donor)
+        };
+        let (older, _) = donor("older");
+        let (kept, kept_unit) = donor("kept");
+        let (newer, _) = donor("newer");
+        assert_eq!(
+            fs::read_to_string(kept.join(AUTO_ROOT).join(SEEDS).join(&key)).unwrap(),
+            kept_unit.unit_key
+        );
+        mark_keep_all(&kept);
+        assert!(keep_all_profile(&kept));
+
+        let profiles = [newer.clone(), kept.clone()];
+        assert_eq!(receive("first", &profiles), Some(kept.clone()));
+        fs::write(kept_unit.unit_dir.join(MARKER), "b".repeat(64)).unwrap();
+        assert_eq!(receive("second", &profiles), Some(newer));
+        fs::remove_dir_all(older.join(AUTO_ROOT).join(SEEDS)).unwrap();
+        assert_eq!(receive("third", &[kept, older.clone()]), Some(older));
+    }
+
+    /// The folders kept for others are listed while they keep that mark; one
+    /// that is gone is forgotten.
+    #[test]
+    fn kept_donors_lists_marked_folders_and_forgets_missing_ones() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let profile = |name: &str| {
+            let profile = temp.path().join(name).join("target/debug");
+            fs::create_dir_all(profile.join(AUTO_ROOT)).unwrap();
+            profile
+        };
+        let (kept, plain, gone) = (profile("kept"), profile("plain"), profile("gone"));
+        mark_keep_all(&kept);
+        mark_keep_all(&gone);
+        for donor in [&kept, &plain, &gone] {
+            register_kept_donor(&cache, donor);
+        }
+        register_kept_donor(&cache, &kept);
+        fs::remove_dir_all(temp.path().join("gone")).unwrap();
+
+        assert_eq!(kept_donors(&cache), vec![kept]);
+        assert_eq!(fs::read_dir(cache.join(KEPT_DONORS)).unwrap().count(), 2);
+    }
+
+    /// The target folder is named alike in every folder, so a build
+    /// machine's own (`target/integrate-stack`) seeds a checkout's `target`,
+    /// and only a whole leading path component is replaced.
+    #[test]
+    fn the_target_folder_is_named_alike_in_every_key() {
+        let stack = Some("target/integrate-stack");
+        let plain = Some("target");
+        for (argument, at_stack, at_plain) in [
+            (
+                "target/integrate-stack/debug/deps",
+                stack,
+                Some("target/debug/deps"),
+            ),
+            (
+                "dependency=target/integrate-stack/debug/deps",
+                stack,
+                Some("dependency=target/debug/deps"),
+            ),
+        ] {
+            assert_eq!(
+                target_neutral(argument, at_stack),
+                target_neutral(at_plain.unwrap(), plain)
+            );
+            assert_ne!(target_neutral(argument, at_stack), argument);
+        }
+        for unchanged in [
+            "target_os=\"linux\"",
+            "--cfg=feature=\"target\"",
+            "mytarget/debug",
+            "target-other/debug",
+            "src/target/lib.rs",
+        ] {
+            assert_eq!(target_neutral(unchanged, plain), unchanged);
+        }
+        assert_eq!(target_neutral("target/debug", None), "target/debug");
     }
 
     #[test]

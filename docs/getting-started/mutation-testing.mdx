@@ -47,14 +47,20 @@ finished incremental state. This is enabled by default for managed incremental
 builds. An unchanged checkout still uses the artifact cache. Registry
 dependencies and build scripts keep their existing compilation paths.
 
-Kache looks for compatible donors among eight recently built target directories
-in the local cache index. Each receiver keeps its own compiler state and lock.
+Kache looks for compatible donors among the folders kept for others
+([Kept units](/docs/getting-started/worktrees#kept-units)) first, then among 32
+recently built target directories in the local cache index. Each donor keeps
+a seed index that names the unit for a receiver's key, so a lookup reads one
+file per donor; the target folder's own name, such as `target` or
+`target/ci`, does not change the key. Each receiver keeps its own compiler state and lock.
 The import clones files with copy-on-write where the filesystem supports it
 and uses independent copies otherwise. No imported file shares an inode with
 the donor, including ThinLTO bitcode that rustc can rewrite in place.
 A busy donor, incompatible flags, unsupported arguments or unfinished
 state leaves the receiver compiling without an imported seed. Each candidate
-import is limited to 1 GiB, 65,536 entries and 256 donor units.
+import is limited to 16 GiB and 262,144 entries. A donor without a seed index,
+written by an older release, has up to 256 of its units read, for up to eight
+such donors.
 
 For recognized rustc layouts, the import keeps the newest finalized session
 per crate, using the timestamp in its name. Tied timestamps and unfamiliar

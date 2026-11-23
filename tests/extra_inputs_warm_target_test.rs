@@ -219,6 +219,14 @@ fn last_fixture_passthrough_reason(cache_dir: &Path) -> Option<String> {
         .next_back()
 }
 
+fn last_fixture_event(cache_dir: &Path) -> Value {
+    common::settled_events(cache_dir)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rfind(|event| event["crate_name"] == CRATE_NAME)
+        .expect("an event of the fixture")
+}
+
 fn run_fixture(target_dir: &Path) -> String {
     let mut binary = target_dir.join("debug").join("extra-input-warm-target");
     if cfg!(windows) {
@@ -254,7 +262,7 @@ fn exercise_uncached_lane(
     extra_env: &[(&str, &str)],
     expected_result: &str,
     expected_reason: Option<&str>,
-) {
+) -> TempDir {
     let target = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
     let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
@@ -313,6 +321,7 @@ fn exercise_uncached_lane(
     assert_build_succeeded(&changed);
     assert!(fixture_event_count(cache.path()) > cold_events);
     assert_eq!(run_fixture(target.path()), after);
+    cache
 }
 
 fn cargo_reported_fixture_fresh(output: &Output) -> bool {
@@ -809,6 +818,30 @@ edition = "2021"
         ],
         "passthrough",
         Some("cache_executables=false"),
+    );
+    // The kept lane takes the unit and keeps its graph: rustc expands the
+    // macro again on each compile, so the graph never serves the old read,
+    // and Cargo still learns the input from the dep-info Kache completes.
+    let kept = exercise_uncached_lane(
+        relocated_project.path(),
+        &relocated_input,
+        &input_reader,
+        "v7",
+        "kept",
+        &[
+            ("KACHE_KEEP_INCREMENTAL", "all"),
+            ("CARGO_INCREMENTAL", "1"),
+        ],
+        "passthrough",
+        Some("incremental kept"),
+    );
+    let changed = last_fixture_event(kept.path());
+    assert!(
+        changed["passthrough_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("incremental kept"))
+            && changed["incremental_seed_attempt"].is_null(),
+        "the changed input compiles from the unit's own graph: {changed}"
     );
     exercise_workspace_wrapper_lane(
         relocated_project.path(),

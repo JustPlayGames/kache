@@ -64,9 +64,44 @@ whole and stores it while other checkouts that need it wait for that compile.
 The unit's private incremental state is left as it is for the next edit.
 
 A unit the branch changed, and everything built on it, compiles incrementally
-as before. Git only picks the lane, never a cache key: when Git is missing,
-slow or cannot resolve the ref, every unit keeps today's behavior. Set
+([Kept units](#kept-units)). Git only picks the lane, never a cache key: when
+Git is missing or cannot resolve the ref, every unit keeps the adaptive lanes,
+and when it does not answer in time a kept unit stays kept. Set
 `KACHE_SHARED_REF=off` or `[cache] shared_ref = ""` to turn it off.
+
+### Kept units
+
+A unit the checkout changed, and every unit built on one compiled that way,
+keeps its incremental state for good (`cache.keep_incremental`, default
+`private`): each compile starts from the last one's graph, with no count of
+builds and no idle timeout ending it, and a cache hit, after a pull that
+brings the shared tree back, leaves the graph for the next edit. Git is asked
+about a unit without state only when its lookup missed, so a fresh checkout
+restores what it can first.
+
+A unit's first private compile imports a compatible graph from another
+checkout. A build machine's folder that every change passes through can keep
+every unit's graph for the others: with `keep_incremental = "all"` every
+managed unit compiles on this lane, nothing of them is stored, and the
+profile is recorded under the cache folder as a folder kept for others. Every
+receiver on the machine tries such folders first, and Kache's own clean-ups
+of unused graphs leave them to whoever keeps the folder. A graph that does
+not fit is rejected by rustc, which then compiles the unit whole: an import
+can cost a cold compile, never a wrong build.
+
+A private compile maps the workspace where a stored compile does
+(`/proc/self/cwd` on Linux, `/kache/workspace` on macOS; Windows keeps
+`C:\src`), so the crates a donor compiled privately and those a receiver
+restored from the cache differ in their crate hash alone: rustc re-runs the
+queries that read them and finds the same answers. The first compile from an
+imported graph still costs more than the next one from the unit's own graph,
+by about those queries.
+
+A crate with [hidden compile-time inputs](/docs/getting-started/configuration#hidden-compile-time-inputs)
+takes this lane too, and no other incremental lane. Kache completes Cargo's
+dep-info with its inputs after every compile, so Cargo still runs the compile
+when one changes, and rustc expands every macro again on each compile, so a
+kept graph never serves a macro's old read of them.
 
 These settings have separate purposes. Disabling `seed_incremental` stops donor
 imports but keeps target-local adaptive compilation. Disabling
