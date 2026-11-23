@@ -2117,6 +2117,14 @@ impl EvictionWritePacer {
 /// on a separate connection, so metadata reads do not hold its Store mutex.
 const COMPILE_TIME_BACKFILL_BATCH: i64 = 10_000;
 
+/// Deletes the blobs of one entry whose refcount dropped to zero. A batch
+/// import runs it once per entry while it holds the index write lock, so it
+/// must find the entry's blobs through indexes, never by scanning `blobs`.
+const DELETE_ENTRY_UNREFERENCED_BLOBS: &str = "DELETE FROM blobs
+     WHERE refcount <= 0 AND hash IN (
+         SELECT hash FROM entry_blobs WHERE cache_key = ?1
+     )";
+
 /// How long a post-eviction demand record is kept (kunobi-ninja/kache#594).
 ///
 /// A tombstone earns its keep by answering "was this key wanted again soon
@@ -3167,13 +3175,7 @@ fn release_entry_blob_refs(conn: &rusqlite::Connection, cache_key: &str) -> rusq
          )",
         params![cache_key],
     )?;
-    conn.execute(
-        "DELETE FROM blobs
-         WHERE refcount <= 0 AND hash IN (
-             SELECT hash FROM entry_blobs WHERE cache_key = ?1
-         )",
-        params![cache_key],
-    )?;
+    conn.execute(DELETE_ENTRY_UNREFERENCED_BLOBS, params![cache_key])?;
     conn.execute(
         "DELETE FROM entry_blobs WHERE cache_key = ?1",
         params![cache_key],
@@ -3393,6 +3395,115 @@ fn share_index_files(db_path: &Path) {
     }
 }
 
+/// Ask the operating system why the index cannot be opened. SQLite reports
+/// `SQLITE_CANTOPEN` for "Permission denied", "Too many open files" and
+/// others alike, and its error carries no errno (#1698).
+///
+/// Checks the index and its `-wal` and `-shm` sidecars, in that order, and
+/// describes the first one that is unusable. A missing file is fine: SQLite
+/// can create it. This runs after the failed open, so a condition that has
+/// cleared by then reports nothing.
+///
+/// It never opens any of the three files. On Unix, closing any descriptor for
+/// a file drops every `fcntl` lock the process holds on that file. The daemon
+/// keeps the index open while it opens more connections to it, so an open and
+/// close here would release the locks of those connections and let another
+/// process write in the middle of their transactions. `stat` and `access`
+/// answer the same questions without a descriptor. When the files look fine,
+/// [`index_dir_open_os_error`] checks whether the process can open anything.
+#[cfg(unix)]
+fn index_open_os_error(db_path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Some(format!("opening {} read/write: {error}", path.display())),
+        };
+        if !metadata.is_file() {
+            return Some(format!(
+                "opening {} read/write: not a regular file",
+                path.display()
+            ));
+        }
+        // `metadata` has already refused a path with a NUL byte, and such a
+        // file cannot exist.
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            continue;
+        };
+        // One call per mode. The first refusal ends the search, so the errno
+        // read below belongs to it.
+        let refused = [libc::R_OK, libc::W_OK]
+            .into_iter()
+            // SAFETY: `c_path` is a NUL-terminated string that outlives the call.
+            .any(|mode| unsafe { libc::access(c_path.as_ptr(), mode) } != 0);
+        if refused {
+            let error = std::io::Error::last_os_error();
+            return Some(format!("opening {} read/write: {error}", path.display()));
+        }
+    }
+    index_dir_open_os_error(db_path.parent().filter(|dir| !dir.as_os_str().is_empty())?)
+}
+
+/// Whether the process can open the directory that holds the index. This is
+/// how the Unix probe notices "Too many open files" without opening the index:
+/// SQLite takes no lock on the directory, so closing it again is harmless.
+/// SQLite does not need to read the directory: it opens it only to sync it,
+/// and ignores a failure there. So a directory that can be searched and not
+/// read is named here even when it is not the cause.
+#[cfg(unix)]
+fn index_dir_open_os_error(dir: &Path) -> Option<String> {
+    match fs::File::open(dir) {
+        Ok(_) => None,
+        Err(error) => Some(format!("opening {}: {error}", dir.display())),
+    }
+}
+
+/// Ask the operating system why the index cannot be opened. SQLite reports
+/// `SQLITE_CANTOPEN` for many different causes and its error carries no
+/// errno (#1698).
+///
+/// Opens the index and its `-wal` and `-shm` sidecars read/write, in that
+/// order, and describes the first failure. Never creates, truncates or writes
+/// a file. A missing file is fine: SQLite can create it. This runs after the
+/// failed open, so a condition that has cleared by then reports nothing.
+///
+/// Opening is safe here, unlike on Unix: a Windows lock belongs to the handle
+/// that took it, and closing another handle to the same file leaves it alone.
+/// Tests build it on every platform, so the Linux mutation run covers it.
+#[cfg(any(test, not(unix)))]
+fn index_open_os_error_by_opening(db_path: &Path) -> Option<String> {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut path = db_path.as_os_str().to_os_string();
+        path.push(suffix);
+        let path = PathBuf::from(path);
+        match fs::OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Some(format!("opening {} read/write: {error}", path.display())),
+        }
+    }
+    None
+}
+
+/// Context for a failed index open: the path, plus what this platform's
+/// probe finds, if anything.
+fn index_open_failure_context(db_path: &Path) -> String {
+    let context = format!("opening index database {}", db_path.display());
+    #[cfg(unix)]
+    let found = index_open_os_error(db_path);
+    #[cfg(not(unix))]
+    let found = index_open_os_error_by_opening(db_path);
+    match found {
+        Some(os_error) => format!("{context} (a direct check reports: {os_error})"),
+        None => context,
+    }
+}
+
 /// Whether a SQLite error means the database file itself is unusable
 /// (`SQLITE_CORRUPT` / `SQLITE_NOTADB`) — the rebuildable-index case
 /// [`open_index_db`] self-heals, as opposed to a transient open failure.
@@ -3590,7 +3701,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
             None => {
                 let (db, recovered) = open_index_db_reporting_recovery(&db_path, config.index_mode)
-                    .with_context(|| format!("opening index database {}", db_path.display()))?;
+                    .with_context(|| index_open_failure_context(&db_path))?;
                 if recovered && let Some(pool) = &pool {
                     pool.forget();
                 }
@@ -4109,6 +4220,45 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Borrow the persistent memo without exposing the index connection.
     pub fn file_hash_cache(&self) -> crate::file_hash::FileHashCache<'_> {
         crate::file_hash::FileHashCache::Store(self, self.config.compress_predictions)
+    }
+
+    /// Store a build-script run's input prediction as `identity`'s newest and
+    /// as the variant `variant` under `prefix`, keeping the `keep` newest
+    /// variants, in one write transaction that asks again while the index
+    /// stays busy ([`begin_write_waiting`]). The prediction is written after
+    /// its run is stored, and a lookup cannot compute that run's key without
+    /// it: two writes, each with one busy window, lost it under contention
+    /// (upstream #2034).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_input_prediction(
+        &self,
+        identity: &str,
+        prefix: &str,
+        variant: &str,
+        schema: u32,
+        crate_name: Option<&str>,
+        prediction_json: &str,
+        keep: usize,
+    ) -> Result<()> {
+        self.refuse_write("record an input prediction")?;
+        let db = self.db();
+        let tx = begin_write_waiting(&db, "recording an input prediction")?;
+        let cache = if self.config.compress_predictions {
+            crate::file_hash::FileHashCache::Compressing(&tx)
+        } else {
+            crate::file_hash::FileHashCache::Borrowed(&tx)
+        };
+        cache.put_input_prediction(identity, schema, crate_name, prediction_json)?;
+        cache.put_input_prediction_trimming(
+            prefix,
+            variant,
+            schema,
+            crate_name,
+            prediction_json,
+            keep,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Check if a committed entry exists for this cache key.
@@ -6131,37 +6281,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let total_size: u64 = meta.files.iter().map(|file| file.size).sum();
             let crate_type = meta.crate_types.join(",");
             let content_hash = compute_content_hash(&meta.files);
-            // A crash or legacy importer may have left an uncommitted row.
-            // It is not a cache hit and must not permanently block a verified
-            // replacement through INSERT OR IGNORE. Undo any partial mapping
-            // bookkeeping in this same transaction before replacing it.
-            tx.execute(
-                "UPDATE blobs
-                 SET refcount = MAX(0, refcount - COALESCE((
-                     SELECT refs FROM entry_blobs
-                     WHERE cache_key = ?1 AND hash = blobs.hash
-                 ), 0))
-                 WHERE hash IN (
-                     SELECT hash FROM entry_blobs WHERE cache_key = ?1
-                 ) AND EXISTS (
-                     SELECT 1 FROM entries
-                     WHERE cache_key = ?1 AND committed = 0
-                 )",
-                params![entry.cache_key],
-            )?;
-            tx.execute(
-                "DELETE FROM entry_blobs
-                 WHERE cache_key = ?1 AND EXISTS (
-                     SELECT 1 FROM entries
-                     WHERE cache_key = ?1 AND committed = 0
-                 )",
-                params![entry.cache_key],
-            )?;
+            // An unfinished generation cannot win INSERT OR IGNORE. Keep its
+            // mappings until we release its references below.
             tx.execute(
                 "DELETE FROM entries WHERE cache_key = ?1 AND committed = 0",
                 params![entry.cache_key],
             )?;
-            tx.execute("DELETE FROM blobs WHERE refcount <= 0", [])?;
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, imported_at, compile_time_backfilled, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, unixepoch(), 1, ?11)",
                 params![
@@ -6187,8 +6312,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             if inserted == 0 {
                 continue;
             }
-            // No row owned this key, so a mapping still recorded for it is
-            // a leftover whose references nothing else will release.
+            // This key had an unfinished row or none at all. Release its old
+            // mappings before counting the new files, preserving shared blobs
+            // even when an older importer failed to count every mapping.
             release_entry_blob_refs(&tx, &entry.cache_key)?;
 
             for file in &meta.files {

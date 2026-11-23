@@ -2039,19 +2039,17 @@ impl Run {
     fn record_prediction(&self, prediction: &Prediction) -> Result<()> {
         let json = serde_json::to_string(prediction)?;
         let identity = self.identity();
-        let predictions = self.store.file_hash_cache();
-        predictions.put_input_prediction(&identity, PREDICTION_SCHEMA, Some(CRATE_NAME), &json)?;
         let prefix = variant_prefix(&identity);
         let variant = format!("{prefix}{}", &blake3::hash(json.as_bytes()).to_hex()[..32]);
-        predictions.put_input_prediction_keeping(
+        self.store.record_input_prediction(
+            &identity,
             &prefix,
             &variant,
             PREDICTION_SCHEMA,
             Some(CRATE_NAME),
             &json,
             PREDICTION_VARIANTS,
-        )?;
-        Ok(())
+        )
     }
 
     /// Look up the runs this configuration's other declarations key, newest

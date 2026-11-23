@@ -595,6 +595,26 @@ fn eligible_incremental_args(temp: &tempfile::TempDir, crate_name: &str) -> Rust
 }
 
 #[test]
+fn store_unavailable_message_names_the_os_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().to_path_buf());
+    let index = config.index_db_path();
+    std::fs::create_dir(&index).unwrap();
+
+    let err =
+        match Store::open_with_options(&config, crate::store::StoreOptions::from_env(|_| None)) {
+            Ok(_) => panic!("a directory is not an index"),
+            Err(err) => err,
+        };
+    let msg = store_unavailable_message(&err);
+    let expected = format!(
+        "(a direct check reports: opening {} read/write: ",
+        index.display()
+    );
+    assert!(msg.contains(&expected), "msg = {msg}");
+}
+
+#[test]
 fn store_unavailable_message_is_actionable() {
     let err = anyhow::anyhow!("disk I/O error")
         .context("opening index database /mnt/c/Users/x/kache/index.db");
@@ -9833,15 +9853,15 @@ fn nvcc_depinfo_rewrite_root_anchors() {
     assert_eq!(nvcc_depinfo_rewrite_root_from_cwd(&parsed, cwd), None);
 }
 
-/// #1015: a fallback wrapper such as sccache keys on the same preprocessor
-/// output, so it would serve the stale object kache just refused to cache.
-/// Only that refusal skips it; other key failures keep the fallback.
 #[test]
 fn only_hidden_input_key_failures_skip_the_fallback() {
-    let hidden = anyhow::Error::new(crate::compiler::cc::CcHiddenInput {
-        construct: ".incbin",
-    });
-    assert!(cc_key_error_skips_fallback(&hidden));
+    use crate::compiler::cc::CcHiddenInput;
+    for input in [
+        CcHiddenInput::AssemblerFile(".incbin"),
+        CcHiddenInput::WallClock,
+    ] {
+        assert!(cc_key_error_skips_fallback(&anyhow::Error::new(input)));
+    }
     assert!(!cc_key_error_skips_fallback(&anyhow::anyhow!(
         "cc -E key probe exited 1"
     )));
@@ -12847,6 +12867,23 @@ fi
         "#define VALUE 1\n"
     );
     assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n");
+
+    // /Brepro fixes time independently of the environment. Both lookups must
+    // restore the existing object without another compiler or read-set capture.
+    for (name, value) in [
+        ("SOURCE_DATE_EPOCH", "1700000000"),
+        ("KACHE_CC_SOURCE_DATE_EPOCH", "passthrough"),
+    ] {
+        let mut changed = env.clone();
+        changed.set(name, value);
+        std::fs::remove_file(&object).unwrap();
+        assert_eq!(run_cc_for(&config, &args, &changed).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&object).unwrap(),
+            "#define VALUE 1\n"
+        );
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "run\n", "{name}");
+    }
 
     std::fs::write(earlier.join("value.h"), "#define VALUE 2\n").unwrap();
     std::fs::remove_file(&object).unwrap();
