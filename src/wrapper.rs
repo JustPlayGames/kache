@@ -2243,6 +2243,24 @@ pub(crate) fn run_cc_for(
     run_cc_inner(config, wrapper_args, start, invocation_start_ns, env)
 }
 
+#[cfg(unix)]
+pub(crate) fn run_mise_compiler_for(
+    config: &Config,
+    args: &[String],
+    env: &crate::invocation::InvocationEnv,
+) -> Result<i32> {
+    let start = wrapper_entry();
+    let parsed = crate::compiler::cc::CcArgs::parse_for(args, env)?;
+    cc_direct_passthrough_with_event(
+        config,
+        &parsed,
+        &cc_entry_crate_name(&parsed),
+        &cc_event_root(&parsed),
+        start,
+        "unsupported|mise selects the compiler at runtime",
+    )
+}
+
 /// A C compile that already ran because its key was deferred: the key is
 /// derived from what the compile read, and the outputs are in place.
 struct CcPrecompiled {
@@ -10110,6 +10128,7 @@ pub(crate) fn invocation_daemon() -> Option<std::sync::Arc<crate::daemon::Daemon
 }
 
 struct InvocationWrapperSettings {
+    cargo_command: Option<kache_protocol::CargoCommand>,
     progress_level: u8,
     temp_dir: Option<PathBuf>,
     daemon: Option<std::sync::Arc<crate::daemon::Daemon>>,
@@ -10139,6 +10158,7 @@ impl InvocationWrapperScope {
         daemon: Option<std::sync::Arc<crate::daemon::Daemon>>,
     ) -> Self {
         Self::enter_with_settings(Some(InvocationWrapperSettings {
+            cargo_command: crate::cargo_proxy::recorded_command(env),
             progress_level: parse_progress_level(env.var("KACHE_PROGRESS").ok().as_deref()),
             temp_dir: env.resolve(env.temp_dir()),
             daemon,
@@ -11050,7 +11070,9 @@ pub(crate) fn build_event_details(config: &Config, inputs: EventInputs<'_>) -> B
             .then(|| cache_key.to_string()),
         rebuilt_path: rebuilt.primary,
         rebuilt_paths: rebuilt.paths,
-        schema: 28,
+        schema: 29,
+        cargo_command: INVOCATION_SETTINGS
+            .with_borrow(|settings| settings.as_ref().and_then(|s| s.cargo_command.clone())),
         demands: crate::demand::take(),
         session_id,
         key_ms,

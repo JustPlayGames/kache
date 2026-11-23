@@ -1466,6 +1466,7 @@ fn sample_build_event(
     events::BuildEvent {
         ts: jiff::Timestamp::now(),
         session_id: String::new(),
+        cargo_command: None,
         demands: Vec::new(),
         rebuilt_package: None,
         rebuilt_fingerprint: None,
