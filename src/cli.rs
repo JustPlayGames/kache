@@ -2517,6 +2517,9 @@ fn stored_entry_row(
             details.push(format!("features [{}]", meta.features.join(", ")));
         }
     }
+    if kache_format::is_checkout_key(&entry.cache_key) {
+        details.push("local only (artifact contains a checkout path)".to_string());
+    }
     if missed == Some(entry.cache_key.as_str()) {
         details.push("the missed key, stored after the compile".to_string());
     }
@@ -9360,8 +9363,11 @@ async fn sync_with_client(
     let to_push: Vec<(String, String)> = if !pull_only && !config.remote_readonly {
         local_entries
             .iter()
-            // Build-script runs describe one host's probes; they never leave it.
-            .filter(|e| e.crate_name != crate::build_script::CRATE_NAME)
+            // Host probes and outputs that name this checkout stay local.
+            .filter(|e| {
+                e.crate_name != crate::build_script::CRATE_NAME
+                    && !kache_format::is_checkout_key(&e.cache_key)
+            })
             .filter(|e| {
                 if let Some(ws) = workspace_crates {
                     ws.contains(&e.crate_name)
@@ -9370,7 +9376,7 @@ async fn sync_with_client(
                 }
             })
             .filter(|e| {
-                let entry_dir = config.store_dir().join(&e.cache_key);
+                let entry_dir = store.entry_dir(&e.cache_key);
                 entry_dir.exists() && !s3_keys.contains_key(&e.cache_key)
             })
             .map(|e| (e.cache_key.clone(), e.crate_name.clone()))
@@ -9787,9 +9793,11 @@ fn manifest_entries_from_events(
         if session_id.is_some_and(|session_id| e.session_id != session_id) {
             continue;
         }
-        // Build-script runs stay in the local store (see `sync`), so a plan
-        // that names one asks the remote for a key it cannot have.
-        if e.cache_key.is_empty() || e.crate_name == crate::build_script::CRATE_NAME {
+        // Omit keys that sync leaves in the local store.
+        if e.cache_key.is_empty()
+            || e.crate_name == crate::build_script::CRATE_NAME
+            || kache_format::is_checkout_key(&e.cache_key)
+        {
             continue;
         }
         match e.result {
@@ -10170,7 +10178,7 @@ fn verify_store(config: &Config, checksums: bool, repair: bool) -> Result<Verify
         entry_keys.push(entry.cache_key.clone());
         entry_ok_flags.push(true);
 
-        let entry_dir = store_dir.join(&entry.cache_key);
+        let entry_dir = store.entry_dir(&entry.cache_key);
         let meta_path = entry_dir.join("meta.json");
 
         // Check metadata file exists and parses

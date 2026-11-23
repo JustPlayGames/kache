@@ -4977,6 +4977,37 @@ fn put_entry(store: &Store, dir: &Path, seed: u8, crate_name: &str, content: &[u
 }
 
 #[test]
+fn checkout_entries_survive_index_rebuild_outside_the_legacy_sync_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let bound = format!("checkout-{}", key(1));
+    let artifact = dir.path().join("out.rlib");
+    std::fs::write(&artifact, b"checkout path").unwrap();
+    {
+        let store = Store::open(&config).unwrap();
+        store
+            .put(
+                &bound,
+                "foo",
+                &[],
+                &[],
+                "target",
+                "debug",
+                &[(artifact, "libfoo.rlib".to_owned())],
+                "",
+                "",
+            )
+            .unwrap();
+        assert!(!config.store_dir().join(&bound).exists());
+        assert!(store.entry_dir(&bound).join("meta.json").is_file());
+    }
+    std::fs::remove_file(config.index_db_path()).unwrap();
+    let store = Store::open(&config).unwrap();
+    store.rebuild_index_from_store().unwrap();
+    assert!(store.get(&bound).unwrap().is_some());
+}
+
+#[test]
 fn rebuild_index_from_store_recovers_entries_after_the_index_is_lost() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
@@ -13348,6 +13379,41 @@ fn key_lock_sweep_stats_report_what_remains() {
         removed: 0,
     };
     assert_eq!(none.remaining(), 0);
+}
+
+#[test]
+fn key_lock_sweep_uses_the_checkout_entry_directory_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let bound = format!("checkout-{}", key(1));
+    let lock = store.try_lock(&bound).unwrap().unwrap();
+    let path = store.entry_dir(&bound).with_extension("lock");
+    assert!(path.is_file());
+    drop(lock);
+    set_age(&path, TWO_HOURS);
+    let unrelated = aged_key_lock(&config, &bound, TWO_HOURS);
+    assert_eq!(
+        sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+        KeyLockSweepStats {
+            seen: 1,
+            removed: 1
+        }
+    );
+    assert!(!path.exists());
+    assert!(unrelated.exists());
+
+    store.insert_entry_row_for_test(&bound);
+    drop(store.try_lock(&bound).unwrap().unwrap());
+    set_age(&path, TWO_HOURS);
+    assert_eq!(
+        sweep_key_locks(&store, KEY_LOCK_SWEEP_CAP),
+        KeyLockSweepStats {
+            seen: 1,
+            removed: 0
+        }
+    );
+    assert!(path.exists());
 }
 
 #[test]

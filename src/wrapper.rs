@@ -5518,7 +5518,10 @@ fn run_parsed_rustc(
     // records: it is cached only with that very `.pdb`, named by file name.
     let unpaired = unpaired_executable_debug_info(args, &result.artifacts);
     // A proc macro can write the checkout path into generated code where the
-    // key cannot see it (kunobi-ninja/kache#1914).
+    // key cannot see it (kunobi-ninja/kache#1914). Upstream stores such
+    // outputs under a key bound to this checkout (#2037); this fork has no
+    // list of lookup keys to find one by (its lookups, flights and hand-offs
+    // all go by the one key), so it still declines them.
     let key_binds_manifest_dir =
         crate::embedded_checkout::key_binds_manifest_dir(key_outputs.env_deps.as_ref());
     let names_checkout = || {

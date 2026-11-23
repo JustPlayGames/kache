@@ -5538,6 +5538,33 @@ fn macos_debug_bundle_admission(args: &RustcArgs, target: Option<&str>) -> bool 
         && target.is_some_and(|target| target.contains("-apple-"))
 }
 
+fn checkout_archive_admission(args: &RustcArgs, target: Option<&str>, custom_target: bool) -> bool {
+    // With -o the caller chooses the primary file's extension, even for a
+    // metadata-only build. Older clients classified archive names as unknown.
+    if args.output.as_deref().is_some_and(is_native_archive_path) {
+        return true;
+    }
+    if !args.emits_link() {
+        return false;
+    }
+    let may_emit_import_lib =
+        custom_target || target.is_none_or(|triple| triple.contains("windows"));
+    // Without --crate-type, a crate-level attribute can request a staticlib.
+    // A Windows executable with exports can also produce an import library,
+    // including a --test harness built from a library crate.
+    args.crate_types.is_empty()
+        || (args.is_test && may_emit_import_lib)
+        || args
+            .crate_types
+            .iter()
+            .flat_map(|arg| arg.split(','))
+            .any(|kind| match kind {
+                "staticlib" => true,
+                "bin" | "cdylib" | "dylib" | "proc-macro" => may_emit_import_lib,
+                _ => false,
+            })
+}
+
 /// Compute the blake3 cache key for a rustc invocation, with what the
 /// computation learned on the way ([`KeyOutputs`]).
 ///
@@ -5780,6 +5807,13 @@ fn compute_key_into(
     if macos_debug_bundle_admission(args, compiler_target) {
         hasher.set_group("debug_bundle_layout");
         fold_field(&mut hasher, b"debug_bundle_layout.v2:", b"per-file");
+    }
+
+    // Older producers did not scan static archives or Windows import
+    // libraries. Their shared entries can contain another checkout's path.
+    if checkout_archive_admission(args, compiler_target, custom_target) {
+        hasher.set_group("checkout_archive");
+        fold_field(&mut hasher, b"checkout_archive.v1:", b"scanned");
     }
 
     // crate identity
@@ -7315,6 +7349,11 @@ fn multiarch_name(target: &str) -> String {
     }
 }
 
+pub(crate) fn is_native_archive_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| is_native_archive_name(&name.to_string_lossy()))
+}
+
 /// Whether a file name marks a native archive: `*.a` or `*.lib`, in any case.
 fn is_native_archive_name(name: &str) -> bool {
     crate::native_link_key::ends_with_ignore_ascii_case(name, ".a")
@@ -7473,11 +7512,7 @@ fn cargo_target_dir(profile: &Path, target: Option<&str>) -> PathBuf {
 pub(crate) fn native_dir_archives(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut archives = Vec::new();
     for path in native_dir_entries(dir)? {
-        if path
-            .file_name()
-            .is_some_and(|name| is_native_archive_name(&name.to_string_lossy()))
-            && path.is_file()
-        {
+        if is_native_archive_path(&path) && path.is_file() {
             archives.push(path);
         }
     }

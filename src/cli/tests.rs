@@ -4495,6 +4495,11 @@ fn explain_crate_entry_rows_name_what_sets_each_entry_apart() {
     let empty = diff_meta("", "", &[], &[]);
     assert_eq!(stored_entry_row(&bare, Some(&empty), Some("other"))[5], "");
     assert_eq!(stored_entry_row(&bare, None, None)[5], "");
+    let bound = stats_entry(&format!("checkout-{}", "a".repeat(64)), "", "");
+    assert_eq!(
+        stored_entry_row(&bound, None, None)[5],
+        "local only (artifact contains a checkout path)"
+    );
 
     let entries: Vec<_> = (0..11)
         .map(|i| stats_entry(&format!("key{i:02}"), "", ""))
@@ -6514,6 +6519,15 @@ fn manifest_entries_from_events_dedups_and_filters() {
         // Ignored: non-cacheable outcomes.
         build_event("passth", EventResult::Passthrough, 5, 0, 0, "k-p"),
         build_event("skip", EventResult::Skipped, 5, 0, 0, "k-s"),
+        // An object containing the absolute checkout path stays local.
+        build_event(
+            "foo",
+            EventResult::LocalHit,
+            50,
+            0,
+            20,
+            &format!("checkout-{}", "c".repeat(64)),
+        ),
         // Ignored: a build-script run, which never reaches the remote.
         build_event(
             crate::build_script::CRATE_NAME,
@@ -7667,6 +7681,7 @@ fn standalone_sync_leaves_pending_work_to_a_reachable_daemon() {
             "",
         )
         .unwrap();
+    crate::daemon::prepare_daemon_socket_dir(&config, &config.socket_path()).unwrap();
     let listener = crate::transport::ListenerOptions::new()
         .name(crate::transport::socket_name(&config.socket_path()).unwrap())
         .create_sync()
@@ -9400,6 +9415,47 @@ async fn sync_with_client_push_skipped_when_remote_readonly() {
     )
     .await
     .expect("push sync should succeed (by skipping pushes)");
+    assert!(backend.put_calls().is_empty());
+}
+
+#[tokio::test]
+async fn sync_skips_checkout_bound_entries_even_with_writes_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = save_manifest_config(dir.path().to_path_buf(), Some(test_remote_cfg()));
+    let store = Store::open(&config).unwrap();
+    let artifact = dir.path().join("libfoo.rlib");
+    std::fs::write(&artifact, b"checkout path").unwrap();
+    let key = format!("checkout-{}", "c".repeat(64));
+    store
+        .put(
+            &key,
+            "foo",
+            &[],
+            &[],
+            "target",
+            "debug",
+            &[(artifact, "libfoo.rlib".to_owned())],
+            "",
+            "",
+        )
+        .unwrap();
+    let remote = test_remote_cfg();
+    let backend = TestBackend::memory();
+    sync_with_client(
+        &as_cache_remote(as_remote_backend(&backend), &remote),
+        &config,
+        &store,
+        None,
+        false,
+        true,
+        false,
+        false,
+        None,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
     assert!(backend.put_calls().is_empty());
 }
 
