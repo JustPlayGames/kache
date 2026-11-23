@@ -19939,6 +19939,73 @@ fn a_started_daemon_sweeps_when_the_last_sweep_is_due_and_never_at_once() {
     );
 }
 
+/// A periodic sweep that finds `gc.lock` held (an automatic size sweep
+/// ranking for minutes) asks again after a pause instead of leaving its age
+/// pass and housekeeping to the next interval, six hours on; one that keeps
+/// finding it held stops after its retries.
+#[tokio::test]
+async fn a_periodic_sweep_that_found_the_lock_held_runs_once_it_is_free() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    std::fs::create_dir_all(config.store_dir()).unwrap();
+    // A stale key lock with no entry: what the sweep's housekeeping removes.
+    let stale = config
+        .store_dir()
+        .join(format!("{}.lock", blake3::hash(b"stale").to_hex()));
+    std::fs::write(&stale, b"1").unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200))
+        .unwrap();
+    let store = Store::open(&config).unwrap();
+    let daemon = Daemon::new(config);
+    let sweep = || {
+        let report = daemon
+            .run_gc(GcPolicy::Automatic { max_age_hours: 0 }, GcDriver::Periodic)
+            .unwrap();
+        std::future::ready(PeriodicGcRun::from_report(&report))
+    };
+
+    // Held through every try: three sweeps, two pauses, nothing done.
+    let held = store.try_gc_lock().unwrap().expect("gc lock");
+    let mut pauses = Vec::new();
+    let started = run_periodic_gc(
+        sweep,
+        |pause| {
+            pauses.push(pause);
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        2,
+    )
+    .await;
+    assert_eq!((started, pauses.len()), (3, 2));
+    assert!(stale.exists(), "no sweep ran while the lock was held");
+
+    // Let go during the first pause: the second sweep runs.
+    let held = std::cell::Cell::new(Some(held));
+    let mut pauses = Vec::new();
+    let started = run_periodic_gc(
+        sweep,
+        |pause| {
+            pauses.push(pause);
+            held.take();
+            std::future::ready(())
+        },
+        PERIODIC_GC_RETRY,
+        PERIODIC_GC_RETRIES,
+    )
+    .await;
+    assert_eq!(started, 2);
+    assert_eq!(pauses, [PERIODIC_GC_RETRY]);
+    assert!(
+        !stale.exists(),
+        "the sweep after the pause ran its housekeeping"
+    );
+}
+
 /// Cargo waits for the target-info probe until a seeding has memoised what
 /// it placed. On a busy journal the index's commit took 0.3-0.6 s of that
 /// wait, so a store that can hand rows to the daemon hands them over at
