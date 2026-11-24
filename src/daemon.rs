@@ -7619,6 +7619,12 @@ impl Daemon {
         report
     }
 
+    /// The timer's sweep: [`Self::periodic_gc`] below normal priority, as
+    /// all the daemon's background work ([`crate::platform::below_normal`]).
+    fn periodic_sweep(&self, stores: Option<Vec<PathBuf>>) -> Vec<PathBuf> {
+        crate::platform::below_normal(|| self.periodic_gc(stores))
+    }
+
     /// Sweep each store independently. Only lock contention schedules a retry.
     fn periodic_gc(&self, pending: Option<Vec<PathBuf>>) -> Vec<PathBuf> {
         let stores = pending.unwrap_or_else(|| {
@@ -8672,9 +8678,7 @@ async fn server_main(
                 // the accept loop and in-flight RemoteCheck stay responsive (#281).
                 let gc = gc_daemon.clone();
                 async move {
-                    tokio::task::spawn_blocking(move || {
-                        crate::platform::below_normal(|| gc.periodic_gc(stores))
-                    })
+                    tokio::task::spawn_blocking(move || gc.periodic_sweep(stores))
                         .await
                         .unwrap_or_else(|e| {
                             tracing::warn!("periodic GC task panicked: {e}");

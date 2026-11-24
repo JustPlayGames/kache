@@ -3495,16 +3495,25 @@ fn daemon_gc_sweeps_hermetic_build_script_runs() {
     assert!(!leftover.exists());
 }
 
-/// The daemon's GC sweeps the probe memos of the store it may write:
-/// one nobody used for eight days is gone after a run, one used
-/// yesterday stays.
+/// The daemon's GC sweeps the probe memos of each store it may write, the
+/// main store's and a volume shard's alike, on a requested run and on the
+/// timer's per-store sweep: one nobody used for eight days is gone after
+/// a run, one used yesterday stays.
 #[test]
-fn daemon_gc_sweeps_idle_probe_memos_of_a_writable_store() {
+fn daemon_gc_sweeps_idle_probe_memos_of_each_writable_store() {
     let dir = tempfile::tempdir().unwrap();
-    let daemon = Daemon::new(test_config(dir.path()));
-    let probes = daemon.config.cache_dir.join("probes");
-    std::fs::create_dir_all(&probes).unwrap();
-    let memo = |name: &str, days: u64| {
+    let mut config = test_config(&dir.path().join("main"));
+    let shard_dir = dir.path().join("shard");
+    config.volume_stores = vec![crate::config::VolumeStore {
+        volume: shard_dir.to_string_lossy().into_owned(),
+        store: shard_dir.clone(),
+        max_size: None,
+    }];
+    Store::open(&config.for_volume_store(&config.volume_stores[0], |_| None)).unwrap();
+    let daemon = Daemon::new(config);
+    let memo = |store: &Path, name: &str, days: u64| {
+        let probes = store.join("probes");
+        std::fs::create_dir_all(&probes).unwrap();
         let path = probes.join(name);
         let used = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600);
         std::fs::File::create(&path)
@@ -3517,16 +3526,57 @@ fn daemon_gc_sweeps_idle_probe_memos_of_a_writable_store() {
             .unwrap();
         path
     };
-    let idle = memo("rustc-ver-1.txt", 8);
-    let in_use = memo("rustc-ver-2.txt", 1);
-    daemon
-        .run_gc(
-            GcPolicy::Automatic { max_age_hours: 0 },
-            GcDriver::Requested,
-        )
-        .unwrap();
-    assert!(!idle.exists(), "a memo idle for 8 days goes");
-    assert!(in_use.exists(), "one used yesterday stays");
+    let stores = [daemon.config.cache_dir.clone(), shard_dir];
+    for run in ["requested", "periodic"] {
+        let memos: Vec<_> = stores
+            .iter()
+            .map(|store| {
+                (
+                    memo(store, "rustc-ver-1.txt", 8),
+                    memo(store, "rustc-ver-2.txt", 1),
+                )
+            })
+            .collect();
+        if run == "requested" {
+            daemon
+                .run_gc(
+                    GcPolicy::Automatic { max_age_hours: 0 },
+                    GcDriver::Requested,
+                )
+                .unwrap();
+        } else {
+            assert!(daemon.periodic_gc(None).is_empty(), "no store was held");
+        }
+        for (idle, in_use) in memos {
+            assert!(
+                !idle.exists(),
+                "{run}: a memo idle for 8 days goes: {idle:?}"
+            );
+            assert!(
+                in_use.exists(),
+                "{run}: one used yesterday stays: {in_use:?}"
+            );
+        }
+    }
+}
+
+/// The timer's sweep runs below normal, on a background thread of its own
+/// (the daemon's runs at 10 or lower), and gives the heap its ranking and
+/// housekeeping freed back to the system once, after the stores.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn the_periodic_sweep_runs_below_normal_and_trims_the_heap_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    crate::platform::HEAP_RELEASES.lock().unwrap().clear();
+    assert!(daemon.periodic_sweep(None).is_empty());
+    let releases = crate::platform::HEAP_RELEASES.lock().unwrap().clone();
+    assert_eq!(releases.len(), 1, "one trim per sweep: {releases:?}");
+    assert_eq!(releases[0].thread.as_deref(), Some("kache-background"));
+    assert!(
+        releases[0].nice >= crate::platform::BACKGROUND_NICE,
+        "the sweep runs below normal: {releases:?}"
+    );
 }
 
 /// The daemon's sweep is what flushes entries a miss stored without an

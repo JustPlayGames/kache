@@ -343,11 +343,34 @@ fn cap_malloc_arenas(arenas: libc::c_int) -> bool {
 /// in the middle of one, those pages stayed resident until reused.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn release_free_heap() {
+    #[cfg(test)]
+    HEAP_RELEASES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(HeapRelease {
+            thread: std::thread::current().name().map(str::to_owned),
+            nice: thread_nice(),
+        });
     // SAFETY: malloc_trim takes the arenas' own locks; 0 keeps no padding.
     unsafe {
         libc::malloc_trim(0);
     }
 }
+
+/// Tests: one [`release_free_heap`] call, the thread that made it and that
+/// thread's nice.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeapRelease {
+    pub(crate) thread: Option<String>,
+    pub(crate) nice: i32,
+}
+
+/// Tests: every [`release_free_heap`] call of this process, in order (each
+/// nextest test is a process of its own).
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+pub(crate) static HEAP_RELEASES: std::sync::Mutex<Vec<HeapRelease>> =
+    std::sync::Mutex::new(Vec::new());
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn release_free_heap() {}
