@@ -3495,6 +3495,40 @@ fn daemon_gc_sweeps_hermetic_build_script_runs() {
     assert!(!leftover.exists());
 }
 
+/// The daemon's GC sweeps the probe memos of the store it may write:
+/// one nobody used for eight days is gone after a run, one used
+/// yesterday stays.
+#[test]
+fn daemon_gc_sweeps_idle_probe_memos_of_a_writable_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::new(test_config(dir.path()));
+    let probes = daemon.config.cache_dir.join("probes");
+    std::fs::create_dir_all(&probes).unwrap();
+    let memo = |name: &str, days: u64| {
+        let path = probes.join(name);
+        let used = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600);
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(used)
+                    .set_accessed(used),
+            )
+            .unwrap();
+        path
+    };
+    let idle = memo("rustc-ver-1.txt", 8);
+    let in_use = memo("rustc-ver-2.txt", 1);
+    daemon
+        .run_gc(
+            GcPolicy::Automatic { max_age_hours: 0 },
+            GcDriver::Requested,
+        )
+        .unwrap();
+    assert!(!idle.exists(), "a memo idle for 8 days goes");
+    assert!(in_use.exists(), "one used yesterday stays");
+}
+
 /// The daemon's sweep is what flushes entries a miss stored without an
 /// fsync: it marks them durable, does nothing once the queue is empty,
 /// and stands aside while another flusher holds the lock.
