@@ -5750,6 +5750,25 @@ fn evict_frees_an_entry_that_is_only_partly_held_outside() {
     assert!(retainer.is_file(), "the target directory keeps its copy");
 }
 
+/// The walk that checks each entry as it reaches it (disk pressure, a
+/// sweep that starts short of space) follows the removal's rule too: an
+/// entry held only in part goes, its private bytes with it.
+#[test]
+fn disk_pressure_frees_an_entry_that_is_only_partly_held_outside() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(&config).unwrap();
+    let retainer = put_partly_held_entry(&store, dir.path(), 40, 300);
+
+    let stats = store.evict_for_disk_pressure(|_| false).unwrap();
+
+    assert_eq!(stats.entries_evicted, 1, "{stats:?}");
+    assert_eq!(stats.entries_unreclaimable, 0, "{stats:?}");
+    assert_eq!(stats.bytes_held, 0, "{stats:?}");
+    assert!(!store.contains("partly"));
+    assert!(retainer.is_file(), "the target directory keeps its copy");
+}
+
 #[test]
 fn a_size_sweep_credits_a_partial_entry_on_the_same_basis_as_its_budget() {
     use crate::eviction::HeldBytesBudget;
