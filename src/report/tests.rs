@@ -5481,20 +5481,22 @@ fn seed_summary_counts_attempts_and_times_successful_compiles() {
         event("imported", None, 7_000),
         event("no-donor", Some(1), 8_000),
         event("unportable", None, 8_000),
+        event("imported-other-libraries", Some(0), 3_000),
     ];
     assert_eq!(
         seed_summary(&events),
         SeedSummary {
-            imported: 3,
+            imported: 4,
             no_donor: 2,
             unportable: 2,
-            seeded_compiles: 1,
-            seeded_compile_ms: 1_000,
+            other_libraries: 1,
+            seeded_compiles: 2,
+            seeded_compile_ms: 4_000,
             unseeded_compiles: 2,
             unseeded_compile_ms: 10_000,
         }
     );
-    assert_eq!(build_bypass_analysis(&events, 10).seeds.looked(), 7);
+    assert_eq!(build_bypass_analysis(&events, 10).seeds.looked(), 8);
 }
 
 #[test]
@@ -5524,6 +5526,7 @@ fn seed_summary_line_shows_rate_and_both_averages_only() {
         imported: 1,
         no_donor: 1,
         unportable: 2,
+        other_libraries: 1,
         seeded_compiles: 2,
         seeded_compile_ms: 2_000,
         unseeded_compiles: 3,
@@ -5533,7 +5536,7 @@ fn seed_summary_line_shows_rate_and_both_averages_only() {
         format_seed_summary(&both),
         Some((
             "1 of 4".into(),
-            "seeded from another checkout, 2 not portable; mean successful compile 1.0 s seeded (n=2), 3.0 s without (n=3)"
+            "seeded from another checkout, 2 not portable, 1 against other builds of some libraries; mean successful compile 1.0 s seeded (n=2), 3.0 s without (n=3)"
                 .into()
         ))
     );

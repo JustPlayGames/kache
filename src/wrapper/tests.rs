@@ -15520,18 +15520,20 @@ fn scheduler_cancellation_guard_keeps_an_existing_error_event() {
 #[test]
 fn seed_attempt_is_settled_and_recorded_on_the_event() {
     use super::SeedAttempt::*;
-    for (looked, portable, imported, attempt) in [
-        (false, true, false, NotTried),
-        (true, false, false, Unportable),
-        (true, true, false, NoDonor),
+    for (looked, portable, imported, other, attempt) in [
+        (false, true, false, false, NotTried),
+        (true, false, false, false, Unportable),
+        (true, true, false, false, NoDonor),
         // A donor an earlier preparation imported counts, looked or not.
-        (false, false, true, Imported),
-        (true, true, true, Imported),
+        (false, false, true, false, Imported),
+        (true, true, true, false, Imported),
+        // A graph made against other builds of some libraries.
+        (true, true, true, true, ImportedOtherLibraries),
     ] {
         assert_eq!(
-            super::SeedAttempt::of(looked, portable, imported),
+            super::SeedAttempt::of(looked, portable, imported, other),
             attempt,
-            "looked={looked} portable={portable} imported={imported}"
+            "looked={looked} portable={portable} imported={imported} other={other}"
         );
     }
     for (attempt, seeded, settled) in [
@@ -15539,6 +15541,8 @@ fn seed_attempt_is_settled_and_recorded_on_the_event() {
         (NotTried, false, NotTried),
         (Imported, false, Unportable),
         (NoDonor, false, NoDonor),
+        (ImportedOtherLibraries, true, ImportedOtherLibraries),
+        (ImportedOtherLibraries, false, Unportable),
         (Unportable, false, Unportable),
     ] {
         assert_eq!(
@@ -15552,6 +15556,7 @@ fn seed_attempt_is_settled_and_recorded_on_the_event() {
     let config = test_config(dir.path().join("cache"));
     for (attempt, recorded) in [
         (Imported, "imported"),
+        (ImportedOtherLibraries, "imported-other-libraries"),
         (NoDonor, "no-donor"),
         (Unportable, "unportable"),
         (NotTried, ""),

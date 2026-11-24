@@ -57,7 +57,10 @@ The import clones files with copy-on-write where the filesystem supports it
 and uses independent copies otherwise. No imported file shares an inode with
 the donor, including ThinLTO bitcode that rustc can rewrite in place.
 A busy donor, incompatible flags, unsupported arguments or unfinished
-state leaves the receiver compiling without an imported seed. Each candidate
+state leaves the receiver compiling without an imported seed. A graph made
+against other builds of some of the receiver's libraries is imported and
+counted apart
+([What a graph is worth on other libraries](/docs/getting-started/worktrees#what-a-graph-is-worth-on-other-libraries)). Each candidate
 import is limited to 16 GiB and 262,144 entries. A donor without a seed index,
 written by an older release, has up to 256 of its units read, for up to eight
 such donors.

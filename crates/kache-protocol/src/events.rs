@@ -286,8 +286,10 @@ pub struct BuildEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub incremental_seed: String,
     /// How the first private compile of a unit looked for another checkout's
-    /// incremental state: `imported`, `no-donor` or `unportable`. Empty when
-    /// it did not look. `serde(default)`, no schema bump.
+    /// incremental state: `imported`, `imported-other-libraries` (a graph
+    /// the donor made against other builds of some of the receiver's
+    /// libraries), `no-donor` or `unportable`. Empty when it did not look.
+    /// `serde(default)`, no schema bump.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub incremental_seed_attempt: String,
     /// Why `Store::put` failed, when the compiler ran and produced outputs that
