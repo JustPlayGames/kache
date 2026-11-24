@@ -141,6 +141,28 @@ other builds of some libraries says `imported-other-libraries` in its
 event, and `kache report` counts it. A seed from an older release has no
 record and is imported as before.
 
+#### The metadata a graph saves
+
+rustc saves a library's metadata in its graph. When a compile finds the
+metadata unchanged, rustc links the saved file as the unit's `.rmeta`
+instead of writing it again, so the `.rmeta` keeps the time the saved file
+was made. Across its runs Cargo calls a library built on another fresh while
+its outputs are newer than that `.rmeta`. Build the library alone
+(`cargo build -p lib`), then the crates above it alone, and a crate built on
+what the target folder held before passes as fresh on metadata it was not
+built against: its next link fails (`E0463`; rustc's log says `Rejecting
+via hash`), and a program built on it alone is not linked again. An
+imported graph saved its metadata in another folder, and a graph that a
+cache hit left in place saved metadata the hit has since replaced. So
+before a compile on such a graph, Kache gives the saved file a copy of its
+own, written then: the `.rmeta` rustc links is newer than whatever was built
+on the folder's old metadata. Where the saved file is still the folder's
+`.rmeta`, it is left alone, and unchanged metadata still lets Cargo skip the
+crates above it. No existing file's time is changed, as other names may
+share it. A cache hit needs none of this: it writes a path package's
+metadata as a file of its own and stamps every restored file with the time
+of the restore.
+
 A crate with [hidden compile-time inputs](/docs/getting-started/configuration#hidden-compile-time-inputs)
 takes this lane too, and no other incremental lane. Kache completes Cargo's
 dep-info with its inputs after every compile, so Cargo still runs the compile

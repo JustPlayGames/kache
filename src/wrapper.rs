@@ -9755,6 +9755,17 @@ fn passthrough_args(
                 .context("resolving rustc passthrough output directory")
         })
         .transpose()?;
+    // Before the pre-clean, which may remove the metadata this compares with.
+    if incremental_preserved && let Some(cwd) = env.cwd() {
+        crate::incremental_policy::reused_metadata::prepare(
+            compiler_args,
+            cwd,
+            out_dir.as_deref(),
+            args.crate_name.as_deref(),
+            args.extra_filename.as_deref(),
+            &args.emit,
+        );
+    }
     compile::pre_clean_outputs(
         output.as_deref(),
         out_dir.as_deref(),
