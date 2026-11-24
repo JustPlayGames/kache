@@ -79,7 +79,7 @@ impl<P: crate::ArtifactPolicy> ArtifactStore<P> {
             None,
             None,
             &durable_upload_keys,
-            &mut std::collections::HashMap::new(),
+            &mut super::HeldByLiveFiles::default(),
             false,
             None,
             &mut |_| false,
