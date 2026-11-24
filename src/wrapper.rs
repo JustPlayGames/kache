@@ -11302,7 +11302,11 @@ fn write_event_with(
 ) -> bool {
     let _trace = crate::phase_trace::phase("event_log");
     if let Err(error) = log(&config.event_log_path(), event) {
-        tracing::debug!(crate_name = %event.crate_name, "could not record compiler event: {error:#}");
+        tracing::debug!(
+            target: "kache::wrapper::event_log",
+            crate_name = %event.crate_name,
+            "could not record compiler event: {error:#}"
+        );
         return false;
     }
     crate::opcounts::mark_event_written();

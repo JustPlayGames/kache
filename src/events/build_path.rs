@@ -10,6 +10,7 @@ pub(super) enum LogLock {
     /// The daemon's writes, which no build waits for: they wait out a busy
     /// log up to [`DAEMON_LOCK_BUDGET`] instead of being dropped.
     Daemon,
+    BuildEvent,
 }
 
 /// How long the daemon's event writes wait for the log. The daemon logs a
@@ -19,10 +20,10 @@ pub(super) enum LogLock {
 const DAEMON_LOCK_BUDGET: Duration = Duration::from_secs(2);
 
 impl LogLock {
-    pub(super) fn exclusive(self, file: &File) -> Result<()> {
+    pub(super) fn exclusive(&self, file: &File) -> Result<()> {
         match self {
             Self::Wait => Ok(file.lock()?),
-            Self::Build => lock_for_build(|| file.try_lock()),
+            Self::Build | Self::BuildEvent => lock_for_build(|| file.try_lock()),
             Self::Daemon => lock_while(|elapsed| elapsed < DAEMON_LOCK_BUDGET, || file.try_lock()),
         }
     }
