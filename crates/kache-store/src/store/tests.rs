@@ -5719,13 +5719,7 @@ fn put_partly_held_entry(
         .hash;
     let retainer = dir.join("target-copy.a");
     std::fs::hard_link(store.blob_path(held_hash), &retainer).unwrap();
-    store
-        .db
-        .execute(
-            "UPDATE entries SET last_accessed = datetime('now', '-1 hour') WHERE cache_key = 'partly'",
-            [],
-        )
-        .unwrap();
+    store.set_last_accessed_for_test("partly", "-1 hour");
     retainer
 }
 
@@ -5837,7 +5831,9 @@ fn a_missing_empty_blob_cannot_pay_for_evicting_a_held_archive() {
     let candidates = store
         .eviction_candidates_for(SweepOrigin::Requested)
         .unwrap();
-    let held = store.held_by_live_files(candidates.iter().map(|entry| entry.key.as_str())).unwrap();
+    let held = store
+        .held_by_live_files(candidates.iter().map(|entry| entry.key.as_str()))
+        .unwrap();
     assert_eq!(held.refused.get("partly"), Some(&30_000));
     assert!(matches!(
         store
