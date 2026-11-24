@@ -226,7 +226,8 @@ fn keeps_to_the_cache(config: &Config, args: &RustcArgs, unit: &AdaptiveUnit) ->
 
 /// How long a kept lease waits for a unit another process holds: a
 /// receiver copying its graph, or a clean-up. Two builds of one target never
-/// compile a unit at once (Cargo locks the target).
+/// compile a unit at once (Cargo locks the target). The wait holds no
+/// compile permit, and a cancelled invocation stops it.
 const KEPT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Which lanes a managed unit takes before its key ([`KeepIncremental`]).
@@ -5037,11 +5038,16 @@ fn run_parsed_rustc(
             );
         }
         // A unit the checkout changed is its own: no record to key from, and
-        // no other checkout asks for it. It compiles on the kept lane.
+        // no other checkout asks for it. It compiles on the kept lane. A wait
+        // for a unit another process holds gives the early permit back first:
+        // a waiter holds no compile slot, and the kept compile, or the
+        // compile before its key when the wait ends without the lane, takes
+        // its own. The discovery flight stays held, as on every miss that
+        // waits for a permit.
         if decide_at_miss
             && let Some(unit) = kept_at_miss_unit.as_ref().or(adaptive_unit.as_ref())
             && kept_after_miss(config, args, unit)
-            && let Some(lease) = unit.try_kept(KEPT_LOCK_WAIT)
+            && let Some(lease) = unit.try_kept_then(KEPT_LOCK_WAIT, || drop(early_permit.take()))
         {
             drop(discovery_flight);
             drop(early_permit);

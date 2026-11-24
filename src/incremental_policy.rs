@@ -343,7 +343,19 @@ impl AdaptiveUnit {
     /// compile or a damaged record starts over from an empty graph. Waits up
     /// to `wait` for a donor's copy or a clean-up that holds the unit.
     pub(crate) fn try_kept(&self, wait: Duration) -> Option<Lease> {
-        let lock = self.lock_waiting(wait)?;
+        self.try_kept_then(wait, || {})
+    }
+
+    /// [`Self::try_kept`], calling `before_waiting` once when another
+    /// process holds the unit and the lease is about to wait for it, so the
+    /// caller lets go of what no wait should hold (a compile permit). Not
+    /// called when the lock comes at once or `wait` is zero.
+    pub(crate) fn try_kept_then(
+        &self,
+        wait: Duration,
+        before_waiting: impl FnOnce(),
+    ) -> Option<Lease> {
+        let lock = self.lock_waiting(wait, before_waiting)?;
         match self.load_state() {
             LoadedState::Missing => {}
             // Any phase's graph is this unit's own: the unit key covers the
@@ -834,12 +846,14 @@ impl AdaptiveUnit {
     }
 
     fn lock(&self) -> Option<UnitLock> {
-        self.lock_waiting(Duration::ZERO)
+        self.lock_waiting(Duration::ZERO, || {})
     }
 
     /// The unit's lock, retried for up to `wait` while another process holds
-    /// it. Any other failure ends at once.
-    fn lock_waiting(&self, wait: Duration) -> Option<UnitLock> {
+    /// it; `before_waiting` runs once, before the first retry. A cancelled
+    /// invocation stops waiting ([`crate::invocation::process::check`]), and
+    /// any other failure ends at once.
+    fn lock_waiting(&self, wait: Duration, before_waiting: impl FnOnce()) -> Option<UnitLock> {
         if !self.ensure_layout() {
             return None;
         }
@@ -858,10 +872,16 @@ impl AdaptiveUnit {
             return None;
         }
         let deadline = Instant::now() + wait;
+        let mut before_waiting = Some(before_waiting);
         loop {
             match file.try_lock() {
                 Ok(()) => return Some(UnitLock(file)),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                Err(std::fs::TryLockError::WouldBlock)
+                    if Instant::now() < deadline && crate::invocation::process::check().is_ok() =>
+                {
+                    if let Some(before_waiting) = before_waiting.take() {
+                        before_waiting();
+                    }
                     std::thread::sleep(LOCK_POLL);
                 }
                 Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => {
@@ -3904,6 +3924,50 @@ mod tests {
         assert!(worktree_seed::empty_directory(&lease.unit.rustc_dir));
         assert!(read_state(&unit).in_flight);
         assert!(!unit.is_kept());
+    }
+
+    /// A kept lease that must wait for a unit another process holds lets go
+    /// of what its caller holds (the early compile permit) once, before the
+    /// wait; a lock that comes at once, or no wait at all, keeps it.
+    #[test]
+    fn a_kept_lease_frees_what_its_caller_holds_only_to_wait() {
+        let (_temp, _args, unit) = fixture();
+        let freed = std::cell::Cell::new(0);
+        let free = || freed.set(freed.get() + 1);
+        let lease = unit.try_kept_then(Duration::from_secs(30), free).unwrap();
+        assert_eq!(freed.get(), 0, "a free unit needs no wait");
+        drop(lease);
+
+        let held = unit.lock().unwrap();
+        assert!(unit.try_kept_then(Duration::ZERO, free).is_none());
+        assert_eq!(freed.get(), 0, "no wait, nothing to free");
+
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(LOCK_POLL * 4);
+            drop(held);
+        });
+        let lease = unit.try_kept_then(Duration::from_secs(30), free);
+        holder.join().unwrap();
+        assert_eq!(lease.unwrap().kind(), LeaseKind::Kept);
+        assert_eq!(freed.get(), 1, "freed once, before the first of many polls");
+    }
+
+    /// A cancelled invocation stops waiting for a held unit at once rather
+    /// than sleep out the kept lane's minute.
+    #[test]
+    fn a_cancelled_invocation_stops_waiting_for_a_held_unit() {
+        use crate::invocation::process::{Cancellation, CancellationScope};
+        let (_temp, _args, unit) = fixture();
+        let _held = unit.lock().unwrap();
+        let token = Cancellation::default();
+        token.cancel();
+        let _scope = CancellationScope::enter(Some(token));
+        let asked = Instant::now();
+        assert!(unit.try_kept(Duration::from_secs(60)).is_none());
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "a cancelled wait must not sleep out its bound"
+        );
     }
 
     #[test]
