@@ -1012,3 +1012,180 @@ fn a_checkout_keeps_its_own_edits_warm_and_restores_the_shared_tree() {
         assert_kept(&event, "");
     }
 }
+
+/// `cargo build -p <package>` of `project` into its `target`, through Kache
+/// with the shared ref `shared` and `keep_incremental` set to `keep`.
+fn build_package(project: &Path, cache_dir: &Path, package: &str, keep: &str) {
+    settle_writes(&[project]);
+    let output = build_command(project, cache_dir, &project.join("target"), package)
+        .env("KACHE_SHARED_REF", "shared")
+        .env("KACHE_KEEP_INCREMENTAL", keep)
+        .output()
+        .expect("failed to build the workspace fixture");
+    assert!(
+        output.status.success(),
+        "cargo build -p {package} failed\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// What the app last built in `project` prints.
+fn app_answer(project: &Path) -> String {
+    let app = project.join(format!(
+        "target/debug/adaptive-app{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let run = Command::new(&app)
+        .output()
+        .expect("failed to run the workspace binary");
+    String::from_utf8_lossy(&run.stdout).into_owned()
+}
+
+fn write_answer(project: &Path, answer: u64) {
+    fs::write(
+        project.join("lib/src/lib.rs"),
+        format!("pub fn answer() -> u64 {{ {answer} }}\n"),
+    )
+    .unwrap();
+}
+
+/// Commit `project` as it is and point the shared ref at it.
+fn commit_shared(project: &Path) {
+    fs::write(project.join(".gitignore"), "/target*\n").unwrap();
+    git(project, &["init", "-q"]);
+    git(project, &["add", "-A"]);
+    git(project, &["commit", "-q", "-m", "one"]);
+    git(project, &["branch", "shared"]);
+}
+
+fn git_missing() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// The one event `build` adds for `crate_name`, if it adds one.
+fn new_event(cache_dir: &Path, crate_name: &str, build: impl FnOnce()) -> Option<Value> {
+    let before = crate_events(cache_dir, crate_name).len();
+    build();
+    let events = crate_events(cache_dir, crate_name);
+    assert!(events.len() <= before + 1, "{crate_name} events: {events:#?}");
+    events.into_iter().nth(before)
+}
+
+/// Cargo tells a library built on another fresh across its runs while it is
+/// newer than that library's metadata. A compile on a kept graph can take
+/// its metadata from the graph unchanged: rustc links the file it saved
+/// there, whose time is when it was made. A graph imported from a folder
+/// kept for others made it before this checkout built the crate above on
+/// another library: the library built alone, then the crate above alone, the
+/// crate above is compiled again. When the library's metadata is the graph's
+/// own file, a compile that leaves it unchanged keeps it as it is, and the
+/// crate above stays fresh.
+#[test]
+fn metadata_from_an_imported_graph_is_newer_than_what_was_built_on_the_old() {
+    if git_missing() {
+        return;
+    }
+    let checkouts = tempfile::tempdir().unwrap();
+    let root = checkout_path(checkouts.path());
+    let [station, first] = ["station", "first"].map(|name| root.join(name));
+    let cache = tempfile::tempdir().unwrap();
+    let cache = cache.path();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache);
+    for project in [&station, &first] {
+        create_workspace(project);
+    }
+
+    // The folder kept for others compiled the library as 2.
+    write_answer(&station, 2);
+    build_package(&station, cache, "adaptive-app", "all");
+    // The checkout's shared tree holds 1, and the crates above are built on
+    // it after that.
+    write_answer(&first, 1);
+    commit_shared(&first);
+    build_package(&first, cache, "adaptive-app", "private");
+    assert_eq!(app_answer(&first), "1");
+
+    // Its edit is what the folder kept for others compiled.
+    write_answer(&first, 2);
+    let lib = new_event(cache, "adaptive_lib", || {
+        build_package(&first, cache, "adaptive-lib", "private")
+    })
+    .expect("the library is compiled");
+    assert_passthrough(&lib, "incremental kept: changed here");
+    assert_eq!(lib["incremental_seed_attempt"], "imported", "event: {lib:#}");
+    let mid = new_event(cache, "adaptive_mid", || {
+        build_package(&first, cache, "adaptive-app", "private")
+    });
+    assert!(
+        mid.is_some(),
+        "the crate built on the library's old metadata was left as it was"
+    );
+    assert_eq!(app_answer(&first), "2");
+
+    // The same source again: the graph's own metadata, unchanged.
+    write_answer(&first, 2);
+    let lib = new_event(cache, "adaptive_lib", || {
+        build_package(&first, cache, "adaptive-lib", "private")
+    })
+    .expect("the library is compiled");
+    assert_passthrough(&lib, "incremental kept: changed here");
+    assert_eq!(
+        lib["incremental_seed_attempt"].as_str().unwrap_or(""),
+        "",
+        "event: {lib:#}"
+    );
+    let mid = new_event(cache, "adaptive_mid", || {
+        build_package(&first, cache, "adaptive-app", "private")
+    });
+    assert!(mid.is_none(), "unchanged metadata needs no rebuild: {mid:#?}");
+    assert_eq!(app_answer(&first), "2");
+}
+
+/// A restore of the shared tree leaves a checkout's kept graph, so the
+/// graph's metadata is not what the target holds after it: compiled again
+/// on that graph, the library's metadata is newer than the crates the
+/// restore's build put above it.
+#[test]
+fn metadata_from_a_kept_graph_is_newer_than_what_a_restore_built_on() {
+    if git_missing() {
+        return;
+    }
+    let checkout = tempfile::tempdir().unwrap();
+    let project = checkout_path(checkout.path());
+    let cache = tempfile::tempdir().unwrap();
+    let cache = cache.path();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache);
+    create_workspace(&project);
+    write_answer(&project, 1);
+    commit_shared(&project);
+    let build = |package: &str| build_package(&project, cache, package, "private");
+
+    build("adaptive-app");
+    write_answer(&project, 2);
+    build("adaptive-app");
+    assert_eq!(app_answer(&project), "2");
+    write_answer(&project, 1);
+    let lib = new_event(cache, "adaptive_lib", || build("adaptive-app")).unwrap();
+    assert_eq!(lib["result"], "local_hit", "event: {lib:#}");
+    assert_eq!(app_answer(&project), "1");
+
+    // The edit again, on the graph the restore left.
+    write_answer(&project, 2);
+    let lib = new_event(cache, "adaptive_lib", || build("adaptive-lib")).unwrap();
+    assert_passthrough(&lib, "incremental kept: changed here");
+    assert_eq!(
+        lib["incremental_seed_attempt"].as_str().unwrap_or(""),
+        "",
+        "event: {lib:#}"
+    );
+    let mid = new_event(cache, "adaptive_mid", || build("adaptive-app"));
+    assert!(
+        mid.is_some(),
+        "the crate the restore's build put on the old metadata was left as it was"
+    );
+    assert_eq!(app_answer(&project), "2");
+}
+

@@ -254,6 +254,17 @@ pub(crate) fn run_rustc(
         .transpose()?;
     let output_path = output_path.as_deref();
     let out_dir = out_dir.as_deref();
+    // Before the pre-clean, which may remove the metadata this compares with.
+    if matches!(incremental_mode, IncrementalMode::PreserveIsolated { .. }) {
+        crate::incremental_policy::reused_metadata::prepare(
+            args,
+            cwd,
+            out_dir,
+            crate_name,
+            extra_filename,
+            emit,
+        );
+    }
     // Pre-clean output paths: remove any read-only hardlinks left by a previous
     // kache cache hit. Without this, rustc cannot overwrite the 0444 hardlinked
     // files and fails with "output file is not writeable".
