@@ -99,6 +99,10 @@ pub(crate) struct Lease {
     worktree_seed_key: Option<String>,
     /// The donor profile whose state this lease imported.
     worktree_seed_donor: Option<PathBuf>,
+    /// The imported graph was made against other builds of some libraries.
+    worktree_seed_other_libraries: bool,
+    /// What this compile's graph is made against, published with its seed.
+    worktree_seed_externs: Option<worktree_seed::ExternRecord>,
     worktree_bootstrap: bool,
     /// A deferred seed compiling into scratch while its marker flushes.
     deferred_graph: Option<DeferredGraph>,
@@ -386,6 +390,8 @@ impl AdaptiveUnit {
             completion: Completion::Kept,
             worktree_seed_key: None,
             worktree_seed_donor: None,
+            worktree_seed_other_libraries: false,
+            worktree_seed_externs: None,
             worktree_bootstrap: false,
             deferred_graph: None,
             _lock: lock,
@@ -469,6 +475,8 @@ impl AdaptiveUnit {
             },
             worktree_seed_key: None,
             worktree_seed_donor: None,
+            worktree_seed_other_libraries: false,
+            worktree_seed_externs: None,
             worktree_bootstrap: false,
             deferred_graph: None,
             _lock: lock,
@@ -609,6 +617,8 @@ impl AdaptiveUnit {
             completion: Completion::DeferredSeed { previous },
             worktree_seed_key: None,
             worktree_seed_donor: None,
+            worktree_seed_other_libraries: false,
+            worktree_seed_externs: None,
             worktree_bootstrap: false,
             deferred_graph,
             _lock: lock,
@@ -689,6 +699,8 @@ impl AdaptiveUnit {
             },
             worktree_seed_key: None,
             worktree_seed_donor: None,
+            worktree_seed_other_libraries: false,
+            worktree_seed_externs: None,
             worktree_bootstrap: false,
             deferred_graph: None,
             _lock: lock,
@@ -733,6 +745,8 @@ impl AdaptiveUnit {
             completion: Completion::Immediate { restore },
             worktree_seed_key: None,
             worktree_seed_donor: None,
+            worktree_seed_other_libraries: false,
+            worktree_seed_externs: None,
             worktree_bootstrap: false,
             deferred_graph: None,
             _lock: lock,
@@ -792,6 +806,8 @@ impl AdaptiveUnit {
             },
             worktree_seed_key: None,
             worktree_seed_donor: None,
+            worktree_seed_other_libraries: false,
+            worktree_seed_externs: None,
             worktree_bootstrap: false,
             deferred_graph: None,
             _lock: lock,
@@ -1280,7 +1296,11 @@ impl Lease {
             cleanup::drop_superseded_sessions(&self.unit.rustc_dir);
         }
         if kept && outcome == CompileOutcome::Success {
-            worktree_seed::publish(&self.unit, self.worktree_seed_key.as_deref());
+            worktree_seed::publish(
+                &self.unit,
+                self.worktree_seed_key.as_deref(),
+                self.worktree_seed_externs.as_ref(),
+            );
         }
         kept
     }

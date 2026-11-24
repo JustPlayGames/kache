@@ -807,6 +807,10 @@ pub struct SeedSummary {
     pub imported: usize,
     pub no_donor: usize,
     pub unportable: usize,
+    /// Of `imported`, the graphs a donor made against other builds of some
+    /// of the receiver's libraries.
+    #[serde(default)]
+    pub other_libraries: usize,
     pub seeded_compiles: usize,
     pub seeded_compile_ms: u64,
     pub unseeded_compiles: usize,
@@ -834,6 +838,11 @@ pub(crate) fn seed_summary(events: &[BuildEvent]) -> SeedSummary {
             "unportable" => {
                 summary.unportable += 1;
                 false
+            }
+            "imported-other-libraries" => {
+                summary.imported += 1;
+                summary.other_libraries += 1;
+                true
             }
             _ => continue,
         };
@@ -2992,6 +3001,12 @@ fn format_seed_summary(seeds: &SeedSummary) -> Option<(String, String)> {
     let mut note = "seeded from another checkout".to_string();
     if seeds.unportable > 0 {
         note.push_str(&format!(", {} not portable", seeds.unportable));
+    }
+    if seeds.other_libraries > 0 {
+        note.push_str(&format!(
+            ", {} against other builds of some libraries",
+            seeds.other_libraries
+        ));
     }
     if seeds.seeded_compiles > 0 && seeds.unseeded_compiles > 0 {
         // Observational: the two groups can hold different crates.

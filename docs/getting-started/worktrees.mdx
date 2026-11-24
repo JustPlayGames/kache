@@ -83,19 +83,63 @@ A unit's first private compile imports a compatible graph from another
 checkout. A build machine's folder that every change passes through can keep
 every unit's graph for the others: with `keep_incremental = "all"` every
 managed unit compiles on this lane, nothing of them is stored, and the
-profile is recorded under the cache folder as a folder kept for others. Every
-receiver on the machine tries such folders first, and Kache's own clean-ups
-of unused graphs leave them to whoever keeps the folder. A graph that does
-not fit is rejected by rustc, which then compiles the unit whole: an import
-can cost a cold compile, never a wrong build.
+profile is recorded under the cache folder as a folder kept for others.
+Receivers on the machine look in such folders before other checkouts, and
+Kache's own clean-ups of unused graphs leave them to
+whoever keeps the folder. A graph that does not fit is rejected by rustc,
+which then compiles the unit whole: an import can cost a cold compile, never
+a wrong build.
 
-A private compile maps the workspace where a stored compile does
+#### What a graph is worth on other libraries
+
+A graph is worth what rustc can keep of it on the receiver's libraries. A
+private compile maps the workspace where a stored compile does
 (`/proc/self/cwd` on Linux, `/kache/workspace` on macOS; Windows keeps
-`C:\src`), so the crates a donor compiled privately and those a receiver
-restored from the cache differ in their crate hash alone: rustc re-runs the
-queries that read them and finds the same answers. The first compile from an
-imported graph still costs more than the next one from the unit's own graph,
-by about those queries.
+`C:\src`), so a library's source paths are the same in both, but its crate
+hash is not: with `-C incremental` rustc hashes the source spans of the
+library's items into it, and every crate hash folds in those of the
+libraries below. A library compiled on a kept lane is therefore another
+build than the store's, and so is every library built on it. Measured with
+rustc 1.99.1 on two crates, one built on the other, the dependent's own
+graph reused against another build of the library:
+
+| The library the dependent is compiled against | Instances compiled again |
+| --- | --- |
+| The build the graph was made against | 0 of 35,769 |
+| Built in another folder, remapped to the same name (same crate hash) | 0 |
+| Compiled with `-C incremental`, otherwise the same | 541 (the library's generic items) |
+| Built in another folder, not remapped | 30,856 |
+
+A library compiled incrementally costs little; one built with other source
+paths costs far more. A real workspace mixes them, and a graph still pays
+there. A build machine's folder that compiles every workspace crate
+incrementally held 1,069 registry crates (of 2,970) whose crate hash
+differed from the store's build of the same version and arguments; more
+than half of them name a registry folder without the trailing separator
+that the store's builds of it have. Two folders of one commit, filled hours
+apart, held different builds of 412 of their 2,033 registry crates; why is
+not known. A checkout's first edit of a base crate, with 197 private crates
+above it, built in 31 to 72 s (median 40 s, three runs) with the graphs of
+another folder at the same commit, though a median 13 % (by size) of each
+graph's direct registry libraries were other builds than the checkout's.
+Without the graphs it took 197 to 463 s, and compiled plain 158 to 196 s.
+The same edit against the build machine's folder, at a newer commit, took 87
+to 126 s, and 239 s without its graphs. The one loss seen was a test crate
+built on 49 libraries: it compiled again 91 % of its 174,890 instances and
+took 47.8 s, where no graph took 37 to 40 s.
+
+So a receiver imports a graph whatever libraries it was made against, and
+every seed records what its graph was made against: the metadata digest of
+each `--extern`, whether the donor's checkout compiled that library
+privately, and the `--out-dir`. Among the donors that published the graph,
+one that wrote to the receiver's `--out-dir` goes first: the folder is not
+part of a graph's key, but rustc compiles every codegen unit again when it
+differs. Then comes one made against the receiver's libraries, apart from
+those either checkout compiled privately (another build of the same crate),
+then a folder kept for others, then the newest. An import made against
+other builds of some libraries says `imported-other-libraries` in its
+event, and `kache report` counts it. A seed from an older release has no
+record and is imported as before.
 
 #### The metadata a graph saves
 

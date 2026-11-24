@@ -38,6 +38,9 @@ const REMAP_PREFIX: &str = if cfg!(windows) {
     "/kache/workspace"
 };
 const MAX_DONORS: usize = 256;
+/// Next to a published seed: what its graph was made against
+/// ([`ExternRecord`]).
+const EXTERNS: &str = "externs-v1";
 const MAX_COPY_FILES: usize = 262_144;
 /// A test program's graph of a large crate, with its object files, is
 /// several gigabytes.
@@ -64,8 +67,9 @@ impl Lease {
         enabled: bool,
     ) -> Vec<String> {
         self.worktree_seed_key = None;
+        self.worktree_seed_externs = None;
         // An import stays this lease's, through a later preparation that
-        // finds the state already there.
+        // finds the state already there, and so does a skipped one.
         self.worktree_bootstrap = false;
         let isolated = self.compiler_args(args);
         if !enabled || args.inner_rustc.is_some() || path_exists(&self.bootstrap_env_marker()) {
@@ -143,12 +147,22 @@ impl Lease {
             &identity,
             target.as_deref(),
         );
+        let externs = ExternRecord::of(
+            args,
+            &cwd,
+            ExternRecord::read(&self.unit.unit_dir.join(EXTERNS)).as_ref(),
+        );
         if empty_directory(&self.unit.rustc_dir)
-            && let Some(donor_profile) = import_from(&self.unit, donor_profiles, &key)
+            && let Import::Copied {
+                profile,
+                other_libraries,
+            } = import_from(&self.unit, donor_profiles, &key, externs.as_ref())
         {
-            tracing::debug!(donor = %donor_profile.display(), "imported worktree incremental seed");
-            self.worktree_seed_donor = Some(donor_profile);
+            tracing::debug!(donor = %profile.display(), other_libraries, "imported worktree incremental seed");
+            self.worktree_seed_donor = Some(profile);
+            self.worktree_seed_other_libraries = other_libraries;
         }
+        self.worktree_seed_externs = externs;
         self.worktree_seed_key = Some(key);
         self.worktree_bootstrap = inject_bootstrap;
         normalized
@@ -161,6 +175,13 @@ impl Lease {
     /// The other checkout's profile whose incremental state was imported.
     pub(crate) fn worktree_seed_donor(&self) -> Option<&Path> {
         self.worktree_seed_donor.as_deref()
+    }
+
+    /// Whether the imported graph was made against other builds of some
+    /// libraries than this checkout's, as the donor's record shows
+    /// ([`ExternRecord`]).
+    pub(crate) fn worktree_seed_other_libraries(&self) -> bool {
+        self.worktree_seed_other_libraries && self.worktree_seed_donor.is_some()
     }
 
     pub(crate) fn worktree_portable(&self) -> bool {
@@ -217,11 +238,213 @@ fn bootstrap_override_allowed(current: Option<&std::ffi::OsStr>, flags: &[String
             .all(|flag| flag.starts_with("remap-cwd-prefix=") || flag == "incremental-info")
 }
 
-pub(super) fn publish(unit: &AdaptiveUnit, key: Option<&str>) {
+pub(super) fn publish(unit: &AdaptiveUnit, key: Option<&str>, externs: Option<&ExternRecord>) {
     let Some(key) = key else { return };
-    if write_small_file(&unit.unit_dir, &unit.unit_dir.join(MARKER), key.as_bytes()) {
+    // What the graph was made against goes first: a receiver that finds the
+    // marker reads the record of this compile, never of an earlier one.
+    let record = unit.unit_dir.join(EXTERNS);
+    let recorded = match externs {
+        Some(externs) => write_small_file(&unit.unit_dir, &record, externs.render().as_bytes()),
+        None => remove_path_safely(&record),
+    };
+    if recorded && write_small_file(&unit.unit_dir, &unit.unit_dir.join(MARKER), key.as_bytes()) {
         index_seed(unit, key);
     }
+}
+
+/// What a unit's graph was made against: the `--out-dir` its arguments
+/// named and the metadata of every library it read by `--extern`, a library
+/// its checkout compiled privately marked as such.
+///
+/// A graph used against other builds of its libraries compiles again what
+/// those builds changed. A library compiled privately (on an incremental
+/// lane, with `-C incremental`) has another crate hash than the same library
+/// compiled for the store, as rustc then hashes every item's span into it:
+/// a dependent's graph used against the other build compiles that library's
+/// generic items again and keeps the rest (rustc 1.99.1: 541 of 35,769
+/// instances), as after an edit of it. A library built with other source
+/// paths costs far more (30,856 of them). On a large workspace a graph made
+/// against other builds of some registry crates still served: the first
+/// compiles after a base crate's edit took 40 s with such graphs and 270 s
+/// without any.
+///
+/// So a receiver imports a donor's graph whatever it was made against, and
+/// the record tells the imports made against other builds apart. Among
+/// donors, one that wrote to the same `--out-dir` goes first, as a
+/// different `--out-dir` (another target folder) compiles every codegen
+/// unit again; then one made against the receiver's libraries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ExternRecord {
+    out_dir: String,
+    /// By `name=file name` (Cargo's file names carry the unit's metadata
+    /// hash, alike in every checkout).
+    externs: BTreeMap<String, ExternDigest>,
+    /// The libraries its checkout compiled privately.
+    private: std::collections::BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternDigest {
+    digest: String,
+    /// Size and modification time when hashed: the unit's next compile
+    /// hashes again only the libraries that changed since.
+    size: u64,
+    modified_ns: u128,
+}
+
+impl ExternRecord {
+    /// The record of `args`' libraries, read where rustc reads them: a
+    /// library's `.rmeta` beside its `.rlib` when there is one (the metadata
+    /// its graph depends on, without the object code), the file named
+    /// otherwise. Digests of `previous` serve files whose size and time did
+    /// not change. None when a library cannot be read.
+    pub(crate) fn of(args: &RustcArgs, cwd: &Path, previous: Option<&Self>) -> Option<Self> {
+        let out_dir = match &args.out_dir {
+            Some(dir) => relative(dir.to_str()?, cwd)?,
+            None => String::new(),
+        };
+        let mut record = Self {
+            out_dir,
+            ..Self::default()
+        };
+        for dependency in &args.externs {
+            let Some(path) = dependency.path.as_deref() else {
+                continue;
+            };
+            let resolved = args.resolve_invocation_path(path)?;
+            let name = format!(
+                "{}={}",
+                dependency.name,
+                resolved.file_name()?.to_str()?
+            );
+            let metadata = match resolved.extension().and_then(|ext| ext.to_str()) {
+                Some("rlib") => Some(resolved.with_extension("rmeta"))
+                    .filter(|rmeta| fs::symlink_metadata(rmeta).is_ok_and(|meta| meta.is_file()))
+                    .unwrap_or_else(|| resolved.clone()),
+                _ => resolved.clone(),
+            };
+            let meta = fs::metadata(&metadata).ok()?;
+            let size = meta.len();
+            let modified_ns = meta
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_nanos();
+            let digest = match previous.and_then(|previous| previous.externs.get(&name)) {
+                Some(known) if known.size == size && known.modified_ns == modified_ns => {
+                    known.digest.clone()
+                }
+                _ => kache_store::file_hash::hash_file(&metadata).ok()?,
+            };
+            if super::private_outputs::is_private(&resolved) {
+                record.private.insert(name.clone());
+            }
+            record.externs.insert(
+                name,
+                ExternDigest {
+                    digest,
+                    size,
+                    modified_ns,
+                },
+            );
+        }
+        Some(record)
+    }
+
+    fn read(path: &Path) -> Option<Self> {
+        if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() <= 1 << 20) {
+            return None;
+        }
+        Self::parse(&fs::read_to_string(path).ok()?)
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        let out_dir = lines.next()?.strip_prefix("out-dir\t")?.to_owned();
+        let mut externs = BTreeMap::new();
+        let mut private = std::collections::BTreeSet::new();
+        for line in lines {
+            let mut fields = line.split('\t');
+            let (Some("extern"), Some(name), Some(digest), Some(size), Some(modified), flag, None) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next(),
+            ) else {
+                return None;
+            };
+            match flag {
+                None => {}
+                Some("private") => {
+                    private.insert(name.to_owned());
+                }
+                Some(_) => return None,
+            }
+            externs.insert(
+                name.to_owned(),
+                ExternDigest {
+                    digest: digest.to_owned(),
+                    size: size.parse().ok()?,
+                    modified_ns: modified.parse().ok()?,
+                },
+            );
+        }
+        Some(Self {
+            out_dir,
+            externs,
+            private,
+        })
+    }
+
+    fn render(&self) -> String {
+        let mut text = format!("out-dir\t{}\n", self.out_dir);
+        for (name, extern_digest) in &self.externs {
+            text.push_str(&format!(
+                "extern\t{name}\t{}\t{}\t{}{}\n",
+                extern_digest.digest,
+                extern_digest.size,
+                extern_digest.modified_ns,
+                if self.private.contains(name) {
+                    "\tprivate"
+                } else {
+                    ""
+                }
+            ));
+        }
+        text
+    }
+
+    /// Whether a graph made against `donor` was made against this
+    /// receiver's libraries: every one is the donor's, apart from those this
+    /// checkout or the donor's compiled privately (the same crate, built on
+    /// an incremental lane).
+    fn same_libraries(&self, donor: &Self) -> bool {
+        self.externs.iter().all(|(name, mine)| {
+            donor.externs.get(name).is_some_and(|theirs| {
+                theirs.digest == mine.digest
+                    || self.private.contains(name)
+                    || donor.private.contains(name)
+            })
+        })
+    }
+}
+
+/// What looking for a donor's graph came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Import {
+    /// The graph of this donor profile was copied; `other_libraries` when
+    /// the donor's record shows it was made against other builds of some
+    /// libraries than the receiver's.
+    Copied {
+        profile: PathBuf,
+        other_libraries: bool,
+    },
+    /// No donor had it.
+    Absent,
 }
 
 /// Name the unit in its profile's seed index under `key`, unless it is
@@ -307,19 +530,49 @@ pub(crate) fn kept_donors(cache_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Copy the newest graph of a unit that published `key` in one of
-/// `profiles` into the receiver's empty graph. The profiles whose seed index
-/// names the key come first: a folder kept for others before any other,
-/// then the newest entry. Profiles without an index (an older release's)
-/// have their units read one by one after that. The donor profile, if one
-/// was copied.
-fn import_from(receiver: &AdaptiveUnit, profiles: &[PathBuf], key: &str) -> Option<PathBuf> {
+/// `profiles` into the receiver's empty graph, and tell whether it was made
+/// against the receiver's libraries (`receiver_externs`, [`ExternRecord`]).
+/// The profiles whose seed index names the key come first: one whose unit
+/// wrote to the receiver's `--out-dir` before any other, then one whose
+/// graph was made against the receiver's libraries, then a folder kept for
+/// others, then the newest entry. Profiles without an index (an older
+/// release's) have their units read one by one after that.
+fn import_from(
+    receiver: &AdaptiveUnit,
+    profiles: &[PathBuf],
+    key: &str,
+    receiver_externs: Option<&ExternRecord>,
+) -> Import {
     let mut indexed = Vec::new();
     let mut unindexed = Vec::new();
     for profile in profiles {
         let index = profile.join(AUTO_ROOT).join(SEEDS);
         match fs::symlink_metadata(index.join(key)) {
             Ok(meta) if meta.is_file() => {
-                indexed.push((keep_all_profile(profile), meta.modified().ok(), profile));
+                let Some(unit_key) = fs::read_to_string(index.join(key))
+                    .ok()
+                    .filter(|name| valid_hex_digest(name))
+                else {
+                    continue;
+                };
+                let donor_externs = ExternRecord::read(
+                    &profile
+                        .join(AUTO_ROOT)
+                        .join(POLICY_VERSION)
+                        .join(&unit_key)
+                        .join(EXTERNS),
+                );
+                let (same_out_dir, same_libraries) = receiver_externs
+                    .zip(donor_externs)
+                    .map_or((false, false), |(mine, theirs)| {
+                        (theirs.out_dir == mine.out_dir, mine.same_libraries(&theirs))
+                    });
+                indexed.push((
+                    (same_out_dir, same_libraries, keep_all_profile(profile)),
+                    meta.modified().ok(),
+                    profile,
+                    unit_key,
+                ));
             }
             Ok(_) => {}
             Err(_) if !real_directory(&index) => unindexed.push(profile),
@@ -327,30 +580,29 @@ fn import_from(receiver: &AdaptiveUnit, profiles: &[PathBuf], key: &str) -> Opti
         }
     }
     indexed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    for (_, _, profile) in indexed {
-        let entry = profile.join(AUTO_ROOT).join(SEEDS).join(key);
-        let Some(unit_key) = fs::read_to_string(entry)
-            .ok()
-            .filter(|name| valid_hex_digest(name))
-        else {
-            continue;
-        };
-        if import_unit(receiver, profile, &unit_key, key) {
-            return Some(profile.clone());
+    for (_, _, profile, unit_key) in &indexed {
+        let outcome = import_unit(receiver, profile, unit_key, key, receiver_externs);
+        if outcome != Import::Absent {
+            return outcome;
         }
     }
-    unindexed
-        .into_iter()
-        .take(MAX_SCANNED_DONORS)
-        .find(|profile| import(receiver, profile, key))
-        .cloned()
+    for profile in unindexed.into_iter().take(MAX_SCANNED_DONORS) {
+        let outcome = import(receiver, profile, key, receiver_externs);
+        if outcome != Import::Absent {
+            return outcome;
+        }
+    }
+    Import::Absent
 }
 
 /// The arguments a seed's key folds, with the target folder named alike in
-/// every folder: rustc's graph does not depend on where the outputs and the
-/// libraries it reads live (`--out-dir`, `-L` and `--extern` are not among
-/// the options its graph records), so a folder of the build machine's own
-/// (`target/integrate-stack`) can seed a checkout's `target`. Only a whole
+/// every folder: `--out-dir`, `-L` and `--extern` are not among the options
+/// rustc's graph records, so a graph from a folder of the build machine's
+/// own (`target/integrate-stack`) is not thrown away in a checkout's
+/// `target`. It keeps its analysis there, but not its code: rustc compiles
+/// every codegen unit again when the `--out-dir` it names differs, so a
+/// receiver prefers a donor that wrote to its own ([`ExternRecord`]), and
+/// the libraries must be the donor's either way. Only a whole
 /// leading path component is replaced, at the start of an argument or after
 /// an `=` (`dependency=target/...`), never inside a value like
 /// `target_os="linux"`.
@@ -583,34 +835,58 @@ fn donor_profile(profile: &Path) -> bool {
 }
 
 /// Read the units of `profile` one by one for a seed published under `key`.
-fn import(receiver: &AdaptiveUnit, profile: &Path, key: &str) -> bool {
+fn import(
+    receiver: &AdaptiveUnit,
+    profile: &Path,
+    key: &str,
+    receiver_externs: Option<&ExternRecord>,
+) -> Import {
     if !donor_profile(profile) {
-        return false;
+        return Import::Absent;
     }
     let Ok(entries) = fs::read_dir(profile.join(AUTO_ROOT).join(POLICY_VERSION)) else {
-        return false;
+        return Import::Absent;
     };
-    entries.take(MAX_DONORS).flatten().any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| copy_unit(receiver, profile, name, key))
-    })
+    for entry in entries.take(MAX_DONORS).flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let outcome = copy_unit(receiver, profile, &name, key, receiver_externs);
+        if outcome != Import::Absent {
+            return outcome;
+        }
+    }
+    Import::Absent
 }
 
 /// Copy the graph of the unit `unit_key` of `profile`, which the seed index
 /// named under `key`.
-fn import_unit(receiver: &AdaptiveUnit, profile: &Path, unit_key: &str, key: &str) -> bool {
-    donor_profile(profile) && copy_unit(receiver, profile, unit_key, key)
+fn import_unit(
+    receiver: &AdaptiveUnit,
+    profile: &Path,
+    unit_key: &str,
+    key: &str,
+    receiver_externs: Option<&ExternRecord>,
+) -> Import {
+    if !donor_profile(profile) {
+        return Import::Absent;
+    }
+    copy_unit(receiver, profile, unit_key, key, receiver_externs)
 }
 
 /// Copy the newest graph of the donor unit `name` of `profile` into the
-/// receiver's empty graph, if that unit published `key` and no compile holds
-/// it.
-fn copy_unit(receiver: &AdaptiveUnit, profile: &Path, name: &str, key: &str) -> bool {
+/// receiver's empty graph, if that unit published `key` and no compile
+/// holds it.
+fn copy_unit(
+    receiver: &AdaptiveUnit,
+    profile: &Path,
+    name: &str,
+    key: &str,
+    receiver_externs: Option<&ExternRecord>,
+) -> Import {
     let unit_dir = profile.join(AUTO_ROOT).join(POLICY_VERSION).join(name);
     if !valid_hex_digest(name) || !real_directory(&unit_dir) || unit_dir == receiver.unit_dir {
-        return false;
+        return Import::Absent;
     }
     let donor = AdaptiveUnit {
         source_file: None,
@@ -627,17 +903,17 @@ fn copy_unit(receiver: &AdaptiveUnit, profile: &Path, name: &str, key: &str) -> 
     // Open only an existing regular lock; the owner always creates it
     // before writing a marker. Never wait on a busy donor.
     if unsafe_file(&donor.lock_path) {
-        return false;
+        return Import::Absent;
     }
     let Ok(file) = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&donor.lock_path)
     else {
-        return false;
+        return Import::Absent;
     };
     if file.try_lock().is_err() {
-        return false;
+        return Import::Absent;
     }
     let _lock = UnitLock(file);
     let marker = donor.unit_dir.join(MARKER);
@@ -653,13 +929,19 @@ fn copy_unit(receiver: &AdaptiveUnit, profile: &Path, name: &str, key: &str) -> 
         )
         || !real_directory(&donor.rustc_dir)
     {
-        return false;
+        return Import::Absent;
     }
+    // A graph made against other builds of some libraries still serves
+    // (ExternRecord); the record tells such an import apart. A donor
+    // without one (an older release's) tells nothing.
+    let other_libraries = receiver_externs
+        .zip(ExternRecord::read(&donor.unit_dir.join(EXTERNS)))
+        .is_some_and(|(mine, theirs)| !mine.same_libraries(&theirs));
     let Ok(stage) = tempfile::Builder::new()
         .prefix("worktree-seed-")
         .tempdir_in(&receiver.unit_dir)
     else {
-        return false;
+        return Import::Absent;
     };
     let mut budget = CopyBudget {
         files: MAX_COPY_FILES,
@@ -668,11 +950,18 @@ fn copy_unit(receiver: &AdaptiveUnit, profile: &Path, name: &str, key: &str) -> 
     if copy_tree(&donor.rustc_dir, stage.path(), &mut budget, 0).is_err()
         || empty_directory(stage.path())
     {
-        return false;
+        return Import::Absent;
     }
     // The receiver's unit lock has been held since before this method.
     // Rename replaces only its empty graph, never partially imports one.
-    fs::rename(stage.path(), &receiver.rustc_dir).is_ok()
+    if fs::rename(stage.path(), &receiver.rustc_dir).is_ok() {
+        Import::Copied {
+            profile: profile.to_path_buf(),
+            other_libraries,
+        }
+    } else {
+        Import::Absent
+    }
 }
 
 struct CopyBudget {
@@ -941,6 +1230,19 @@ mod tests {
         }
     }
 
+    /// What a test's donors and receivers compiled against: no libraries,
+    /// into Cargo's usual `--out-dir`.
+    fn no_externs() -> ExternRecord {
+        ExternRecord {
+            out_dir: "target/debug/deps".into(),
+            ..ExternRecord::default()
+        }
+    }
+
+    fn copied(outcome: Import) -> bool {
+        matches!(outcome, Import::Copied { .. })
+    }
+
     fn fixture(root: &Path) -> (RustcArgs, AdaptiveUnit) {
         let profile = root.join("target/debug");
         fs::create_dir_all(profile.join("deps")).unwrap();
@@ -1190,29 +1492,204 @@ mod tests {
         fs::create_dir_all(&graph).unwrap();
         fs::write(graph.join("dep-graph.bin"), b"complete").unwrap();
         let key = "a".repeat(64);
-        publish(&donor, Some(&key));
+        publish(&donor, Some(&key), Some(&no_externs()));
         let profile = root.join("donor/target/debug");
         assert!(
-            !import(&receiver, &profile, &key),
+            !copied(import(&receiver, &profile, &key, None)),
             "busy donor must not be copied"
         );
         assert!(donor_lease.finish(CompileOutcome::Success));
         let alias = root.join("donor-profile-alias");
         std::os::unix::fs::symlink(&profile, &alias).unwrap();
-        assert!(!import(&receiver, &alias, &key));
+        assert!(!copied(import(&receiver, &alias, &key, None)));
         assert!(empty_directory(&receiver.rustc_dir));
-        assert!(!import(&receiver, &profile, &"b".repeat(64)));
+        assert!(!copied(import(&receiver, &profile, &"b".repeat(64), None)));
         fs::create_dir(donor.rustc_dir.join("s-123-working")).unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         assert!(empty_directory(&receiver.rustc_dir));
         fs::remove_dir(donor.rustc_dir.join("s-123-working")).unwrap();
-        assert!(import(&receiver, &profile, &key));
+        assert!(copied(import(&receiver, &profile, &key, None)));
         let copied = receiver
             .rustc_dir
             .join("crate/s-123-finished/dep-graph.bin");
         assert_eq!(fs::read(&copied).unwrap(), b"complete");
         fs::write(&copied, b"changed").unwrap();
         assert_eq!(fs::read(graph.join("dep-graph.bin")).unwrap(), b"complete");
+    }
+
+    /// A donor's graph is copied whatever libraries it was made against:
+    /// one made against other builds of some of them still serves the items
+    /// those builds left alone, and the import says so. A record that names
+    /// only libraries the receiver's or the donor's checkout compiled
+    /// privately apart counts as the same libraries; a donor without a record
+    /// tells nothing. Among donors, one that wrote to the receiver's
+    /// `--out-dir` goes first, then one made against the receiver's
+    /// libraries, newer or not.
+    #[cfg(unix)]
+    #[test]
+    fn a_graph_made_against_other_libraries_is_imported_and_told_apart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let key = "a".repeat(64);
+        let record = |out_dir: &str, libraries: &[(&str, &str)]| ExternRecord {
+            out_dir: out_dir.into(),
+            externs: libraries
+                .iter()
+                .map(|(name, digest)| {
+                    (
+                        (*name).to_owned(),
+                        ExternDigest {
+                            digest: (*digest).to_owned(),
+                            size: 1,
+                            modified_ns: 1,
+                        },
+                    )
+                })
+                .collect(),
+            private: Default::default(),
+        };
+        let donor = |name: &str, externs: Option<&ExternRecord>| {
+            let (_, unit) = fixture(&root.join(name));
+            let lease = unit.try_immediate().unwrap();
+            fs::write(unit.rustc_dir.join("graph"), name).unwrap();
+            publish(&unit, Some(&key), externs);
+            assert!(lease.finish(CompileOutcome::Success));
+            root.join(name).join("target/debug")
+        };
+        let receive = |name: &str, profiles: &[PathBuf], mine: &ExternRecord| {
+            let (_, unit) = fixture(&root.join(name));
+            let _lease = unit.try_immediate().unwrap();
+            let outcome = import_from(&unit, profiles, &key, Some(mine));
+            let graph = fs::read_to_string(unit.rustc_dir.join("graph")).ok();
+            (outcome, graph)
+        };
+        let copied = |profile: &PathBuf, other_libraries: bool| Import::Copied {
+            profile: profile.clone(),
+            other_libraries,
+        };
+        let deps = "target/debug/deps";
+        let core = "core=libcore-1.rmeta";
+        let edit = "edit=libedit-2.rmeta";
+        let mine = record(deps, &[(core, "store core"), (edit, "e1")]);
+
+        // An older release's seed, without a record, is imported.
+        let unrecorded = donor("unrecorded", None);
+        assert_eq!(
+            receive("receiver-1", std::slice::from_ref(&unrecorded), &mine),
+            (copied(&unrecorded, false), Some("unrecorded".into()))
+        );
+        // A graph made against another build of `core`.
+        let station = record(deps, &[(core, "station core"), (edit, "e1")]);
+        let other = donor("other", Some(&station));
+        assert_eq!(
+            receive("receiver-2", std::slice::from_ref(&other), &mine),
+            (copied(&other, true), Some("other".into()))
+        );
+        // `edit` is this checkout's own compile: the donor's may differ, as
+        // a graph's own upstream does after an edit.
+        let mut edited = record(deps, &[(core, "station core"), (edit, "e9")]);
+        edited.private.insert(edit.into());
+        assert_eq!(
+            receive("receiver-3", std::slice::from_ref(&other), &edited),
+            (copied(&other, false), Some("other".into()))
+        );
+        // A library the donor compiled privately is another build of the
+        // same crate too (a folder kept for others compiles every crate of
+        // its workspace so).
+        let mut kept = record(deps, &[(core, "kept core"), (edit, "e1")]);
+        kept.private.insert(core.into());
+        let kept_folder = donor("kept", Some(&kept));
+        assert_eq!(
+            receive("receiver-4", std::slice::from_ref(&kept_folder), &mine),
+            (copied(&kept_folder, false), Some("kept".into()))
+        );
+        // Of two donors, the one made against the receiver's libraries goes
+        // first, though it is the older and listed last.
+        let matching = donor("matching", Some(&mine));
+        let newer = donor("newer", Some(&station));
+        assert_eq!(
+            receive("receiver-5", &[newer.clone(), matching.clone()], &mine),
+            (copied(&matching, false), Some("matching".into()))
+        );
+        // And before that, the one that wrote to the receiver's `--out-dir`.
+        let stack = donor(
+            "stack-folder",
+            Some(&record("target/integrate-stack/debug/deps", &[(core, "store core"), (edit, "e1")])),
+        );
+        assert_eq!(
+            receive("receiver-6", &[stack, newer.clone()], &mine),
+            (copied(&newer, true), Some("newer".into()))
+        );
+    }
+
+    /// The record names what rustc reads: a library's `.rmeta` beside its
+    /// `.rlib` (object code changes nothing a graph depends on), a library
+    /// this checkout compiled privately as such, and the `--out-dir` as the
+    /// portable arguments name it. A digest is computed again only for a
+    /// file whose size or time changed.
+    #[test]
+    fn the_record_names_each_library_by_its_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temp.path()).unwrap();
+        let deps = cwd.join("target/debug/deps");
+        fs::create_dir_all(&deps).unwrap();
+        let rlib = deps.join("libcore-1.rlib");
+        fs::write(&rlib, b"objects and metadata").unwrap();
+        fs::write(deps.join("libcore-1.rmeta"), b"metadata").unwrap();
+        let only_rmeta = deps.join("libedit-2.rmeta");
+        fs::write(&only_rmeta, b"edited metadata").unwrap();
+        let args = RustcArgs::parse(&[
+            "/toolchain/bin/rustc".into(),
+            "--crate-name".into(),
+            "sample".into(),
+            "src/lib.rs".into(),
+            "--out-dir".into(),
+            deps.display().to_string(),
+            "--extern".into(),
+            format!("core={}", rlib.display()),
+            "--extern".into(),
+            format!("edit={}", only_rmeta.display()),
+            "--extern".into(),
+            "std".into(),
+        ])
+        .unwrap();
+        super::super::private_outputs::mark([only_rmeta.as_path()]);
+        let record = ExternRecord::of(&args, &cwd, None).unwrap();
+        assert_eq!(record.out_dir, "target/debug/deps");
+        let digest = |bytes: &[u8]| blake3::hash(bytes).to_hex().to_string();
+        assert_eq!(
+            record.externs["core=libcore-1.rlib"].digest,
+            digest(b"metadata")
+        );
+        assert_eq!(
+            record.externs["edit=libedit-2.rmeta"].digest,
+            digest(b"edited metadata")
+        );
+        assert_eq!(record.externs.len(), 2);
+        assert_eq!(
+            record.private.iter().collect::<Vec<_>>(),
+            ["edit=libedit-2.rmeta"]
+        );
+        let written = ExternRecord::parse(&record.render()).unwrap();
+        assert_eq!(written, record);
+
+        // An unchanged file keeps its digest; a changed one is hashed again.
+        let mut stale = written;
+        stale.externs.get_mut("core=libcore-1.rlib").unwrap().digest = "remembered".into();
+        stale.externs.get_mut("edit=libedit-2.rmeta").unwrap().digest = "remembered".into();
+        let modified = std::time::SystemTime::now() + Duration::from_secs(5);
+        File::options()
+            .write(true)
+            .open(&only_rmeta)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let again = ExternRecord::of(&args, &cwd, Some(&stale)).unwrap();
+        assert_eq!(again.externs["core=libcore-1.rlib"].digest, "remembered");
+        assert_eq!(
+            again.externs["edit=libedit-2.rmeta"].digest,
+            digest(b"edited metadata")
+        );
     }
 
     /// A receiver finds a donor's unit through the donor's seed index, a
@@ -1229,14 +1706,16 @@ mod tests {
             let (_, unit) = fixture(&root.join(name));
             let lease = unit.try_immediate().unwrap();
             fs::write(unit.rustc_dir.join("graph"), name).unwrap();
-            publish(&unit, Some(&key));
+            publish(&unit, Some(&key), Some(&no_externs()));
             assert!(lease.finish(CompileOutcome::Success));
             (root.join(name).join("target/debug"), unit)
         };
         let receive = |name: &str, profiles: &[PathBuf]| {
             let (_, unit) = fixture(&root.join(name));
             let _lease = unit.try_immediate().unwrap();
-            let donor = import_from(&unit, profiles, &key)?;
+            let Import::Copied { profile: donor, .. } = import_from(&unit, profiles, &key, None) else {
+                return None;
+            };
             assert_eq!(
                 fs::read_to_string(unit.rustc_dir.join("graph")).unwrap(),
                 donor.parent()?.parent()?.file_name()?.to_str()?
@@ -1333,7 +1812,7 @@ mod tests {
         let _receiver_lease = receiver.try_immediate().unwrap();
         fs::write(donor.rustc_dir.join("unit.pre-lto.bc"), b"old shared state").unwrap();
         let key = "a".repeat(64);
-        publish(&donor, Some(&key));
+        publish(&donor, Some(&key), Some(&no_externs()));
         assert!(lease.finish(CompileOutcome::Success));
 
         let profile = root.join("donor/target/debug");
@@ -1341,7 +1820,7 @@ mod tests {
         assert_eq!(donor.unit_dir.parent(), Some(current.as_path()));
         let legacy = profile.join("incremental.kache-auto/v1");
         fs::rename(&current, &legacy).unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         assert!(empty_directory(&receiver.rustc_dir));
 
         let fresh = AdaptiveUnit::eligible(&args, b"guard").unwrap();
@@ -1370,7 +1849,7 @@ mod tests {
         let _receiver_lease = receiver.try_immediate().unwrap();
         fs::write(donor.rustc_dir.join("graph"), b"complete").unwrap();
         let key = "a".repeat(64);
-        publish(&donor, Some(&key));
+        publish(&donor, Some(&key), Some(&no_externs()));
         assert!(lease.finish(CompileOutcome::Success));
         let profile = root.join("donor/target/debug");
 
@@ -1378,17 +1857,17 @@ mod tests {
         fs::create_dir(&linked_profile).unwrap();
         std::os::unix::fs::symlink(profile.join(AUTO_ROOT), linked_profile.join(AUTO_ROOT))
             .unwrap();
-        assert!(!import(&receiver, &linked_profile, &key));
+        assert!(!copied(import(&receiver, &linked_profile, &key, None)));
 
         let invalid = donor.unit_dir.with_file_name("not-a-unit-digest");
         fs::rename(&donor.unit_dir, &invalid).unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         fs::rename(&invalid, &donor.unit_dir).unwrap();
 
         let saved_unit = root.join("saved-unit");
         fs::rename(&donor.unit_dir, &saved_unit).unwrap();
         std::os::unix::fs::symlink(&saved_unit, &donor.unit_dir).unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         fs::remove_file(&donor.unit_dir).unwrap();
         fs::rename(&saved_unit, &donor.unit_dir).unwrap();
 
@@ -1398,23 +1877,23 @@ mod tests {
         fs::rename(&marker, &saved_marker).unwrap();
         std::os::unix::fs::symlink(&target_name, &marker).unwrap();
         assert_eq!(fs::symlink_metadata(&marker).unwrap().len(), 64);
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         fs::remove_file(&marker).unwrap();
         fs::rename(&saved_marker, &marker).unwrap();
 
         let abandoned = donor.try_immediate().unwrap();
-        publish(&donor, Some(&key));
+        publish(&donor, Some(&key), Some(&no_externs()));
         drop(abandoned);
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         crate::atomic::atomic_replace_deferrable(&donor.state_path, b"invalid state", false)
             .unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         fs::remove_file(&donor.state_path).unwrap();
 
         let saved_graph = donor.unit_dir.join("saved-graph");
         fs::rename(&donor.rustc_dir, &saved_graph).unwrap();
         std::os::unix::fs::symlink(&saved_graph, &donor.rustc_dir).unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         fs::remove_file(&donor.rustc_dir).unwrap();
         fs::rename(&saved_graph, &donor.rustc_dir).unwrap();
 
@@ -1422,17 +1901,17 @@ mod tests {
         fs::create_dir(&broken).unwrap();
         std::os::unix::fs::symlink(donor.rustc_dir.join("graph"), broken.join("linked-graph"))
             .unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         assert!(empty_directory(&receiver.rustc_dir));
         fs::remove_dir_all(&broken).unwrap();
 
         let saved_file = donor.unit_dir.join("saved-file");
         fs::rename(donor.rustc_dir.join("graph"), &saved_file).unwrap();
-        assert!(!import(&receiver, &profile, &key));
+        assert!(!copied(import(&receiver, &profile, &key, None)));
         fs::rename(&saved_file, donor.rustc_dir.join("graph")).unwrap();
 
         assert!(empty_directory(&receiver.rustc_dir));
-        assert!(import(&receiver, &profile, &key));
+        assert!(copied(import(&receiver, &profile, &key, None)));
         assert_eq!(
             fs::read(receiver.rustc_dir.join("graph")).unwrap(),
             b"complete"
@@ -1555,7 +2034,7 @@ mod tests {
         let donor = AdaptiveUnit::eligible(&donor_args, b"guard").unwrap();
         let donor_lease = donor.try_immediate().unwrap();
         fs::write(donor.rustc_dir.join("graph"), b"complete").unwrap();
-        publish(&donor, Some(&key));
+        publish(&donor, Some(&key), Some(&no_externs()));
         assert!(donor_lease.finish(CompileOutcome::Success));
         let profile = root.join("donor/target/debug");
         let missing = root.join("gone/target/debug");
@@ -1783,7 +2262,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (args, unit) = fixture(temp.path());
         let lease = unit.try_immediate().unwrap();
-        publish(&unit, Some(&"a".repeat(64)));
+        publish(&unit, Some(&"a".repeat(64)), Some(&no_externs()));
         lease.compiler_args(&args);
         assert!(!unit.unit_dir.join(MARKER).exists());
         fs::write(unit.rustc_dir.join("graph"), b"graph").unwrap();

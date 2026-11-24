@@ -1013,6 +1013,129 @@ fn a_checkout_keeps_its_own_edits_warm_and_restores_the_shared_tree() {
     }
 }
 
+/// A graph made against another build of a library is imported, builds
+/// right, and its event says so; a donor made against the receiver's own
+/// libraries goes first. A checkout whose shared tree holds another library
+/// made its graph of the crate above against that one: a checkout at the
+/// first commit imports it as made against other libraries. A second
+/// checkout at the first commit restored the same library from the store,
+/// so it imports the first's graph rather than the other's. A folder kept
+/// for others compiled the library itself, incrementally: another build of
+/// the same crate, which counts as the same library, and a folder kept for
+/// others goes before a checkout, so a third checkout imports from there.
+#[test]
+fn a_graph_made_against_another_library_is_imported_and_told_apart() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return;
+    }
+    let checkouts = tempfile::tempdir().unwrap();
+    let root = checkout_path(checkouts.path());
+    let [other, first, second, station, third] =
+        ["other", "first", "second", "station", "third"].map(|name| root.join(name));
+    let cache = tempfile::tempdir().unwrap();
+    let _daemon = common::DaemonGuard::new(kache_binary(), cache.path());
+    let future = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 3_600;
+    // This build's event for the middle crate.
+    let build = |project: &Path, keep: &str, answer: u64| {
+        settle_writes(&[project]);
+        let before = crate_events(cache.path(), "adaptive_mid").len();
+        let target = project.join("target");
+        let output = build_command(project, cache.path(), &target, "adaptive-app")
+            .env("KACHE_SHARED_REF", "shared")
+            .env("KACHE_KEEP_INCREMENTAL", keep)
+            .output()
+            .expect("failed to build the workspace fixture");
+        assert!(
+            output.status.success(),
+            "build failed for variant {answer}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let run = Command::new(target.join(format!(
+            "debug/adaptive-app{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+        .output()
+        .expect("failed to run the workspace binary");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), answer.to_string());
+        let events = crate_events(cache.path(), "adaptive_mid");
+        assert_eq!(events.len(), before + 1, "events: {events:#?}");
+        events.into_iter().nth(before).unwrap()
+    };
+    let edit_middle = |project: &Path, mtime: i64| {
+        let source = project.join("mid/src/lib.rs");
+        fs::write(
+            &source,
+            "pub fn answer() -> u64 { adaptive_lib::answer() + 1 }\n",
+        )
+        .unwrap();
+        filetime::set_file_mtime(&source, FileTime::from_unix_time(mtime, 0)).unwrap();
+    };
+    let assert_seed = |event: &Value, seed: &str, donor: Option<&Path>| {
+        assert_passthrough(event, "incremental kept: changed here");
+        assert_eq!(
+            event["incremental_seed_attempt"].as_str().unwrap_or(""),
+            seed,
+            "event: {event:#}"
+        );
+        match donor {
+            Some(donor) => assert!(
+                event["incremental_seed"]
+                    .as_str()
+                    .is_some_and(|path| Path::new(path).starts_with(donor)),
+                "event: {event:#}"
+            ),
+            None => assert!(event["incremental_seed"].is_null(), "event: {event:#}"),
+        }
+    };
+
+    for (project, answer) in [(&other, 7), (&first, 1), (&second, 1), (&station, 1), (&third, 1)] {
+        create_workspace(project);
+        fs::write(
+            project.join("lib/src/lib.rs"),
+            format!("pub fn answer() -> u64 {{ {answer} }}\n"),
+        )
+        .unwrap();
+        fs::write(project.join(".gitignore"), "/target*\n").unwrap();
+        git(project, &["init", "-q"]);
+        git(project, &["add", "-A"]);
+        git(project, &["commit", "-q", "-m", "one"]);
+        git(project, &["branch", "shared"]);
+    }
+
+    // Another commit's checkout stores its library and edits the crate above.
+    assert_eq!(build(&other, "private", 7)["result"], "miss");
+    edit_middle(&other, future + 1);
+    assert_seed(&build(&other, "private", 8), "no-donor", None);
+
+    // Its graph was made against another library than this checkout's.
+    assert_eq!(build(&first, "private", 1)["result"], "miss");
+    edit_middle(&first, future + 2);
+    assert_seed(
+        &build(&first, "private", 2),
+        "imported-other-libraries",
+        Some(&other),
+    );
+
+    // The first checkout's graph was made against the store's library.
+    assert_eq!(build(&second, "private", 1)["result"], "local_hit");
+    edit_middle(&second, future + 3);
+    assert_seed(&build(&second, "private", 2), "imported", Some(&first));
+
+    // The folder kept for others compiled the library itself.
+    assert_passthrough(&build(&station, "all", 1), "incremental kept: every unit");
+    assert_eq!(build(&third, "private", 1)["result"], "local_hit");
+    edit_middle(&third, future + 4);
+    assert_seed(&build(&third, "private", 2), "imported", Some(&station));
+}
+
 /// `cargo build -p <package>` of `project` into its `target`, through Kache
 /// with the shared ref `shared` and `keep_incremental` set to `keep`.
 fn build_package(project: &Path, cache_dir: &Path, package: &str, keep: &str) {

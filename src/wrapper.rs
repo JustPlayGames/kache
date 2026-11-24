@@ -10153,14 +10153,20 @@ enum SeedAttempt {
     Unportable,
     NoDonor,
     Imported,
+    /// Imported a graph the donor made against other builds of some of
+    /// this checkout's libraries (`ExternRecord`): it serves the items
+    /// those builds left alone.
+    ImportedOtherLibraries,
 }
 
 impl SeedAttempt {
     /// `looked`: the unit had no state of its own and seeding was on.
     /// `imported` holds the lease's donor, which an earlier preparation may
-    /// have set.
-    fn of(looked: bool, portable: bool, imported: bool) -> Self {
+    /// have set; `other_libraries`, that its graph was made against other
+    /// builds of some libraries.
+    fn of(looked: bool, portable: bool, imported: bool, other_libraries: bool) -> Self {
         match (imported, looked, portable) {
+            (true, ..) if other_libraries => Self::ImportedOtherLibraries,
             (true, ..) => Self::Imported,
             (false, false, _) => Self::NotTried,
             (false, true, false) => Self::Unportable,
@@ -10172,8 +10178,9 @@ impl SeedAttempt {
     /// imported the seed, and a declined bootstrap discards an import.
     fn settle(self, seeded: bool) -> Self {
         match (self, seeded) {
+            (Self::ImportedOtherLibraries, true) => self,
             (_, true) => Self::Imported,
-            (Self::Imported, false) => Self::Unportable,
+            (Self::Imported | Self::ImportedOtherLibraries, false) => Self::Unportable,
             (other, false) => other,
         }
     }
@@ -10184,6 +10191,7 @@ impl SeedAttempt {
             Self::Unportable => "unportable",
             Self::NoDonor => "no-donor",
             Self::Imported => "imported",
+            Self::ImportedOtherLibraries => "imported-other-libraries",
         }
     }
 }
@@ -10219,6 +10227,7 @@ fn prepare_worktree_compiler_args(
         looked,
         lease.worktree_portable(),
         lease.worktree_seed_donor().is_some(),
+        lease.worktree_seed_other_libraries(),
     );
     (compiler_args, attempt)
 }
