@@ -89,7 +89,9 @@ fn cow_warn_marker() -> Option<PathBuf> {
     })
 }
 
-fn shared_hardlink_restores_enabled() -> bool {
+/// Whether restores may link a blob another target already links
+/// ([`set_shared_hardlink_restores`]).
+pub fn shared_hardlink_restores_enabled() -> bool {
     policy_bool(&SHARED_HARDLINK_RESTORES, |policy| {
         &policy.shared_hardlink_restores
     })

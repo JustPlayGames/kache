@@ -7019,11 +7019,37 @@ fn shared_inode_loadable(args: &RustcArgs, platform_allows: bool) -> Option<Arti
         None
     } else if args.crate_types == ["proc-macro"] {
         Some(ArtifactKind::DynamicLibrary)
-    } else if crate::build_script::build_script_output(args).is_some() {
+    } else if crate::build_script::build_script_output(args).is_some()
+        || shares_a_test_binary_inode(args)
+    {
         Some(ArtifactKind::Executable)
     } else {
         None
     }
+}
+
+/// Whether this compile's test binary may come back as a link to its blob
+/// when no other target links that blob, as a build script's does: a Linux
+/// `--test` unit with no crate type, the entry the store already keeps by
+/// hardlink ([`crate::compiler_store::CompilerArtifactPolicy`]). Cargo runs a
+/// test binary and nothing rewrites it in place; it is never uplifted out of
+/// `deps/`, and the wrapper's pre-clean (or the linker's own unlink) removes
+/// a read-only output before a rebuild writes a new one.
+///
+/// Only the one-consumer link: the restore stamps the file it leaves, and
+/// Cargo judges a test binary by its own mtime against its dependencies', so
+/// a stamp on an inode another target also holds would make that target's
+/// stale test binary look fresh (8e6cf91b). The hardlink fallback copies
+/// whenever the blob already has a consumer, and keeps a contended link only
+/// when it is the blob's one other name. Under `[cache]
+/// shared_hardlink_restores`, which drops that rule, a test binary stays a
+/// private copy. On a filesystem without reflink this replaces most of what
+/// hits wrote: 1.5 TiB of test-binary copies a day on the build machine.
+fn shares_a_test_binary_inode(args: &RustcArgs) -> bool {
+    cfg!(target_os = "linux")
+        && args.is_test
+        && args.crate_types.is_empty()
+        && !crate::link::shared_hardlink_restores_enabled()
 }
 
 /// Whether a restored artifact's bytes are still the store blob's bytes.
