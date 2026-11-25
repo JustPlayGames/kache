@@ -294,6 +294,27 @@ mod tests {
         db.execute("DELETE FROM t WHERE x = 1", []).unwrap();
         db.execute_batch("COMMIT").unwrap();
         assert_eq!(seen.lock().unwrap().len(), 1, "the reads held no lock");
+
+        // Time a statement takes under the lock counts as inside SQLite.
+        db.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (4)").unwrap();
+        let started = Instant::now();
+        db.query_row(
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 1000000)
+             SELECT count(*) FROM c",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+        let query = started.elapsed();
+        std::thread::sleep(LONG);
+        db.execute_batch("COMMIT").unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(
+            seen[1].in_statements * 2 >= query,
+            "the query's {query:?} under the lock is counted: {:?}",
+            seen[1]
+        );
     }
 
     /// Collects each event's target and message.
