@@ -206,6 +206,9 @@ pub struct FileHashRow {
     /// Recorded for an output Cargo re-dates after the unit.
     #[serde(default)]
     pub redated: bool,
+    /// The ReFS identity that stands in for `inode` on a Dev Drive (#2060).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_id: Option<[u8; 24]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,6 +224,8 @@ pub struct HashFileRequest {
     pub ctime_ns: i64,
     #[serde(default)]
     pub inode: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_id: Option<[u8; 24]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -231,6 +236,8 @@ pub struct HashFileResult {
     pub ctime_ns: i64,
     #[serde(default)]
     pub inode: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs_id: Option<[u8; 24]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     #[serde(default)]

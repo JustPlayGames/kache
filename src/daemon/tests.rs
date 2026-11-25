@@ -5857,6 +5857,7 @@ fn hash_files_request(file: &Path) -> (HashFilesRequest, i64) {
             mtime_ns,
             ctime_ns,
             inode: fingerprint.inode,
+            refs_id: fingerprint.refs_id,
         }],
     };
     let settles_at = mtime_ns.max(ctime_ns) + crate::cache_key::HASH_SETTLE_NS;
@@ -5883,6 +5884,7 @@ fn weak_windows_hash_requests_never_use_or_fill_daemon_memory() {
                 mtime_ns: file.mtime_ns,
                 ctime_ns: file.ctime_ns,
                 inode: file.inode,
+                refs_id: file.refs_id,
             },
             "legacy stale hash".into(),
         );
@@ -6557,6 +6559,7 @@ async fn test_socket_hash_files_missing_file_reports_error_result() {
         mtime_ns: 0,
         ctime_ns: 0,
         inode: 0,
+        refs_id: None,
     };
 
     let daemon = Arc::new(Daemon::new(config));
@@ -6593,6 +6596,7 @@ fn send_hash_files_request_missing_socket_errors() {
         mtime_ns: 0,
         ctime_ns: 0,
         inode: 0,
+        refs_id: None,
     };
     let err =
         send_hash_files_request(&socket_path, vec![req]).expect_err("missing socket -> error");
@@ -6608,6 +6612,7 @@ fn hash_files_response_parser_handles_results_error_and_malformed() {
         mtime_ns: 2,
         ctime_ns: 3,
         inode: 4,
+        refs_id: None,
         hash: Some("abc".into()),
         cache_hit: false,
         bytes_hashed: 1,
@@ -13037,6 +13042,7 @@ fn test_hash_files_request_serde() {
             mtime_ns: 456,
             ctime_ns: 789,
             inode: 1011,
+            refs_id: None,
         }],
     });
     let json = serde_json::to_string(&req).unwrap();
@@ -18969,6 +18975,7 @@ fn memo_row_request(config: &Config, path: &Path) -> (RecordFileHashesRequest, S
         inode: fingerprint.inode,
         hash: hash.clone(),
         redated: false,
+        refs_id: fingerprint.refs_id,
     };
     let req = RecordFileHashesRequest {
         cache_dir: config.cache_dir.to_string_lossy().into_owned(),
@@ -19041,6 +19048,7 @@ fn memo_rows_are_not_handed_off_without_a_daemon() {
             mtime_ns: 1,
             ctime_ns: 1,
             inode: 1,
+            refs_id: None,
         },
         hash: "h".into(),
         redated: false,
@@ -19112,6 +19120,7 @@ fn memo_rows_are_handed_off_without_waiting_for_the_answer() {
             mtime_ns: 1,
             ctime_ns: 1,
             inode: 1,
+            refs_id: None,
         },
         hash: "h".into(),
         redated: false,
@@ -19547,6 +19556,7 @@ mod hash_warmup_tests {
             mtime_ns: 1,
             ctime_ns: 2,
             inode: 3,
+            refs_id: None,
         }
     }
 
