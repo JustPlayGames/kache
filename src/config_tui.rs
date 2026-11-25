@@ -806,6 +806,11 @@ fn fields_to_file_config(fields: &[FormField], original: &FileConfig) -> FileCon
             repository: get("oci_repository"),
             insecure: get_bool("oci_insecure"),
             // Not a form field: carried over so saving never drops it.
+            pull_request_bucket: original
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.remote.as_ref())
+                .and_then(|remote| remote.pull_request_bucket.clone()),
             pull_request_prefix: original
                 .cache
                 .as_ref()
@@ -2119,13 +2124,14 @@ mod tests {
     }
 
     #[test]
-    fn saving_from_the_editor_keeps_the_pull_request_prefix() {
+    fn saving_from_the_editor_keeps_the_pull_request_bucket_and_prefix() {
         let original = FileConfig {
             cache: Some(CacheFileConfig {
                 remote: Some(RemoteFileConfig {
                     _type: Some("s3".to_string()),
                     bucket: Some("b".to_string()),
                     pull_request_prefix: Some("artifacts-pr".to_string()),
+                    pull_request_bucket: Some("build-cache-pr".to_string()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2136,6 +2142,10 @@ mod tests {
         let saved = fields_to_file_config(&fields, &original);
         let remote = saved.cache.unwrap().remote.unwrap();
         assert_eq!(remote.pull_request_prefix.as_deref(), Some("artifacts-pr"));
+        assert_eq!(
+            remote.pull_request_bucket.as_deref(),
+            Some("build-cache-pr")
+        );
     }
 
     #[test]
@@ -2193,6 +2203,7 @@ mod tests {
                 target_liveness: None,
                 seed_new_targets: None,
                 build_script_hermetic: None,
+                build_script_image: None,
                 build_script_omit_cargo_source_dir_mtime: None,
                 build_script_out_dir_max_size: None,
                 gc_evict_shared: Some(true),
@@ -2265,6 +2276,7 @@ mod tests {
                     path: None,
                     atomic_write_dir: None,
                     pull_request_prefix: None,
+                    pull_request_bucket: None,
                     repository: None,
                     insecure: None,
                 }),

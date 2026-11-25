@@ -182,11 +182,14 @@ enum KeyCommands {
         args: Vec<String>,
     },
 
-    /// Name the fields that differ between two key-input JSON documents
+    /// Compare two key-input documents or the recorded link inputs in two build traces
     Diff {
-        /// First document, from `kache key explain`
+        /// Compare one crate’s recorded link inputs in two trace files
+        #[arg(long, value_name = "CRATE")]
+        link_trace: Option<String>,
+        /// First key-input document or trace file
         file_a: PathBuf,
-        /// Second document, from `kache key explain`
+        /// Second key-input document or trace file
         file_b: PathBuf,
     },
 }
@@ -254,7 +257,11 @@ enum DaemonCommands {
     /// Run the daemon server in the foreground
     Run,
     /// Start the daemon in the background and wait until it is ready
-    Start,
+    Start {
+        /// Internal Windows frontend bootstrap. Compile locally if startup is already owned.
+        #[arg(long, hide = true)]
+        if_idle: bool,
+    },
     /// Stop a running daemon
     Stop,
     /// Restart the daemon, through its login service when one is installed
@@ -322,7 +329,7 @@ fn command_supports_json(command: &Option<Commands>) -> bool {
             None | Some(DaemonCommands::Status) => true,
             Some(
                 DaemonCommands::Run
-                | DaemonCommands::Start
+                | DaemonCommands::Start { .. }
                 | DaemonCommands::Stop
                 | DaemonCommands::Restart
                 | DaemonCommands::Install
@@ -1096,8 +1103,12 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
             command: Some(DaemonCommands::Run),
         }) => daemon::run_server(&config, &config_provenance, readiness),
         Some(Commands::Daemon {
-            command: Some(DaemonCommands::Start),
-        }) => match daemon::start(&config) {
+            command: Some(DaemonCommands::Start { if_idle }),
+        }) => match if if_idle {
+            daemon::start_for_compiler(&config)
+        } else {
+            daemon::start(&config)
+        } {
             Ok(outcome) => {
                 eprintln!("{}", daemon_start_message(&outcome));
                 if !outcome.is_ready() {
@@ -1247,7 +1258,28 @@ fn run_cli(cli: Cli, readiness: Option<kunobi_daemon::readiness::channel::Notifi
                     &mut stdout,
                 )
             }
-            KeyCommands::Diff { file_a, file_b } => {
+            KeyCommands::Diff {
+                file_a,
+                file_b,
+                link_trace: Some(crate_name),
+            } => {
+                let changed = key_inputs::link_trace::compare(
+                    &crate_name,
+                    &file_a,
+                    &file_b,
+                    json,
+                    std::io::stdout().lock(),
+                )?;
+                if changed {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            KeyCommands::Diff {
+                file_a,
+                file_b,
+                link_trace: None,
+            } => {
                 let fields = key_inputs::diff_files(&file_a, &file_b)?;
                 if json {
                     serde_json::to_writer(std::io::stdout(), &fields)?;
@@ -2106,6 +2138,7 @@ fn daemon_start_message(outcome: &daemon::Ensured) -> String {
         }
         daemon::Ensured::AlreadyRunning(None) => "daemon already running".to_string(),
         daemon::Ensured::Started => "daemon started".to_string(),
+        daemon::Ensured::StartingElsewhere => "another process is starting the daemon".to_string(),
         daemon::Ensured::TimedOut => "daemon did not start within timeout".to_string(),
     }
 }

@@ -25,8 +25,8 @@
 //! its previous run. A script that declares nothing depends on its whole
 //! package directory, exactly as in Cargo. Named link inputs outside target
 //! also key the run: a fresh home can lack libraries the previous run found
-//! or downloaded. A run is recorded in the local store
-//! and is never published to a remote. A local miss is restored from
+//! or downloaded. Runs stay local unless the operator configures an immutable build image
+//! and syncs eligible runs to a remote. A local miss is restored from
 //! `readonly_store` when that store has the run; the read-only store is not
 //! written.
 //!
@@ -55,13 +55,16 @@ pub(crate) mod declarations;
 mod external;
 mod git;
 mod hermetic;
+pub(crate) mod image;
 pub(crate) mod inputs;
+pub(crate) mod macro_deps;
 mod outside;
 #[cfg(unix)]
 pub(crate) mod repair;
 mod restore;
 mod rooted_links;
 
+pub(crate) use hermetic::ConsumerOutDir;
 use rooted_links::RootedSymlink;
 
 use declarations::parse_declarations;
@@ -2020,6 +2023,9 @@ impl Run {
         let mut hasher = blake3::Hasher::new();
         fold(&mut hasher, "kind", b"kache-build-script-v1");
         fold(&mut hasher, "binary", self.binary_hash.as_bytes());
+        // Upstream #2067: a pinned image separates the predictions of its
+        // trusted workers from every other build's (nothing when unset).
+        image::fold_image(&mut hasher, self.config.build_script_image.as_deref());
         for name in PREDICTION_CONFIGURATION {
             fold(&mut hasher, "configuration", name.as_bytes());
             match var(name) {
@@ -2031,7 +2037,16 @@ impl Run {
     }
 
     fn prediction(&self) -> Result<Option<Prediction>> {
-        stored_prediction(&self.store, &self.identity())
+        let local = stored_prediction(&self.store, &self.identity())?;
+        match self.config.build_script_image.as_deref() {
+            // Upstream #2067: a run another worker of the same image shared
+            // is keyed by its binary and image alone.
+            Some(image) if local.is_none() => image::imported_prediction(
+                &self.store,
+                &image::identity(&self.binary_hash, Some(image)),
+            ),
+            _ => Ok(local),
+        }
     }
 
     /// Record `prediction` as this configuration's newest, and as one of its
@@ -2119,6 +2134,7 @@ impl Run {
     ) -> Result<String> {
         let mut hasher = blake3::Hasher::new();
         fold(&mut hasher, "kind", kind);
+        image::fold_image(&mut hasher, self.config.build_script_image.as_deref());
         fold(
             &mut hasher,
             "key_version",
@@ -2259,13 +2275,21 @@ impl Run {
     /// Restore `meta` using blobs from `blobs`. Hash memos are written to this
     /// run's own store, so a read-only source is left unchanged.
     fn restore_from(&self, blobs: &Store, meta: &EntryMeta) -> Result<u64> {
-        let manifest = meta
-            .files
-            .iter()
-            .find(|file| file.name == MANIFEST_NAME)
-            .context("recorded run has no manifest")?;
-        let manifest: Manifest =
-            serde_json::from_slice(&std::fs::read(blobs.blob_path(&manifest.hash))?)?;
+        let logical;
+        let (manifest, meta) = if image::reserved(&meta.crate_name) {
+            let (manifest, translated) = image::restore(self, blobs, meta)?;
+            logical = translated;
+            (manifest, &logical)
+        } else {
+            let manifest = meta
+                .files
+                .iter()
+                .find(|file| file.name == MANIFEST_NAME)
+                .context("recorded run has no manifest")?;
+            let manifest: Manifest =
+                serde_json::from_slice(&std::fs::read(blobs.blob_path(&manifest.hash))?)?;
+            (manifest, meta)
+        };
         anyhow::ensure!(
             matches!(manifest.version, 1..=BYTES_MANIFEST_VERSION),
             "unsupported build-script manifest"
@@ -2637,6 +2661,14 @@ impl Run {
         let manifest_path = staging.path().join(MANIFEST_NAME);
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
         let mut output_files = files;
+        let image_namespace = image::encode(
+            self,
+            &key,
+            &prediction,
+            &manifest,
+            &mut output_files,
+            staging.path(),
+        )?;
         output_files.push((manifest_path, MANIFEST_NAME.to_string()));
         let size: u64 = output_files
             .iter()
@@ -2646,7 +2678,7 @@ impl Run {
         let store_start = std::time::Instant::now();
         let put = self.store.put_with_compile_time_independent(
             &key,
-            CRATE_NAME,
+            image_namespace.as_deref().unwrap_or(CRATE_NAME),
             &["build-script".to_string()],
             &[],
             &std::env::var("TARGET").unwrap_or_default(),
@@ -6971,6 +7003,116 @@ mod tests {
             manifest.stdout
         );
         b.restore(&meta).unwrap();
+    }
+
+    #[test]
+    fn regular_and_hermetic_run_keys_both_include_the_selected_image() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (mut run, _) = two_targets(dir.as_path());
+        let prediction = recorded_prediction(Vec::new(), Vec::new(), false, Vec::new(), false);
+        let below = Path::new("debug/build/test-1/out");
+        let mut regular = BTreeSet::new();
+        let mut sealed = BTreeSet::new();
+        for image in [
+            None,
+            Some("sha256:a".to_string()),
+            Some("sha256:b".to_string()),
+        ] {
+            run.config.build_script_image = image;
+            assert!(regular.insert(run.action_key(&prediction).unwrap()));
+            assert!(sealed.insert(hermetic::key(&run, &prediction, below).unwrap()));
+        }
+    }
+
+    #[test]
+    fn a_local_image_prediction_is_available_without_sync() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (mut run, _) = two_targets(dir.as_path());
+        run.config.build_script_image = Some(format!("sha256:{}", "a".repeat(64)));
+        let p = recorded_prediction(
+            vec!["${KACHE_MANIFEST_DIR}/build.rs".into()],
+            vec![],
+            false,
+            vec![],
+            false,
+        );
+        assert!(run.prediction().unwrap().is_none());
+        run.record_prediction(&p).unwrap();
+        assert_eq!(run.prediction().unwrap(), Some(p));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runs_ineligible_for_image_sync_keep_their_local_artifact_names() {
+        let mut lock = crate::test_support::process_state_test_lock();
+        let dir = lock.enter();
+        let (mut run, _) = two_targets(dir.as_path());
+        let mut vars = EnvRestore::new();
+        run.config.build_script_image = Some(format!("sha256:{}", "a".repeat(64)));
+        for case in [
+            "package",
+            "prediction",
+            "output",
+            "declarations",
+            "large-descriptor",
+            "large-manifest",
+            "eligible",
+        ] {
+            let package = if case == "package" {
+                "bad/name"
+            } else {
+                "producer"
+            };
+            vars.set("CARGO_PKG_NAME", package.as_ref());
+            let mut p = recorded_prediction(
+                vec!["${KACHE_MANIFEST_DIR}".into()],
+                vec![],
+                true,
+                vec![],
+                false,
+            );
+            if case == "prediction" {
+                p.embedded_roots = None;
+            }
+            let mut m: Manifest = serde_json::from_value(serde_json::json!({
+                "version": if case == "output" { 0 } else { 1 },
+                "directories":[], "empty_files":[], "stderr":"",
+                "stdout": if case == "declarations" { "cargo:rerun-if-changed=input\n" } else { "" }
+            }))
+            .unwrap();
+            if case == "large-manifest" {
+                m.stderr = "x".repeat(4_194_304);
+            }
+            let staging = tempfile::tempdir().unwrap();
+            let local = (dir.as_path().join("payload"), "out/file".to_string());
+            let original = if case == "large-descriptor" {
+                let suffix = "x".repeat(220);
+                (0..20_000)
+                    .map(|i| (local.0.clone(), format!("out/file-{i}-{suffix}")))
+                    .collect()
+            } else {
+                vec![local]
+            };
+            let mut files = original.clone();
+            let namespace =
+                image::encode(&run, &"b".repeat(64), &p, &m, &mut files, staging.path()).unwrap();
+            if case == "eligible" {
+                assert_eq!(
+                    namespace,
+                    Some(image::package_namespace(
+                        run.config.build_script_image.as_deref().unwrap(),
+                        package
+                    ))
+                );
+                assert_eq!(files[0].1, "output-0");
+            } else {
+                assert!(namespace.is_none(), "{case}");
+                assert!(files == original, "{case}");
+                assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
+            }
+        }
     }
 
     /// A library the script names under the target directory, beside `OUT_DIR`,

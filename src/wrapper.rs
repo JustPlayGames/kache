@@ -5,7 +5,7 @@ use kache_store::eviction::HeldBytesBudget;
 pub(crate) use kache_store::markers::*;
 use std::path::{Component, Path, PathBuf};
 
-use crate::args::{ExternDep, RustcArgs};
+use crate::args::RustcArgs;
 use crate::cache_key::FileHashStats;
 use crate::cache_key::FileHasher;
 use crate::compile;
@@ -2506,8 +2506,10 @@ fn run_cc_inner(
     // Refuse-to-cache check: non-empty = this invocation isn't a
     // cacheable single-source `-c` compile (link mode, multi-arch,
     // PCH, modules, etc. — see CcArgs::refuse_reasons). Passthrough.
-    let trace_preflight = crate::phase_trace::phase("cc_preflight");
-    let refuse = compiler.refuse_reasons(&parsed);
+    let refuse = {
+        let _trace = crate::phase_trace::phase("cc_preflight");
+        compiler.refuse_reasons(&parsed)
+    };
     if !refuse.is_empty() {
         let reasons: Vec<&str> = refuse.iter().map(|r| r.description()).collect();
         tracing::debug!(
@@ -2561,7 +2563,6 @@ fn run_cc_inner(
             format!("source excluded: {}", source.display()),
         );
     }
-    drop(trace_preflight);
 
     let trace_store_open = crate::phase_trace::phase("store_open");
     let (store, fallback_stores) =
@@ -3276,6 +3277,7 @@ fn cc_passthrough_impl(
     // existing output path (#645).
     refuse_legacy_cc_blob_outputs(config, parsed)?;
     crate::opcounts::record_compiler_run();
+    let _trace = crate::phase_trace::phase("cc_passthrough_compiler");
     let status = crate::invocation::io::status(
         parsed
             .invocation_env
@@ -3997,6 +3999,12 @@ pub(crate) fn run_for(
     let args = compiler
         .parse(wrapper_args)
         .context("parsing rustc arguments")?;
+    let consumer = if cfg!(unix) && config.build_script_hermetic {
+        crate::build_script::ConsumerOutDir::for_compile(config, env)
+    } else {
+        None
+    };
+
     // Resolve once before any cache/passthrough fast path. The same snapshot
     // drives the key and the final Cargo-facing dep-info, so a concurrent
     // config/glob change cannot make those two views disagree.
@@ -4045,22 +4053,58 @@ pub(crate) fn run_for(
         safe_extra_inputs_config = Some(safe);
     }
     let effective_config = safe_extra_inputs_config.as_ref().unwrap_or(config);
-    let exit = run_parsed_rustc(
-        effective_config,
-        &compiler,
-        &args,
-        start,
-        invocation_start_ns,
-        extra_inputs.as_ref(),
-        extra_inputs_hash_stats,
-        extra_inputs_too_new,
-        extra_inputs_key_ms,
-        extra_inputs_guard_inputs,
-        None,
-        None,
-    )?;
-
+    let hermetic = cfg!(unix) && config.build_script_hermetic;
+    let macro_free = hermetic && crate::build_script::macro_deps::proven(&args);
+    let private_compile = consumer.is_some() && !macro_free;
+    if let Some(consumer) = &consumer {
+        if private_compile {
+            consumer.require_writable();
+            if consumer.sealed() {
+                use std::io::Write as _;
+                let package = env.var("CARGO_PKG_NAME")?;
+                let _ = writeln!(
+                    crate::invocation::io::stderr(),
+                    "kache: the existing OUT_DIR for {package} links to a sealed build-script run; run `cargo clean -p {package}` and rebuild with a writable OUT_DIR"
+                );
+                return Ok(1);
+            }
+        } else {
+            consumer.record_plain();
+        }
+    }
+    let exit = if private_compile {
+        // Rustc can run a macro that writes extra files beyond its artifacts.
+        let mut direct = effective_config.clone();
+        direct.fallback = None;
+        passthrough_with_event(
+            &direct,
+            &args,
+            crate_name,
+            &rustc_event_root(&args),
+            start,
+            "proc macro may write to OUT_DIR",
+            KeyEventRecord::default(),
+        )?
+    } else {
+        run_parsed_rustc(
+            effective_config,
+            &compiler,
+            &args,
+            start,
+            invocation_start_ns,
+            extra_inputs.as_ref(),
+            extra_inputs_hash_stats,
+            extra_inputs_too_new,
+            extra_inputs_key_ms,
+            extra_inputs_guard_inputs,
+            None,
+            None,
+        )?
+    };
     if exit == 0 {
+        if macro_free {
+            crate::build_script::macro_deps::record(&args);
+        }
         retire_prestaged_executables(effective_config, &compiler, &args);
         complete_current_extra_inputs_after_success(
             effective_config,
@@ -5604,7 +5648,7 @@ fn run_parsed_rustc(
     }
 
     // Don't cache failures
-    after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
+    after_rustc_exit(result.exit_code, &result.stderr, config, args);
     if result.exit_code != 0 {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
@@ -7856,7 +7900,7 @@ fn adaptive_compile_before_key(
         crate::invocation::io::stdout(),
         crate::invocation::io::stderr(),
     );
-    after_rustc_exit(result.exit_code, &result.stderr, &ctx.args.externs);
+    after_rustc_exit(result.exit_code, &result.stderr, ctx.config, ctx.args);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
     let seeded_from = lease.worktree_seed_donor().map(Path::to_path_buf);
     let _ = lease.finish(outcome);
@@ -8042,7 +8086,7 @@ fn compile_before_key(
         crate::invocation::io::stdout(),
         crate::invocation::io::stderr(),
     );
-    after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
+    after_rustc_exit(result.exit_code, &result.stderr, config, args);
     if result.exit_code != 0 {
         let elapsed = start.elapsed().as_millis() as u64;
         log_event(
@@ -10472,7 +10516,7 @@ fn adaptive_incremental_with_event<R: Into<String>>(
         crate::invocation::io::stdout(),
         crate::invocation::io::stderr(),
     );
-    after_rustc_exit(result.exit_code, &result.stderr, &args.externs);
+    after_rustc_exit(result.exit_code, &result.stderr, config, args);
     let outcome = compile_outcome(result.exit_code, result.signaled, &result.stderr);
     let seeded_from = lease.worktree_seed_donor().map(Path::to_path_buf);
     // A folder that keeps every unit is a donor for every other: mark it so
@@ -10649,10 +10693,27 @@ fn rustc_output_in(reason: &str) -> &str {
 /// preserve-incremental and untrusted-backend lanes, and kache's own errors.
 /// A write failure there gets rustc's error alone. Covering those lanes would
 /// mean capturing their stderr.
-fn after_rustc_exit(exit_code: i32, rustc_output: &str, externs: &[ExternDep]) {
-    if exit_code != 0 {
-        crate::out_dir_alias::after_failed_compile(rustc_output, externs);
+fn after_rustc_exit(exit_code: i32, rustc_output: &str, config: &Config, args: &RustcArgs) {
+    if exit_code == 0 {
+        return;
     }
+    if cfg!(unix)
+        && crate::out_dir_alias::is_permission_failure(rustc_output)
+        && crate::build_script::ConsumerOutDir::for_compile(config, args.invocation_env())
+            .is_some_and(|out| out.note_sealed_write_failure())
+    {
+        use std::io::Write as _;
+        let package = args
+            .invocation_env()
+            .var("CARGO_PKG_NAME")
+            .expect("Cargo package of the marked OUT_DIR");
+        let _ = writeln!(
+            crate::invocation::io::stderr(),
+            "[kache] this package's hermetic build-script OUT_DIR is read-only. Run `cargo clean -p {package}` and rebuild to use a writable OUT_DIR for this package."
+        );
+        return;
+    }
+    crate::out_dir_alias::after_failed_compile(rustc_output, &args.externs);
 }
 
 fn passthrough_with_event<R: Into<String>>(
@@ -10698,7 +10759,7 @@ fn passthrough_with_event<R: Into<String>>(
     }
     drop(permit);
     let elapsed = start.elapsed().as_millis() as u64;
-    after_rustc_exit(output.exit_code, rustc_output_in(&reason), &args.externs);
+    after_rustc_exit(output.exit_code, rustc_output_in(&reason), config, args);
     log_event(
         config,
         EventInputs::passthrough(root, crate_name, elapsed, reason, &output).key_record(key_record),
