@@ -5758,15 +5758,36 @@ fn only_proc_macros_and_build_scripts_may_share_a_restored_inode() {
             compile("build_script_x", "bin", "/t/debug/deps"),
         ),
         (
-            "test harness",
-            rustc_args(&["rustc", "--crate-name", "hk", "--test", "src/main.rs"]),
+            "test harness with a crate type",
+            rustc_args(&[
+                "rustc",
+                "--crate-name",
+                "hk",
+                "--crate-type",
+                "bin",
+                "--test",
+                "src/main.rs",
+            ]),
         ),
     ] {
         assert_eq!(shared_inode_loadable(&other, true), None, "{label}");
     }
+    // A test binary (`--test`, no crate type) links its blob on Linux, where
+    // the store already keeps it by hardlink, unless shared restores are on.
+    let test = rustc_args(&["rustc", "--crate-name", "hk", "--test", "src/main.rs"]);
+    let linux = cfg!(target_os = "linux").then_some(ArtifactKind::Executable);
+    assert_eq!(shared_inode_loadable(&test, true), linux);
+    // A `harness = false` test (neither `--test` nor a crate type) keeps its copy.
+    let plain = rustc_args(&["rustc", "--crate-name", "hk", "src/main.rs"]);
+    assert_eq!(shared_inode_loadable(&plain, true), None, "harness = false");
+    crate::link::set_shared_hardlink_restores(true);
+    let shared_on = shared_inode_loadable(&test, true);
+    crate::link::set_shared_hardlink_restores(false);
+    assert_eq!(shared_on, None, "shared restores would drop the one-consumer rule");
     // Platforms that may rewrite a restored loadable share nothing.
     assert_eq!(shared_inode_loadable(&proc_macro, false), None);
     assert_eq!(shared_inode_loadable(&build_script, false), None);
+    assert_eq!(shared_inode_loadable(&test, false), None);
 }
 
 /// The Linux restore path for a proc-macro: the file comes back loadable,
@@ -5963,6 +5984,83 @@ fn restore_from_cache_never_re_dates_another_targets_test_binary() {
     let again = restore("b");
     assert_eq!(ino(&again), ino(&b));
     assert_eq!(mtime(&stored), old);
+}
+
+/// End to end on Linux without reflink: a test binary whose blob no target
+/// links comes back as a link to it, stamped, instead of a copy of tens to
+/// hundreds of MB. Every later target copies while that link stands, and its
+/// stamp leaves the linked one alone, so a stale test binary there keeps its
+/// mtime (8e6cf91b); once the link is gone, the next restore links again.
+#[cfg(target_os = "linux")]
+#[test]
+fn restore_from_cache_links_a_test_binary_only_while_no_other_target_does() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path().join("cache"));
+    let store = Store::open(&config).unwrap();
+    let hash = "8686868686868686868686868686868686868686868686868686868686868686";
+    create_blob(&store, hash, b"test binary");
+    let blob = store.blob_path(hash);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if crate::link::try_reflink(&blob, &dir.path().join("probe")).is_ok() {
+        eprintln!("reflink available; the no-CoW restore path is not reachable here");
+        return;
+    }
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&blob, old).unwrap();
+    let deps = |tree: &str| dir.path().join(tree).join("target/debug/deps");
+    let restore = |tree: &str| {
+        let root = dir.path().join(tree);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"hk\"\n").unwrap();
+        let out_dir_str = deps(tree).to_str().unwrap().to_string();
+        let args = rustc_args(&[
+            "rustc",
+            "--crate-name",
+            "hk",
+            "src/lib.rs",
+            "--test",
+            "--emit",
+            "link",
+            "--out-dir",
+            &out_dir_str,
+            "-C",
+            "extra-filename=-1",
+        ]);
+        let mut cached = cached_file("hk-1", hash);
+        cached.executable = true;
+        cached.size = crate::prestage::MIN_BYTES * 2;
+        let mut meta = entry_meta("hk", vec![cached], &["link"]);
+        meta.crate_types.clear(); // `--test`: no crate type
+        restore_from_cache(&config, &RustcCompiler::new(), &store, &args, &meta, None).unwrap();
+        deps(tree).join("hk-1")
+    };
+    let ino = |path: &Path| std::fs::metadata(path).unwrap().ino();
+    let mtime = |path: &Path| {
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(path).unwrap())
+    };
+
+    let a = restore("a");
+    assert_eq!(ino(&a), ino(&blob), "a links the blob no target held");
+    assert!(mtime(&a) > old, "a's link is stamped");
+    assert_eq!(std::fs::metadata(&a).unwrap().mode() & 0o777, 0o555);
+    // a's test binary goes stale: its library is rebuilt later than its stamp.
+    let stale = filetime::FileTime::from_unix_time(1_100_000_000, 0);
+    filetime::set_file_mtime(&a, stale).unwrap();
+    let b = restore("b");
+    assert_ne!(ino(&b), ino(&blob), "b copies while a links the blob");
+    assert!(mtime(&b) > stale);
+    assert_eq!(mtime(&a), stale, "b's restore left a's test binary's mtime alone");
+    assert_eq!(std::fs::read(&b).unwrap(), b"test binary");
+    assert_eq!(std::fs::metadata(&b).unwrap().mode() & 0o111, 0o111);
+    // a's rebuild (or its worktree's removal) drops the link: c links again.
+    std::fs::remove_file(&a).unwrap();
+    filetime::set_file_mtime(&b, stale).unwrap();
+    let c = restore("c");
+    assert_eq!(ino(&c), ino(&blob), "c links once no target holds the blob");
+    assert_eq!(mtime(&b), stale, "c re-dates nothing b holds");
+    assert_eq!(std::fs::read(&blob).unwrap(), b"test binary");
 }
 
 /// End to end on Linux without reflink: a pipelined library restored into
