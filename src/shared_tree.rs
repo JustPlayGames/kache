@@ -34,6 +34,10 @@ use std::time::{Duration, Instant};
 /// How long Git may take over one unit before the unit keeps its lane.
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const GIT_POLL: Duration = Duration::from_millis(1);
+/// How long a Git past its deadline has to remove its lock files after
+/// SIGTERM before it is killed.
+#[cfg(unix)]
+const GIT_GRACE: Duration = Duration::from_millis(200);
 /// Sources outside its package one unit may have Git compare. A unit that
 /// reads more keeps its lane.
 const MAX_OUTSIDE_SOURCES: usize = 64;
@@ -178,7 +182,8 @@ fn package_against_merge_base(
 /// The exit code of `git -C dir <args>`, when it exits before `deadline`,
 /// run as the invocation would run it. The repository's filesystem monitor
 /// stays off (a configured one is a program Git would start), and Git takes
-/// no lock a concurrent Git command of the user's could trip over.
+/// no optional lock. `git diff` still refreshes the index under `index.lock`
+/// when stats moved, so a Git past `deadline` is stopped with [`stop`].
 fn git_status<S: AsRef<OsStr>>(
     env: &InvocationEnv,
     dir: &Path,
@@ -208,12 +213,33 @@ fn git_status<S: AsRef<OsStr>>(
             Ok(Some(status)) => return status.code(),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(GIT_POLL),
             Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop(&mut child);
                 return None;
             }
         }
     }
+}
+
+/// Stops a Git that ran past its deadline. SIGTERM first: Git's signal
+/// handler removes the lock files it holds (`index.lock` while `git diff`
+/// refreshes the index), which a SIGKILL would leave behind for the user's
+/// next Git command in that checkout to fail on. Killed after [`GIT_GRACE`].
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: `pid` is this process's own child, not yet waited for, so
+        // the id still names it and no other process.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let grace = Instant::now() + GIT_GRACE;
+        while Instant::now() < grace {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(GIT_POLL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -271,6 +297,46 @@ mod tests {
         git(&repo, &["commit", "-q", "-m", "first"]);
         git(&repo, &["branch", "shared"]);
         repo
+    }
+
+    /// `git diff` refreshes the index under `index.lock` even with
+    /// `GIT_OPTIONAL_LOCKS=0`, and Git removes its lock files when it is
+    /// asked to stop. A Git past its deadline is asked first: one killed
+    /// outright leaves `index.lock` behind, and the user's next Git command in
+    /// that checkout fails on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_past_its_deadline_is_asked_to_stop_before_it_is_killed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let started = dir.path().join("started");
+        let lock = dir.path().join("index.lock");
+        // A Git that takes its lock, removes it on SIGTERM as Git's own
+        // handler does, and never finishes.
+        let script = bin.join("git");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntouch '{lock}'\ntrap 'rm -f \"{lock}\"; exit 143' TERM\ntouch '{started}'\nwhile :; do sleep 0.02; done\n",
+                lock = lock.display(),
+                started = started.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = InvocationEnv::capture();
+        let mut path = bin.clone().into_os_string();
+        if let Some(rest) = env.var_os("PATH") {
+            path.push(":");
+            path.push(rest);
+        }
+        env.set("PATH", path);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(git_status(&env, dir.path(), &["diff"], deadline), None);
+        assert!(started.exists(), "the stand-in Git ran and took its lock");
+        assert!(!lock.exists(), "a Git stopped at its deadline left index.lock");
     }
 
     fn at_merge_base(repo: &Path, package: &str, outside: &[PathBuf]) -> bool {
