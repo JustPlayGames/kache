@@ -372,6 +372,59 @@ enum PutSources<'a> {
     Snapshots(&'a [String]),
 }
 
+/// An entry's directory and meta.json bytes, written before a registration
+/// takes the index's write lock, so that under the lock only the rename that
+/// makes meta.json appear runs. Creating a directory in the store's large
+/// directory and a file in it are file system calls that a busy disk can
+/// keep for seconds, and every other writer of the index waits for the lock
+/// meanwhile.
+///
+/// meta.json still appears only under the lock (#670): the staged bytes sit
+/// under a hidden temporary name. A removal's cleanup that takes the
+/// directory before the lock is taken leaves `publish` failing, and the
+/// registration writes the file again as it did before. Dropped unpublished,
+/// the temp file goes, and the directory too when this created it and it is
+/// still empty.
+#[derive(Debug)]
+struct MetaPrestage {
+    meta: Option<crate::atomic::StagedReplace>,
+    published: std::cell::Cell<bool>,
+    made_dir: Option<PathBuf>,
+}
+
+impl MetaPrestage {
+    /// Publish the staged meta.json at `meta_path`; `false` when it could
+    /// not be (the caller writes it again).
+    fn publish(&self, meta_path: &Path) -> bool {
+        let Some(meta) = &self.meta else {
+            return false;
+        };
+        match meta.publish(meta_path) {
+            Ok(()) => {
+                self.published.set(true);
+                true
+            }
+            Err(error) => {
+                tracing::debug!(%error, "staged entry metadata went: {}", meta_path.display());
+                false
+            }
+        }
+    }
+}
+
+impl Drop for MetaPrestage {
+    fn drop(&mut self) {
+        drop(self.meta.take());
+        if !self.published.get()
+            && let Some(dir) = &self.made_dir
+        {
+            // Only an empty directory goes: one that another put filled
+            // meanwhile stays.
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
 /// An entry whose outputs a put has staged, hashed and published as blobs
 /// (its Phase 1), not yet registered in the index.
 ///
@@ -5413,6 +5466,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if changed.is_empty() && !batch.iter().any(CheckedHandoff::is_ready) {
             return refuse_all(batch, &"refused");
         }
+        // Each entry's directory and meta.json bytes before the lock, so that
+        // under it only a rename publishes each (see `MetaPrestage`).
+        let prestaged: Vec<Option<MetaPrestage>> = batch
+            .iter()
+            .map(|checked| {
+                checked
+                    .0
+                    .as_ref()
+                    .ok()
+                    .and_then(|staged| self.prestage_meta(staged))
+            })
+            .collect();
         let db = self.db();
         let started = match wait {
             RegistrationWait::Patient => self.begin_entry_registration(&db),
@@ -5430,7 +5495,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let mut results = Vec::with_capacity(batch.len());
         let mut registered = Vec::new();
-        for checked in batch {
+        for (checked, prestaged) in batch.into_iter().zip(&prestaged) {
             let staged = match checked.0 {
                 Ok(staged) => staged,
                 Err(refused) => {
@@ -5456,7 +5521,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .savepoint()
                 .map_err(anyhow::Error::from)
                 .and_then(|savepoint| {
-                    self.register_in(&savepoint, &staged)?;
+                    self.register_in(&savepoint, &staged, prestaged.as_ref())?;
                     savepoint.commit()?;
                     Ok(())
                 });
@@ -5894,6 +5959,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         wait: RegistrationWait,
     ) -> Result<Option<StorePutResult>> {
         self.refuse_write("store an entry")?;
+        let prestaged = self.prestage_meta(staged);
         let db = self.db();
         let tx = match wait {
             RegistrationWait::Patient => self.begin_entry_registration(&db)?,
@@ -5903,7 +5969,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 Err(error) => return Err(error.into()),
             },
         };
-        self.register_in(&tx, staged)?;
+        self.register_in(&tx, staged, prestaged.as_ref())?;
         tx.commit()?;
         self.finish_strict_durability(&staged.meta.cache_key)?;
         self.seed_registered(staged);
@@ -5913,7 +5979,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// Register a staged entry and its blob references on `conn`, which
     /// holds the index's write lock in a transaction (or a savepoint of one)
     /// that the caller commits.
-    fn register_in(&self, conn: &rusqlite::Connection, staged: &StagedPut) -> Result<()> {
+    fn register_in(
+        &self,
+        conn: &rusqlite::Connection,
+        staged: &StagedPut,
+        prestaged: Option<&MetaPrestage>,
+    ) -> Result<()> {
         let cache_key = staged.meta.cache_key.as_str();
         let entry_dir = self.entry_dir(cache_key);
         let meta_path = entry_dir.join("meta.json");
@@ -5974,15 +6045,57 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         // no reader — locked or not — can ever observe a truncated or
         // partially written meta.json, and the rename's parent-directory
         // fsync makes the new name durable alongside the contents.
-        fs::create_dir_all(&entry_dir).context("creating entry directory")?;
-        let durable = self.durable_writes();
-        crate::atomic::atomic_replace_deferrable(&meta_path, staged.meta_json.as_bytes(), durable)
+        //
+        // The directory and the bytes were written before the lock when they
+        // could be (`prestaged`): under it, only the rename that makes
+        // meta.json appear runs. A staged file a racing removal's cleanup
+        // took with the directory meanwhile is written again here.
+        if !prestaged.is_some_and(|meta| meta.publish(&meta_path)) {
+            fs::create_dir_all(&entry_dir).context("creating entry directory")?;
+            let durable = self.durable_writes();
+            crate::atomic::atomic_replace_deferrable(
+                &meta_path,
+                staged.meta_json.as_bytes(),
+                durable,
+            )
             .context("writing entry metadata")?;
+        }
         conn.execute(
             "INSERT OR REPLACE INTO entries (cache_key, crate_name, crate_type, profile, num_features, size, content_hash, compile_time_ms, key_schema, committed, durable, compile_time_backfilled, unit_id, rustc_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 1, ?11, ?12)",
             params![cache_key, staged.meta.crate_name, staged.crate_type_str, staged.meta.profile, staged.num_features, staged.total_size as i64, staged.content_hash, staged.meta.compile_time_ms as i64, kache_format::CACHE_KEY_VERSION, false, staged.unit, staged.meta.rustc_version],
         )?;
         Ok(())
+    }
+
+    /// The entry directory and meta.json bytes of `staged`, written before
+    /// the index's write lock is taken ([`MetaPrestage`]). `None` when they
+    /// could not be (the registration then writes them under the lock).
+    fn prestage_meta(&self, staged: &StagedPut) -> Option<MetaPrestage> {
+        let entry_dir = self.entry_dir(&staged.meta.cache_key);
+        let created_dir = !entry_dir.is_dir();
+        if let Err(error) = fs::create_dir_all(&entry_dir) {
+            tracing::debug!(%error, "prestaging entry metadata: {}", entry_dir.display());
+            return None;
+        }
+        let mut prestage = MetaPrestage {
+            meta: None,
+            published: std::cell::Cell::new(false),
+            made_dir: created_dir.then(|| entry_dir.clone()),
+        };
+        match crate::atomic::stage_replace(
+            &entry_dir.join("meta.json"),
+            staged.meta_json.as_bytes(),
+            self.durable_writes(),
+        ) {
+            Ok(meta) => {
+                prestage.meta = Some(meta);
+                Some(prestage)
+            }
+            Err(error) => {
+                tracing::debug!(%error, "prestaging entry metadata: {}", entry_dir.display());
+                None
+            }
+        }
     }
 
     /// What follows a staged entry's registration once committed.

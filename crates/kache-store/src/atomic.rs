@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static ATOMIC_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -250,13 +250,7 @@ where
     A: FnOnce(&Path) -> Result<()>,
     D: Fn(&Path) -> Result<()>,
 {
-    let nonce = ATOMIC_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let file_name = dest_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("file");
-    let temp_path = dest_path.with_file_name(format!(".{file_name}.{pid}.{nonce}.tmp"));
+    let temp_path = temp_path_for(dest_path);
 
     let res = (|| -> Result<()> {
         write_fn(&temp_path)?;
@@ -271,17 +265,44 @@ where
         let _ = remove_file_robust(&temp_path);
         return Err(e);
     }
+    rename_into_place(&temp_path, dest_path, allow_concurrent_winner, sync_dir)
+}
 
+/// The temporary name a replacement of `dest_path` is written under: hidden,
+/// beside it, unique to this process and call.
+fn temp_path_for(dest_path: &Path) -> PathBuf {
+    let nonce = ATOMIC_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = dest_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
+    dest_path.with_file_name(format!(".{file_name}.{pid}.{nonce}.tmp"))
+}
+
+/// Rename the written `temp_path` over `dest_path`, then `sync_dir` its
+/// directory: the second half of [`atomic_write_and_replace_core`] and of
+/// [`StagedReplace::publish`]. The temp file is gone afterwards, renamed or
+/// removed.
+fn rename_into_place<D>(
+    temp_path: &Path,
+    dest_path: &Path,
+    allow_concurrent_winner: bool,
+    sync_dir: D,
+) -> Result<bool>
+where
+    D: Fn(&Path) -> Result<()>,
+{
     // Preserve the destination's permissions so atomic replacement does not widen them.
     // Setting permissions is best-effort (e.g. read-only mounts or filesystem limitations).
     if let Ok(meta) = fs::metadata(dest_path) {
-        let _ = fs::set_permissions(&temp_path, meta.permissions());
+        let _ = fs::set_permissions(temp_path, meta.permissions());
     }
 
     const MAX_ATTEMPTS: u32 = 10;
     let mut last_err = None;
     for attempt in 0..MAX_ATTEMPTS {
-        match fs::rename(&temp_path, dest_path) {
+        match fs::rename(temp_path, dest_path) {
             Ok(()) => {
                 if let Some(parent) = dest_path.parent() {
                     sync_dir(parent)?;
@@ -290,14 +311,14 @@ where
             }
             Err(e) => {
                 if allow_concurrent_winner && dest_path.is_file() {
-                    let _ = remove_file_robust(&temp_path);
+                    let _ = remove_file_robust(temp_path);
                     if let Some(parent) = dest_path.parent() {
                         sync_dir(parent)?;
                     }
                     return Ok(false);
                 }
                 if dest_path.is_dir() || !is_transient_rename_error(&e) {
-                    let _ = remove_file_robust(&temp_path);
+                    let _ = remove_file_robust(temp_path);
                     return Err(e).context("atomic rename");
                 }
                 last_err = Some(e);
@@ -306,7 +327,7 @@ where
         }
     }
 
-    let _ = remove_file_robust(&temp_path);
+    let _ = remove_file_robust(temp_path);
     if allow_concurrent_winner && dest_path.is_file() {
         if let Some(parent) = dest_path.parent() {
             sync_dir(parent)?;
@@ -315,6 +336,59 @@ where
     }
     let err = last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed"));
     Err(anyhow::Error::new(err).context("atomic rename failed after retries"))
+}
+
+/// A replacement written beside its destination ahead of time
+/// ([`stage_replace`]), so that publishing it later is one rename: a caller
+/// that must publish under a lock writes the bytes before it takes the lock.
+/// Dropped unpublished, it removes its temp file.
+#[derive(Debug)]
+pub struct StagedReplace {
+    temp: PathBuf,
+    durable: bool,
+}
+
+/// Write `bytes` beside `dest_path` under a temporary name, fsynced when
+/// `durable` (see [`atomic_replace_deferrable`]), for a later
+/// [`StagedReplace::publish`]. Nothing is visible at `dest_path` yet.
+pub fn stage_replace(dest_path: &Path, bytes: &[u8], durable: bool) -> Result<StagedReplace> {
+    let staged = StagedReplace {
+        temp: temp_path_for(dest_path),
+        durable,
+    };
+    fs::write(&staged.temp, bytes).context("writing a staged replacement")?;
+    if durable {
+        fsync_file(&staged.temp).context("flushing a staged replacement")?;
+    }
+    Ok(staged)
+}
+
+impl StagedReplace {
+    /// Rename the staged bytes over `dest_path` (which must name the same
+    /// directory and file the stage was made for), syncing the directory
+    /// when durable. Fails when the temp file is gone: whatever removed its
+    /// directory meanwhile, the caller writes the destination again its
+    /// usual way.
+    pub fn publish(&self, dest_path: &Path) -> Result<()> {
+        debug_assert_eq!(self.temp.parent(), dest_path.parent());
+        let durable = self.durable;
+        rename_into_place(&self.temp, dest_path, false, |parent| {
+            if durable {
+                let _ = fsync_dir(parent);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for StagedReplace {
+    fn drop(&mut self) {
+        // After a publish the name is free: nothing to remove.
+        if self.temp.symlink_metadata().is_ok() {
+            let _ = remove_file_robust(&self.temp);
+        }
+    }
 }
 
 pub fn atomic_replace(dest_path: &Path, bytes: &[u8]) -> Result<()> {

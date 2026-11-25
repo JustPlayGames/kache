@@ -18622,6 +18622,103 @@ fn a_put_unless_busy_on_a_busy_index_registers_later() {
     ));
 }
 
+/// The hidden temporary files beside `entry_dir`'s meta.json.
+fn staged_meta_files(entry_dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(entry_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(".meta.json.") && name.ends_with(".tmp"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Register `staged` from another thread's store while this one holds the
+/// index's write lock, run `meanwhile` once the waiting registration has
+/// staged its meta.json beside the entry (or after `STAGE_SEEN` without
+/// one), then let the lock go. Says whether the staged file was seen.
+fn register_while_the_lock_is_held(
+    store: &Store,
+    config: &Config,
+    staged: &StagedPut,
+    meanwhile: impl FnOnce(),
+) -> bool {
+    const STAGE_SEEN: Duration = Duration::from_secs(10);
+    let entry_dir = store.entry_dir(staged.cache_key());
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let seen = std::thread::scope(|scope| {
+        let registering = scope.spawn(|| {
+            let waiting = Store::open(config.clone()).unwrap();
+            waiting.set_busy_timeout_for_test(OWN_WAIT_WHILE_BUSY);
+            waiting.register_staged_put(staged)
+        });
+        let started = std::time::Instant::now();
+        let mut seen = false;
+        while started.elapsed() < STAGE_SEEN && !registering.is_finished() {
+            if !staged_meta_files(&entry_dir).is_empty() {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let early = entry_dir.join("meta.json").exists();
+        meanwhile();
+        writer.execute_batch("ROLLBACK").unwrap();
+        registering.join().unwrap().unwrap();
+        assert!(!early, "meta.json appears only under the lock");
+        seen
+    });
+    // The entry is whole: its meta.json, and no staged file left beside it.
+    let meta = store.get(staged.cache_key()).unwrap().expect("registered");
+    assert_eq!(meta.files[0].hash, staged.files()[0].hash);
+    assert!(entry_dir.join("meta.json").is_file());
+    assert!(staged_meta_files(&entry_dir).is_empty(), "no staged file left");
+    seen
+}
+
+/// A registration writes its entry's directory and meta.json bytes before it
+/// waits for the index's write lock: under the lock only the rename runs. A
+/// busy attempt that gives up leaves neither behind.
+#[test]
+fn a_registration_stages_its_meta_before_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 6)];
+    let staged = put_while_the_index_is_busy(&store, &config, "staged_meta", &files);
+    let entry_dir = store.entry_dir("staged_meta");
+    assert!(
+        !entry_dir.exists(),
+        "a busy attempt takes back the directory it made"
+    );
+
+    assert!(
+        register_while_the_lock_is_held(&store, &config, &staged, || {}),
+        "the meta.json bytes were staged before the lock"
+    );
+}
+
+/// A staged meta.json that a removal's cleanup took with its directory
+/// while the registration waited for the lock is written again under it.
+#[test]
+fn a_registration_whose_staged_meta_went_writes_it_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let files = [staged_put_output(dir.path(), 7)];
+    let staged = put_while_the_index_is_busy(&store, &config, "staged_gone", &files);
+    let entry_dir = store.entry_dir("staged_gone");
+    register_while_the_lock_is_held(&store, &config, &staged, || {
+        let _ = fs::remove_dir_all(&entry_dir);
+    });
+}
+
 /// A link to each blob of a busy put, as a wrapper hands it over.
 #[cfg(unix)]
 fn link_staged_blobs(store: &Store, staged: &StagedPut, dir: &Path) -> Vec<PathBuf> {
