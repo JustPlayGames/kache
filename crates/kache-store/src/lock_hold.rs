@@ -8,8 +8,10 @@
 //! holding the write lock (`BEGIN IMMEDIATE`, or a deferred transaction's
 //! first write) and ends when one leaves it without (`COMMIT`, `ROLLBACK`).
 //! A hold of [`LONG_LOCK_HOLD`] or more is logged, once, with who held it:
-//! the process, its thread, the transaction's first write and how many
-//! statements it ran. A write outside a transaction holds the lock only
+//! the process, its thread, the transaction's first write, how many
+//! statements it ran and how much of the hold those statements took inside
+//! SQLite (the rest ran between them: the holder's own work, its file system
+//! calls among them). A write outside a transaction holds the lock only
 //! while it runs and is not seen.
 //!
 //! It costs one check of the connection's transaction state per statement,
@@ -43,6 +45,9 @@ pub struct LongHold {
     pub first_write: String,
     /// Statements the transaction ran while it held the lock.
     pub statements: u32,
+    /// How long those statements ran inside SQLite, the one that let the
+    /// lock go included: `held` minus this ran between them.
+    pub in_statements: Duration,
 }
 
 /// Log each hold of the write lock on `db` that lasts [`LONG_LOCK_HOLD`],
@@ -74,6 +79,7 @@ fn log(hold: &LongHold) {
     tracing::warn!(
         target: ALWAYS_LOGGED,
         statements = hold.statements,
+        in_statements_ms = hold.in_statements.as_millis() as u64,
         first_write = %hold.first_write,
         "index write lock held {} ms by pid {} thread {}",
         hold.held.as_millis(),
@@ -98,7 +104,7 @@ pub(crate) fn watch_with(
     db.trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE,
         Some(move |event: TraceEvent<'_>| {
-            let TraceEvent::Profile(statement, _) = event else {
+            let TraceEvent::Profile(statement, ran) = event else {
                 return;
             };
             let holds_write_lock = handle.holds_write_lock();
@@ -110,13 +116,18 @@ pub(crate) fn watch_with(
                         first_write: None,
                         first: None,
                         statements: 0,
+                        in_statements: Duration::ZERO,
                     };
                     started.ran(&statement.sql());
                     hold = Some(started);
                 }
-                (Some(held), true) => held.ran(&statement.sql()),
+                (Some(held), true) => {
+                    held.ran(&statement.sql());
+                    held.in_statements += ran;
+                }
                 (Some(_), false) => {
-                    let Some(held) = hold.take() else { return };
+                    let Some(mut held) = hold.take() else { return };
+                    held.in_statements += ran;
                     let lasted = held.since.elapsed();
                     if lasted >= threshold {
                         report(Event::LongHold(&LongHold {
@@ -127,6 +138,7 @@ pub(crate) fn watch_with(
                                 .to_owned(),
                             first_write: held.first_write.or(held.first).unwrap_or_default(),
                             statements: held.statements,
+                            in_statements: held.in_statements.min(lasted),
                         }));
                     }
                 }
@@ -142,6 +154,7 @@ struct Hold {
     first_write: Option<String>,
     first: Option<String>,
     statements: u32,
+    in_statements: Duration,
 }
 
 impl Hold {
@@ -261,6 +274,12 @@ mod tests {
             assert!(seen[0].held >= LONG, "{:?}", seen[0]);
             assert_eq!(seen[0].first_write, "UPDATE t SET x = 2");
             assert_eq!(seen[0].statements, 3, "BEGIN, UPDATE, INSERT");
+            // The sleep ran between statements, outside SQLite.
+            assert!(
+                seen[0].held - seen[0].in_statements >= LONG,
+                "{:?}",
+                seen[0]
+            );
             assert_eq!(
                 seen[0].thread,
                 std::thread::current().name().unwrap_or("unnamed")
