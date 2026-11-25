@@ -849,8 +849,18 @@ mod tests {
                 .unwrap()
         };
         let json = serde_json::to_string(&p).unwrap();
+        // The fork records a configuration's prediction with its variants.
+        let prefix = super::super::variant_prefix(&local);
         store
-            .record_input_prediction(None, &local, PREDICTION_SCHEMA, Some(CRATE_NAME), &json)
+            .record_input_prediction(
+                &local,
+                &prefix,
+                &format!("{prefix}0"),
+                PREDICTION_SCHEMA,
+                Some(CRATE_NAME),
+                &json,
+                1,
+            )
             .unwrap();
         import(&local, &p);
         import(&other, &p);

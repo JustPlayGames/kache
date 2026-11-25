@@ -4395,7 +4395,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
 
     pub fn record_imported_prediction(&self, prediction: &ImportedPrediction<'_>) -> Result<()> {
         self.refuse_write("import an input prediction")?;
-        let tx = self.begin_immediate_writer()?;
+        let db = self.db();
+        let tx = begin_write_waiting(&db, "importing an input prediction")?;
         prediction.record(&tx)?;
         tx.commit()?;
         Ok(())

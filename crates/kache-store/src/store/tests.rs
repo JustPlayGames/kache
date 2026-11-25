@@ -3106,7 +3106,7 @@ fn failed_imported_declarations_roll_back_the_entry_and_its_blob_references() {
     let store = Store::open(test_config(dir.path())).unwrap();
     let key = "b".repeat(64);
     write_verified_fixture(&store, &key, &key, "lib.rlib", None);
-    store.db.execute_batch("CREATE TRIGGER fail_prediction BEFORE INSERT ON input_predictions BEGIN SELECT RAISE(ABORT, 'controlled rollback'); END;").unwrap();
+    store.db().execute_batch("CREATE TRIGGER fail_prediction BEFORE INSERT ON input_predictions BEGIN SELECT RAISE(ABORT, 'controlled rollback'); END;").unwrap();
     let prediction = ImportedPrediction {
         identity: "image-fixture",
         schema: 1,
@@ -3128,7 +3128,7 @@ fn failed_imported_declarations_roll_back_the_entry_and_its_blob_references() {
             .is_none()
     );
     let refs: i64 = store
-        .db
+        .db()
         .query_row("SELECT COALESCE(SUM(refcount), 0) FROM blobs", [], |row| {
             row.get(0)
         })
