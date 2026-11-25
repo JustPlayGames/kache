@@ -11702,6 +11702,59 @@ fn static_lib_fallback_binds_lexical_archive_path() {
     assert_ne!(first_hash, second_hash);
 }
 
+/// Upstream #2059: an rlib-only compile keys an archive it bundles by its file
+/// name and bytes, never its directory. This fork already left the directory
+/// out of every COFF archive (`bundled-coff-v2`, `linked-coff-v2`), so the rlib
+/// form keys the name beside that path-free digest, and the raw bytes beside
+/// it for an archive neither reading accepts.
+#[test]
+fn only_an_rlib_shares_identical_opaque_archive_bytes_across_checkouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let fh = FileHasher::new();
+    for (bytes, changed, prefix) in [
+        (
+            crate::native_archive::closed_coff_archive_for_tests(b"original"),
+            crate::native_archive::closed_coff_archive_for_tests(b"changed"),
+            "rlib-coff-v1:",
+        ),
+        (
+            crate::native_archive::bitcode_archive_for_tests(b"original"),
+            crate::native_archive::bitcode_archive_for_tests(b"changed"),
+            "rlib-ar-v1:",
+        ),
+    ] {
+        let case = dir.path().join(prefix.trim_end_matches(':'));
+        let left = case.join("checkout-a/lib/probe.lib");
+        let right = case.join("checkout-b/lib/probe.lib");
+        for file in [&left, &right] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, &bytes).unwrap();
+        }
+        let hash = |p: &Path, usage| fh.hash_static_lib_for(p, usage).unwrap();
+        let portable = hash(&left, StaticLibUse::Rlib);
+        assert!(portable.starts_with(prefix), "{portable}");
+        assert_eq!(portable, hash(&right, StaticLibUse::Rlib));
+        assert_ne!(portable, hash(&left, StaticLibUse::Bundled));
+        let renamed = right.with_file_name("libprobe.a");
+        std::fs::copy(&right, &renamed).unwrap();
+        assert_ne!(portable, hash(&renamed, StaticLibUse::Rlib));
+        std::fs::write(&right, &changed).unwrap();
+        assert_ne!(portable, hash(&right, StaticLibUse::Rlib));
+        std::fs::write(&right, b"!<thin>\n").unwrap();
+        assert!(fh.hash_static_lib_for(&right, StaticLibUse::Rlib).is_err());
+        std::fs::write(&right, b"not a regular archive").unwrap();
+        assert!(hash(&right, StaticLibUse::Rlib).starts_with("path-ar-v1:"));
+    }
+    // A link of the bitcode archive keeps its directory: a linker can name
+    // `archive-path(member)`.
+    let linked = |side: &str| {
+        let path = dir.path().join("rlib-ar-v1").join(side).join("lib/linked.lib");
+        std::fs::write(&path, crate::native_archive::bitcode_archive_for_tests(b"x")).unwrap();
+        fh.hash_static_lib_for(&path, StaticLibUse::Linked).unwrap()
+    };
+    assert_ne!(linked("checkout-a"), linked("checkout-b"));
+}
+
 /// A link through Cargo's `OUT_DIR` symlink into a sealed hermetic
 /// directory keys the archive by content; anything else stays resolved.
 #[cfg(unix)]
@@ -11783,10 +11836,14 @@ fn linked_archive_use_follows_output_and_oso_root() {
         }
         linked_archive_use(&RustcArgs::parse(&argv).unwrap(), archive, oso_root)
     };
-    for crate_type in ["lib", "rlib", "staticlib"] {
+    assert_eq!(
+        use_of("staticlib", false, outside, None),
+        StaticLibUse::Bundled
+    );
+    for crate_type in ["lib", "rlib"] {
         assert_eq!(
             use_of(crate_type, false, outside, None),
-            StaticLibUse::Bundled,
+            StaticLibUse::Rlib,
             "{crate_type}"
         );
     }
@@ -11844,7 +11901,9 @@ fn a_link_that_strips_debug_info_keys_its_archives_without_it() {
         &["rustc", "src/lib.rs", "--crate-type", "rlib", "-C", "strip=debuginfo"].map(String::from),
     )
     .unwrap();
-    assert_eq!(linked_archive_use(&lib, archive, None), StaticLibUse::Bundled);
+    // An rlib-only compile links nothing: its archives are bundled (#2059's
+    // Rlib use), never keyed as a stripped link.
+    assert_eq!(linked_archive_use(&lib, archive, None), StaticLibUse::Rlib);
 
     let dir = tempfile::tempdir().unwrap();
     let fh = FileHasher::new();

@@ -312,7 +312,7 @@ impl Client {
     /// Compile the crate `kt` rooted at `source`, from `cwd`, into `target`,
     /// as the package at `manifest_dir`.
     fn compile_unit(&self, cwd: &Path, source: &str, target: &Path, manifest_dir: &Path) {
-        self.compile_unit_with_log(cwd, source, target, manifest_dir, "off");
+        self.compile_unit_with_log(cwd, source, target, manifest_dir, "off", &[]);
     }
 
     fn compile_unit_with_log(
@@ -322,32 +322,35 @@ impl Client {
         target: &Path,
         manifest_dir: &Path,
         log_filter: &str,
+        extra: &[&str],
     ) -> Output {
         let deps = target.join("debug/deps");
         std::fs::create_dir_all(&deps).unwrap();
         let out_dir = deps.display().to_string();
         let search = format!("dependency={out_dir}");
         let rustc = rustc_path();
+        let mut argv = vec![
+            rustc.as_str(),
+            "--crate-name",
+            "kt",
+            "--edition=2021",
+            source,
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,metadata,link",
+            "-C",
+            "metadata=fedcba9876543210",
+            "-C",
+            "extra-filename=-fedcba9876543210",
+            "--out-dir",
+            &out_dir,
+            "-L",
+            &search,
+        ];
+        argv.extend_from_slice(extra);
         let output = self.run_within_at_env(
             Some(cwd),
-            &[
-                &rustc,
-                "--crate-name",
-                "kt",
-                "--edition=2021",
-                source,
-                "--crate-type",
-                "lib",
-                "--emit=dep-info,metadata,link",
-                "-C",
-                "metadata=fedcba9876543210",
-                "-C",
-                "extra-filename=-fedcba9876543210",
-                "--out-dir",
-                &out_dir,
-                "-L",
-                &search,
-            ],
+            &argv,
             &[
                 ("CARGO_MANIFEST_DIR", manifest_dir),
                 ("KACHE_LOG", Path::new(log_filter)),
@@ -770,7 +773,8 @@ fn checkout_naming_rust_output_is_declined_and_never_uploaded() {
         if target.exists() {
             std::fs::remove_dir_all(&target).unwrap();
         }
-        let output = client.compile_unit_with_log(checkout, "lib.rs", &target, checkout, "debug");
+        let output =
+            client.compile_unit_with_log(checkout, "lib.rs", &target, checkout, "debug", &[]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !stderr.contains("failed to send upload job to daemon"),
