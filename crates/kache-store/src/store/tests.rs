@@ -19032,6 +19032,97 @@ fn handed_off_entries_register_together_once_the_index_is_free() {
     );
 }
 
+/// A batch the busy lock sends back keeps each entry's staged meta.json for
+/// its next try, which writes none again: the daemon asks in 20 ms tries,
+/// and staging the whole batch before each, on a stalled disk, left it
+/// asking a small part of its wait until its entries failed
+/// (KACHE-NEXT-1126FI). Registered, the batch leaves no staged file; given
+/// up, it takes its staged files and the directories it made back.
+#[cfg(unix)]
+#[test]
+fn a_busy_batch_stages_each_meta_json_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = test_config(dir.path());
+    let store = Store::open(config.clone()).unwrap();
+    let handed: Vec<_> = (0..4)
+        .map(|index| {
+            busy_put_handed_over(
+                &store,
+                &config,
+                dir.path(),
+                &format!("once_{index}"),
+                30 + index,
+            )
+        })
+        .collect();
+    let (kept, given_up) = handed.split_at(2);
+    let daemon = Store::open(config.clone()).unwrap();
+    let check = |handed: &[(Box<StagedPut>, Vec<PathBuf>, PathBuf)]| -> Vec<CheckedHandoff> {
+        handed
+            .iter()
+            .map(|(staged, links, _)| check_staged_links(&daemon, staged, links))
+            .collect()
+    };
+    let staged_files = |handed: &[(Box<StagedPut>, Vec<PathBuf>, PathBuf)]| -> Vec<Vec<PathBuf>> {
+        handed
+            .iter()
+            .map(|(staged, _, _)| staged_meta_files(&store.entry_dir(staged.cache_key())))
+            .collect()
+    };
+
+    let writer = Connection::open(config.index_db_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let BatchAttempt::Busy(batch) =
+        daemon.register_handed_off_batch(check(kept), Duration::from_millis(5))
+    else {
+        panic!("a busy index registers nothing");
+    };
+    let first = staged_files(kept);
+    assert!(
+        first.iter().all(|files| files.len() == 1),
+        "each meta.json stays staged for the next try: {first:?}"
+    );
+    let BatchAttempt::Busy(batch) =
+        daemon.register_handed_off_batch(batch, Duration::from_millis(5))
+    else {
+        panic!("a busy index registers nothing");
+    };
+    assert_eq!(
+        staged_files(kept),
+        first,
+        "a second try stages nothing again"
+    );
+
+    let BatchAttempt::Busy(abandoned) =
+        daemon.register_handed_off_batch(check(given_up), Duration::from_millis(5))
+    else {
+        panic!("a busy index registers nothing");
+    };
+    drop(abandoned);
+    for (staged, _, _) in given_up {
+        assert!(
+            !store.entry_dir(staged.cache_key()).exists(),
+            "a batch given up takes back the directory it made"
+        );
+    }
+    writer.execute_batch("ROLLBACK").unwrap();
+
+    let BatchAttempt::Registered(results) =
+        daemon.register_handed_off_batch(batch, Duration::from_millis(5))
+    else {
+        panic!("a free index registers the batch");
+    };
+    for ((staged, _, _), result) in kept.iter().zip(results) {
+        assert_eq!(result.unwrap(), staged.result());
+        let entry_dir = store.entry_dir(staged.cache_key());
+        assert!(entry_dir.join("meta.json").is_file());
+        assert!(
+            staged_meta_files(&entry_dir).is_empty(),
+            "no staged file left"
+        );
+    }
+}
+
 /// A blob changed in place after its compile returned costs the entries
 /// that name it, and only those: one whose check read the blob before the
 /// change is refused too, the blob is unlinked, and the rest of the batch

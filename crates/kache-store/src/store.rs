@@ -485,7 +485,13 @@ pub enum PutAttempt {
 /// registered with others in one transaction
 /// ([`ArtifactStore::register_handed_off_batch`]).
 #[derive(Debug)]
-pub struct CheckedHandoff(std::result::Result<StagedPut, RefusedHandoff>);
+pub struct CheckedHandoff {
+    checked: std::result::Result<StagedPut, RefusedHandoff>,
+    /// Its meta.json, staged beside the entry before the batch's first try
+    /// at the index's write lock and kept while a busy lock sends the batch
+    /// back, so a later try writes it no more (see `MetaPrestage`).
+    prestaged: Option<MetaPrestage>,
+}
 
 #[derive(Debug)]
 struct RefusedHandoff {
@@ -497,8 +503,15 @@ struct RefusedHandoff {
 }
 
 impl CheckedHandoff {
+    fn new(checked: std::result::Result<StagedPut, RefusedHandoff>) -> Self {
+        Self {
+            checked,
+            prestaged: None,
+        }
+    }
+
     fn refused(error: anyhow::Error) -> Self {
-        Self(Err(RefusedHandoff {
+        Self::new(Err(RefusedHandoff {
             error,
             changed: None,
         }))
@@ -506,11 +519,11 @@ impl CheckedHandoff {
 
     /// Whether the entry passed its checks and can be registered.
     pub fn is_ready(&self) -> bool {
-        self.0.is_ok()
+        self.checked.is_ok()
     }
 
     fn with_unit(mut self, unit: &str) -> Self {
-        if let Ok(staged) = &mut self.0 {
+        if let Ok(staged) = &mut self.checked {
             staged.unit = unit.to_string();
         }
         self
@@ -5390,7 +5403,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 Err(error) => return CheckedHandoff::refused(error),
             };
             if hash != file.hash || size != file.size {
-                return CheckedHandoff(Err(RefusedHandoff {
+                return CheckedHandoff::new(Err(RefusedHandoff {
                     error: anyhow::anyhow!(
                         "{} changed after the compile returned (stored as {}, its blob now \
                          hashes to {hash}); refusing to store it",
@@ -5419,7 +5432,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             result,
             false,
         );
-        CheckedHandoff(staged.map_err(|error| RefusedHandoff {
+        CheckedHandoff::new(staged.map_err(|error| RefusedHandoff {
             error,
             changed: None,
         }))
@@ -5444,12 +5457,12 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         self.register_batch(batch, RegistrationWait::AtMost(wait))
     }
 
-    fn register_batch(&self, batch: Vec<CheckedHandoff>, wait: RegistrationWait) -> BatchAttempt {
+    fn register_batch(&self, mut batch: Vec<CheckedHandoff>, wait: RegistrationWait) -> BatchAttempt {
         let refuse_all = |batch: Vec<CheckedHandoff>, error: &dyn std::fmt::Display| {
             BatchAttempt::Registered(
                 batch
                     .into_iter()
-                    .map(|checked| match checked.0 {
+                    .map(|checked| match checked.checked {
                         Ok(_) => Err(anyhow::anyhow!("registering a handed-off entry: {error}")),
                         Err(refused) => Err(refused.error),
                     })
@@ -5461,23 +5474,26 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let changed: Vec<(String, PathBuf)> = batch
             .iter()
-            .filter_map(|checked| checked.0.as_ref().err()?.changed.clone())
+            .filter_map(|checked| checked.checked.as_ref().err()?.changed.clone())
             .collect();
         if changed.is_empty() && !batch.iter().any(CheckedHandoff::is_ready) {
             return refuse_all(batch, &"refused");
         }
         // Each entry's directory and meta.json bytes before the lock, so that
-        // under it only a rename publishes each (see `MetaPrestage`).
-        let prestaged: Vec<Option<MetaPrestage>> = batch
-            .iter()
-            .map(|checked| {
-                checked
-                    .0
-                    .as_ref()
-                    .ok()
-                    .and_then(|staged| self.prestage_meta(staged))
-            })
-            .collect();
+        // under it only a rename publishes each (see `MetaPrestage`). Once per
+        // entry: a batch the busy lock sent back keeps what it staged. The
+        // daemon asks in 20 ms tries, and staging a whole batch again before
+        // each, a few file system calls per entry that a stalled disk keeps
+        // for long, left it asking a small part of its wait while other
+        // writers took the lock, until its entries failed ("the index stayed
+        // busy for 20s", KACHE-NEXT-1126FI).
+        for handoff in &mut batch {
+            if handoff.prestaged.is_none()
+                && let Ok(staged) = &handoff.checked
+            {
+                handoff.prestaged = self.prestage_meta(staged);
+            }
+        }
         let db = self.db();
         let started = match wait {
             RegistrationWait::Patient => self.begin_entry_registration(&db),
@@ -5495,8 +5511,13 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
         let mut results = Vec::with_capacity(batch.len());
         let mut registered = Vec::new();
-        for (checked, prestaged) in batch.into_iter().zip(&prestaged) {
-            let staged = match checked.0 {
+        // Kept to the end, as the staged files go only after the commit.
+        let mut prestages = Vec::with_capacity(batch.len());
+        for handoff in batch {
+            let CheckedHandoff { checked, prestaged } = handoff;
+            prestages.push(prestaged);
+            let prestaged = prestages.last().and_then(Option::as_ref);
+            let staged = match checked {
                 Ok(staged) => staged,
                 Err(refused) => {
                     results.push(Err(refused.error));
@@ -5521,7 +5542,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 .savepoint()
                 .map_err(anyhow::Error::from)
                 .and_then(|savepoint| {
-                    self.register_in(&savepoint, &staged, prestaged.as_ref())?;
+                    self.register_in(&savepoint, &staged, prestaged)?;
                     savepoint.commit()?;
                     Ok(())
                 });
