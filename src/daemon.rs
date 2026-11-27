@@ -11267,6 +11267,9 @@ pub(crate) fn seed_new_target(
         if seeded.left > 0 {
             line.push_str(&format!(", {} left at the deadline", seeded.left));
         }
+        if seeded.sibling != crate::target_seed::SiblingDonor::None {
+            line.push_str(&format!(", checkout's donor {}", seeded.sibling.word()));
+        }
         tracing::info!("{line}");
         if let Some(env) = note {
             crate::target_seed::note_in_log_for(env, &line);

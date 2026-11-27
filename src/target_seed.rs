@@ -2180,6 +2180,129 @@ pub(crate) struct Seeded {
     pub(crate) linked: usize,
     /// Files large enough for the hash memo, for [`PlacedFile::memo_rows`].
     pub(crate) placed: Vec<PlacedFile>,
+    /// What the donor the checkout's other targets were seeded from did
+    /// for this seeding ([`sibling_donors`]).
+    pub(crate) sibling: SiblingDonor,
+}
+
+/// The file in a seeded profile naming the donor it was seeded from: its
+/// target directory, then its workspace root, one a line ([`record_donor`]).
+const SEEDED_FROM: &str = ".kache-seeded-from";
+
+/// What the donor another target of the same checkout was seeded from did
+/// for a seeding that copied units ([`ranked_donors`]), as the daemon's
+/// line says it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiblingDonor {
+    /// No other target of the checkout names one.
+    #[default]
+    None,
+    /// The units came from another target of the same checkout.
+    Sibling,
+    /// The units came from the donor a sibling was seeded from.
+    Sticky,
+    /// That donor was tried, but a build held it or it gave nothing.
+    StickyBusy,
+    /// That donor is no longer one seeding can use: gone, untracked, or
+    /// built by another compiler or Cargo home.
+    StickyGone,
+}
+
+impl SiblingDonor {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            SiblingDonor::None => "none",
+            SiblingDonor::Sibling => "sibling",
+            SiblingDonor::Sticky => "sticky",
+            SiblingDonor::StickyBusy => "sticky-busy",
+            SiblingDonor::StickyGone => "sticky-gone",
+        }
+    }
+}
+
+/// Record in the seeded `profile` the donor its units came from. A donor of
+/// the same checkout passes on the donor it recorded itself, so every
+/// target of a checkout names the one its first seeding came from.
+fn record_donor(profile: &Path, donor: &Donor, same_checkout: bool) {
+    let (target_dir, workspace_root) = same_checkout
+        .then(|| recorded_donor(&donor.target_dir.join(PROFILE)))
+        .flatten()
+        .map(|(target_dir, workspace_root, _)| (target_dir, workspace_root))
+        .unwrap_or_else(|| (donor.target_dir.clone(), donor.workspace_root.clone()));
+    let (Some(target_dir), Some(workspace_root)) = (target_dir.to_str(), workspace_root.to_str())
+    else {
+        return;
+    };
+    if target_dir.contains('\n') || workspace_root.contains('\n') {
+        return;
+    }
+    let staged = profile.join(format!("{SEEDED_FROM}.{}", std::process::id()));
+    let written = std::fs::write(&staged, format!("{target_dir}\n{workspace_root}\n"))
+        .and_then(|()| std::fs::rename(&staged, profile.join(SEEDED_FROM)));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&staged);
+        tracing::debug!(
+            "could not record the donor of {}: {error}",
+            profile.display()
+        );
+    }
+}
+
+/// The donor a seeded `profile` recorded ([`record_donor`]): its target
+/// directory, its workspace root and when it was recorded.
+fn recorded_donor(profile: &Path) -> Option<(PathBuf, PathBuf, std::time::SystemTime)> {
+    let path = profile.join(SEEDED_FROM);
+    let at = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut lines = text.lines();
+    let target_dir = PathBuf::from(lines.next().filter(|line| !line.is_empty())?);
+    let workspace_root = PathBuf::from(lines.next().unwrap_or_default());
+    Some((target_dir, workspace_root, at))
+}
+
+/// The donors the other targets of `target`'s checkout were seeded from
+/// ([`recorded_donor`]), the first recorded first: the checkout's first
+/// seeding names the donor every target of it then shares bytes with.
+/// The other targets are the tracked donors of the checkout and the
+/// targets under its `target/`, two levels down, as integrate's are.
+///
+/// A target seeded while its checkout's `target/` was building took the
+/// most recent donor of another checkout: integrate's stack folder, seeded
+/// while `target/` built the app cluster, took integrate-store's while
+/// `target/` had integrate-station's, whose registry units have other
+/// bytes. Every crate above them keyed apart, about 19 compiles a landing.
+fn sibling_donors(target: &NewTarget, donors: &[Donor]) -> Vec<PathBuf> {
+    let ours = |dir: &Path| dir == target.target_dir || dir.starts_with(&target.target_dir);
+    let mut siblings: Vec<PathBuf> = donors
+        .iter()
+        .filter(|donor| same_checkout(donor, target) && !ours(&donor.target_dir))
+        .map(|donor| donor.target_dir.clone())
+        .collect();
+    let mut pending = vec![(target.workspace_root.join("target"), 0)];
+    while let Some((dir, depth)) = pending.pop() {
+        if ours(&dir) {
+            continue;
+        }
+        if depth < 2 {
+            pending.extend(subdirectories(&dir).into_iter().map(|sub| (sub, depth + 1)));
+        }
+        siblings.push(dir);
+    }
+    let mut recorded: Vec<(std::time::SystemTime, PathBuf)> = siblings
+        .iter()
+        .filter_map(|dir| recorded_donor(&dir.join(PROFILE)))
+        .map(|(donor, _, at)| (at, donor))
+        .filter(|(_, donor)| !ours(donor))
+        .collect();
+    recorded.sort();
+    let mut seen = BTreeSet::new();
+    recorded
+        .into_iter()
+        .map(|(_, donor)| donor)
+        .filter(|donor| seen.insert(donor.clone()))
+        .collect()
 }
 
 /// Editor and check targets reuse only the same lane in another checkout.
@@ -2263,10 +2386,13 @@ pub(crate) fn seed_for_lane(
         return Seeded::default();
     }
     let checked = mode == WorkspaceUnits::Checked;
+    let sticky = sibling_donors(target, donors);
+    let mut sticky_tried = false;
     for (tried, (donor, layout, read)) in ranked_donors(
         target,
         rustc_version,
         donors,
+        &sticky,
         &registry,
         &both,
         checked,
@@ -2282,6 +2408,8 @@ pub(crate) fn seed_for_lane(
             break;
         }
         let same_checkout = same_checkout(donor, target);
+        let is_sticky = !same_checkout && sticky.contains(&donor.target_dir);
+        sticky_tried |= is_sticky;
         // Another checkout's workspace units, each checked by content.
         let cross = (!same_checkout && checked && !workspace.is_empty())
             .then(|| {
@@ -2479,12 +2607,25 @@ pub(crate) fn seed_for_lane(
         });
         let copied = copied.into_inner();
         if copied > 0 {
+            record_donor(&to, donor, same_checkout);
+            let sibling = if same_checkout {
+                SiblingDonor::Sibling
+            } else if is_sticky {
+                SiblingDonor::Sticky
+            } else if sticky.is_empty() {
+                SiblingDonor::None
+            } else if sticky_tried {
+                SiblingDonor::StickyBusy
+            } else {
+                SiblingDonor::StickyGone
+            };
             return Seeded {
                 units: copied,
                 donor: Some(donor.workspace_root.clone()),
                 left: units.len().saturating_sub(next.into_inner()),
                 linked: files.linked.into_inner(),
                 placed: files.placed.into_inner().unwrap_or_default(),
+                sibling,
             };
         }
     }
@@ -2566,10 +2707,12 @@ const RANKED_DONORS: usize = 8;
 
 /// The donors that can give `target` units, in the order seeding tries them:
 /// of the [`RANKED_DONORS`] most recently used, those of `target`'s own
-/// checkout first, then the others, each group the one that can give the
-/// most first (the more recent of two that give as many), then every other
-/// in order of use. A build gets every unit of `packages` a donor holds; a
-/// check (`check_lane`) only those [`check_units`] counts.
+/// checkout first, then the donors its other targets were seeded from
+/// (`sticky`, [`sibling_donors`]), however long ago they were used, then
+/// the others, each ranked group the one that can give the most first (the
+/// more recent of two that give as many), then every other in order of use.
+/// A build gets every unit of `packages` a donor holds; a check
+/// (`check_lane`) only those [`check_units`] counts.
 ///
 /// The checkout used last may have built a small part of the workspace: a
 /// `cargo xtask` command builds the dependencies of one crate, 361 units of
@@ -2588,13 +2731,14 @@ fn ranked_donors<'a>(
     target: &'a NewTarget,
     rustc_version: &'a str,
     donors: &'a [Donor],
+    sticky: &'a [PathBuf],
     registry: &'a BTreeSet<String>,
     both: &'a BTreeSet<String>,
     checked: bool,
     check_lane: bool,
     until: Instant,
 ) -> impl Iterator<Item = (&'a Donor, Layout, Option<CheckRead>)> + 'a {
-    let mut usable = donors.iter().filter_map(move |donor| {
+    let usable_one = move |donor: &'a Donor| {
         if donor.target_dir == target.target_dir
             || seed_lane(&donor.target_dir) != seed_lane(&target.target_dir)
             || !donor_built_by(donor, rustc_version)
@@ -2609,11 +2753,22 @@ fn ranked_donors<'a>(
             return None;
         }
         layout(&donor.target_dir.join(PROFILE)).map(|layout| (donor, layout))
-    });
+    };
+    let mut usable = donors.iter().filter_map(usable_one);
     let (own, others): (Vec<_>, Vec<_>) = usable
         .by_ref()
         .take(RANKED_DONORS)
         .partition(|(donor, _)| same_checkout(donor, target));
+    // The checkout's own donors come first already.
+    let is_sticky =
+        move |donor: &Donor| !same_checkout(donor, target) && sticky.contains(&donor.target_dir);
+    let recorded: Vec<_> = sticky
+        .iter()
+        .filter_map(|dir| donors.iter().find(|donor| &donor.target_dir == dir))
+        .filter(|donor| is_sticky(donor))
+        .filter_map(usable_one)
+        .map(|(donor, layout)| (donor, layout, None))
+        .collect();
     let rank = move |candidates: Vec<(&'a Donor, Layout)>| {
         rank_by_units(
             target, candidates, registry, both, checked, check_lane, until,
@@ -2621,8 +2776,20 @@ fn ranked_donors<'a>(
     };
     rank(own)
         .into_iter()
-        .chain(std::iter::once(others).flat_map(rank))
-        .chain(usable.map(|(donor, layout)| (donor, layout, None)))
+        .chain(recorded)
+        .chain(std::iter::once(others).flat_map(move |others| {
+            rank(
+                others
+                    .into_iter()
+                    .filter(|(donor, _)| !is_sticky(donor))
+                    .collect(),
+            )
+        }))
+        .chain(
+            usable
+                .filter(move |(donor, _)| !is_sticky(donor))
+                .map(|(donor, layout)| (donor, layout, None)),
+        )
 }
 
 /// `candidates`, the one that can give the most first, stable: equals keep
@@ -3933,6 +4100,141 @@ source = "git+https://example.com/gitdep#abc"
         );
     }
 
+    /// Donors for the sibling tests: `first`, used before, whose `dep` has
+    /// other bytes than `recent`'s, used last, which holds more units; a
+    /// store holding both; and checkout `w`'s `target/` seeded from `first`,
+    /// tracked as a donor.
+    fn sibling_fixture(root: &Path) -> (Donor, Donor, tempfile::TempDir, NewTarget, Donor) {
+        let first = donor(root, "first", Layout::Shared);
+        let deps = first.target_dir.join(PROFILE).join("deps");
+        write(&deps.join(format!("libdep-{HASH}.rlib")), "rlib-first");
+        let recent = donor(root, "recent", Layout::Shared);
+        let profile = recent.target_dir.join(PROFILE);
+        write(
+            &profile
+                .join(".fingerprint")
+                .join(format!("gitdep-{OTHER}"))
+                .join("lib"),
+            "fp",
+        );
+        write(
+            &profile.join("deps").join(format!("libgitdep-{OTHER}.rlib")),
+            "rlib",
+        );
+        let cache = tempfile::tempdir().unwrap();
+        cache_storing(cache.path(), &["rlib", "rlib-first"]);
+        let own = checkout(root, "w");
+        let seeded = seed(
+            &own,
+            VERSION,
+            std::slice::from_ref(&first),
+            cache.path(),
+            later(),
+        );
+        assert_eq!(
+            seeded.donor,
+            Some(first.workspace_root.clone()),
+            "the fixture seeds"
+        );
+        let own_donor = Donor {
+            target_dir: own.target_dir.clone(),
+            workspace_root: own.workspace_root.clone(),
+            rustc: Some(VERSION.into()),
+        };
+        (first, recent, cache, own, own_donor)
+    }
+
+    fn stack_of(own: &NewTarget, name: &str) -> NewTarget {
+        NewTarget {
+            target_dir: own.target_dir.join(name),
+            ..own.clone()
+        }
+    }
+
+    fn seeded_dep(target: &NewTarget) -> String {
+        let rlib = target
+            .target_dir
+            .join(PROFILE)
+            .join("deps")
+            .join(format!("libdep-{HASH}.rlib"));
+        std::fs::read_to_string(rlib).unwrap()
+    }
+
+    /// A target seeded while its checkout's `target/` builds takes the donor
+    /// `target/` was seeded from, not the most recent donor of another
+    /// checkout: integrate's stack folder, seeded while `target/` built,
+    /// took other bytes of the same registry units, and every crate above
+    /// them was compiled twice. A free sibling still goes first, and passes
+    /// that donor on.
+    #[test]
+    fn a_busy_sibling_hands_its_donor_to_a_new_target_of_its_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, recent, cache, own, own_donor) = sibling_fixture(dir.path());
+        let held = try_lock(&own.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
+        // Most recently used first, as the store lists them.
+        let donors = [own_donor, recent.clone(), first.clone()];
+        let stack = stack_of(&own, "integrate-stack");
+        let seeded = seed(&stack, VERSION, &donors, cache.path(), later());
+        assert_eq!(seeded.donor, Some(first.workspace_root.clone()));
+        assert_eq!(seeded.sibling, SiblingDonor::Sticky);
+        assert_eq!(seeded_dep(&stack), "rlib-first");
+        drop(held);
+        let clippy = stack_of(&own, "integrate-clippy");
+        let seeded = seed(&clippy, VERSION, &donors, cache.path(), later());
+        assert_eq!(seeded.donor, Some(own.workspace_root.clone()));
+        assert_eq!(seeded.sibling, SiblingDonor::Sibling);
+        assert_eq!(seeded_dep(&clippy), "rlib-first");
+        let (named, _, _) = recorded_donor(&clippy.target_dir.join(PROFILE)).unwrap();
+        assert_eq!(named, first.target_dir, "a sibling passes its donor on");
+    }
+
+    /// The recorded donor is tried however long ago it was used; held by a
+    /// build or no longer tracked, seeding takes the ranked order and says so.
+    #[test]
+    fn a_recorded_donor_is_tried_wherever_it_was_used_and_skipped_when_it_cannot_give() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, recent, cache, own, own_donor) = sibling_fixture(dir.path());
+        let _held = try_lock(&own.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
+        let mut donors = vec![own_donor.clone(), recent.clone()];
+        donors.extend(
+            (0..RANKED_DONORS).map(|n| donor(dir.path(), &format!("o{n}"), Layout::Shared)),
+        );
+        donors.push(first.clone());
+        let seeded = seed(
+            &stack_of(&own, "far"),
+            VERSION,
+            &donors,
+            cache.path(),
+            later(),
+        );
+        assert_eq!(seeded.donor, Some(first.workspace_root.clone()));
+        assert_eq!(seeded.sibling, SiblingDonor::Sticky);
+
+        let first_held = try_lock(&first.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
+        let donors = [own_donor.clone(), recent.clone(), first.clone()];
+        let busy = stack_of(&own, "busy");
+        let seeded = seed(&busy, VERSION, &donors, cache.path(), later());
+        assert_eq!(seeded.donor, Some(recent.workspace_root.clone()));
+        assert_eq!(seeded.sibling, SiblingDonor::StickyBusy);
+        assert_eq!(seeded_dep(&busy), "rlib");
+        drop(first_held);
+
+        // Another checkout of the same shape, whose `first` is untracked.
+        let root = dir.path().join("untracked");
+        let (_, recent, cache, own, own_donor) = sibling_fixture(&root);
+        let _held = try_lock(&own.target_dir.join(PROFILE).join(".cargo-lock")).unwrap();
+        let donors = [own_donor, recent.clone()];
+        let seeded = seed(
+            &stack_of(&own, "gone"),
+            VERSION,
+            &donors,
+            cache.path(),
+            later(),
+        );
+        assert_eq!(seeded.donor, Some(recent.workspace_root.clone()));
+        assert_eq!(seeded.sibling, SiblingDonor::StickyGone);
+    }
+
     #[test]
     fn seeds_editor_and_check_targets_only_from_the_matching_lane() {
         let dir = tempfile::tempdir().unwrap();
@@ -4326,9 +4628,10 @@ source = "git+https://example.com/gitdep#abc"
                 !marker(&to, layout, &unit("app", OTHER)).exists(),
                 "{layout:?}"
             );
+            // The lock and the donor's record are the seeding's own.
             let copied: Vec<_> = walk(&to)
                 .into_iter()
-                .filter(|file| !file.ends_with(".cargo-lock"))
+                .filter(|file| !file.ends_with(".cargo-lock") && !file.ends_with(SEEDED_FROM))
                 .collect();
             // Not the registry unit's compiler dep-info (`deps/*.d`).
             let expected = match layout {
@@ -6944,6 +7247,7 @@ source = "git+https://example.com/gitdep#abc"
             &new,
             VERSION,
             &donors,
+            &[],
             &registry,
             &both,
             true,
