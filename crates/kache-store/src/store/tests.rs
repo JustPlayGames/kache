@@ -6508,7 +6508,7 @@ fn every_upload_spool_of_the_store_pins_its_entries_against_eviction() {
     let size = store.evict().unwrap();
     assert!(size.entries_pinned >= 1);
     assert!(store.contains(&key));
-    let pressure = store.evict_for_disk_pressure(|| false).unwrap();
+    let pressure = store.evict_for_disk_pressure(|_| false).unwrap();
     assert!(pressure.entries_pinned >= 1);
     assert!(store.contains(&key));
 
