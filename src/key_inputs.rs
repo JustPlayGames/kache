@@ -258,6 +258,7 @@ fn link_search_inputs(
 ) -> Vec<String> {
     const KNOWN_L_KINDS: [&str; 5] = ["dependency", "crate", "native", "framework", "all"];
     let out_dir = env.var_os("OUT_DIR");
+    let unit_target_dir = args.target_dir();
     let mut values = Vec::new();
     for spec in &args.link_search {
         let (kind, path) = match spec.split_once('=') {
@@ -274,7 +275,8 @@ fn link_search_inputs(
             values.push(text_from_os_key_bytes(&identity));
             continue;
         }
-        let normalized = path_normalizer.normalize(path);
+        let normalized = cache_key::unit_target_search_path(unit_target_dir.as_deref(), path)
+            .unwrap_or_else(|| path_normalizer.normalize(path));
         values.push(match kind {
             Some(kind) => format!("{kind}={normalized}"),
             None => normalized,
@@ -515,7 +517,7 @@ mod tests {
             inputs.link_search,
             vec![
                 relative,
-                native.display().to_string(),
+                "<UNIT_TARGET>/debug/build/pkg/out/lib".to_string(),
                 "framework=Frameworks".to_string(),
                 "native=other/lib".to_string(),
                 "all=search".to_string(),
@@ -539,6 +541,45 @@ mod tests {
             None,
         );
         assert_eq!(configured.link_search, vec!["<BASE_DIR_0>".to_string()]);
+    }
+
+    /// A build script's OUT_DIR of another unit, under this unit's target
+    /// folder, is printed as the key hashes it: `<UNIT_TARGET>/...`. One unit
+    /// built in `target/` and in `target/integrate-stack` then shows no
+    /// `link_search` difference in `kache key diff`, as its keys have none.
+    #[test]
+    fn a_dependencys_native_dir_reads_alike_in_two_target_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let env = fixture_env(root.path(), &[]);
+        let documents: Vec<Value> = ["target", "target/integrate-stack"]
+            .iter()
+            .map(|folder| {
+                let target = root.path().join(folder);
+                let native = target.join("debug/build/ring-1/out");
+                std::fs::create_dir_all(&native).unwrap();
+                std::fs::create_dir_all(target.join("debug/deps")).unwrap();
+                let inputs = sample(
+                    &env,
+                    &PathNormalizer::empty(),
+                    &[
+                        "rustc",
+                        "--crate-name=demo",
+                        "--crate-type=lib",
+                        "--out-dir",
+                        target.join("debug/deps").to_str().unwrap(),
+                        "-L",
+                        &format!("native={}", native.display()),
+                    ],
+                    None,
+                );
+                assert_eq!(
+                    inputs.link_search,
+                    vec!["native=<UNIT_TARGET>/debug/build/ring-1/out".to_string()]
+                );
+                value(&inputs)
+            })
+            .collect();
+        assert!(diff_key_input_documents(&documents[0], &documents[1]).is_empty());
     }
 
     #[test]
@@ -779,11 +820,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(
-            retargeted.link_search[0].starts_with("<TARGET>"),
-            "{}",
-            retargeted.link_search[0]
-        );
+        // A search path under the unit's own target folder reads as the key
+        // hashes it, wherever that folder is.
+        assert_eq!(retargeted.link_search[0], "<UNIT_TARGET>/native");
     }
 
     #[test]

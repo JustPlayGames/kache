@@ -2917,6 +2917,25 @@ pub(crate) fn out_dir_native_search_identity(
     Some(env_os_key_bytes(rest.as_os_str()))
 }
 
+/// A `-L` search path under the unit's own target folder `dir`, as the key
+/// hashes it: `<UNIT_TARGET>/<rest>` with `/` separators, so one unit built in
+/// two target folders of one checkout (`target/`, `target/integrate-stack`)
+/// keys alike. `None` when the path is outside `dir` or resolves out of it;
+/// the caller then normalizes the whole path. `kache key explain` and `key
+/// diff` print the same string (key_inputs.rs).
+pub(crate) fn unit_target_search_path(dir: Option<&Path>, path: &str) -> Option<String> {
+    let dir = dir?;
+    let rest = Path::new(path).strip_prefix(dir).ok()?;
+    if !resolves_inside(Path::new(path), dir) {
+        return None;
+    }
+    Some(if cfg!(windows) {
+        format!("<UNIT_TARGET>/{}", rest.to_string_lossy().replace('\\', "/"))
+    } else {
+        format!("<UNIT_TARGET>/{}", rest.to_string_lossy())
+    })
+}
+
 /// Whether `path`, lexically under the unit's target folder `dir`, stays
 /// inside it once resolved, so `-L` may name it `<UNIT_TARGET>/...` without
 /// the folder's name. One that leaves it (a symlink, a `..`) names files no
@@ -6244,17 +6263,8 @@ fn compute_key_into(
             );
             continue;
         }
-        let normalized = match unit_target_dir.as_deref().and_then(|dir| {
-            let rest = Path::new(path).strip_prefix(dir).ok()?;
-            resolves_inside(Path::new(path), dir).then_some(rest)
-        }) {
-            Some(rest) if cfg!(windows) => format!(
-                "<UNIT_TARGET>/{}",
-                rest.to_string_lossy().replace('\\', "/")
-            ),
-            Some(rest) => format!("<UNIT_TARGET>/{}", rest.to_string_lossy()),
-            None => path_normalizer.normalize(path),
-        };
+        let normalized = unit_target_search_path(unit_target_dir.as_deref(), path)
+            .unwrap_or_else(|| path_normalizer.normalize(path));
         hasher.update(b"link_search:");
         if let Some(k) = kind {
             hasher.update(k.as_bytes());
