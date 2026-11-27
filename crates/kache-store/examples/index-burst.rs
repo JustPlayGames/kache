@@ -229,6 +229,7 @@ fn main() -> Result<()> {
                         mtime_ns: stamp,
                         ctime_ns: stamp,
                         inode: 1_000_000 + index as i64,
+                        refs_id: None,
                     };
                     let found = if let Some(own) = &own {
                         own.file_hash_cache().get(&fp)?

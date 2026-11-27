@@ -1611,6 +1611,7 @@ fn placed_file(
         mtime_ns: kache_store::file_hash::metadata_mtime_ns(metadata),
         ctime_ns: kache_store::file_hash::metadata_ctime_ns(metadata),
         inode: kache_store::file_hash::metadata_inode(metadata),
+        refs_id: None,
     };
     let hash = learned
         .lock()
@@ -5132,6 +5133,7 @@ source = "git+https://example.com/gitdep#abc"
                             cache_dir: cache.path(),
                             excluded: &[],
                             outside: &outside,
+                            scoped_value: &|_, _| None,
                             max_entries: 100,
                         },
                     )

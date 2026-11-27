@@ -1109,6 +1109,34 @@ fn hermetic_build_scripts_are_off_by_default_and_obey_env_precedence() {
 }
 
 #[test]
+fn image_sharing_requires_an_explicit_digest_and_respects_ignore_env() {
+    let _lock = config_path_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let _config = set_kache_config_for_test(&path);
+    let _unset = NamedEnvGuard::remove("KACHE_BUILD_SCRIPT_IMAGE");
+    assert_eq!(Config::load().unwrap().build_script_image, None);
+    let first = format!("sha256:{}", "a".repeat(64));
+    let second = format!("sha256:{}", "0".repeat(64));
+    for (ignore, expected) in [(false, &second), (true, &first)] {
+        std::fs::write(
+            &path,
+            format!("[cache]\nignore_env={ignore}\nbuild_script_image='{first}'\n"),
+        )
+        .unwrap();
+        let _env = NamedEnvGuard::set("KACHE_BUILD_SCRIPT_IMAGE", &second);
+        assert_eq!(
+            Config::load().unwrap().build_script_image.as_ref(),
+            Some(expected)
+        );
+    }
+    for bad in ["latest", "sha256:aa", &format!("sha256:{}", "F".repeat(64))] {
+        std::fs::write(&path, format!("[cache]\nbuild_script_image='{bad}'\n")).unwrap();
+        assert!(Config::load().is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn unused_unit_cleanup_defaults_to_thirty_days() {
     let _lock = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
@@ -1303,6 +1331,7 @@ fn remote_key_listing_defaults_to_on_only_for_a_filesystem_remote() {
         restore_max_size: crate::config::DEFAULT_RESTORE_MAX_SIZE,
         prefix: "artifacts".to_string(),
         backend: RemoteBackendConfig::S3(S3RemoteConfig {
+            pull_request_bucket: None,
             bucket: "bucket".to_string(),
             endpoint: None,
             region: "us-east-1".to_string(),
@@ -1325,7 +1354,9 @@ fn remote_key_listing_is_off_unless_the_file_or_env_turns_it_on() {
     std::fs::write(&config_path, "[cache]\n").unwrap();
     {
         let _listing = NamedEnvGuard::remove("KACHE_REMOTE_KEY_LISTING");
-        assert!(!Config::load().unwrap().remote_key_listing);
+        let config = Config::load().unwrap();
+        assert!(!config.remote_key_listing);
+        assert!(!config.prefetch_catalog_head);
     }
 
     std::fs::write(&config_path, "[cache]\nremote_key_listing = true\n").unwrap();
@@ -1338,7 +1369,12 @@ fn remote_key_listing_is_off_unless_the_file_or_env_turns_it_on() {
         assert!(!Config::load().unwrap().remote_key_listing);
     }
 
-    std::fs::write(&config_path, "[cache]\nremote_key_listing = false\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "[cache]\nremote_key_listing = false\nprefetch_catalog_head = true\n",
+    )
+    .unwrap();
+    assert!(Config::load().unwrap().prefetch_catalog_head);
     {
         let _listing = NamedEnvGuard::set("KACHE_REMOTE_KEY_LISTING", "1");
         assert!(Config::load().unwrap().remote_key_listing);
@@ -2566,7 +2602,11 @@ fn every_env_var_config_reads_maps_to_a_config_key() {
     let remote: Vec<&str> = ENV_FILE_KEYS
         .iter()
         .filter(|(var, key)| {
-            key.starts_with("cache.remote.") && *var != "KACHE_PULL_REQUEST_PREFIX"
+            key.starts_with("cache.remote.")
+                && !matches!(
+                    *var,
+                    "KACHE_PULL_REQUEST_PREFIX" | "KACHE_PULL_REQUEST_BUCKET"
+                )
         })
         .map(|(var, _)| *var)
         .collect();
@@ -3504,6 +3544,7 @@ fn test_file_config_roundtrip() {
             auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
+            build_script_image: None,
             build_script_omit_cargo_source_dir_mtime: None,
             build_script_out_dir_max_size: None,
             gc_evict_shared: None,
@@ -3542,6 +3583,7 @@ fn test_file_config_roundtrip() {
             s3_concurrency: Some(8),
             prefetch_enabled: None,
             remote_key_listing: None,
+            prefetch_catalog_head: None,
             remote_key_cache_refresh_secs: None,
             prefetch_max_keys: None,
             prefetch_max_bytes: None,
@@ -3569,6 +3611,7 @@ fn test_file_config_roundtrip() {
                 path: None,
                 atomic_write_dir: None,
                 pull_request_prefix: None,
+                pull_request_bucket: None,
                 repository: None,
                 insecure: None,
             }),
@@ -4281,6 +4324,7 @@ fn test_config_store_dir() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -4322,6 +4366,7 @@ fn test_config_store_dir() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -4391,6 +4436,7 @@ fn test_config_index_db_path() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -4432,6 +4478,7 @@ fn test_config_index_db_path() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -4497,6 +4544,7 @@ fn test_config_event_log_path() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -4538,6 +4586,7 @@ fn test_config_event_log_path() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -4670,6 +4719,7 @@ fn test_config_socket_path() {
         auto_clean_superseded_executables: 0,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: crate::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -4711,6 +4761,7 @@ fn test_config_socket_path() {
         s3_concurrency: 16,
         prefetch_enabled: DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: DEFAULT_PREFETCH_MAX_BYTES,
@@ -5518,6 +5569,7 @@ fn test_save_and_load_file_config() {
             auto_clean_superseded_executables: None,
             seed_new_targets: None,
             build_script_hermetic: None,
+            build_script_image: None,
             build_script_omit_cargo_source_dir_mtime: None,
             build_script_out_dir_max_size: None,
             gc_evict_shared: None,
@@ -5556,6 +5608,7 @@ fn test_save_and_load_file_config() {
             s3_concurrency: None,
             prefetch_enabled: None,
             remote_key_listing: None,
+            prefetch_catalog_head: None,
             remote_key_cache_refresh_secs: None,
             prefetch_max_keys: None,
             prefetch_max_bytes: None,
@@ -7101,6 +7154,29 @@ fn oci_remote_rejects_mixed_backend_fields_and_round_trips_toml() {
 }
 
 #[test]
+fn separate_buckets_must_have_distinct_plain_names() {
+    for name in ["abc", "a.b", "artifacts-2", &"a".repeat(63)] {
+        assert!(valid_isolated_bucket(name), "{name}");
+    }
+    for name in [
+        "",
+        "ab",
+        ".abc",
+        "abc.",
+        "-abc",
+        "abc-",
+        "a..b",
+        "a_b",
+        "a@b",
+        "aBc",
+        "a/b",
+        &"a".repeat(64),
+    ] {
+        assert!(!valid_isolated_bucket(name), "{name}");
+    }
+}
+
+#[test]
 fn a_pull_request_prefix_must_stay_clear_of_the_base_prefix() {
     assert_eq!(pull_request_prefix_for("artifacts", "  ").unwrap(), None);
     assert_eq!(
@@ -7123,6 +7199,15 @@ fn a_pull_request_prefix_must_stay_clear_of_the_base_prefix() {
 }
 
 fn load_in_ci(event: &str, protected: &str, remote_toml: &str) -> Config {
+    load_in_ci_with_pr_bucket(event, protected, remote_toml, None)
+}
+
+fn load_in_ci_with_pr_bucket(
+    event: &str,
+    protected: &str,
+    remote_toml: &str,
+    bucket: Option<&str>,
+) -> Config {
     let _guard = config_path_lock();
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("kache/config.toml");
@@ -7136,6 +7221,10 @@ fn load_in_ci(event: &str, protected: &str, remote_toml: &str) -> Config {
     let _gitlab = NamedEnvGuard::remove("GITLAB_CI");
     let _explicit = NamedEnvGuard::remove("KACHE_REMOTE_READONLY");
     let _prefix_env = NamedEnvGuard::remove("KACHE_PULL_REQUEST_PREFIX");
+    let _pr_bucket = match bucket {
+        Some(name) => NamedEnvGuard::set("KACHE_PULL_REQUEST_BUCKET", name),
+        None => NamedEnvGuard::remove("KACHE_PULL_REQUEST_BUCKET"),
+    };
     let _bucket = NamedEnvGuard::remove("KACHE_S3_BUCKET");
     let _s3_prefix = NamedEnvGuard::remove("KACHE_S3_PREFIX");
     Config::load().unwrap()
@@ -7148,6 +7237,37 @@ fn a_pull_request_job_with_its_own_prefix_may_write_there() {
     let config = load_in_ci("pull_request", "false", with_prefix);
     assert_eq!(config.pull_request_prefix.as_deref(), Some("artifacts-pr"));
     assert!(!config.remote_readonly);
+
+    let separate = "[cache.remote]\ntype='s3'\nbucket='base-store'\nprefix='artifacts'\npull_request_bucket='pr-store'\npull_request_prefix='artifacts'";
+    let overridden =
+        load_in_ci_with_pr_bucket("pull_request", "false", separate, Some("ci-bucket"));
+    assert!(
+        matches!(overridden.require_remote().unwrap().backend, RemoteBackendConfig::S3(ref s3) if s3.pull_request_bucket.as_deref() == Some("ci-bucket"))
+    );
+    let filesystem = "[cache.remote]\npath='/tmp/store'\npull_request_prefix='cache'";
+    let invalid = load_in_ci_with_pr_bucket("pull_request", "false", filesystem, Some("ci-bucket"));
+    assert!(invalid.require_remote().is_err());
+    let pr = load_in_ci("pull_request", "false", separate);
+    assert_eq!(pr.pull_request_prefix.as_deref(), Some("artifacts"));
+    assert!(!pr.remote_readonly);
+    assert_ne!(
+        pr.pull_request_scope(),
+        load_in_ci(
+            "pull_request",
+            "false",
+            &separate.replace("pr-store", "other-pr-store")
+        )
+        .pull_request_scope()
+    );
+    let trusted = load_in_ci("push", "true", separate);
+    assert!(trusted.pull_request_prefix.is_none());
+    assert!(
+        matches!(trusted.remote.unwrap().backend, RemoteBackendConfig::S3(s3) if s3.pull_request_bucket.is_none())
+    );
+    for bad in ["base-store", "BASE-STORE", "foo/../base-store"] {
+        let pr = load_in_ci("pull_request", "false", &separate.replace("pr-store", bad));
+        assert!(pr.require_remote().is_err(), "{bad}");
+    }
 
     let without = "[cache.remote]\ntype = \"s3\"\nbucket = \"b\"\nprefix = \"artifacts\"\n";
     let config = load_in_ci("pull_request", "false", without);

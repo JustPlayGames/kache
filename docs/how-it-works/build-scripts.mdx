@@ -181,6 +181,8 @@ generated libraries under `OUT_DIR` when possible. Hermetic runs that name
 external link inputs use the regular run cache instead. Older run and hermetic
 entries use separate keys and cannot bypass these checks.
 
+Workers with the same pinned native environment can [share eligible runs through sync](/docs/remote-cache/sync#share-build-script-runs-within-an-image). Build-script execution records otherwise stay local.
+
 Existing launchers keep their pinned engine after an upgrade. Stop builds and
 programs using the target, then run `kache doctor --repair-build-scripts target`
 to refresh those launchers with the upgraded engine.
@@ -265,6 +267,7 @@ and keys:
   key. A path under the Cargo home's `registry` or `git` directory counts by
   name only, since Cargo treats those as immutable;
 - each `cargo:rerun-if-env-changed` variable, by its exact value or as unset.
+  A [crate-scoped path-only variable](/docs/getting-started/configuration#cache-key-controls) can share a declared path across checkouts.
   A variable Cargo itself sets on the rustc command, such as `OUT_DIR`,
   `CARGO_MANIFEST_DIR` or `CARGO_PKG_VERSION`, counts by name only. A variable
   whose name ends in `_OUT_DIR` counts by name only when it holds another
@@ -363,8 +366,15 @@ The regular cache cannot check for such values.
   run without a digest, sends the build through the regular build-script cache.
   `rustc-link-search` lines are replayed with Cargo's own `OUT_DIR`, so
   `cargo run` and `cargo test` still find libraries there.
-- The first run of a script records what it declares, so hermetic runs start
-  with the second.
+- A compiler can execute a proc macro re-exported by a Rust library. Kache
+  records which local libraries were built without macro dependencies and
+  checks their file identities before allowing a consumer to use sealed
+  outputs. A unit that can run a macro, or whose dependencies lack this
+  evidence, keeps a writable target directory. Kache runs its compiler to
+  recreate any files the macro produces.
+- When upgrading an existing store, a fresh target can build immediately. If
+  a macro consumer's target already links to a sealed run, Kache asks you to
+  run `cargo clean -p <package>` and rebuild before executing that macro.
 
 Registry and Git dependencies live under the Cargo home, so their keys match
 across worktrees. A workspace member's manifest directory is part of its key,

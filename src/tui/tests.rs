@@ -145,6 +145,7 @@ fn test_config() -> Config {
         target_liveness: false,
         seed_new_targets: false,
         build_script_hermetic: false,
+        build_script_image: None,
         build_script_omit_cargo_source_dir_mtime: false,
         build_script_out_dir_max_size: kache_config::config::DEFAULT_BUILD_SCRIPT_OUT_DIR_MAX_SIZE,
         gc_evict_shared: false,
@@ -185,6 +186,7 @@ fn test_config() -> Config {
         s3_concurrency: 16,
         prefetch_enabled: crate::config::DEFAULT_PREFETCH_ENABLED,
         remote_key_listing: false,
+        prefetch_catalog_head: false,
         remote_key_cache_refresh_secs: crate::config::DEFAULT_REMOTE_KEY_CACHE_REFRESH_SECS,
         prefetch_max_keys: crate::config::DEFAULT_PREFETCH_MAX_KEYS,
         prefetch_max_bytes: crate::config::DEFAULT_PREFETCH_MAX_BYTES,
@@ -592,9 +594,12 @@ fn lookup_series_buckets_by_time_and_keeps_idle_time_flat() {
         at(290, EventResult::PrefetchHit),
         at(290, EventResult::Passthrough),
         at(400, EventResult::LocalHit),
+        at(300, EventResult::Passthrough),
+        at(-5, EventResult::Passthrough),
         at(-5, EventResult::LocalHit),
     ];
-    let (hits, misses) = lookup_series(&events, now, window, 3);
+    let (hits, misses, passthroughs) = lookup_series(&events, now, window, 3);
+    assert_eq!(passthroughs, 1);
     assert_eq!(
         hits,
         vec![1, 0, 2],
@@ -605,7 +610,7 @@ fn lookup_series_buckets_by_time_and_keeps_idle_time_flat() {
         vec![1, 1, 1],
         "keyed declined stores and dups count as misses"
     );
-    assert_eq!(lookup_series(&events, now, window, 0), (vec![], vec![]));
+    assert_eq!(lookup_series(&events, now, window, 0), (vec![], vec![], 0));
 }
 
 #[test]
@@ -1970,7 +1975,7 @@ fn lookup_series_counts_an_event_from_this_instant_in_the_newest_column() {
     let now = jiff::Timestamp::now();
     let mut event = sample_build_event("x", EventResult::LocalHit, 1, 1);
     event.ts = now;
-    let (hits, misses) = lookup_series(&[event], now, Duration::from_secs(300), 4);
+    let (hits, misses, _) = lookup_series(&[event], now, Duration::from_secs(300), 4);
     assert_eq!(hits, vec![0, 0, 0, 1]);
     assert_eq!(misses, vec![0; 4]);
 }
@@ -2013,6 +2018,11 @@ fn sparkline_labels_its_axis_and_says_when_nothing_happened() {
         "{screen}"
     );
     assert!(screen.contains("no lookups in the last 5m"), "{screen}");
+
+    s.events = vec![sample_build_event("probe", EventResult::Passthrough, 1, 1); 2];
+    let screen = rendered_sparkline(&s, 80, 5);
+    assert!(screen.contains("no lookups · passthroughs: 2"), "{screen}");
+    assert!(screen.contains("hit    0") && screen.contains("miss   0"));
 
     // Only misses: the idle note goes away (hits + misses, not a product).
     s.events = vec![sample_build_event("a", EventResult::Miss, 1, 1)];

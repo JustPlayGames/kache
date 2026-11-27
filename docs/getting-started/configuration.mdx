@@ -250,9 +250,10 @@ Cargo rejects two `cfg` runners that both match a target, so if the project alre
 What a scheduled test binary does:
 
 - It takes slots from the top of the pool. A quarter of the pool, at least one slot, is kept for compiles, so tests never lock a build out.
-- With no thread count set, it takes every free test slot, at least one, and runs with `RUST_TEST_THREADS` set to the number it holds. The reserve stays free even when nothing else runs, so a lone `cargo test` gets fewer threads than without the runner: 12 on 16 CPUs, 3 on 4, 1 on 2. With `--test-threads` or `RUST_TEST_THREADS`, it takes that many slots and the setting is left alone. Under nextest's process-per-test mode, each test takes one slot.
+- With no thread count set, it takes every free test slot, at least one, and runs with `RUST_TEST_THREADS` set to that initial count. The reserve stays free even when nothing else runs, so a lone `cargo test` gets fewer threads than without the runner: 12 on 16 CPUs, 3 on 4, 1 on 2. With `--test-threads` or `RUST_TEST_THREADS`, it takes that many slots and the setting is left alone. Under nextest's process-per-test mode, each test takes one slot.
+- On Linux and macOS, the default runner can return spare slots after five seconds of low CPU use. It keeps enough slots for the recorded memory usage. The original thread count stays in effect if the binary gets busy again. Explicit thread counts and nextest reservations keep their slots until the process exits.
 - On Unix, Kache records the binary's peak memory. A binary that used more than 512 MiB takes at least one slot per 512 MiB on its next run. Under nextest's process-per-test mode it records each test's peak instead, so a heavy test does not raise the others.
-- It waits up to 30 minutes for slots, then runs without them. Under nextest the wait is 2 minutes, because nextest counts it toward the test's timeouts.
+- After 10 seconds waiting for slots, the runner reports which test binaries hold them and how many slots compiles hold. It waits up to 30 minutes for slots, then runs without them. Under nextest the wait is 2 minutes, because nextest counts it toward the test's timeouts.
 - Builds and test binaries started inside a test count against that test's slots and do not wait for slots of their own. A nested `cargo build` can therefore run more compiles at once than its test holds slots.
 - While tests hold slots, a compile that has waited asks for no more slots than the tests leave free, and never fewer than the reserve. A test that waits on a build therefore cannot block that build.
 - Exit codes, signals, stdin and Ctrl-C behave as if the binary ran directly. The runner writes nothing to stdout.
@@ -546,7 +547,7 @@ Missing, changed or incomplete evidence keeps the units. Unsupported layouts, sy
 | `KACHE_CACHE_CC_LINKS` | `cache.cache_cc_links` | `false` | Opt into caching eligible C/C++ links with explicit file inputs and their sidecars. Links using named libraries (`-l`, `--library`) or response files pass through. |
 | `KACHE_TRUST_CODEGEN_BACKENDS` | `cache.trust_codegen_backends` | `false` | Cache rustc compiles that load a codegen backend dylib (`-Zcodegen-backend=<path>`), keyed by the dylib's contents. The backend must be passed as a path, and libraries it loads at run time are not part of the key. Off because a backend can write files rustc does not report, and a cache hit would not restore them. |
 | `KACHE_CLEAN_INCREMENTAL` | `cache.clean_incremental` | `true` | Remove tracked incremental directories during cleanup |
-| `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Give isolated incremental state to a workspace member or path dependency whose sources or dependencies changed since its last build in the same target, whether or not the command selects it. A pull or a branch switch counts. Kache skips the cache for up to eight builds of such a unit, each within 15 minutes of the last, and neither stores nor uploads them. A compile error keeps the state. See [Executables and incremental builds](/docs/getting-started/quick-start#executables-and-incremental-builds). |
+| `KACHE_ADAPTIVE_INCREMENTAL` | `cache.adaptive_incremental` | `true` | Give isolated incremental state to a workspace member or path dependency whose sources or dependencies changed since its last build in the same target, whether or not the command selects it. A pull or a branch switch counts. Kache can skip the cache for up to eight builds of such a unit, each within 15 minutes of the last. It checks sooner if the sources return to their last recorded cached contents. Private incremental outputs stay local. A compile error keeps the state. See [Executables and incremental builds](/docs/getting-started/quick-start#executables-and-incremental-builds). |
 | `KACHE_SEED_INCREMENTAL` | `cache.seed_incremental` | `true` | Import compatible local incremental state between worktrees on rustc 1.98 or later. Private compilations use an unstable cwd-remapping flag; stable and beta children receive restricted bootstrap permission. Set `0` or `false` to opt out. See [incremental seeds between worktrees](/docs/getting-started/mutation-testing#incremental-seeds-between-worktrees). |
 | `KACHE_PRESERVE_INCREMENTAL` | `cache.preserve_incremental` | `false` | Force eligible Cargo units onto isolated incremental state |
 | `KACHE_INCREMENTAL_CRATES` | `cache.incremental_crates` | `[]` | Force listed rustc crate names onto that incremental path, whether or not the command selects them |
@@ -557,6 +558,7 @@ Missing, changed or incomplete evidence keeps the units. Unsupported layouts, sy
 | `KACHE_MODIFIED_INPUT_GUARD` | `cache.modified_input_guard` | `false` | Do not store a Rust result when a keyed input changed at or after build start, or just before it by the margin file times can trail the clock. A compile that ran before its key, as in [misses without a record](/docs/how-it-works/cache-key#misses-without-a-record), is not stored when a source it read changed then; this option extends the check to the other inputs a key hashes and to keys taken before the compile. A keyed input whose size, write time or inode differs after the compile from what the key read also leaves the result unstored, which catches a save between the key and the compiler's read. A rewrite that keeps all three is missed: a second save within one tick of a coarse file clock, or on Windows, which has no inode, a replacement with the same size and write time. C/C++ and CUDA compiles always apply this check to the files their key hashes. When the key comes before such a compile, a timestamp that is in the future when Kache reads the file counts as clock skew, not a change. |
 | `KACHE_INPUT_PREDICTIONS` | `cache.input_predictions` | `true` | Remember each crate's source closure and derive the next key from it, skipping the dep-info pre-pass when every recorded input still checks out |
 | `KACHE_VERIFY_INPUT_PREDICTIONS` | none | off | `sampled` or `always`: also run the dep-info pre-pass for a validated prediction and count disagreements in the report. The pre-pass result is the one used |
+| `KACHE_BUILD_SCRIPT_IMAGE` | `cache.build_script_image` | unset | Share eligible build-script runs through sync between trusted workers on the same immutable image. Set its `sha256:` digest. See [Sync](/docs/remote-cache/sync#share-build-script-runs-within-an-image). |
 | `KACHE_BUILD_SCRIPT_HERMETIC` | `cache.build_script_hermetic` | `false` | On Unix, run cached build scripts with `OUT_DIR` in a shared directory named by their inputs, so a run is shared across target directories. See [Build scripts](/docs/how-it-works/build-scripts). |
 | `KACHE_BUILD_SCRIPT_OMIT_CARGO_SOURCE_DIR_MTIME` | `cache.build_script_omit_cargo_source_dir_mtime` | `false` | Omit directory timestamps for declared inputs resolved inside this Cargo home's `registry/src` or `git/checkouts`. Enable only when scripts do not read those timestamps; Kache cannot detect that read. File contents/times and symlink referent times remain keyed. Applies to normal and hermetic runs. See [Build scripts](/docs/how-it-works/build-scripts). |
 | `KACHE_BUILD_SCRIPT_OUT_DIR_MAX_SIZE` | `cache.build_script_out_dir_max_size` | `5GiB` | Largest build-script output kache stores: the files in `OUT_DIR` plus the target files the script names. A larger run is not cached and runs again. Must be greater than zero. A run this large uploads to a remote only when `cache.remote_upload_memory_bytes` covers its compressed size. |
@@ -632,6 +634,15 @@ its artifacts. `CARGO_MANIFEST_DIR` is never accepted, in either form: rustc
 embeds it in crate metadata, and every crate's sources live under it, so the
 checks above would pass for a value that does change the artifact. Kache warns
 when a list names it and ignores the entry.
+
+For workspace and path packages, a scoped entry also applies to the package
+unit's key when its build script declares the variable with
+`cargo:rerun-if-env-changed`. For example, `app:DATA_DIR` lets identical
+checkouts share `app` when the script declares the files read from `DATA_DIR`
+with `cargo:rerun-if-changed`. Check that neither the crate nor its macros bake
+the literal path into the artifact. Kache normalizes a known path or the source
+of an unquoted MSVC `/pathmap:source=destination` option. Changing the
+destination or other flags still changes the key.
 
 Build scripts can also share runs when a linker wrapper lives in each
 checkout. Set `KACHE_BASE_DIR` to the checkout root and opt the tool variable
@@ -722,7 +733,8 @@ Each entry is a directory name, left out at any depth below the workspace root a
 | `KACHE_S3_USER_AGENT` | `cache.remote.user_agent` | none | Custom HTTP User-Agent |
 | none | `cache.remote.path` | none | Filesystem remote root |
 | none | `cache.remote.atomic_write_dir` | `<path>/.kache-tmp` | Same-filesystem staging directory |
-| `KACHE_PULL_REQUEST_PREFIX` | `cache.remote.pull_request_prefix` | none | In a pull request job (a GitHub `pull_request` event or a GitLab merge request pipeline), read this prefix after `prefix` and write only here. It must differ from `prefix`, and neither may contain the other. OCI remotes stay read-only. See [A prefix for pull requests](/docs/remote-cache/ci#a-prefix-for-pull-requests). |
+| `KACHE_PULL_REQUEST_PREFIX` | `cache.remote.pull_request_prefix` | none | In a pull request job (a GitHub `pull_request` event or a GitLab merge request pipeline), read this prefix after `prefix` and write only here. In a shared bucket it must differ from `prefix`, and neither may contain the other. OCI remotes stay read-only. See [A prefix for pull requests](/docs/remote-cache/ci#a-prefix-for-pull-requests). |
+| `KACHE_PULL_REQUEST_BUCKET` | `cache.remote.pull_request_bucket` | none | Separate S3 bucket for the pull request prefix. See [CI permissions](/docs/remote-cache/ci#a-prefix-for-pull-requests) for credentials. |
 | `KACHE_S3_CONCURRENCY` | `cache.s3_concurrency` | `16` | Concurrent operations for all remote backends |
 | `KACHE_S3_POOL_IDLE_SECS` | `cache.s3_pool_idle_secs` | `300` | S3 connection pool idle time |
 | `KACHE_REMOTE_RESTORE_TIMEOUT_SECS` | `cache.remote_restore_timeout_secs` | `300` | Daemon operation deadline; `0` disables this operation limit |
@@ -786,6 +798,7 @@ See [Remote cache](/docs/remote-cache/overview) for setup guides and credential 
 | --- | --- | --- | --- |
 | `KACHE_PREFETCH_ENABLED` | `cache.prefetch_enabled` | `true` | Enable speculative manifest and planner prefetch |
 | `KACHE_REMOTE_KEY_LISTING` | `cache.remote_key_listing` | `false` for S3, GCS, and OCI; `true` for a filesystem remote | List the remote's keys, for the fallback planner's key index and packed-prefetch catalogs; on S3 this needs `s3:ListBucket` |
+| none | `cache.prefetch_catalog_head` | `false` | Fetch a publisher's pack catalog pointer by exact key. See [Read published prefetch packs with GET access](/docs/remote-cache/s3-setup#read-published-prefetch-packs-with-get-access). |
 | `KACHE_REMOTE_KEY_CACHE_REFRESH_SECS` | `cache.remote_key_cache_refresh_secs` | `60` | Refresh the remote key index while listing is on; `0` means initial load only |
 | `KACHE_PREFETCH_MAX_KEYS` | `cache.prefetch_max_keys` | `2000` | Entries allowed per plan; `0` is unlimited |
 | `KACHE_PREFETCH_MAX_BYTES` | `cache.prefetch_max_bytes` | `2GiB` | Compressed bytes allowed per plan; `0` is unlimited. In-flight downloads may finish. In TOML the value is a quoted size, such as `"4GiB"` or `"0"` |

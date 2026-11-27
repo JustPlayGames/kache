@@ -1200,6 +1200,7 @@ fn walk_one_root(root: &WalkedRoot, max_entries: usize) -> StampOutcome {
                 mtime_ns: metadata_mtime_ns(metadata),
                 ctime_ns: metadata_ctime_ns(metadata),
                 inode,
+                refs_id: None,
             });
         }
     };
@@ -5119,6 +5120,7 @@ fn closure_dirs_digest(
                 mtime_ns: metadata_mtime_ns(&metadata),
                 ctime_ns: metadata_ctime_ns(&metadata),
                 inode: 0,
+                refs_id: None,
             };
             if stamp_written_since(&stamp, not_after) {
                 return None;
@@ -5185,6 +5187,7 @@ fn holds_no_file(directory: &Path, not_after: Option<i64>) -> Option<bool> {
                 mtime_ns: metadata_mtime_ns(&metadata),
                 ctime_ns: metadata_ctime_ns(&metadata),
                 inode: 0,
+                refs_id: None,
             };
             stamp_written_since(&stamp, not_after)
         })
@@ -6259,7 +6262,13 @@ fn compute_key_into(
         }
         hasher.update(normalized.as_bytes());
         hasher.update(b"\n");
-        tracing::trace!("[key:{}] link_search:{}", crate_name, normalized);
+        tracing::trace!(
+            "[key:{}] link_search:{}{}{}",
+            crate_name,
+            kind.unwrap_or(""),
+            if kind.is_some() { "=" } else { "" },
+            normalized
+        );
     }
 
     // Native libraries to link (`-l`). The name alone (machine-independent;
@@ -7879,7 +7888,7 @@ fn fold_native_link_inputs<H: KeyFold>(
             "[key:{}] native_archive:{}={} ({usage:?})",
             crate_name,
             path.display(),
-            &digest[..digest.len().min(24)]
+            digest
         );
         Ok::<_, anyhow::Error>(digest)
     };
@@ -8040,7 +8049,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                 "[key:{}] link_lib_content:{}={} ({})",
                 crate_name,
                 lib,
-                &content_hash[..content_hash.len().min(16)],
+                content_hash,
                 path.display()
             );
             archives.push(path);
@@ -8063,7 +8072,7 @@ fn fold_native_link_inputs<H: KeyFold>(
             b"link_arg_input.v1:",
             format!("{index}={digest}").as_bytes(),
         );
-        tracing::trace!("[key:{}] link_arg_input:{}", crate_name, file.display());
+        tracing::trace!("[key:{}] link_arg_input:{index}={digest}", crate_name);
     }
 
     // A `-Bstatic` in the link arguments can make the linker skip a shared
@@ -8083,7 +8092,7 @@ fn fold_native_link_inputs<H: KeyFold>(
                 b"link_arg_library.v1:",
                 format!("{index}={digest}").as_bytes(),
             );
-            tracing::trace!("[key:{}] link_arg_library:{}", crate_name, path.display());
+            tracing::trace!("[key:{}] link_arg_library:{index}={digest}", crate_name);
             archives.push(path);
         }
     }
@@ -8374,10 +8383,7 @@ fn normalize_env_dep_value_with_hasher(
     // CARGO_MANIFEST_DIR is never forceable: rustc can embed it in crate
     // metadata and generated code, so erasing it from the key can restore an
     // rlib containing another checkout's path (#167).
-    let forced = !is_manifest_dir_var(var)
-        && path_normalizer.path_only_env_vars().iter().any(|entry| {
-            matches!(entry.split_once(':'), Some((krate, v)) if krate == crate_name && v == var)
-        });
+    let forced = forced_path_only_env(path_normalizer.path_only_env_vars(), crate_name, var);
     // The checks below read the resolved form. It is the raw value, and so
     // shares its canonical path, unless resolution changed the string.
     let resolved_value = (resolved != val).then(|| EnvDepValue::new(&resolved));
@@ -8535,6 +8541,14 @@ fn env_dep_path_only_decision(
         return EnvDepNormalizationDecision::KeptAbsoluteNoIncludeProof;
     }
     env_dep_source_decision(var, paths.source_files, file_hasher)
+}
+
+/// A scoped entry asserts that this crate only uses the variable as a locator.
+pub(crate) fn forced_path_only_env(entries: &[String], crate_name: &str, var: &str) -> bool {
+    !is_manifest_dir_var(var)
+        && entries
+            .iter()
+            .any(|entry| entry.split_once(':') == Some((crate_name, var)))
 }
 
 /// Whether `var` names Cargo's manifest dir. Windows matches environment
@@ -10419,9 +10433,9 @@ impl std::fmt::Display for NativeRuntimeHashesWarming {
 impl std::error::Error for NativeRuntimeHashesWarming {}
 
 fn native_runtime_fingerprints_can_warm(files: &[FileFingerprint], observed_at: i64) -> bool {
-    files
-        .iter()
-        .all(|file| file.inode != 0 && stamp_is_settled(file, observed_at))
+    files.iter().all(|file| {
+        (file.inode != 0 || file.refs_id.is_some()) && stamp_is_settled(file, observed_at)
+    })
 }
 
 #[derive(Clone)]
@@ -10447,9 +10461,9 @@ fn may_carry_over(
     let was = &first.fingerprint;
     was.path != now.path
         && first.settled()
-        && file_hash_memo_eligible(now.inode, requires_identity)
-        && (now.size, now.mtime_ns, now.ctime_ns, now.inode)
-            == (was.size, was.mtime_ns, was.ctime_ns, was.inode)
+        && file_stamp_memo_eligible(now.inode, now.refs_id, requires_identity)
+        && (now.size, now.mtime_ns, now.ctime_ns, now.inode, now.refs_id)
+            == (was.size, was.mtime_ns, was.ctime_ns, was.inode, was.refs_id)
 }
 
 /// The Win32 spelling of an absolute `path` on a drive: `\\?\C:\a\b`,
@@ -10998,7 +11012,7 @@ impl<'db> FileHasher<'db> {
         }
         inputs.iter().all(|input| {
             let expected = &input.fingerprint;
-            expected.inode != 0
+            (expected.inode != 0 || expected.refs_id.is_some())
                 && FileFingerprint::from_path(Path::new(&expected.path))
                     .is_ok_and(|current| current == *expected)
         })
@@ -11022,7 +11036,7 @@ impl<'db> FileHasher<'db> {
                 FileFingerprint::from_path(Path::new(&expected.path)).map_or(true, |current| {
                     current.size != expected.size
                         || current.mtime_ns != expected.mtime_ns
-                        || current.inode != expected.inode
+                        || (current.inode, current.refs_id) != (expected.inode, expected.refs_id)
                 })
             })
     }
@@ -11516,7 +11530,11 @@ impl<'db> FileHasher<'db> {
             // bytes come from the content cache, and only a file differing in
             // both is read through the maps.
             if current.fingerprint == expected.fingerprint
-                && file_hash_memo_eligible(current.fingerprint.inode, cfg!(windows))
+                && file_stamp_memo_eligible(
+                    current.fingerprint.inode,
+                    current.fingerprint.refs_id,
+                    cfg!(windows),
+                )
             {
                 // Unhashed, so registered here with the bytes its stamp
                 // proves: the recheck after a compile has to cover it like
@@ -11908,7 +11926,7 @@ impl<'db> FileHasher<'db> {
                 continue;
             };
             if fingerprint.size < MIN_PERSISTED_HASH_BYTES
-                || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+                || !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows))
                 || self.prefetched.borrow().contains_key(&fingerprint)
             {
                 continue;
@@ -11919,6 +11937,7 @@ impl<'db> FileHasher<'db> {
                 mtime_ns: fingerprint.mtime_ns,
                 ctime_ns: fingerprint.ctime_ns,
                 inode: fingerprint.inode,
+                refs_id: fingerprint.refs_id,
             });
         }
 
@@ -11940,6 +11959,7 @@ impl<'db> FileHasher<'db> {
                             mtime_ns: result.mtime_ns,
                             ctime_ns: result.ctime_ns,
                             inode: result.inode,
+                            refs_id: result.refs_id,
                         },
                         PrefetchedHash {
                             hash,
@@ -12029,6 +12049,7 @@ impl<'db> FileHasher<'db> {
                     mtime_ns: file.mtime_ns,
                     ctime_ns: file.ctime_ns,
                     inode: file.inode,
+                    refs_id: file.refs_id,
                 });
                 missing.insert(file);
             }
@@ -12049,6 +12070,7 @@ impl<'db> FileHasher<'db> {
                     mtime_ns: result.mtime_ns,
                     ctime_ns: result.ctime_ns,
                     inode: result.inode,
+                    refs_id: result.refs_id,
                 };
                 if !missing.contains(&file) {
                     continue;
@@ -12343,6 +12365,7 @@ impl<'db> FileHasher<'db> {
                     mtime_ns: metadata_mtime_ns(metadata),
                     ctime_ns: metadata_ctime_ns(metadata),
                     inode: metadata_inode(metadata),
+                    refs_id: None,
                 },
                 observed_ns,
             };
@@ -12459,7 +12482,7 @@ impl<'db> FileHasher<'db> {
             MIN_PERSISTED_HASH_BYTES
         };
         if fingerprint.size < memo_floor
-            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+            || !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows))
         {
             let hash = read_file_hash(path)?;
             self.record_miss(fingerprint.size);
@@ -12695,7 +12718,7 @@ impl<'db> FileHasher<'db> {
         // Windows); the archive read is cheap and not worth a row.
         let size = fingerprint.size;
         if size < MIN_PERSISTED_HASH_BYTES
-            || !file_hash_memo_eligible(fingerprint.inode, cfg!(windows))
+            || !file_stamp_memo_eligible(fingerprint.inode, fingerprint.refs_id, cfg!(windows))
         {
             let hash = compute_static_lib_hash_for(path, usage, &self.invocation_env)?;
             self.record_miss(size);
@@ -12726,6 +12749,7 @@ impl<'db> FileHasher<'db> {
             mtime_ns: fingerprint.mtime_ns,
             ctime_ns: fingerprint.ctime_ns,
             inode: fingerprint.inode,
+            refs_id: fingerprint.refs_id,
         };
         match cache.get(&key) {
             Ok(Some(hash)) => {
@@ -12781,7 +12805,11 @@ impl<'db> FileHasher<'db> {
         let resolved = self.resolve_path(path)?;
         let path = resolved.as_path();
         if self.cache.is_none()
-            || !file_hash_memo_eligible(observed.fingerprint.inode, cfg!(windows))
+            || !file_stamp_memo_eligible(
+                observed.fingerprint.inode,
+                observed.fingerprint.refs_id,
+                cfg!(windows),
+            )
         {
             return self.hash(path);
         }

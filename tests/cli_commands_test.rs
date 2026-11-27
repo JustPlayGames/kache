@@ -4380,6 +4380,51 @@ fn daemon_status_subcommand_succeeds() {
     );
 }
 
+#[test]
+fn compiler_bootstrap_yields_to_another_starter_and_recovers() {
+    let e = env();
+    let runtime = e.cache.join("private-runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let lock = || {
+        kunobi_daemon::ProcessLock::try_acquire(runtime.join("daemon.lock"))
+            .unwrap()
+            .unwrap()
+    };
+    let start = || {
+        e.cmd()
+            .env("KACHE_RUNTIME_DIR", &runtime)
+            .args(["daemon", "start", "--if-idle"])
+            .output()
+            .unwrap()
+    };
+    let held = lock();
+    let busy = start();
+    assert!(!busy.status.success());
+    assert!(
+        String::from_utf8_lossy(&busy.stderr).contains("another process is starting the daemon")
+    );
+    drop(held);
+
+    let ready = start();
+    assert!(
+        ready.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let held = lock();
+    let existing = start();
+    drop(held);
+    let stopped = e
+        .cmd()
+        .env("KACHE_RUNTIME_DIR", &runtime)
+        .args(["daemon", "stop"])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success());
+    assert!(existing.status.success());
+    assert!(String::from_utf8_lossy(&existing.stderr).contains("daemon already running"));
+}
+
 /// kache-action looks for `<KACHE_RUNTIME_DIR>/daemon.sock`, spelled out in
 /// full, in `kache daemon status` to tell whether a release honors the
 /// runtime directory. On GitHub runners that directory is under $HOME, so the
@@ -5372,6 +5417,42 @@ fn why_miss_compares_a_second_checkout_with_the_first() {
     assert_eq!(value["checkout_comparison"]["verdict"], "dependencies");
     assert_eq!(value["dependency_chain"]["baseline_root"], "/checkouts/a");
     assert_eq!(value["dependency_chain"]["roots"][0]["crate_name"], "leaf");
+}
+
+#[test]
+fn why_miss_points_to_the_crate_whose_link_inputs_changed() {
+    let e = env();
+    write_checkout_builds(
+        &e,
+        &[
+            ("/checkouts/a", "old", "one"),
+            ("/checkouts/b", "new", "two"),
+        ],
+    );
+    let events = e.cache.join("events.jsonl");
+    let mut input = String::new();
+    for line in std::fs::read_to_string(&events).unwrap().lines() {
+        let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+        let digest = event["key_fields"]["env_deps"].clone();
+        event["key_fields"] = serde_json::json!({"link":digest});
+        input.push_str(&event.to_string());
+        input.push('\n');
+    }
+    std::fs::write(events, input).unwrap();
+    for name in ["leaf", "app"] {
+        let output = e.cmd().args(["--json", "explain", name]).output().unwrap();
+        assert!(output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let links: Vec<_> = value["hints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hint| hint.as_str())
+            .filter(|hint| hint.contains("--link-trace"))
+            .collect();
+        assert_eq!(links.len(), 1);
+        assert!(links[0].contains("key diff --link-trace leaf first.log second.log"));
+    }
 }
 
 /// `leaf` computes the same key in both checkouts but produces a different
