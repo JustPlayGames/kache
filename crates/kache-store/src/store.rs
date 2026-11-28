@@ -170,6 +170,48 @@ fn verify_durability_file(
     Ok(file)
 }
 
+/// What durability promotion keeps of a verified blob of a large entry, whose
+/// handles it cannot all keep open: the inode (or file id), the size and the
+/// change times. A blob replaced after verification is another inode, or, when
+/// a freed inode number is reused, one created after it (a later change time);
+/// one rewritten in place has a later modification time.
+#[derive(Debug, PartialEq, Eq)]
+struct BlobFingerprint {
+    identity: kache_fs::InodeId,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl BlobFingerprint {
+    fn of_handle(file: &fs::File) -> std::io::Result<Self> {
+        Ok(Self::from_metadata(
+            kache_fs::handle_identity(file)?,
+            &file.metadata()?,
+        ))
+    }
+
+    fn of_path(path: &Path) -> std::io::Result<Self> {
+        Ok(Self::from_metadata(
+            kache_fs::file_identity(path)?,
+            &fs::metadata(path)?,
+        ))
+    }
+
+    fn from_metadata(identity: kache_fs::InodeId, metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            identity,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
 /// A hardlinked ingest must not publish a writable shared inode.
 fn set_blob_readonly_checked(blob: &Path) -> std::io::Result<()> {
     let meta = fs::metadata(blob)?;
@@ -7849,18 +7891,31 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             }
         }
 
-        // Keep the common case's bulk IO outside the writer lock. Large
-        // entries verify sequentially under it rather than retaining enough
-        // handles to exhaust a normal process descriptor limit.
+        // Every blob is verified and flushed before the writer lock: a flush
+        // waits for the filesystem's journal, and a large entry flushing
+        // under the lock held every build's index write for as long as its
+        // fsyncs took (39 s after a 100 GB sweep on a busy disk). The common
+        // case keeps each verified handle open, so the identity check under
+        // the lock proves the flushed file is still the published one. A
+        // large entry cannot keep that many descriptors open: it keeps each
+        // blob's fingerprint instead (identity, size and change times), which
+        // a replaced or rewritten blob does not match.
         let sequential = meta.files.len() > DURABILITY_MAX_VERIFIED_HANDLES;
         let mut verified = Vec::new();
-        if !sequential {
-            for cached in unique_files.values() {
-                let Some(blob) = self.verify_pending_blob(cache_key, cached, &mut sync_file, None)
-                else {
+        let mut fingerprinted = Vec::new();
+        for cached in unique_files.values() {
+            let Some((blob, file)) = self.verify_pending_blob(cache_key, cached, &mut sync_file)
+            else {
+                return Ok(false);
+            };
+            if sequential {
+                let Ok(fingerprint) = BlobFingerprint::of_handle(&file) else {
                     return Ok(false);
                 };
-                verified.push(blob);
+                drop(file);
+                fingerprinted.push((blob, fingerprint));
+            } else {
+                verified.push((blob, file));
             }
         }
         // The metadata and its directory are flushed before the writer lock
@@ -7897,22 +7952,14 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         if current_hash.as_deref() != Some(content_hash.as_str()) {
             return Ok(false);
         }
-        if sequential {
-            for cached in unique_files.values() {
-                let Some((blob, file)) =
-                    self.verify_pending_blob(cache_key, cached, &mut sync_file, Some(&tx))
-                else {
-                    return Ok(false);
-                };
-                if kache_fs::file_identity(&blob).ok() != Some(kache_fs::handle_identity(&file)?) {
-                    return Ok(false);
-                }
+        for (blob, file) in &verified {
+            if kache_fs::file_identity(blob).ok() != Some(kache_fs::handle_identity(file)?) {
+                return Ok(false);
             }
-        } else {
-            for (blob, file) in &verified {
-                if kache_fs::file_identity(blob).ok() != Some(kache_fs::handle_identity(file)?) {
-                    return Ok(false);
-                }
+        }
+        for (blob, fingerprint) in &fingerprinted {
+            if BlobFingerprint::of_path(blob).ok().as_ref() != Some(fingerprint) {
+                return Ok(false);
             }
         }
         if kache_fs::file_identity(&meta_path).ok()
@@ -7935,12 +7982,11 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         cache_key: &str,
         cached: &CachedFile,
         sync_file: &mut impl FnMut(&fs::File) -> std::io::Result<()>,
-        writer_guard: Option<&rusqlite::Transaction<'_>>,
     ) -> Option<(PathBuf, fs::File)> {
         let blob = self.blob_path(&cached.hash);
         let checked = (|| -> Result<fs::File> {
             let file = verify_durability_file(&blob, cached, sync_file, |path| {
-                self.open_pending_blob(path, writer_guard)
+                self.open_pending_blob(path)
             })?;
             crate::atomic::fsync_dir(blob.parent().expect("blob path has a parent"))?;
             Ok(file)
@@ -7958,28 +8004,15 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         }
     }
 
-    fn open_pending_blob(
-        &self,
-        path: &Path,
-        writer_guard: Option<&rusqlite::Transaction<'_>>,
-    ) -> Result<fs::File> {
+    fn open_pending_blob(&self, path: &Path) -> Result<fs::File> {
         // Windows needs a writable handle for FlushFileBuffers. Serialize
         // only the read-only-bit/open/restore window with other flushers and
         // publishers; hashing and fsync still run after this guard drops.
-        // Large-entry promotion already holds the writer transaction.
         #[cfg(windows)]
         let db = self.db();
         #[cfg(windows)]
-        let _writer = if writer_guard.is_none() {
-            Some(rusqlite::Transaction::new_unchecked(
-                &db,
-                rusqlite::TransactionBehavior::Immediate,
-            )?)
-        } else {
-            None
-        };
-        #[cfg(not(windows))]
-        let _ = writer_guard;
+        let _writer =
+            rusqlite::Transaction::new_unchecked(&db, rusqlite::TransactionBehavior::Immediate)?;
         Ok(open_published_file(path)?)
     }
 

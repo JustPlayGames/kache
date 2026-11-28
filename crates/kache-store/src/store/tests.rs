@@ -3576,7 +3576,6 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                 .unwrap()
         };
         put();
-        let meta_path = store.entry_dir("many-artifacts").join("meta.json");
         let mut calls = 0;
         assert!(
             store
@@ -3584,31 +3583,22 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
                     "many-artifacts",
                     |file| {
                         calls += 1;
-                        // A metadata flush under the lock kept every build's
-                        // index write waiting for the journal.
-                        let metadata_sync = kache_fs::file_identity(&meta_path).ok()
-                            == kache_fs::handle_identity(file).ok();
-                        let must_hold_writer = count == 65 && !metadata_sync;
+                        // A flush under the lock kept every build's index
+                        // write waiting for the journal: a large entry's
+                        // blobs held it 39 s on a busy disk.
                         let store_db = peer.db();
                         let competing = rusqlite::Transaction::new_unchecked(
                             &store_db,
                             rusqlite::TransactionBehavior::Immediate,
                         );
                         match competing {
-                            Ok(tx) => {
-                                assert!(
-                                    !must_hold_writer,
-                                    "large-entry verification must retain the writer lock"
-                                );
-                                drop(tx);
-                            }
+                            Ok(tx) => drop(tx),
                             Err(SqlError::SqliteFailure(code, _))
                                 if code.code == ErrorCode::DatabaseBusy =>
                             {
-                                assert!(
-                                    must_hold_writer,
-                                    "ordinary blob IO and the metadata flush must run outside \
-                                     the writer lock"
+                                panic!(
+                                    "blob and metadata flushes must run outside the writer \
+                                     lock ({count} records)"
                                 );
                             }
                             Err(error) => panic!("unexpected writer probe: {error}"),
@@ -3633,6 +3623,22 @@ fn durability_verification_bounds_handles_at_the_64_record_boundary() {
         .unwrap();
         let last = &meta.files[count - 1];
         let blob = store.blob_path(&last.hash);
+        // A blob replaced by an identical copy after its flush is not the file
+        // flushed: past the handle bound only its fingerprint tells.
+        #[cfg(unix)]
+        {
+            assert!(
+                !store
+                    .flush_entry_durability_with("many-artifacts", fs::File::sync_all, || {
+                        let copy = blob.with_extension("copy");
+                        fs::copy(&blob, &copy).unwrap();
+                        fs::rename(&copy, &blob).unwrap();
+                    })
+                    .unwrap(),
+                "a blob replaced after its flush was promoted ({count} records)"
+            );
+            assert_eq!(store.pending_durability().unwrap(), 1);
+        }
         let mut permissions = fs::metadata(&blob).unwrap().permissions();
         permissions.set_readonly(false);
         fs::set_permissions(&blob, permissions).unwrap();
@@ -3953,10 +3959,9 @@ fn durability_flush_rechecks_the_verified_cas_inode() {
     assert!(store.flush_entry_durability("same-generation").unwrap());
 }
 
-/// An entry within the handle bound flushes its blobs, metadata and
-/// directory before the writer lock: on macOS each flush is an F_FULLFSYNC,
-/// and lookups and stores wait on that lock. A larger entry still flushes its
-/// blobs under it.
+/// An entry flushes its blobs, metadata and directory before the writer lock:
+/// on macOS each flush is an F_FULLFSYNC, and lookups and stores wait on that
+/// lock.
 #[test]
 fn durability_flush_syncs_blobs_and_metadata_before_taking_the_writer_lock() {
     let dir = tempfile::tempdir().unwrap();
