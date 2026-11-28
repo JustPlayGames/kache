@@ -12749,25 +12749,19 @@ fn evict_fires_at_the_trigger_and_stops_at_the_target() {
     assert_eq!(store.physical_size().unwrap(), 760);
 }
 
-/// kunobi-ninja/kache#594: a size-driven sweep records every tombstone
-/// with the value-density shadow's verdict on the same entry, and the
-/// demand stream splits by that verdict. The store here is built so the
-/// two policies disagree: the live policy evicts the LARGEST stale entry
-/// (huge but expensive to rebuild), while the shadow — ranking by
-/// rebuild cost per reclaimable byte — would have kept it and evicted
-/// the small cheap one instead.
-#[test]
-fn size_sweep_records_shadow_verdicts_and_demand_splits() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
+/// Two entries the live policy and the fresh shadow rank apart: a big one
+/// no build has hit yet, stored 10 minutes ago and quick to compile, which
+/// the live policy evicts first, and a small one hit five times an hour
+/// ago, which the shadow takes instead. The sweep's budget is 95 KB.
+fn store_the_shadow_disagrees_on(dir: &Path) -> Store {
+    let mut config = test_config(dir);
     config.max_size = 450_000; // target 405_000; physical 500_000
     let store = Store::open(&config).unwrap();
-
     for (key, bytes, fill, compile_ms) in [
-        ("huge_expensive", 400_000usize, b'a', 60_000u64),
-        ("small_cheap", 100_000usize, b'b', 1u64),
+        ("fresh_big", 400_000usize, b'a', 16_000u64),
+        ("warm_small", 100_000usize, b'b', 7u64),
     ] {
-        let src = dir.path().join(format!("{key}.rlib"));
+        let src = dir.join(format!("{key}.rlib"));
         std::fs::write(&src, vec![fill; bytes]).unwrap();
         store
             .put_with_compile_time(
@@ -12787,38 +12781,50 @@ fn size_sweep_records_shadow_verdicts_and_demand_splits() {
     }
     store
         .db()
-        .execute(
-            "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
-            [],
+        .execute_batch(
+            "UPDATE entries SET last_accessed = datetime('now', '-10 minutes'), hit_count = 0
+              WHERE cache_key = 'fresh_big';
+             UPDATE entries SET last_accessed = datetime('now', '-1 hour'), hit_count = 5
+              WHERE cache_key = 'warm_small';",
         )
         .unwrap();
+    store
+}
+
+/// kunobi-ninja/kache#594: a size-driven sweep records every tombstone
+/// with the shadow's verdict on the same entry, and the demand stream
+/// splits by that verdict.
+#[test]
+fn size_sweep_records_shadow_verdicts_and_demand_splits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_the_shadow_disagrees_on(dir.path());
 
     let stats = store.evict().unwrap();
     assert_eq!(
         stats.entries_evicted, 1,
-        "the live policy evicts the largest entry and reaches its target"
+        "the live policy evicts the fresh entry and reaches its target"
     );
-    assert!(!store.contains("huge_expensive"));
-    assert!(store.contains("small_cheap"));
+    assert!(!store.contains("fresh_big"));
+    assert!(store.contains("warm_small"));
 
     // The tombstone carries the shadow's dissent: for the same 95 KB
-    // budget the value-density ranking would have taken small_cheap
-    // (density ~10 ms/MB) and kept huge_expensive (~150,000 ms/MB).
+    // budget the fresh shadow would have taken warm_small and kept
+    // fresh_big.
     let (shadow_policy, shadow_would_evict): (String, i64) = store
         .db()
         .query_row(
             "SELECT shadow_policy, shadow_would_evict FROM eviction_tombstones
-                 WHERE cache_key = 'huge_expensive'",
+                 WHERE cache_key = 'fresh_big'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(shadow_policy, "value-density");
+    assert_eq!(shadow_policy, crate::eviction::SHADOW_POLICY);
     assert_eq!(shadow_would_evict, 0, "the shadow would have kept it");
 
     // Demand on the evicted key lands in the shadow-kept cohort — the
     // shadow's save, had it been live.
-    assert!(store.get("huge_expensive").unwrap().is_none());
+    assert!(store.get("fresh_big").unwrap().is_none());
     assert_eq!(
         store.shadow_demand_split().unwrap(),
         ShadowDemandSplit {
@@ -12829,22 +12835,24 @@ fn size_sweep_records_shadow_verdicts_and_demand_splits() {
         }
     );
 
-    // Pin the split query's cohort handling: an agreed row counts, a
-    // pre-shadow row (NULL verdict) enters neither cohort, and an
-    // unknown-cost row is recorded but excluded from the headline —
-    // the density shadow ranks unknown cost as worthless by
-    // construction, so counting it would bias the comparison.
+    // Pin the split query's cohort handling: an agreed row counts; a
+    // pre-shadow row (NULL verdict) and a row of an earlier shadow enter
+    // neither cohort; an unknown-cost row is recorded but excluded from
+    // the headline.
     store
             .db()
             .execute_batch(
                 "INSERT INTO eviction_tombstones
                     (cache_key, policy, compile_time_ms, shadow_policy, shadow_would_evict, demanded_at)
-                 VALUES ('agreed_row', 'size-pressure', 500, 'value-density', 1, datetime('now'));
+                 VALUES ('agreed_row', 'size-pressure', 500, 'size-pressure-fresh', 1, datetime('now'));
                  INSERT INTO eviction_tombstones (cache_key, policy, compile_time_ms)
                  VALUES ('pre_shadow_row', 'size-pressure', 500);
                  INSERT INTO eviction_tombstones
                     (cache_key, policy, compile_time_ms, shadow_policy, shadow_would_evict)
-                 VALUES ('unknown_cost_row', 'size-pressure', 0, 'value-density', 0);",
+                 VALUES ('unknown_cost_row', 'size-pressure', 0, 'size-pressure-fresh', 0);
+                 INSERT INTO eviction_tombstones
+                    (cache_key, policy, compile_time_ms, shadow_policy, shadow_would_evict)
+                 VALUES ('earlier_shadow_row', 'size-pressure', 500, 'value-density', 0);",
             )
             .unwrap();
     assert_eq!(
@@ -12865,46 +12873,11 @@ fn size_sweep_records_shadow_verdicts_and_demand_splits() {
 #[test]
 fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
     let dir = tempfile::tempdir().unwrap();
-    let mut config = test_config(dir.path());
-    config.max_size = 450_000; // target 405_000; physical 500_000
-    let store = Store::open(&config).unwrap();
-
-    for (key, bytes, fill, compile_ms) in [
-        ("huge_expensive", 400_000usize, b'a', 60_000u64),
-        ("small_cheap", 100_000usize, b'b', 7u64),
-    ] {
-        let src = dir.path().join(format!("{key}.rlib"));
-        std::fs::write(&src, vec![fill; bytes]).unwrap();
-        store
-            .put_with_compile_time(
-                key,
-                "c",
-                &["lib".into()],
-                &[],
-                "",
-                "dev",
-                &[(src.clone(), "lib.rlib".into())],
-                "",
-                "",
-                compile_ms,
-            )
-            .unwrap();
-        store.remove_clone_for_test(&src);
-    }
-    let age = |store: &Store| {
-        store
-            .db()
-            .execute(
-                "UPDATE entries SET last_accessed = datetime('now', '-1 hour')",
-                [],
-            )
-            .unwrap();
-    };
-    age(&store);
+    let store = store_the_shadow_disagrees_on(dir.path());
 
     store.evict().unwrap();
-    assert!(!store.contains("huge_expensive"));
-    assert!(store.contains("small_cheap"), "the live policy kept it");
+    assert!(!store.contains("fresh_big"));
+    assert!(store.contains("warm_small"), "the live policy kept it");
     let recorded = |store: &Store| -> Vec<(String, i64, i64)> {
         let store_db = store.db();
         let mut stmt = store_db
@@ -12917,7 +12890,7 @@ fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
     };
     assert_eq!(
         recorded(&store),
-        vec![("small_cheap".to_string(), 100_000, 7)],
+        vec![("warm_small".to_string(), 100_000, 7)],
         "only the entry the shadow would have taken instead"
     );
 
@@ -12940,12 +12913,13 @@ fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
         }
     );
 
-    // The build uses both again. The live policy pays for the expensive
-    // rebuild; the shadow pays for the hit on the entry it would have lost.
-    assert!(store.get("huge_expensive").unwrap().is_none());
-    assert!(store.get("small_cheap").unwrap().is_some());
+    // The build uses both again. The live policy pays for the fresh
+    // entry's rebuild; the shadow pays for the hit on the entry it would
+    // have lost.
+    assert!(store.get("fresh_big").unwrap().is_none());
+    assert!(store.get("warm_small").unwrap().is_some());
     let used = store.shadow_counterfactual().unwrap();
-    assert_eq!(used.live.demanded_compile_time_ms, 60_000);
+    assert_eq!(used.live.demanded_compile_time_ms, 16_000);
     assert_eq!(used.shadow.demanded_compile_time_ms, 7);
 
     // A later sweep that wants the same victim again keeps its first record,
@@ -12965,14 +12939,30 @@ fn size_sweep_records_the_shadows_own_victims_for_both_sided_cost() {
         .eviction_candidates_for(SweepOrigin::Requested)
         .unwrap()
         .into_iter()
-        .find(|entry| entry.key == "small_cheap")
+        .find(|entry| entry.key == "warm_small")
         .unwrap();
-    store.record_shadow_victims("value-density", "2026-01-01 00:00:00", &[&victim]);
-    let again: String = store
+    let swept = |store: &Store| -> (String, String) {
+        store
+            .db()
+            .query_row("SELECT swept_at, shadow_policy FROM shadow_victims", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+    };
+    let shadow = crate::eviction::SHADOW_POLICY;
+    store.record_shadow_victims(shadow, "2026-01-01 00:00:00", &[&victim]);
+    assert_eq!(swept(&store), (first, shadow.to_string()));
+
+    // A row an earlier shadow recorded gives way to this shadow's first.
+    store
         .db()
-        .query_row("SELECT swept_at FROM shadow_victims", [], |row| row.get(0))
+        .execute("UPDATE shadow_victims SET shadow_policy = 'value-density'", [])
         .unwrap();
-    assert_eq!(again, first);
+    store.record_shadow_victims(shadow, "2026-01-01 00:00:00", &[&victim]);
+    assert_eq!(
+        swept(&store),
+        ("2026-01-01 00:00:00".to_string(), shadow.to_string())
+    );
 
     // Retention follows the tombstones.
     store.prune_tombstones(0).unwrap();
@@ -17632,7 +17622,7 @@ fn eviction_horizon_public_api_reads_existing_observations_without_writes() {
     let dir = tempfile::tempdir().unwrap();
     let config = test_config(dir.path());
     let owner = Store::open(&config).unwrap();
-    owner.db().execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime(100,'unixepoch'),'lru',1073741824,0,0,900,datetime(150,'unixepoch'),'value-density',1)",[]).unwrap();
+    owner.db().execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime(100,'unixepoch'),'lru',1073741824,0,0,900,datetime(150,'unixepoch'),'size-pressure-fresh',1)",[]).unwrap();
     let reader = Store::open_read_only(&config).unwrap();
     let changes = reader.db().total_changes();
     let report = reader.eviction_horizon_evidence(200, 100).unwrap();

@@ -244,6 +244,60 @@ impl EvictionPolicy for SizePressureSparingYoungPolicy {
     }
 }
 
+/// Idle hours under which an entry no build has hit yet counts as fresh for
+/// [`SizePressureSparingFreshPolicy`]: 45 minutes.
+pub const FRESH_MAX_IDLE_HOURS: f64 = 0.75;
+
+/// The shadow that size-driven sweeps rank beside the live policy: what the
+/// tombstones' `shadow_policy` and the `shadow_victims` rows name. Rows of
+/// an earlier shadow (`value-density`) stay and are not counted for it.
+pub const SHADOW_POLICY: &str = "size-pressure-fresh";
+
+/// [`SizePressureSparingYoungPolicy`] that also ranks an entry no build has
+/// hit yet, idle under [`FRESH_MAX_IDLE_HOURS`], with [`YOUNG_SCORE_FACTOR`]
+/// times its score, whatever its compile time (the factor is not applied
+/// twice). A shadow candidate: it never decides what a sweep removes.
+///
+/// The victims of a sweep that come back soonest are such entries: on a
+/// build machine (2026-11-28) 78 of one sweep's 95 known-key misses were one
+/// commit's test programs, 120-313 MB each, compiled in 5-29 s (under
+/// [`YOUNG_MIN_COMPILE_MS`]), stored 25 minutes before the sweep and asked
+/// for again 2 minutes after it from a second checkout. Whether sparing
+/// them costs more in the colder entries taken instead is what the shadow's
+/// demand log answers, before any live policy changes.
+pub struct SizePressureSparingFreshPolicy {
+    /// As [`SizePressureSparingYoungPolicy::hours`]; `0` spares no young
+    /// entry.
+    pub young_hours: u64,
+}
+
+impl SizePressureSparingFreshPolicy {
+    fn score(&self, e: &EntryFeatures) -> f64 {
+        let young =
+            e.idle_hours < self.young_hours as f64 && e.compile_time_ms >= YOUNG_MIN_COMPILE_MS;
+        let fresh = e.hit_count == 0 && e.idle_hours < FRESH_MAX_IDLE_HOURS;
+        let score = size_pressure_score(e);
+        if young || fresh {
+            score * YOUNG_SCORE_FACTOR
+        } else {
+            score
+        }
+    }
+}
+
+impl EvictionPolicy for SizePressureSparingFreshPolicy {
+    fn name(&self) -> &'static str {
+        SHADOW_POLICY
+    }
+
+    fn select(&self, candidates: &[EntryFeatures]) -> Vec<String> {
+        let mut ranked: Vec<(f64, &EntryFeatures)> =
+            candidates.iter().map(|e| (self.score(e), e)).collect();
+        ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        ranked.into_iter().map(|(_, e)| e.key.clone()).collect()
+    }
+}
+
 /// Retention value per reclaimable byte; **lower is evicted first**
 /// (kunobi-ninja/kache#594, shadow candidate — never the live policy yet).
 ///
@@ -572,6 +626,25 @@ mod tests {
         assert!(value_density_score(&a) < value_density_score(&b));
         let order = ValueDensityPolicy.select(&[b, a]);
         assert_eq!(order, vec!["a", "b"]);
+    }
+
+    /// The fresh shadow keeps a big entry no build has hit yet, idle under 45
+    /// minutes and quick to compile, past a small entry idle for hours, which
+    /// the live policy evicts after it; one hit, or 45 minutes idle, ends that.
+    #[test]
+    fn sparing_fresh_ranks_never_hit_entries_under_45_minutes_later() {
+        const MB: i64 = 1024 * 1024;
+        let mut fresh = feat("fresh", 200 * MB, 0, 0.4);
+        fresh.compile_time_ms = 16_000;
+        let old = feat("old", 10 * MB, 0, 7.0);
+        let hit = feat("hit", 600 * MB, 1, 0.4);
+        let past = feat("past", 200 * MB, 0, 1.0);
+        let all = [fresh, old, hit, past];
+
+        let live = SizePressureSparingYoungPolicy { hours: 12 }.select(&all);
+        assert_eq!(live, vec!["past", "hit", "fresh", "old"]);
+        let shadow = SizePressureSparingFreshPolicy { young_hours: 12 }.select(&all);
+        assert_eq!(shadow, vec!["past", "hit", "old", "fresh"]);
     }
 
     /// The budget walk takes the ranking's prefix whose expected reclaim

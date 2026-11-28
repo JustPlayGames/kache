@@ -25,7 +25,7 @@ fn daemon_free_report_reads_mature_evidence_after_last_wal_owner_closes() {
     report(cache.path());
     let index = cache.path().join("index.db");
     let db = rusqlite::Connection::open(&index).unwrap();
-    db.execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime('now','-8 days'),'lru',1073741824,0,0,900,datetime('now','-7 days'),'value-density',1)",[]).unwrap();
+    db.execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime('now','-8 days'),'lru',1073741824,0,0,900,datetime('now','-7 days'),'size-pressure-fresh',1)",[]).unwrap();
     drop(db);
     assert!(
         !cache.path().join("index.db-wal").exists(),

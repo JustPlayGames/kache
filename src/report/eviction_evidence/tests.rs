@@ -7,7 +7,7 @@ fn horizon_is_independent_of_event_window_and_reads_production_schema() {
     let config = crate::test_support::test_config(dir.path().to_path_buf());
     let store = Store::open(&config).unwrap();
     let db = rusqlite::Connection::open(config.index_db_path()).unwrap();
-    db.execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime(100,'unixepoch'),'lru',1073741824,0,0,900,datetime(604900,'unixepoch'),'value-density',1)",[]).unwrap();
+    db.execute("INSERT INTO eviction_tombstones(cache_key,evicted_at,policy,size,hit_count,idle_hours,compile_time_ms,demanded_at,shadow_policy,shadow_would_evict) VALUES ('old',datetime(100,'unixepoch'),'lru',1073741824,0,0,900,datetime(604900,'unixepoch'),'size-pressure-fresh',1)",[]).unwrap();
     drop(db);
     drop(store);
     // Reopen for report after the last WAL owner has closed.

@@ -7786,7 +7786,7 @@ impl Daemon {
                     );
                 }
                 // The #594 policy comparison: demand rate on entries the
-                // value-density shadow would have KEPT vs entries it agreed
+                // shadow policy would have KEPT vs entries it agreed
                 // to evict. A markedly higher rate on the kept cohort is the
                 // evidence for flipping the live policy; comparable rates
                 // are the evidence against.
@@ -7798,7 +7798,8 @@ impl Daemon {
                         shadow_agreed_demanded = split.agreed_demanded,
                         shadow_kept = split.shadow_kept,
                         shadow_kept_demanded = split.shadow_kept_demanded,
-                        "gc: post-eviction demand by shadow verdict (value-density, #594)"
+                        shadow = kache_store::eviction::SHADOW_POLICY,
+                        "gc: post-eviction demand by shadow verdict (#594)"
                     );
                 }
                 // Both sides over the same sweeps: what each policy's
@@ -7813,7 +7814,8 @@ impl Daemon {
                         shadow_evicted = cost.shadow.evicted,
                         shadow_bytes = cost.shadow.bytes,
                         shadow_demanded_compile_time_ms = cost.shadow.demanded_compile_time_ms,
-                        "gc: rebuild cost of each policy's evictions (value-density, #594)"
+                        shadow = kache_store::eviction::SHADOW_POLICY,
+                        "gc: rebuild cost of each policy's evictions (#594)"
                     );
                 }
 

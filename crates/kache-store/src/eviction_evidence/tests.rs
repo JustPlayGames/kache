@@ -15,10 +15,10 @@ fn live(
     size: i64,
     cost: i64,
 ) {
-    db.execute("INSERT OR REPLACE INTO eviction_tombstones VALUES (?1, datetime(?2, 'unixepoch'), datetime(?3, 'unixepoch'), 'value-density', ?4, ?5, ?6, 0)", params![key, start, demand, agreed, size, cost]).unwrap();
+    db.execute("INSERT OR REPLACE INTO eviction_tombstones VALUES (?1, datetime(?2, 'unixepoch'), datetime(?3, 'unixepoch'), 'size-pressure-fresh', ?4, ?5, ?6, 0)", params![key, start, demand, agreed, size, cost]).unwrap();
 }
 fn shadow(db: &Connection, key: &str, start: i64, hits: i64) {
-    db.execute("INSERT OR IGNORE INTO shadow_victims VALUES (?1, datetime(?2, 'unixepoch'), 'value-density', 100, 500, ?3)", params![key,start,hits]).unwrap();
+    db.execute("INSERT OR IGNORE INTO shadow_victims VALUES (?1, datetime(?2, 'unixepoch'), 'size-pressure-fresh', 100, 500, ?3)", params![key,start,hits]).unwrap();
 }
 fn hit(db: &Connection, key: &str, stamp: i64, hits: i64) {
     db.execute(

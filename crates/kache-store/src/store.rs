@@ -1942,7 +1942,8 @@ pub struct PolicyCost {
     pub demanded_compile_time_ms: u64,
 }
 
-/// The live policy against the value-density shadow over the same sweeps:
+/// The live policy against the shadow ([`crate::eviction::SHADOW_POLICY`])
+/// over the same sweeps:
 /// see [`Store::shadow_counterfactual`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ShadowCounterfactual {
@@ -8989,7 +8990,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// `stop_at` is `Some((current_size, target))` for size-driven sweeps and
     /// `None` when the policy's whole selection should be removed.
     ///
-    /// Size-driven sweeps are shadowed by the #594 value-density candidate:
+    /// Size-driven sweeps are shadowed by a candidate policy
+    /// ([`crate::eviction::SHADOW_POLICY`], after #594's value-density):
     /// it ranks the same candidate set for the same byte budget, and each
     /// tombstone records whether it agreed — while the live policy alone
     /// decides what actually goes. The demand stream then compares the two
@@ -9089,7 +9091,9 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
         let shadow = match stop_at {
             Some((current, target)) if held_probe == HeldProbe::Upfront => {
                 use crate::eviction::EvictionPolicy as _;
-                let candidate = crate::eviction::ValueDensityPolicy;
+                let candidate = crate::eviction::SizePressureSparingFreshPolicy {
+                    young_hours: self.config.gc_spare_young_hours,
+                };
                 let shadow_order = candidate.select(&candidates);
                 Some(ShadowSelection {
                     policy: candidate.name(),
@@ -9784,9 +9788,18 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
             let tx = db.unchecked_transaction()?;
             {
                 let mut insert = tx.prepare(
-                    "INSERT OR IGNORE INTO shadow_victims
+                    // A key keeps its first sweep under one shadow; a row of
+                    // an earlier shadow gives way to this one's.
+                    "INSERT INTO shadow_victims
                         (cache_key, swept_at, shadow_policy, size, hit_count, compile_time_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(cache_key) DO UPDATE SET
+                        swept_at = excluded.swept_at,
+                        shadow_policy = excluded.shadow_policy,
+                        size = excluded.size,
+                        hit_count = excluded.hit_count,
+                        compile_time_ms = excluded.compile_time_ms
+                     WHERE shadow_victims.shadow_policy <> excluded.shadow_policy",
                 )?;
                 for victim in victims {
                     insert.execute(params![
@@ -9818,10 +9831,10 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
     /// unknown cost are left out, as in [`Self::shadow_demand_split`].
     pub fn shadow_counterfactual(&self) -> Result<ShadowCounterfactual> {
         let row = self.db().query_row(
-            "WITH since AS (SELECT MIN(swept_at) AS t FROM shadow_victims),
+            "WITH since AS (SELECT MIN(swept_at) AS t FROM shadow_victims WHERE shadow_policy = ?1),
              live AS (
                 SELECT * FROM eviction_tombstones
-                 WHERE shadow_policy = 'value-density' AND compile_time_ms > 0
+                 WHERE shadow_policy = ?1 AND compile_time_ms > 0
                    AND evicted_at >= (SELECT t FROM since)
              ),
              own AS (
@@ -9833,7 +9846,7 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                   LEFT JOIN entries e ON e.cache_key = sv.cache_key
                   LEFT JOIN eviction_tombstones t
                          ON t.cache_key = sv.cache_key AND t.evicted_at >= sv.swept_at
-                 WHERE sv.shadow_policy = 'value-density' AND sv.compile_time_ms > 0
+                 WHERE sv.shadow_policy = ?1 AND sv.compile_time_ms > 0
              )
              SELECT
                 (SELECT COUNT(*) FROM live),
@@ -9841,17 +9854,17 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 (SELECT COALESCE(SUM(compile_time_ms), 0) FROM live WHERE demanded_at IS NOT NULL),
                 (SELECT COUNT(*) FROM live
                   WHERE shadow_would_evict = 1
-                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims))
+                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims WHERE shadow_policy = ?1))
                   + (SELECT COUNT(*) FROM own),
                 (SELECT COALESCE(SUM(size), 0) FROM live
                   WHERE shadow_would_evict = 1
-                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims))
+                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims WHERE shadow_policy = ?1))
                   + (SELECT COALESCE(SUM(size), 0) FROM own),
                 (SELECT COALESCE(SUM(compile_time_ms), 0) FROM live
                   WHERE shadow_would_evict = 1 AND demanded_at IS NOT NULL
-                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims))
+                    AND cache_key NOT IN (SELECT cache_key FROM shadow_victims WHERE shadow_policy = ?1))
                   + (SELECT COALESCE(SUM(compile_time_ms), 0) FROM own WHERE demanded)",
-            [],
+            [crate::eviction::SHADOW_POLICY],
             |row| {
                 let count = |i: usize| row.get::<_, i64>(i).map(|v| v.max(0) as u64);
                 Ok(ShadowCounterfactual {
@@ -10030,8 +10043,8 @@ impl<P: ArtifactPolicy> ArtifactStore<P> {
                 COUNT(CASE WHEN shadow_would_evict = 0 THEN 1 END),
                 COUNT(CASE WHEN shadow_would_evict = 0 AND demanded_at IS NOT NULL THEN 1 END)
              FROM eviction_tombstones
-             WHERE shadow_policy = 'value-density' AND compile_time_ms > 0",
-            [],
+             WHERE shadow_policy = ?1 AND compile_time_ms > 0",
+            [crate::eviction::SHADOW_POLICY],
             |row| {
                 Ok(ShadowDemandSplit {
                     agreed: row.get::<_, i64>(0)?.max(0) as usize,

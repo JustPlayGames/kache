@@ -139,7 +139,7 @@ pub(crate) fn read(
                 unixepoch(evicted_at), unixepoch(demanded_at), demanded_at IS NOT NULL,
                 size, compile_time_ms, NULL, NULL, 0
            FROM eviction_tombstones
-          WHERE shadow_policy = 'value-density' AND shadow_would_evict IN (0, 1)
+          WHERE shadow_policy = ?1 AND shadow_would_evict IN (0, 1)
          UNION ALL
          SELECT 2, unixepoch(sv.swept_at), unixepoch(t.demanded_at),
                 t.demanded_at IS NOT NULL, sv.size, sv.compile_time_ms,
@@ -149,9 +149,9 @@ pub(crate) fn read(
            LEFT JOIN entries e ON e.cache_key = sv.cache_key
            LEFT JOIN eviction_tombstones t ON t.cache_key = sv.cache_key
                                          AND t.evicted_at >= sv.swept_at
-          WHERE sv.shadow_policy = 'value-density'",
+          WHERE sv.shadow_policy = ?1",
     )?;
-    let rows = query.query_map([], |row| {
+    let rows = query.query_map([crate::eviction::SHADOW_POLICY], |row| {
         Ok((
             row.get::<_, u8>(0)?,
             Observation {
