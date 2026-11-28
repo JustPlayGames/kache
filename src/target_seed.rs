@@ -458,26 +458,36 @@ fn needles_for(donor: &Donor, same_checkout: bool) -> Vec<String> {
 /// one kache built into, or a Cargo target directory under the checkout's
 /// `target/` (two levels down, as integrate's are).
 fn checkout_has_other_targets(target: &NewTarget, donors: &[Donor]) -> bool {
-    let ours = |dir: &Path| dir == target.target_dir || dir.starts_with(&target.target_dir);
     if donors.iter().any(|donor| {
-        same_checkout(donor, target) && !ours(&donor.target_dir) && donor.target_dir.exists()
+        same_checkout(donor, target)
+            && donor.target_dir != target.target_dir
+            && donor.target_dir.exists()
     }) {
         return true;
     }
-    let root = target.workspace_root.join("target");
-    let mut pending = vec![(root, 0)];
+    checkout_target_dirs(target).iter().any(|dir| {
+        dir.join("CACHEDIR.TAG").exists() || dir.join(PROFILE).join(".fingerprint").exists()
+    })
+}
+
+/// The directories under `target`'s checkout's `target/`, two levels down
+/// (as integrate's targets are), but `target` itself: the places another
+/// target of the checkout can be. The walk goes on inside `target`, so a
+/// checkout's `target/` finds the targets nested in it
+/// (`target/integrate-stack`); skipping everything under it, as these walks
+/// did, left a re-seeded `target/` blind to them.
+fn checkout_target_dirs(target: &NewTarget) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut pending = vec![(target.workspace_root.join("target"), 0)];
     while let Some((dir, depth)) = pending.pop() {
-        if ours(&dir) {
-            continue;
-        }
-        if dir.join("CACHEDIR.TAG").exists() || dir.join(PROFILE).join(".fingerprint").exists() {
-            return true;
-        }
         if depth < 2 {
             pending.extend(subdirectories(&dir).into_iter().map(|sub| (sub, depth + 1)));
         }
+        if dir != target.target_dir {
+            dirs.push(dir);
+        }
     }
-    false
+    dirs
 }
 
 /// A target directory units may be copied from.
@@ -2274,27 +2284,17 @@ fn recorded_donor(profile: &Path) -> Option<(PathBuf, PathBuf, std::time::System
 /// `target/` had integrate-station's, whose registry units have other
 /// bytes. Every crate above them keyed apart, about 19 compiles a landing.
 fn sibling_donors(target: &NewTarget, donors: &[Donor]) -> Vec<PathBuf> {
-    let ours = |dir: &Path| dir == target.target_dir || dir.starts_with(&target.target_dir);
     let mut siblings: Vec<PathBuf> = donors
         .iter()
-        .filter(|donor| same_checkout(donor, target) && !ours(&donor.target_dir))
+        .filter(|donor| same_checkout(donor, target) && donor.target_dir != target.target_dir)
         .map(|donor| donor.target_dir.clone())
         .collect();
-    let mut pending = vec![(target.workspace_root.join("target"), 0)];
-    while let Some((dir, depth)) = pending.pop() {
-        if ours(&dir) {
-            continue;
-        }
-        if depth < 2 {
-            pending.extend(subdirectories(&dir).into_iter().map(|sub| (sub, depth + 1)));
-        }
-        siblings.push(dir);
-    }
+    siblings.extend(checkout_target_dirs(target));
     let mut recorded: Vec<(std::time::SystemTime, PathBuf)> = siblings
         .iter()
         .filter_map(|dir| recorded_donor(&dir.join(PROFILE)))
         .map(|(donor, _, at)| (at, donor))
-        .filter(|(_, donor)| !ours(donor))
+        .filter(|(_, donor)| *donor != target.target_dir)
         .collect();
     recorded.sort();
     let mut seen = BTreeSet::new();
@@ -4188,6 +4188,33 @@ source = "git+https://example.com/gitdep#abc"
         assert_eq!(named, first.target_dir, "a sibling passes its donor on");
     }
 
+    /// A checkout's `target/` seeded again (its profile gone, the targets
+    /// nested in it kept) takes the donor those nested targets recorded, as
+    /// a nested target takes `target/`'s. On the build machine every
+    /// re-seeded `target/` beside a nested sibling took the most recent
+    /// donor of another checkout instead (2026-11-28: 5 of 5, "checkout's
+    /// donor" never said): the walk for siblings skipped everything under
+    /// the target being seeded, which for `target/` is every nested target.
+    #[test]
+    fn a_reseeded_target_takes_the_donor_its_nested_targets_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, recent, cache, own, own_donor) = sibling_fixture(dir.path());
+        let donors = [own_donor, recent.clone(), first.clone()];
+        let stack = stack_of(&own, "integrate-stack");
+        let seeded = seed(&stack, VERSION, &donors, cache.path(), later());
+        assert_eq!(seeded.donor, Some(own.workspace_root.clone()));
+        let (named, _, _) = recorded_donor(&stack.target_dir.join(PROFILE)).unwrap();
+        assert_eq!(
+            named, first.target_dir,
+            "the fixture's nested target names first"
+        );
+        std::fs::remove_dir_all(own.target_dir.join(PROFILE)).unwrap();
+        let seeded = seed(&own, VERSION, &donors, cache.path(), later());
+        assert_eq!(seeded.donor, Some(first.workspace_root.clone()));
+        assert_eq!(seeded.sibling, SiblingDonor::Sticky);
+        assert_eq!(seeded_dep(&own), "rlib-first");
+    }
+
     /// The recorded donor is tried however long ago it was used; held by a
     /// build or no longer tracked, seeding takes the ranked order and says so.
     #[test]
@@ -4708,6 +4735,14 @@ source = "git+https://example.com/gitdep#abc"
         assert!(!checkout_has_other_targets(&target, &[]));
         std::fs::create_dir_all(root.join("target/integrate-x/debug/.fingerprint")).unwrap();
         assert!(checkout_has_other_targets(&target, &[]));
+        // The checkout's `target/` sees that target nested in it: its run
+        // files must not take older times either.
+        let outer = NewTarget {
+            target_dir: root.join("target"),
+            workspace_root: root.clone(),
+            cargo_home: None,
+        };
+        assert!(checkout_has_other_targets(&outer, &[]));
     }
 
     /// A path package's units come from a target of the same checkout, whose
